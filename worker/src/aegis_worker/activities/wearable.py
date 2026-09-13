@@ -30,6 +30,7 @@ from typing import Any
 
 import httpx
 import structlog
+from aegis.errors import error_text
 from temporalio import activity
 
 logger = structlog.get_logger()
@@ -201,7 +202,7 @@ class WearableActivities:
                         "wearable_endpoint_failed",
                         vendor=vendor,
                         endpoint=endpoint,
-                        error=str(exc)[:200],
+                        error=error_text(exc),
                     )
                     continue
                 records.extend(_oura_records(endpoint, items, vendor))
@@ -305,7 +306,7 @@ class WearableActivities:
                     "wearable_observation_write_failed",
                     metric=str(rec.get("metric") or "")[:64],
                     day=day,
-                    error=str(exc)[:200],
+                    error=error_text(exc),
                 )
                 continue
             if row is None:

@@ -23,6 +23,8 @@ from dataclasses import dataclass
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
+    from aegis.errors import error_text
+
     from aegis_worker.activities.homelab import HomelabActivities
     from aegis_worker.activities.hub import HubActivities
     from aegis_worker.shared.retry import FAST, NO_RETRY, TIMEOUT_FAST, TIMEOUT_STANDARD
@@ -117,7 +119,7 @@ class DeliveryWatchdogFlow:
                 retry_policy=NO_RETRY,
             )
         except Exception as exc:  # noqa: BLE001 — a hub outage must not hide the findings
-            workflow.logger.warning("delivery_watchdog_hub_failed err=%s", str(exc)[:200])
+            workflow.logger.warning("delivery_watchdog_hub_failed err=%s", error_text(exc))
             outcome = {"fresh": findings, "resolved": []}
 
         fresh = {f.get("klass") for f in outcome.get("fresh") or []}

@@ -80,4 +80,4 @@ async def test_a_library_that_fails_is_an_error_line(monkeypatch):
         _act(_kc(0.9)).research_gather, {"question": "how should I tune the learning rate"}
     )
     assert out["books"][0]["id"] == 12
-    assert any(e.startswith("library: calibre down") for e in out["errors"])
+    assert any(e.startswith("library: RuntimeError: calibre down") for e in out["errors"])

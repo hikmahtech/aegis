@@ -29,6 +29,7 @@ from typing import Any
 
 import structlog
 
+from aegis.errors import error_text
 from aegis.llm import LLMTruncationError, parse_llm_json
 from aegis.llm.tier import tier_to_model
 from aegis.observability import log_audit
@@ -182,14 +183,14 @@ async def _classify(*, pool: Any, llm: Any, text: str) -> Classification:
             purpose=PURPOSE,
         )
     except LLMTruncationError as exc:
-        logger.warning("capture_classify_truncated", error=str(exc)[:200])
+        logger.warning("capture_classify_truncated", error=error_text(exc))
         return Classification(SAFE_LANE, "unknown", 0.0, "llm_truncated")
     except Exception as exc:  # noqa: BLE001 — capture must survive any LLM fault
         # The kill-switch path raises before any row, which the audit row
         # still records.
         logger.warning(
             "capture_classify_failed",
-            error=str(exc)[:200],
+            error=error_text(exc),
             exc_type=type(exc).__name__,
         )
         return Classification(

@@ -7,6 +7,7 @@ from typing import Any
 
 import httpx
 import structlog
+from aegis.errors import error_text
 from temporalio import activity
 
 _logger = structlog.get_logger()
@@ -56,7 +57,7 @@ async def safe_send_message(delivery: Any, *, agent_id: str, message: str, log_e
                 await record_notification(pool, agent_id, log_event, sent=False)
                 return False
         except Exception as exc:  # noqa: BLE001 — budget must never block delivery
-            _logger.warning("notification_budget_check_failed", error=str(exc)[:200])
+            _logger.warning("notification_budget_check_failed", error=error_text(exc))
 
     async def _record(event: str, sent: bool) -> None:
         if pool is None:
@@ -71,7 +72,7 @@ async def safe_send_message(delivery: Any, *, agent_id: str, message: str, log_e
     try:
         result = await delivery.send_message(agent_id=agent_id, message=message, chat_id=0)
     except Exception as exc:  # noqa: BLE001 — boundary, must not propagate
-        _logger.warning(f"{log_event}_raised", error=str(exc)[:200])
+        _logger.warning(f"{log_event}_raised", error=error_text(exc))
         await _record(f"{log_event}_raised", sent=False)
         return False
 
@@ -177,8 +178,8 @@ class DeliveryActivities:
             )
             return resp.json()
         except Exception as exc:  # noqa: BLE001 — voice is additive, never fatal
-            activity.logger.warning("send_voice_failed: %s", str(exc)[:200])
-            return {"ok": False, "error": str(exc)[:200]}
+            activity.logger.warning("send_voice_failed: %s", error_text(exc))
+            return {"ok": False, "error": error_text(exc)}
 
     @activity.defn
     async def send_system_event(self, message: str, chat_id: int = 0) -> dict:

@@ -27,6 +27,7 @@ from html import escape
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
+    from aegis.errors import error_text
     from aegis.services.research import DEPTHS, render_report
 
     from aegis_worker.activities.agent_registry import AgentRegistryActivities
@@ -95,7 +96,7 @@ class ResearchFlow:
                 retry_policy=RETRY_ONCE,
             )
         except Exception as exc:
-            workflow.logger.warning("research_gather_degraded err=%s", str(exc)[:200])
+            workflow.logger.warning("research_gather_degraded err=%s", error_text(exc))
             gathered = {"kg": [], "web": [], "papers": [], "to_read": [], "errors": []}
             notes["gather_degraded"] = True
         errors = list(gathered.get("errors") or [])
@@ -112,7 +113,7 @@ class ResearchFlow:
                 pages = list(read.get("pages") or [])
                 errors += list(read.get("errors") or [])
             except Exception as exc:
-                workflow.logger.warning("research_read_degraded err=%s", str(exc)[:200])
+                workflow.logger.warning("research_read_degraded err=%s", error_text(exc))
                 notes["read_degraded"] = True
 
         try:
@@ -123,7 +124,7 @@ class ResearchFlow:
                 retry_policy=RETRY_ONCE,
             )
         except Exception as exc:
-            workflow.logger.warning("research_synthesis_degraded err=%s", str(exc)[:200])
+            workflow.logger.warning("research_synthesis_degraded err=%s", error_text(exc))
             synth = {
                 "answer": "I gathered sources but the synthesis step failed.",
                 "synthesized": False,
@@ -144,7 +145,7 @@ class ResearchFlow:
                 )
                 saved = bool(res.get("saved"))
             except Exception as exc:
-                workflow.logger.warning("research_save_failed err=%s", str(exc)[:200])
+                workflow.logger.warning("research_save_failed err=%s", error_text(exc))
                 notes["save_failed"] = True
 
         # The activity renders the report under the configured `report_chars`;
@@ -183,7 +184,7 @@ class ResearchFlow:
             )
             agent_id = str((resolved or {}).get("research") or "")
         except Exception as exc:  # noqa: BLE001 — routing is a nicety
-            workflow.logger.warning("research_agent_resolve_failed err=%s", str(exc)[:200])
+            workflow.logger.warning("research_agent_resolve_failed err=%s", error_text(exc))
             return ""
         if not agent_id:
             workflow.logger.warning("research_agent_unresolved tag=research")
@@ -209,6 +210,6 @@ class ResearchFlow:
                 retry_policy=RETRY_ONCE,
             )
         except Exception as exc:  # noqa: BLE001 — the answer stands; the message is extra
-            workflow.logger.warning("research_report_failed err=%s", str(exc)[:200])
+            workflow.logger.warning("research_report_failed err=%s", error_text(exc))
             return False
         return bool(isinstance(res, dict) and res.get("ok"))

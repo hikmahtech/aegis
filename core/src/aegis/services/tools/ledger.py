@@ -47,6 +47,7 @@ from typing import Literal
 import asyncpg
 import structlog
 
+from aegis.errors import error_text
 from aegis.services import books, books_chart
 from aegis.services import ledger_write as lw
 from aegis.services.tools.base import ToolContext
@@ -331,9 +332,9 @@ async def _dispatch_books_write(
         reattached = True
         handle = client.get_workflow_handle(workflow_id)
     except Exception as exc:  # noqa: BLE001 — a dispatch failure is an answer, not a crash
-        logger.warning("books_write_dispatch_failed", op=op, error=str(exc)[:200])
+        logger.warning("books_write_dispatch_failed", op=op, error=error_text(exc))
         return (
-            f"error: the books write could not be queued: {str(exc)[:200]}. "
+            f"error: the books write could not be queued: {error_text(exc)}. "
             "Nothing was written."
         )
     try:
@@ -352,9 +353,9 @@ async def _dispatch_books_write(
         )
     except Exception as exc:  # noqa: BLE001 — the workflow failed; say so, don't raise
         logger.warning(
-            "books_write_failed", op=op, workflow_id=workflow_id, error=str(exc)[:200]
+            "books_write_failed", op=op, workflow_id=workflow_id, error=error_text(exc)
         )
-        return f"error: the books write failed: {str(exc)[:200]}"
+        return f"error: the books write failed: {error_text(exc)}"
     message = result.get("message") if isinstance(result, dict) else None
     return str(message) if message else f"the books write {workflow_id} reported nothing"
 

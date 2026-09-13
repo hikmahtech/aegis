@@ -16,6 +16,7 @@ import httpx
 import structlog
 
 from aegis.connectors._base import HTTPConnector
+from aegis.errors import error_text
 
 logger = structlog.get_logger()
 
@@ -110,11 +111,11 @@ class TodoistConnector(HTTPConnector):
             r = await client.post(_SYNC_PATH, json=payload)
         except httpx.TimeoutException as exc:
             elapsed = int((time.perf_counter() - started) * 1000)
-            await self._record("sync", "timeout", elapsed, str(exc)[:200])
+            await self._record("sync", "timeout", elapsed, error_text(exc))
             return self._envelope(ok=False, error="timeout", retryable=True)
         except httpx.NetworkError as exc:
             elapsed = int((time.perf_counter() - started) * 1000)
-            await self._record("sync", "network_error", elapsed, str(exc)[:200])
+            await self._record("sync", "network_error", elapsed, error_text(exc))
             return self._envelope(ok=False, error="network", retryable=True)
 
         elapsed = int((time.perf_counter() - started) * 1000)
@@ -141,11 +142,11 @@ class TodoistConnector(HTTPConnector):
             r = await client.post(_SYNC_PATH, json=payload)
         except httpx.TimeoutException as exc:
             elapsed = int((time.perf_counter() - started) * 1000)
-            await self._record("commands", "timeout", elapsed, str(exc)[:200])
+            await self._record("commands", "timeout", elapsed, error_text(exc))
             return self._envelope(ok=False, error="timeout", retryable=True)
         except httpx.NetworkError as exc:
             elapsed = int((time.perf_counter() - started) * 1000)
-            await self._record("commands", "network_error", elapsed, str(exc)[:200])
+            await self._record("commands", "network_error", elapsed, error_text(exc))
             return self._envelope(ok=False, error="network", retryable=True)
 
         elapsed = int((time.perf_counter() - started) * 1000)
@@ -184,11 +185,11 @@ class TodoistConnector(HTTPConnector):
             r = await client.post(_UPLOAD_PATH, files=files, timeout=_UPLOAD_TIMEOUT)
         except httpx.TimeoutException as exc:
             elapsed = int((time.perf_counter() - started) * 1000)
-            await self._record("upload", "timeout", elapsed, str(exc)[:200])
+            await self._record("upload", "timeout", elapsed, error_text(exc))
             return self._envelope(ok=False, error="timeout", retryable=True)
         except httpx.NetworkError as exc:
             elapsed = int((time.perf_counter() - started) * 1000)
-            await self._record("upload", "network_error", elapsed, str(exc)[:200])
+            await self._record("upload", "network_error", elapsed, error_text(exc))
             return self._envelope(ok=False, error="network", retryable=True)
 
         elapsed = int((time.perf_counter() - started) * 1000)

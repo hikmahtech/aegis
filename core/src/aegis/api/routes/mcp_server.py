@@ -76,6 +76,7 @@ from jsonschema.exceptions import ValidationError as JSONSchemaValidationError
 from aegis.api.auth import security, verify_auth
 from aegis.api.deps import get_settings
 from aegis.config import Settings
+from aegis.errors import error_text
 from aegis.llm.tier import tier_to_model_or
 from aegis.mcp_manager import _PROTOCOL_VERSION as MCP_PROTOCOL_VERSION
 from aegis.observability import record_tool_call
@@ -1156,10 +1157,10 @@ async def _handle_tools_call(
             error=type(exc).__name__,
             arg_keys=arg_keys,
         )
-        await _record("error", {"error": f"{type(exc).__name__}: {str(exc)[:_ERROR_CHARS]}"})
+        await _record("error", {"error": error_text(exc, _ERROR_CHARS)})
         return _tool_result(
             request_id,
-            f"Tool '{name}' failed: {type(exc).__name__}: {str(exc)[:_ERROR_CHARS]}",
+            f"Tool '{name}' failed: {error_text(exc, _ERROR_CHARS)}",
             is_error=True,
         )
 

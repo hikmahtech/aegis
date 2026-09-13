@@ -138,7 +138,8 @@ async def test_probe_once_handles_exception(monkeypatch):
     # Must not raise.
     await _main._slack_socket_probe_once(_FakeAdapter(RuntimeError("boom")))
 
-    assert _main._slack_socket_state.last_error == "boom"
+    # The type leads, so a timeout with no message still says what it was (#575).
+    assert _main._slack_socket_state.last_error == "RuntimeError: boom"
 
 
 async def test_probe_once_none_leaves_state_untouched(monkeypatch):

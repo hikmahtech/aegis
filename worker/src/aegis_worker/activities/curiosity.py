@@ -49,6 +49,7 @@ from decimal import Decimal
 from html import escape
 from typing import Any
 
+from aegis.errors import error_text
 from temporalio import activity
 
 from aegis_worker.activities.delivery import safe_send_message
@@ -305,7 +306,7 @@ class CuriosityActivities:
                 scored += await getattr(self, f"_detect_{name}")(agent_id, known, th)
             except Exception as exc:  # noqa: BLE001 — one bad detector must not kill the run
                 activity.logger.warning(
-                    "curiosity_detector_failed detector=%s err=%s", name, str(exc)[:200]
+                    "curiosity_detector_failed detector=%s err=%s", name, error_text(exc)
                 )
 
         if not scored:
@@ -441,7 +442,7 @@ class CuriosityActivities:
 
             return books.latest_prices(self.books_cfg)
         except Exception as exc:  # noqa: BLE001 — a rank is not worth a failed run
-            activity.logger.warning("curiosity_prices_unreadable err=%s", str(exc)[:200])
+            activity.logger.warning("curiosity_prices_unreadable err=%s", error_text(exc))
             return {}
 
     async def _detect_unknown_payee(
@@ -788,7 +789,7 @@ class CuriosityActivities:
                 agent_id=agent_id,
             )
         except Exception as exc:  # noqa: BLE001 — degrade to the template, never crash
-            activity.logger.warning("curiosity_phrasing_failed err=%s", str(exc)[:200])
+            activity.logger.warning("curiosity_phrasing_failed err=%s", error_text(exc))
             return candidates
 
         try:
@@ -801,7 +802,7 @@ class CuriosityActivities:
                 if text and 0 <= idx < len(candidates):
                     candidates[idx]["question"] = text
         except Exception as exc:  # noqa: BLE001
-            activity.logger.warning("curiosity_phrasing_parse_failed err=%s", str(exc)[:200])
+            activity.logger.warning("curiosity_phrasing_parse_failed err=%s", error_text(exc))
         return candidates
 
     # -------------------------------------------------------------------- A7
@@ -915,7 +916,7 @@ class CuriosityActivities:
                 interaction_id,
             )
         except Exception as exc:  # noqa: BLE001 — a malformed id must not lose the answer
-            activity.logger.warning("curiosity_answer_lookup_failed err=%s", str(exc)[:200])
+            activity.logger.warning("curiosity_answer_lookup_failed err=%s", error_text(exc))
         agent_id = (row["agent_id"] if row else None) or str(meta.get("agent_id") or "")
         if not agent_id:
             # Nobody named on the card: the GTD agent's question (#556).
@@ -958,7 +959,7 @@ class CuriosityActivities:
                     out["problem_id"] = res.get("problem_id")
                 except Exception as exc:  # noqa: BLE001 — the memory write stands
                     activity.logger.warning(
-                        "curiosity_track_failed subject=%s err=%s", subject, str(exc)[:200]
+                        "curiosity_track_failed subject=%s err=%s", subject, error_text(exc)
                     )
             out["tracked"] = tracked
 
@@ -970,7 +971,7 @@ class CuriosityActivities:
                     "curiosity_books_answer_failed id=%s subject=%s err=%s",
                     interaction_id,
                     subject,
-                    str(exc)[:200],
+                    error_text(exc),
                 )
                 out.update({"rule": None, "reason": "books_failed"})
             # Say what happened, when what happened is not what the owner would
@@ -1165,7 +1166,7 @@ class CuriosityActivities:
                 "curiosity_books_backlog_failed payee=%s account=%s err=%s",
                 payee,
                 account,
-                str(exc)[:200],
+                error_text(exc),
             )
             # `rewrite_events` reverts its own write, so the backlog is exactly
             # where it was — which is what the owner is now told, alongside the

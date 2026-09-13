@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import asyncpg
+from aegis.errors import error_text
 from aegis.llm import parse_llm_json
 from temporalio import activity
 
@@ -631,7 +632,7 @@ class ReviewActivities:
                 decisions = ranked
             return {"narrative": narrative, "decisions": decisions[:top_n]}
         except Exception as exc:  # noqa: BLE001
-            activity.logger.warning("frame_review_llm_failed err=%s", str(exc)[:200])
+            activity.logger.warning("frame_review_llm_failed err=%s", error_text(exc))
             return {"narrative": fallback, "decisions": decisions[:top_n]}
 
     @activity.defn
@@ -989,7 +990,7 @@ class ReviewActivities:
             except Exception as exc:  # noqa: BLE001
                 activity.logger.warning(
                     "daily_review_snooze_failed interaction=%s err=%s",
-                    interaction_id, str(exc)[:200],
+                    interaction_id, error_text(exc),
                 )
         return {
             "acknowledged": True,

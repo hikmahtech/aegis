@@ -16,6 +16,7 @@ import structlog
 from pydantic import Field
 
 from aegis.connectors.calibre import CalibreError
+from aegis.errors import error_text
 from aegis.services import library
 from aegis.services.connector_health import record_connector_health
 from aegis.services.library_config import get_library_config
@@ -32,9 +33,9 @@ def _unavailable(reason: str) -> str:
 
 
 async def _failed(pool: asyncpg.Pool, ctx: ToolContext, exc: Exception) -> str:
-    await record_connector_health(pool, ctx.settings, "calibre", ok=False, error=str(exc))
-    logger.warning("library_tool_failed", error=str(exc)[:200])
-    return json.dumps({"error": f"the Calibre library could not be read: {str(exc)[:300]}"})
+    await record_connector_health(pool, ctx.settings, "calibre", ok=False, error=error_text(exc, 500))
+    logger.warning("library_tool_failed", error=error_text(exc))
+    return json.dumps({"error": f"the Calibre library could not be read: {error_text(exc, 300)}"})
 
 
 @aegis_tool

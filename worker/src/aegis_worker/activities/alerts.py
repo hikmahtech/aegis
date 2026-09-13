@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from aegis.errors import error_text
 from aegis.llm import parse_llm_json
 from aegis.observability import log_audit
 from aegis.security import SPOTLIGHT_INSTRUCTION, assess_rule_of_two, spotlight
@@ -220,7 +221,7 @@ async def restart_repeat_window_minutes(pool: Any) -> int:
             "SELECT value FROM settings WHERE key = $1", ALERT_REMEDIATION_SETTINGS_KEY
         )
     except Exception as exc:  # noqa: BLE001 — a config read is never fatal
-        activity.logger.warning("alert_remediation_settings_read_failed err=%s", str(exc)[:200])
+        activity.logger.warning("alert_remediation_settings_read_failed err=%s", error_text(exc))
         return DEFAULT_RESTART_REPEAT_WINDOW_MINUTES
     return _alert_remediation.merge(row["value"] if row else None)["repeat_window_minutes"]
 
@@ -795,7 +796,7 @@ class AlertActivities:
         try:
             rows = await self.db_pool.fetch(_CLAIM_ROWS_SQL)
         except Exception as exc:  # noqa: BLE001
-            activity.logger.warning("alert_label_claim_db_failed err=%s", str(exc)[:200])
+            activity.logger.warning("alert_label_claim_db_failed err=%s", error_text(exc))
             return None
         claims = _label_claims(alert, rows)
         if len(claims) > 1:
@@ -975,11 +976,11 @@ class AlertActivities:
             activity.logger.warning(
                 "upload_kimi_log_fetch_failed file=%s error=%s",
                 output_file,
-                str(exc)[:200],
+                error_text(exc),
             )
             return {
                 "ok": False,
-                "error": f"fetch_failed: {str(exc)[:200]}",
+                "error": f"fetch_failed: {error_text(exc)}",
                 "file_attachment": None,
                 "file_name": "",
             }
@@ -1132,7 +1133,7 @@ class AlertActivities:
                 # A store that cannot answer costs the investigation its
                 # history, not its run. Logged so a degraded store shows up in
                 # the worker logs rather than as thinner verdicts.
-                activity.logger.warning("gather_alert_knowledge_kg_failed err=%s", str(exc)[:200])
+                activity.logger.warning("gather_alert_knowledge_kg_failed err=%s", error_text(exc))
 
         return "\n\n".join(parts)
 
@@ -1232,7 +1233,7 @@ class AlertActivities:
             )
         except Exception as exc:
             activity.logger.warning(
-                "resolve_infra_resource_db_failed err=%s", str(exc)[:200]
+                "resolve_infra_resource_db_failed err=%s", error_text(exc)
             )
             return null_result
         if not row:
@@ -1343,7 +1344,7 @@ class AlertActivities:
             env = await self.homelab_connector.service_ps(service)
         except Exception as exc:  # noqa: BLE001 — evidence, never a gate
             activity.logger.warning(
-                "alert_service_diagnostics_failed service=%s err=%s", service, str(exc)[:200]
+                "alert_service_diagnostics_failed service=%s err=%s", service, error_text(exc)
             )
             return []
         if not isinstance(env, dict) or not env.get("ok") or not isinstance(env.get("data"), list):
@@ -1575,7 +1576,7 @@ class AlertActivities:
                 # Tier-1 KG cache miss for resource resolution — fall through
                 # to LLM. Log so KS flakiness is observable.
                 activity.logger.warning(
-                    "resolve_alert_resource_kg_lookup_failed err=%s", str(exc)[:200]
+                    "resolve_alert_resource_kg_lookup_failed err=%s", error_text(exc)
                 )
 
         # Fetch candidate resources for LLM to choose from. When the alert
@@ -2216,10 +2217,10 @@ class AlertActivities:
                 "engine": run_result.get("engine", "kimi"),
             }
         except Exception as exc:
-            activity.logger.error("run_investigation_failed error=%s", str(exc))
+            activity.logger.error("run_investigation_failed error=%s", error_text(exc, 500))
             return {
                 "status": "failed",
-                "output": f"Investigation error: {str(exc)[:500]}",
+                "output": f"Investigation error: {error_text(exc, 500)}",
                 "session_id": "",
                 "branch": "",
                 "branches": {},
@@ -2419,6 +2420,6 @@ class AlertActivities:
                 out["outcome"] = outcome
             return out
         except Exception as exc:
-            activity.logger.warning("record_verdict_to_kg_failed: %s", str(exc)[:200])
-            return {"ingested": False, "reason": str(exc)[:200]}
+            activity.logger.warning("record_verdict_to_kg_failed: %s", error_text(exc))
+            return {"ingested": False, "reason": error_text(exc)}
 

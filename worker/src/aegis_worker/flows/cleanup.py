@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
+    from aegis.errors import error_text
+
     from aegis_worker.activities.cleanup import CleanupActivities
     from aegis_worker.activities.hub import HubActivities
     from aegis_worker.shared.retry import NO_RETRY, TIMEOUT_LONG
@@ -113,7 +115,7 @@ class CleanupFlow:
                 result["dispatches"] = dispatch_result
             except Exception as exc:
                 workflow.logger.error(
-                    "dispatch_cleanup_failed error=%s", str(exc)[:200]
+                    "dispatch_cleanup_failed error=%s", error_text(exc)
                 )
                 result["dispatches"] = {"status": "failed"}
 
@@ -132,9 +134,9 @@ class CleanupFlow:
             )
             workflow.logger.info("cleanup_flow_complete total=%d", total)
         except Exception as exc:
-            workflow.logger.error("cleanup_flow_failed error=%s", str(exc)[:200])
+            workflow.logger.error("cleanup_flow_failed error=%s", error_text(exc))
             result["prune_status"] = "failed"
-            result["prune_error"] = str(exc)[:200]
+            result["prune_error"] = error_text(exc)
 
         # Janitor: sweep orphaned `interactions` rows whose parent workflow
         # vanished before apply_interaction_timeout could fire. Independent
@@ -150,7 +152,7 @@ class CleanupFlow:
                 result["interactions_archived"] = orphan_result.get("archived", 0)
             except Exception as exc:
                 workflow.logger.error(
-                    "orphan_interaction_sweep_failed error=%s", str(exc)[:200]
+                    "orphan_interaction_sweep_failed error=%s", error_text(exc)
                 )
                 result["interactions_archived"] = -1
 
@@ -170,7 +172,7 @@ class CleanupFlow:
                 result["work_sessions"] = session_result
             except Exception as exc:
                 workflow.logger.error(
-                    "task_session_sweep_failed error=%s", str(exc)[:200]
+                    "task_session_sweep_failed error=%s", error_text(exc)
                 )
                 result["work_sessions"] = {"status": "failed"}
 
@@ -187,7 +189,7 @@ class CleanupFlow:
                 )
                 result["problems_closed"] = closed
             except Exception as exc:
-                workflow.logger.error("problem_close_sweep_failed error=%s", str(exc)[:200])
+                workflow.logger.error("problem_close_sweep_failed error=%s", error_text(exc))
                 result["problems_closed"] = {"status": "failed"}
 
         return result

@@ -15,6 +15,8 @@ from zoneinfo import ZoneInfo
 
 import structlog
 
+from aegis.errors import error_text
+
 logger = structlog.get_logger()
 
 SETTING = "user_timezone"
@@ -34,7 +36,7 @@ async def user_zone(pool: Any) -> ZoneInfo:
             if isinstance(name, str) and name.strip():
                 return ZoneInfo(name.strip())
         except Exception as exc:  # noqa: BLE001 — never break a caller on a config read
-            logger.warning("user_timezone_read_failed", error=str(exc)[:200])
+            logger.warning("user_timezone_read_failed", error=error_text(exc))
     return ZoneInfo("UTC")
 
 

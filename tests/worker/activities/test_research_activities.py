@@ -80,7 +80,7 @@ async def test_a_failed_search_is_an_error_line_not_a_failed_step():
     )
     assert out["web"] == []
     assert out["to_read"] == ["https://seed.example/x"]
-    assert any(e.startswith("web: searxng 502") for e in out["errors"])
+    assert any(e.startswith("web: RuntimeError: searxng 502") for e in out["errors"])
 
 
 # --------------------------------------------------------------------------

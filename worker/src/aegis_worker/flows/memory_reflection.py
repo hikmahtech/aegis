@@ -23,6 +23,8 @@ from datetime import timedelta
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
+    from aegis.errors import error_text
+
     from aegis_worker.shared.retry import RETRY_ONCE
 
 _TIMEOUT = timedelta(minutes=5)
@@ -70,9 +72,9 @@ class MemoryReflectionFlow:
                 workflow.logger.warning(
                     "memory_consolidation_step_failed agent=%s err=%s",
                     input.agent_id,
-                    str(exc)[:200],
+                    error_text(exc),
                 )
-                result["consolidation"] = {"status": "error", "error": str(exc)[:200]}
+                result["consolidation"] = {"status": "error", "error": error_text(exc)}
 
         prune = await workflow.execute_activity(
             "prune_agent_memories",

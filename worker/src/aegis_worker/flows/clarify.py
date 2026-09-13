@@ -62,6 +62,8 @@ from dataclasses import dataclass
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
+    from aegis.errors import error_text
+
     from aegis_worker.activities.clarify import ClarifyActivities
     from aegis_worker.flows.agent_chat_reply import AgentChatReplyFlow, AgentChatReplyInput
     from aegis_worker.flows.alert_investigation import AlertInvestigationFlow
@@ -422,7 +424,7 @@ class ClarifyFlow:
                 workflow.logger.warning(
                     "clarify_flow_item_failed task_id=%s error=%s",
                     task.get("id"),
-                    str(exc)[:200],
+                    error_text(exc),
                 )
                 continue
 

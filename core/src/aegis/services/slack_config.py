@@ -20,6 +20,7 @@ from typing import Any
 import structlog
 
 from aegis.crypto import decrypt_secret, encrypt_secret
+from aegis.errors import error_text
 
 logger = structlog.get_logger()
 
@@ -43,7 +44,7 @@ async def resolve_slack_config(pool: Any, settings: Any) -> dict[str, Any]:
             app_token = decrypt_secret(v.get("app_token_enc"), settings.secret_key)
             channel = v.get("channel") or ""
     except Exception as exc:  # noqa: BLE001 — fall back to env on any read error
-        logger.warning("slack_config_read_failed", error=str(exc)[:200])
+        logger.warning("slack_config_read_failed", error=error_text(exc))
 
     if not bot_token:
         bot_token = os.environ.get("AEGIS_SLACK_BOT_TOKEN", "")

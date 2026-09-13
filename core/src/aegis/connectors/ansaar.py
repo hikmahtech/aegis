@@ -15,6 +15,7 @@ from urllib.parse import quote
 import httpx
 
 from aegis.connectors._base import HTTPConnector
+from aegis.errors import error_text
 
 
 class AnsaarError(RuntimeError):
@@ -52,7 +53,7 @@ class AnsaarClient(HTTPConnector):
             await self._record(path, "error", int((time.monotonic() - t0) * 1000), type(exc).__name__)
             raise AnsaarError(f"{path}: {type(exc).__name__}") from exc
         except AnsaarError as exc:
-            await self._record(path, "error", int((time.monotonic() - t0) * 1000), str(exc))
+            await self._record(path, "error", int((time.monotonic() - t0) * 1000), error_text(exc, 500))
             raise
         if resp.status_code != 200:
             await self._record(path, "error", int((time.monotonic() - t0) * 1000), f"HTTP {resp.status_code}")

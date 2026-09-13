@@ -12,6 +12,7 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any
 
+from aegis.errors import error_text
 from aegis.services import library, library_config, notes, research_config, topics_config
 from aegis.services import research as rs
 from aegis.services.user_time import user_now
@@ -48,7 +49,7 @@ class ResearchActivities:
                 or ""
             )
         except Exception as exc:  # noqa: BLE001 — a name is a nicety
-            activity.logger.warning("research_agent_name_failed err=%s", str(exc)[:200])
+            activity.logger.warning("research_agent_name_failed err=%s", error_text(exc))
             return ""
 
     @activity.defn
@@ -81,7 +82,7 @@ class ResearchActivities:
                 ]
                 used += [str(h.get("content_id") or "") for h in hits or []]
             except Exception as exc:  # noqa: BLE001 — a slow store costs its part, not the run
-                errors.append(f"knowledge: {str(exc)[:200]}")
+                errors.append(f"knowledge: {error_text(exc)}")
         kg = await self._notes_first(question, kg, errors, used, int(cfg["note_hits"]))
 
         books = await self._library(question, errors, used)
@@ -98,7 +99,7 @@ class ResearchActivities:
                     domains=domains,
                 )
             except Exception as exc:  # noqa: BLE001
-                errors.append(f"web: {str(exc)[:200]}")
+                errors.append(f"web: {error_text(exc)}")
 
         papers: list[dict] = []
         if int(limits["papers"]) > 0 and rs.looks_academic(
@@ -161,7 +162,7 @@ class ResearchActivities:
                 {"workflow_id": workflow_id, "question": question[:300]},
             )
         except Exception as exc:  # noqa: BLE001 — the log is bookkeeping, not the answer
-            activity.logger.warning("research_retrieval_log_failed err=%s", str(exc)[:200])
+            activity.logger.warning("research_retrieval_log_failed err=%s", error_text(exc))
 
     async def _notes_first(
         self, question: str, kg: list[dict], errors: list[str], used: list[str], limit: int = 3
@@ -179,7 +180,7 @@ class ResearchActivities:
         try:
             hits = await self.knowledge_connector.search(question, limit=limit, source_type="note")
         except Exception as exc:  # noqa: BLE001 — a slow store costs its part, not the run
-            errors.append(f"notes: {str(exc)[:200]}")
+            errors.append(f"notes: {error_text(exc)}")
             return kg
         used += [str(h.get("content_id") or "") for h in hits or []]
         mine = [
@@ -210,7 +211,7 @@ class ResearchActivities:
                 source_type=library.BOOK_SOURCE_TYPE,
             )
         except Exception as exc:  # noqa: BLE001 — a slow store costs its part, not the run
-            errors.append(f"library: {str(exc)[:200]}")
+            errors.append(f"library: {error_text(exc)}")
             return []
         used += [str(h.get("content_id") or "") for h in hits or []]
         books = [
@@ -235,7 +236,7 @@ class ResearchActivities:
                 timeout=library.RESEARCH_LIBRARY_READ_S,
             )
         except Exception as exc:  # noqa: BLE001 — the book's description still counts
-            errors.append(f"library: {str(exc)[:200]}")
+            errors.append(f"library: {error_text(exc)}")
             return books
         passages = read.get("passages") or []
         if passages:
@@ -307,7 +308,7 @@ class ResearchActivities:
             )
             answer = str(result.get("response") or "").strip()
         except Exception as exc:  # noqa: BLE001 — the run still answers, saying it failed
-            activity.logger.warning("research_synthesis_failed err=%s", str(exc)[:200])
+            activity.logger.warning("research_synthesis_failed err=%s", error_text(exc))
         if not answer:
             return {
                 "answer": f"I gathered {len(sources)} sources but the synthesis failed.",
@@ -372,8 +373,8 @@ class ResearchActivities:
             # Any failure, not only a NotesError: an unexpected one used to
             # escape, fail the activity and report `saved: False` for an answer
             # the knowledge store had already kept.
-            activity.logger.warning("research_vault_save_failed err=%s", str(exc)[:200])
-            return {"status": "error", "error": str(exc)[:200]}
+            activity.logger.warning("research_vault_save_failed err=%s", error_text(exc))
+            return {"status": "error", "error": error_text(exc)}
         return {"status": res["status"], "path": ap.rel}
 
     @activity.defn

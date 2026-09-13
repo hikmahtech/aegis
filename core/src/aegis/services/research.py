@@ -35,6 +35,7 @@ from xml.etree import ElementTree
 import httpx
 import structlog
 
+from aegis.errors import error_text
 from aegis.services import research_config as rcfg
 from aegis.services.content_extract import fetch_and_extract
 from aegis.services.url_guard import UnsafeURLError, public_url_problem
@@ -262,9 +263,9 @@ async def read_url(url: str, *, max_chars: int = READ_URL_CHARS) -> dict:
         text, title = await fetch_and_extract(url, None, max_chars=max_chars + 1)
     except UnsafeURLError as exc:
         # The page redirected off the public internet: say where, plainly.
-        return {"url": url, "error": str(exc)[:300]}
+        return {"url": url, "error": error_text(exc, 300)}
     except Exception as exc:  # noqa: BLE001 — an unreadable page is an answer
-        return {"url": url, "error": f"could not read the page: {str(exc)[:200]}"}
+        return {"url": url, "error": f"could not read the page: {error_text(exc)}"}
     if not text:
         return {
             "url": url,
@@ -292,7 +293,7 @@ def _describe(exc: BaseException) -> str:
         return f"HTTP {code}"
     if isinstance(exc, httpx.TimeoutException):
         return "timed out"
-    return str(exc)[:200] or type(exc).__name__
+    return error_text(exc)
 
 
 def _title_key(title: str) -> str:
@@ -535,7 +536,7 @@ async def paper_read(
     try:
         text, _title = await fetch_and_extract(url, "pdf", max_chars=max_chars + 1)
     except Exception as exc:  # noqa: BLE001 — a PDF that will not parse is an answer
-        return {"id": pid, "url": url, "error": f"could not read the PDF: {str(exc)[:200]}"}
+        return {"id": pid, "url": url, "error": f"could not read the PDF: {error_text(exc)}"}
     if not text:
         return {"id": pid, "url": url, "error": "the PDF gave no text (scanned, or blocked)"}
     return {

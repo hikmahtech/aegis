@@ -34,6 +34,7 @@ from temporalio import workflow
 from temporalio.exceptions import ApplicationError
 
 with workflow.unsafe.imports_passed_through():
+    from aegis.errors import error_text
     from aegis.services.ledger_write import BOOKS_WRITE_TIMEOUT_S
 
     from aegis_worker.shared.retry import RETRY_ONCE, TIMEOUT_FAST
@@ -80,7 +81,7 @@ class BooksWriteFlow:
             # Reported before it is raised: the user who was told "still
             # running" learns it failed, instead of waiting on a workflow whose
             # only record of itself is a `workflow_runs` row.
-            message = f"error: the books {inp.op} write failed: {str(exc)[:200]}"
+            message = f"error: the books {inp.op} write failed: {error_text(exc)}"
             await self._report_if_late(inp, message)
             raise ApplicationError(
                 f"books_write_failed at step=write op={inp.op}: {exc!r}", non_retryable=True
@@ -127,7 +128,7 @@ class BooksWriteFlow:
             )
         except Exception as exc:  # noqa: BLE001 — the write stands; the message is extra
             workflow.logger.warning(
-                "books_write_report_failed op=%s err=%s", inp.op, str(exc)[:200]
+                "books_write_report_failed op=%s err=%s", inp.op, error_text(exc)
             )
             return False
         return bool(isinstance(res, dict) and res.get("ok"))

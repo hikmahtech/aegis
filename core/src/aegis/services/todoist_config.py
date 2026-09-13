@@ -17,6 +17,7 @@ from typing import Any
 import structlog
 
 from aegis.crypto import decrypt_secret, encrypt_secret
+from aegis.errors import error_text
 
 logger = structlog.get_logger()
 
@@ -33,7 +34,7 @@ async def resolve_todoist_api_key(pool: Any, settings: Any) -> str:
             if key:
                 return key
     except Exception as exc:  # noqa: BLE001 — fall back to env on any read error
-        logger.warning("todoist_api_key_read_failed", error=str(exc)[:200])
+        logger.warning("todoist_api_key_read_failed", error=error_text(exc))
     return getattr(settings, "todoist_api_key", "") or ""
 
 

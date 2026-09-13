@@ -8,6 +8,7 @@ from typing import Any
 
 import httpx
 import structlog
+from aegis.errors import error_text
 from temporalio import activity
 
 logger = structlog.get_logger()
@@ -215,7 +216,7 @@ class CleanupActivities:
                         task_id=task_id,
                         worktree_path=worktree_path,
                         host=host,
-                        error=str(exc)[:200],
+                        error=error_text(exc),
                     )
                     skipped += 1
                     continue
@@ -306,7 +307,7 @@ class CleanupActivities:
                         )
                 except Exception as exc:
                     channel_errors += 1
-                    logger.warning("cleanup_channel_delete_error", error=str(exc)[:160])
+                    logger.warning("cleanup_channel_delete_error", error=error_text(exc, 160))
                 await asyncio.sleep(0.05)
                 activity.heartbeat(f"dispatches:{deleted_channel}/{candidates}")
 

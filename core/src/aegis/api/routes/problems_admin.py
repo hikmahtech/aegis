@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field
 from aegis.api.auth import verify_auth
 from aegis.api.deps import get_settings
 from aegis.config import Settings
+from aegis.errors import error_text
 from aegis.observability import log_audit
 from aegis.services import hub_project
 from aegis.services.hub import (
@@ -160,7 +161,7 @@ async def post_close(request: Request, problem_id: str) -> dict[str, Any]:
     try:
         await hub_project.project(pool, problem_id)
     except Exception as exc:  # noqa: BLE001 — Todoist being down must not block the close
-        logger.warning("problem_close_project_failed", problem_id=problem_id, error=str(exc)[:200])
+        logger.warning("problem_close_project_failed", problem_id=problem_id, error=error_text(exc))
     if not await close_problem(pool, problem_id):
         raise HTTPException(status_code=409, detail="problem_not_found_or_not_resolved")
     await _audit(request, "problem_closed", problem_id, {})

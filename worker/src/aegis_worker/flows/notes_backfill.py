@@ -28,6 +28,8 @@ from datetime import timedelta
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
+    from aegis.errors import error_text
+
     from aegis_worker.activities.agent_registry import AgentRegistryActivities
     from aegis_worker.activities.notes import BACKFILL_BATCH
     from aegis_worker.shared.retry import NO_RETRY, TIMEOUT_FAST
@@ -64,7 +66,7 @@ class NotesBackfillFlow:
                 )
                 agent_id = str((resolved or {}).get(_OWNER_TAG) or "")
             except Exception as exc:  # noqa: BLE001 — the author is a nicety
-                workflow.logger.warning("notes_backfill_owner_unresolved err=%s", str(exc)[:200])
+                workflow.logger.warning("notes_backfill_owner_unresolved err=%s", error_text(exc))
         # NO_RETRY: every write is marker-idempotent, so a failed run is simply
         # next week's, or started again by hand; an automatic retry would only
         # hide the error.

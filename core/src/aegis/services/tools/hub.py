@@ -26,6 +26,7 @@ from typing import Any, Literal
 import asyncpg
 import structlog
 
+from aegis.errors import error_text
 from aegis.services import hub_project, work_sessions
 from aegis.services.hub import (
     Event,
@@ -307,7 +308,7 @@ async def _exec_report_progress(
     try:
         await hub_project.project(pool, pid, settings=ctx.settings)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("report_progress_project_failed", problem_id=pid, error=str(exc)[:200])
+        logger.warning("report_progress_project_failed", problem_id=pid, error=error_text(exc))
 
     head = f"Recorded on task {task_id}: {status} ({account}) — {summary[:120]}"
     progress = await hub_project._step_progress(pool, pid)

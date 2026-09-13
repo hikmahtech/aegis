@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
+    from aegis.errors import error_text
+
     from aegis_worker.activities.homelab import HomelabActivities
     from aegis_worker.activities.hub import HubActivities
     from aegis_worker.shared.retry import FAST, NO_RETRY, TIMEOUT_FAST, TIMEOUT_STANDARD
@@ -109,7 +111,7 @@ class ServiceDriftFlow:
                     (str(f.get("klass")), str(f.get("subject"))) for f in outcome.get("fresh") or []
                 }
             except Exception as exc:  # noqa: BLE001 — a hub outage must not hide a drift
-                workflow.logger.warning("service_drift_hub_failed err=%s", str(exc)[:200])
+                workflow.logger.warning("service_drift_hub_failed err=%s", error_text(exc))
                 hub_fresh = {(d["drift_type"], d["service_name"]) for d in drifts}
             if not config.silent:
                 for d in drifts:
@@ -124,7 +126,7 @@ class ServiceDriftFlow:
                         retry_policy=NO_RETRY,
                     )
         except Exception as exc:
-            workflow.logger.error("service_drift_failed error=%s", str(exc)[:200])
+            workflow.logger.error("service_drift_failed error=%s", error_text(exc))
             raise
         return {"drifts_new": drifts_new, "resolved": resolved, "suppressed": suppressed}
 

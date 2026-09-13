@@ -26,6 +26,7 @@ from temporalio.client import Client
 from aegis.api.auth import verify_auth
 from aegis.api.deps import get_settings
 from aegis.config import Settings
+from aegis.errors import error_text
 from aegis.services.personalities import draft_base_conflict
 
 logger = structlog.get_logger()
@@ -142,7 +143,7 @@ async def resolve_interaction(
             "interaction_signal_failed",
             interaction_id=str(interaction_id),
             flow_run_id=row["flow_run_id"],
-            error=str(exc),
+            error=error_text(exc, 500),
         )
 
     return ResolveResponse(

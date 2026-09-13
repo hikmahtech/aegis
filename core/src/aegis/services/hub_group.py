@@ -50,6 +50,7 @@ import asyncpg
 import structlog
 
 from aegis.connectors.todoist import TodoistConnector
+from aegis.errors import error_text
 from aegis.services import hub_project
 from aegis.services.hub import (
     GROUP_SUBJECT,
@@ -193,7 +194,7 @@ async def absorb_strays(
             )
         except ValueError as exc:  # a class the hub will not group: leave it
             logger.warning(
-                "hub_group_absorb_refused", group_id=row["group_id"], error=str(exc)[:200]
+                "hub_group_absorb_refused", group_id=row["group_id"], error=error_text(exc)
             )
             continue
         # A stray that shares the group's own task (one task linked to two

@@ -38,6 +38,7 @@ import asyncpg
 import httpx
 import structlog
 
+from aegis.errors import error_text
 from aegis.services import feeds_config
 from aegis.services.url_guard import UnsafeURLError, public_url_problem
 from aegis.services.user_agent import bot_user_agent
@@ -239,7 +240,7 @@ async def vector_bytes(pool: asyncpg.Pool) -> int:
         if isinstance(typmod, int) and typmod > 0:
             dim = typmod
     except Exception as exc:  # noqa: BLE001 — a preview is not worth a failed request
-        logger.warning("vector_dim_unreadable", error=str(exc)[:200])
+        logger.warning("vector_dim_unreadable", error=error_text(exc))
     return dim * 4
 
 
@@ -415,7 +416,7 @@ async def inspect_feed(url: str, *, user_agent: str | None = None) -> dict[str, 
     except UnsafeURLError as exc:
         return {"ok": False, "error": str(exc)}
     except Exception as exc:  # noqa: BLE001 — an unreachable URL is an answer
-        return {"ok": False, "error": f"could not fetch it: {str(exc)[:200]}"}
+        return {"ok": False, "error": f"could not fetch it: {error_text(exc)}"}
     if status >= 400:
         return {"ok": False, "error": f"the server answered HTTP {status}"}
     body = bytes(body_bytes).decode("utf-8", errors="replace")

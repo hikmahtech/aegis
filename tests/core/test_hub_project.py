@@ -597,7 +597,7 @@ async def test_project_pending_survives_one_bad_problem(db_pool, inbox, todoist,
     monkeypatch.setattr(hub_project, "project", boom)
     results = await project_pending(db_pool, now=NOW)
     mine = [x for x in results if x["problem_id"] == r.problem_id]
-    assert mine and mine[0]["error"].startswith("todoist exploded")
+    assert mine and mine[0]["error"].startswith("RuntimeError: todoist exploded")
 
 
 # --- sessions in the block (PR 5) ----------------------------------------------

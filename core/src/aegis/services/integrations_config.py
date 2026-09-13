@@ -18,6 +18,7 @@ from typing import Any
 import structlog
 
 from aegis.crypto import decrypt_secret, encrypt_secret
+from aegis.errors import error_text
 
 logger = structlog.get_logger()
 
@@ -300,7 +301,7 @@ async def read_integration(pool: Any, settings: Any, key: str) -> str:
     try:
         stored = await pool.fetchval("SELECT value FROM settings WHERE key = $1", _skey(key))
     except Exception as exc:  # noqa: BLE001 — a config read must never break a run
-        logger.warning("integration_read_failed", key=key, error=str(exc)[:200])
+        logger.warning("integration_read_failed", key=key, error=error_text(exc))
         stored = None
     if isinstance(stored, dict):
         val = _resolve(spec, stored, getattr(settings, "secret_key", ""))
@@ -323,7 +324,7 @@ async def apply_config_overrides(settings: Any, pool: Any) -> Any:
             "SELECT key, value FROM settings WHERE key LIKE $1", _PREFIX + "%"
         )
     except Exception as exc:  # noqa: BLE001 — config overlay must never break boot
-        logger.warning("config_overrides_read_failed", error=str(exc)[:200])
+        logger.warning("config_overrides_read_failed", error=error_text(exc))
         return settings
     for r in rows:
         field = r["key"][len(_PREFIX):]

@@ -17,6 +17,7 @@ from typing import Any
 import structlog
 
 from aegis.crypto import decrypt_secret, encrypt_secret
+from aegis.errors import error_text
 
 logger = structlog.get_logger()
 
@@ -44,14 +45,14 @@ async def get_google_client_config(pool: Any, settings: Any) -> dict | None:
                     }
                 }
     except Exception as exc:  # noqa: BLE001 — fall back to the file on any read error
-        logger.warning("google_oauth_read_failed", error=str(exc)[:200])
+        logger.warning("google_oauth_read_failed", error=error_text(exc))
 
     path = getattr(settings, "gmail_credentials_file", "")
     if path and Path(path).exists():
         try:
             return json.loads(Path(path).read_text())
         except Exception as exc:  # noqa: BLE001
-            logger.warning("google_credentials_file_unreadable", error=str(exc)[:200])
+            logger.warning("google_credentials_file_unreadable", error=error_text(exc))
     return None
 
 

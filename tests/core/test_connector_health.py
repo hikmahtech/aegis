@@ -222,11 +222,3 @@ async def test_the_send_allows_the_delivery_clients_timeout(db_pool):
     )
     assert seen["read"] == 30.0 and seen["connect"] == 5.0
     assert (await _state(db_pool))["alerted"] is True
-
-
-def test_error_text_is_never_empty():
-    from aegis.services.connector_health import _error_text
-
-    assert _error_text(httpx.ConnectTimeout("")) == "ConnectTimeout"
-    assert _error_text(RuntimeError("db down")) == "RuntimeError: db down"
-    assert len(_error_text(RuntimeError("x" * 500))) == 200

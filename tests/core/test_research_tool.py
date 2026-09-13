@@ -107,12 +107,12 @@ async def test_an_empty_query_is_refused():
 
 async def test_a_dispatch_failure_is_an_answer_not_a_raise():
     data = await _call({"query": "q"}, _client(start_raises=RuntimeError("frontend down")))
-    assert "could not be started: frontend down" in data["error"]
+    assert "could not be started: RuntimeError: frontend down" in data["error"]
 
 
 async def test_a_failed_run_is_an_answer_not_a_raise():
     data = await _call({"query": "q"}, _client(result_raises=RuntimeError("boom")))
-    assert data["error"] == "research failed: boom"
+    assert data["error"] == "research failed: RuntimeError: boom"
 
 
 @pytest.mark.parametrize("depth", [None, "deep", 3])

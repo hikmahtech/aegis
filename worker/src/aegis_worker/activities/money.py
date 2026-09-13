@@ -13,6 +13,7 @@ from typing import Any
 
 import structlog
 from aegis.api.models.money import MoneyEvent, payee_key
+from aegis.errors import error_text
 from aegis.services import books, books_chart, ledger_write, reconciled, trading_desk
 from aegis.services import journal_index as ji
 from aegis.services.bank_parsers import has_money_shape, is_autopay, parse_any
@@ -900,7 +901,7 @@ class MoneyActivities:
         try:
             quotes = await self.finance.get_quotes(list(self._FX_SYMBOLS))
         except Exception as exc:  # noqa: BLE001 — a dead provider is not a flow failure
-            return {"written": 0, "errors": [f"quotes: {str(exc)[:120]}"]}
+            return {"written": 0, "errors": [f"quotes: {error_text(exc, 120)}"]}
         for q in quotes or []:
             sym = self._FX_SYMBOLS.get(str(q.get("symbol")))
             price = q.get("price")
@@ -912,7 +913,7 @@ class MoneyActivities:
             try:
                 await books.append_prices(lines, self.books_cfg)
             except Exception as exc:  # noqa: BLE001 — see the docstring
-                return {"written": 0, "errors": [*errors, f"books: {str(exc)[:120]}"]}
+                return {"written": 0, "errors": [*errors, f"books: {error_text(exc, 120)}"]}
         return {"written": len(lines), "errors": errors}
 
     async def _hl(self, args: list[str], fmt: str = "text") -> str:
@@ -1013,7 +1014,7 @@ class MoneyActivities:
             brief["bal_text"] = await self._hl(bal_args)
             brief["unpushed"] = await books.unpushed_commits(self.books_cfg)
         except books.BooksError as exc:
-            logger.warning("money_brief_books_unavailable", error=str(exc)[:200])
+            logger.warning("money_brief_books_unavailable", error=error_text(exc))
             brief["books_ok"] = False
             brief["bal_text"] = ""
         if unconverted:
@@ -1210,7 +1211,7 @@ class MoneyActivities:
             total = sum((amount_from_cell(r[1]) for r in recurring), Decimal("0"))
             close["recurring_total"] = str(total.quantize(Decimal("0.01")))
         except books.BooksError as exc:
-            logger.warning("month_close_books_unavailable", error=str(exc)[:200])
+            logger.warning("month_close_books_unavailable", error=error_text(exc))
             close["books_ok"] = False
         if unconverted:
             logger.warning("month_close_fx_stale", commodities=sorted(unconverted))
@@ -1244,7 +1245,7 @@ class MoneyActivities:
             close["desk"] = await trading_desk.month_summary(self.db_pool, month_first, this_first)
             await trading_desk.reconcile_expectation(self.db_pool, close["desk"])
         except Exception as exc:  # noqa: BLE001
-            logger.warning("month_close_desk_failed", error=str(exc)[:200])
+            logger.warning("month_close_desk_failed", error=error_text(exc))
             close["desk"] = None
         return close
 
@@ -1295,4 +1296,4 @@ class MoneyActivities:
         try:
             await books.write_report(rel_path, text, self.books_cfg)
         except books.BooksError as exc:
-            logger.warning("money_report_write_failed", path=rel_path, error=str(exc)[:200])
+            logger.warning("money_report_write_failed", path=rel_path, error=error_text(exc))

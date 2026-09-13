@@ -36,6 +36,7 @@ import httpx
 import structlog
 
 from aegis_comms.adapters.base import DeliveryRef
+from aegis_comms.errors import error_text
 
 logger = structlog.get_logger()
 
@@ -326,7 +327,7 @@ class SlackCoreClient:
             logger.warning(
                 "slack_core_post_failed",
                 path=path,
-                error=str(exc),
+                error=error_text(exc, 500),
                 error_type=type(exc).__name__,
             )
             if error_sink is not None:
@@ -351,7 +352,7 @@ class SlackCoreClient:
                     body=resp.text[:200],
                 )
         except Exception as exc:  # noqa: BLE001
-            logger.warning("slack_core_patch_failed", path=path, error=str(exc))
+            logger.warning("slack_core_patch_failed", path=path, error=error_text(exc, 500))
         return None
 
     async def _get(self, path: str, timeout: float = 15) -> Any:
@@ -365,7 +366,7 @@ class SlackCoreClient:
                 if resp.status_code == 200:
                     return resp.json()
         except Exception as exc:  # noqa: BLE001
-            logger.warning("slack_core_get_failed", path=path, error=str(exc))
+            logger.warning("slack_core_get_failed", path=path, error=error_text(exc, 500))
         return None
 
     async def chat(
@@ -582,7 +583,7 @@ class SlackInbound:
         try:
             agents = await self._core.agents()
         except Exception as exc:  # noqa: BLE001 — routing must never break inbound
-            logger.warning("slack_routing_config_fetch_failed", error=str(exc)[:200])
+            logger.warning("slack_routing_config_fetch_failed", error=error_text(exc))
             agents = None
         if isinstance(agents, list) and agents:
             mention_map = _derive_mention_map(agents) or dict(_AGENT_MENTION_MAP)
@@ -726,7 +727,7 @@ class SlackInbound:
                     channel=channel_id,
                     ts=thread_ts,
                     task_id=task_id,
-                    error=str(exc)[:200],
+                    error=error_text(exc),
                 )
         return True
 
@@ -1279,7 +1280,7 @@ class SlackInbound:
                 resp.raise_for_status()
                 return resp.content
         except Exception as exc:  # noqa: BLE001
-            logger.warning("slack_private_download_failed", error=str(exc))
+            logger.warning("slack_private_download_failed", error=error_text(exc, 500))
             return None
 
     async def _download_and_extract_pdf(self, url: str | None) -> str | None:
@@ -1296,5 +1297,5 @@ class SlackInbound:
             text = await asyncio.to_thread(extract_text, io.BytesIO(content))
             return text.strip() if text and text.strip() else None
         except Exception as exc:  # noqa: BLE001
-            logger.warning("slack_pdf_extraction_failed", error=str(exc))
+            logger.warning("slack_pdf_extraction_failed", error=error_text(exc, 500))
             return None

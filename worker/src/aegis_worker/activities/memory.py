@@ -45,6 +45,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from aegis.errors import error_text
 from temporalio import activity
 
 _VALID_OPS = ("ADD", "UPDATE", "DELETE", "NOOP")
@@ -364,9 +365,9 @@ class MemoryActivities:
             )
         except Exception as exc:  # noqa: BLE001 — a dead LLM skips the pass, never fails the night
             activity.logger.warning(
-                "memory_consolidation_llm_failed agent=%s err=%s", agent_id, str(exc)[:200]
+                "memory_consolidation_llm_failed agent=%s err=%s", agent_id, error_text(exc)
             )
-            return {**base, "status": "llm_failed", "error": str(exc)[:200]}
+            return {**base, "status": "llm_failed", "error": error_text(exc)}
 
         parsed = parse_llm_json(result.get("response") or "")
         ops, skipped = _validate_ops(parsed, {m["id"] for m in memories})

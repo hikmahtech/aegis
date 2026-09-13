@@ -14,6 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from aegis.errors import error_text
 from temporalio import activity
 
 
@@ -75,8 +76,8 @@ class InfraOpsActivities:
         try:
             env = await self.homelab_connector.list_services()
         except Exception as exc:  # noqa: BLE001
-            activity.logger.warning("service_health_failed err=%s", str(exc)[:200])
-            return {"found": False, "healthy": False, "detail": str(exc)[:200]}
+            activity.logger.warning("service_health_failed err=%s", error_text(exc))
+            return {"found": False, "healthy": False, "detail": error_text(exc)}
         if not env.get("ok"):
             return {"found": False, "healthy": False, "detail": str(env.get("error"))[:200]}
 
@@ -110,7 +111,7 @@ class InfraOpsActivities:
         try:
             env = await self.homelab_connector.service_ps(service_name)
         except Exception as exc:  # noqa: BLE001
-            activity.logger.warning("service_logs_failed err=%s", str(exc)[:200])
+            activity.logger.warning("service_logs_failed err=%s", error_text(exc))
             return {"logs": ""}
         if not env.get("ok"):
             return {"logs": str(env.get("error") or "")[:2000]}
@@ -138,7 +139,7 @@ class InfraOpsActivities:
         try:
             listing = await self.homelab_connector.list_services()
         except Exception as exc:  # noqa: BLE001
-            return {"ok": False, "detail": f"could not list services: {str(exc)[:180]}"}
+            return {"ok": False, "detail": f"could not list services: {error_text(exc, 180)}"}
         if not listing.get("ok"):
             return {"ok": False, "detail": f"could not list services: {str(listing.get('error'))[:180]}"}
         resolved, reason = resolve_swarm_service(
@@ -149,7 +150,7 @@ class InfraOpsActivities:
         try:
             env = await self.homelab_connector.restart_service(resolved)
         except Exception as exc:  # noqa: BLE001
-            return {"ok": False, "detail": str(exc)[:200]}
+            return {"ok": False, "detail": error_text(exc)}
         if not env.get("ok"):
             return {"ok": False, "detail": str(env.get("error"))[:500]}
         detail = str(env.get("data") or "")[:400]

@@ -10,6 +10,8 @@ from __future__ import annotations
 import httpx
 import structlog
 
+from aegis_comms.errors import error_text
+
 logger = structlog.get_logger()
 
 _STT_URL = "https://api.elevenlabs.io/v1/speech-to-text"
@@ -37,7 +39,7 @@ async def transcribe(
             resp.raise_for_status()
             return resp.json().get("text") or None
     except Exception as exc:  # noqa: BLE001 — best-effort; caller degrades
-        logger.warning("elevenlabs_transcribe_failed", error=str(exc)[:200])
+        logger.warning("elevenlabs_transcribe_failed", error=error_text(exc))
         return None
 
 
@@ -61,5 +63,5 @@ async def synthesize(
             resp.raise_for_status()
             return resp.content or None
     except Exception as exc:  # noqa: BLE001 — best-effort; caller degrades
-        logger.warning("elevenlabs_synthesize_failed", error=str(exc)[:200])
+        logger.warning("elevenlabs_synthesize_failed", error=error_text(exc))
         return None
