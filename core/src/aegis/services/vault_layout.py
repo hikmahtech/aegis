@@ -715,7 +715,10 @@ def validate(value: Any) -> dict:
         or out["questions_dir"].startswith(out["agent_dir"] + "/")
     ):
         raise ValueError(f"questions_dir: must be inside {out['agent_dir']}/ (the agent's folder)")
-    _check_format(out["date_heading_format"], "date_heading_format", layout)
+    if not out["date_heading_format"].strip() or not any(
+        layout.render(out["date_heading_format"], d).strip() for d in _SAMPLE_DATES
+    ):
+        raise ValueError("date_heading_format: must render to a heading")
     for p in out["index_skip_prefixes"]:
         if not p.strip() or p.startswith("/") or "\\" in p:
             raise ValueError(f"index_skip_prefixes: {p!r} is not a relative prefix")
@@ -805,8 +808,10 @@ def _check_shape(v: dict) -> None:
             typ = _KIND_SHAPE[key]
             if not isinstance(x, typ) or (typ is not bool and isinstance(x, bool)):
                 raise ValueError(f"{kind}.{key}: wrong type")
-        if "sections" in k and not all(isinstance(s, str) for s in k["sections"]):
-            raise ValueError(f"{kind}.sections: must be a list of strings")
+        if "sections" in k and (
+            not k["sections"] or not all(isinstance(s, str) for s in k["sections"])
+        ):
+            raise ValueError(f"{kind}.sections: needs at least one heading, none empty")
 
 
 # --------------------------------------------------------------- storage

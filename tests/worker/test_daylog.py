@@ -377,6 +377,7 @@ async def _run_flow(client, ks, day_acts, task_queue: str, extra_activities=None
         day_acts.commit_daylog_state,
         day_acts.gather_daylogs,
         day_acts.distil_rollup,
+        day_acts.vault_week_rule,
         content_acts.ingest_content,
         _vault_not_configured,
     ]

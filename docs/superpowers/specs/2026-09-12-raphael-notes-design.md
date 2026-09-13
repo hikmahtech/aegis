@@ -99,6 +99,13 @@ reaches the store.
 
 ## 5. The journal
 
+**Amended 2026-09-13 (the OSS audit):** every path, format, template, section
+heading, label, the week rule and the block's tag and indent below are now the
+DEFAULTS of the `vault_layout` settings row (`services/vault_layout.py`,
+admin Vault page, `docs/infrastructure.md` "The vault"); a fork sets its own.
+The rules — insert-only, the marker, pushed-only, encrypted stripping — stay
+code.
+
 **Amended 2026-09-12**, after the user compared the backfilled notes with
 their own. The first version put every note at the `journal/` root, named
 weeks from their Sunday, put the month note loose in the year folder, and

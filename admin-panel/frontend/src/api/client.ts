@@ -404,6 +404,21 @@ export const api = {
     extra_notification_markers: string[];
   }) => apiFetch<any>('/api/admin/email/triage-rules', { method: 'PUT', body: JSON.stringify(body) }),
 
+  // The vault layout (where the journal goes, what an entry looks like) and
+  // the user's clock. Previews are rendered on the server by the real code.
+  getVaultLayout: () => apiFetch<any>('/api/admin/notes/layout'),
+  saveVaultLayout: (body: any) =>
+    apiFetch<any>('/api/admin/notes/layout', { method: 'PUT', body: JSON.stringify(body) }),
+  previewVaultLayout: (layout: any, date: string) =>
+    apiFetch<any>('/api/admin/notes/layout/preview', {
+      method: 'POST', body: JSON.stringify({ layout, date }),
+    }),
+  getTimezone: () => apiFetch<{ timezone: string; effective: string }>('/api/admin/preferences/timezone'),
+  saveTimezone: (timezone: string) =>
+    apiFetch<{ timezone: string; effective: string }>('/api/admin/preferences/timezone', {
+      method: 'PUT', body: JSON.stringify({ timezone }),
+    }),
+
   // Todoist sync + outbox (GTD hub)
   todoistState: () => apiFetch<any>('/api/admin/todoist/state'),
   getTodoistConfig: () => apiFetch<any>('/api/admin/todoist/config'),
