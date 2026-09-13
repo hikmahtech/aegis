@@ -15,6 +15,7 @@ from typing import Any
 from aegis.services import library, library_config, notes, research_config, topics_config
 from aegis.services import research as rs
 from aegis.services.user_time import user_now
+from aegis.services.vault_layout import get_layout
 from temporalio import activity
 
 
@@ -356,11 +357,17 @@ class ResearchActivities:
         cfg = notes.config_from_settings(self.settings)
         if not cfg.configured:
             return None
-        # Dated on the user's calendar, not the container's UTC one.
+        # Dated on the user's calendar, not the container's UTC one; filed
+        # where the vault layout puts questions (#567), signed by the owning
+        # agent under its name.
         asked = await user_now(self.db_pool)
-        ap = notes.question_append(question, report or rs.render_report(answer, sources), asked)
+        layout = await get_layout(self.db_pool)
+        author = notes.author_for(self.agent_id, await self._agent_name())
+        ap = notes.question_append(
+            question, report or rs.render_report(answer, sources), asked, layout
+        )
         try:
-            res = await notes.write(cfg, [ap], "raphael: research answer")
+            res = await notes.write(cfg, [ap], f"{author.prefix}: research answer", author=author)
         except Exception as exc:  # noqa: BLE001 — the store save stands; the vault is the extra
             # Any failure, not only a NotesError: an unexpected one used to
             # escape, fail the activity and report `saved: False` for an answer

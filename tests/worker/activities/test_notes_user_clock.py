@@ -61,9 +61,9 @@ async def test_a_research_answer_is_dated_on_the_users_clock(user_zone, tmp_path
     seen: dict = {}
     real = notes.question_append
 
-    def spy(question, report, asked):
+    def spy(question, report, asked, layout=None):
         seen["asked"] = asked
-        return real(question, report, asked)
+        return real(question, report, asked, layout)
 
     monkeypatch.setattr(notes, "question_append", spy)
     acts = ResearchActivities(settings=vault["settings"], db_pool=user_zone)
