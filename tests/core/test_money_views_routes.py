@@ -576,6 +576,35 @@ async def test_clearing_the_calendar_symbol_turns_the_desk_off(client, desk_conf
     assert (await client.get("/api/admin/money/desk")).json()["configured"] is False
 
 
+async def test_changing_capital_under_a_filled_book_is_refused_with_a_reason(client, desk_config, pool):
+    """The paper book is replayed from `capital` on every past day, so a new one
+    would restate the whole history. 400 with a reason and what to do about it,
+    not a 200 that quietly rewrites every past week (#526)."""
+    await _order(pool, date(2026, 9, 11), "TCS", "buy", 10, Decimal("1000.00"))
+    before = (await client.get("/api/admin/money/desk/rules")).json()
+    assert before["capital_locked"] is True
+
+    res = await client.put(
+        "/api/admin/money/desk/rules", json=before["values"] | {"capital": 250000}
+    )
+
+    assert res.status_code == 400
+    assert "restate every past day" in res.json()["detail"]
+    assert (await client.get("/api/admin/money/desk/rules")).json()["values"] == before["values"]
+
+
+async def test_capital_saves_while_the_paper_book_has_no_history(client, desk_config, pool):
+    """A fork setting the desk up must be able to say what it is starting with."""
+    current = (await client.get("/api/admin/money/desk/rules")).json()
+
+    res = await client.put(
+        "/api/admin/money/desk/rules", json=current["values"] | {"capital": 250000}
+    )
+
+    assert res.status_code == 200 and res.json()["capital_locked"] is False
+    assert (await td.load_rules(pool)).capital == 250_000.0
+
+
 # ------------------------------------------------------- the chart of accounts
 
 

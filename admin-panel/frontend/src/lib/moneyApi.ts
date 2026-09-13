@@ -280,6 +280,13 @@ export type DeskRules = {
   values: DeskRuleValues;
   /** Settings still stored under a key name that was retired. */
   retired_keys: string[];
+  /**
+   * True once a paper order has filled. The book is replayed from `capital` on
+   * every past day, so changing it then would restate the whole history — the
+   * server refuses it, and the form greys the field rather than letting someone
+   * meet a 400 they could not have predicted.
+   */
+  capital_locked: boolean;
 };
 
 // ------------------------------------------------------- the chart of accounts

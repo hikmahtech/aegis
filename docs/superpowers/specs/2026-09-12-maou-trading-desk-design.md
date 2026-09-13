@@ -199,7 +199,10 @@ the day out of the `held_back` count, which is for days the desk did nothing on.
 
 ## 8. The score
 
-- **Start:** the first fill date. Paper capital is `capital` (default ₹1,00,000).
+- **Start:** the first fill date. Paper capital is `capital` (default ₹1,00,000), and it is fixed
+  from the first fill: `replay` starts the book from it on every past day, so an edit afterwards
+  would restate the whole history. `desk_rules.save` refuses one, with a reason. A deposits
+  table, where a change is an event, is the proper answer and is the live spec's job (#526).
 - **Benchmark:** `SHARIABEES.NS` (the Nifty 50 Shariah ETF), the fair comparison for a halal
   investor. It's bought with the same capital at the start close and pays one buy cost. From then
   on it's held the way the desk holds: its splits adjust the units, and its dividends are paid as
@@ -211,6 +214,12 @@ the day out of the `held_back` count, which is for days the desk did nothing on.
   `benchmark_prices` in the rules (§12). An unmapped benchmark gets no fallback, as before. The
   index is never backfilled — its bars are the market calendar, and the desk takes that from one
   source only.
+- **A benchmark that stops being priced is a finding, not a silence.** No close for
+  `PRICE_GRACE_DAYS` market days raises `desk_price_missing` for it, exactly as it does for a
+  holding, same class and same subject shape so the daily run's own reconcile clears it when the
+  price comes back. Without it `benchmark_values` returns an empty series, the weekly gap has
+  nothing to compare, the label reads "too early" for ever and the rendered figure is blank: the
+  score quietly stops meaning anything (#524).
 - **No adjusted closes anywhere.** Yahoo rescales its adjusted close after every later dividend,
   so a value stored in September and one fetched in December are in different scales, and their
   ratio is wrong by the dividend.
@@ -275,6 +284,7 @@ The monthly check reads this one.
 Holding (paper) 9 names, 12% cash: TCS, INFY, HCLTECH, GOLDBEES, ...
 This month: 23 orders, ₹612 in costs.
 Days held back: 2 (1 stale, 1 suspect). Prices from ansaar: 1.
+Idle weekdays: 3 — no new market day to act on (a market holiday, or a day the price source did not serve).
 Risk halt on 22 Nov: the desk sold its whole book. DAILY_LOSS fired on 19 Nov.
 Check: XYZ moved −51% on 3 Nov. Possible missing split.
 ```
@@ -293,7 +303,7 @@ map in `hub_project`). A problem resolves itself on the first run that no longer
 | `desk_decisions_stale` | `decisions` | the daily run |
 | `desk_decisions_suspect` | `decisions` | the daily run |
 | `desk_source_error` | `ansaar` or `yahoo` | the daily run |
-| `desk_price_missing` | the symbol | the daily run |
+| `desk_price_missing` | the symbol, of a holding **or a benchmark** | the daily run |
 | `desk_below_expectation` | `desk` | the monthly close only, so while it holds it comes back once a month, not every day |
 
 ## 11. Data

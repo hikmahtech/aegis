@@ -367,3 +367,82 @@ async def test_saving_a_desk_with_no_row_says_so_rather_than_inventing_one(pool)
     await pool.execute("DELETE FROM activities WHERE slug = $1", td.DESK_SLUG)
     with pytest.raises(LookupError):
         await desk_rules.save(pool, {"fy_start_month": 1, "stale_calendar_days": 6, "stale_price_days": 7})
+
+
+# --- capital cannot be edited out from under a filled book (#526) ------------
+
+SAVE = {
+    "calendar_symbol": "^NSEI", "market_tz": "Asia/Kolkata", "symbol_suffix": ".NS",
+    "currency": "INR", "fy_start_month": 4, "stale_calendar_days": 6, "stale_price_days": 7,
+    "capital": 100000, "sell_charge": 16, "tax_rate": {"equity": 0.2, "etf": 0.3},
+    "long_term_rate": 0.125, "long_term_exemption": 125000,
+    "long_term_exemption_classes": ["equity"], "benchmark": "SHARIABEES.NS",
+    "context_benchmark": "^NSEI", "expected_excess_pa": 0.06,
+}
+
+
+async def orders(pool, *statuses: str) -> None:
+    """One order per status, on one plan day. More than one, because a guard
+    that looked at `any order` rather than `any FILLED order` would pass on a
+    book that holds only a pending one."""
+    day = date(2026, 9, 11)
+    await pool.execute(
+        "INSERT INTO finance.desk_plans (data_date, mode, outcome) VALUES ($1, 'paper', 'orders')", day
+    )
+    for seq, status in enumerate(statuses):
+        await pool.execute(
+            "INSERT INTO finance.desk_orders (mode, data_date, seq, created_day, symbol, asset_class, "
+            "side, qty, ref_price, status, fill_date, fill_price, costs) "
+            "VALUES ('paper', $1, $2, $1, 'TCS', 'equity', 'buy', 3, 1000, $3, $1, 1000, 6)",
+            day, seq, status,
+        )
+
+
+async def test_capital_cannot_be_changed_once_an_order_has_filled(pool):
+    """`replay` starts the book from this number on every past day, so a new one
+    restates the whole history — cash, value and every weekly gap. There is no
+    deposits table yet, so the honest answer is to refuse (#526)."""
+    await set_config(pool, LIVE_ROW)
+    await orders(pool, "pending", "filled")
+
+    with pytest.raises(ValueError, match="restate every past day"):
+        await desk_rules.save(pool, SAVE | {"capital": 250000})
+
+    # Nothing at all was written, not even the settings that were fine.
+    assert (await td.load_rules(pool)).capital == 100_000.0
+    assert await pool.fetchval("SELECT config->>'market_tz' FROM activities WHERE slug = $1", td.DESK_SLUG) is None
+
+
+async def test_everything_else_still_saves_while_capital_is_locked(pool):
+    """The lock is on one number, not on the page."""
+    await set_config(pool, LIVE_ROW)
+    await orders(pool, "pending", "filled")
+
+    out = await desk_rules.save(pool, SAVE | {"market_tz": "America/New_York", "expected_excess_pa": 0.04})
+
+    assert out["capital_locked"] is True
+    rules = await td.load_rules(pool)
+    assert (rules.market_tz, rules.expected_excess_pa, rules.capital) == ("America/New_York", 0.04, 100_000.0)
+
+
+async def test_capital_is_editable_while_nothing_has_filled(pool):
+    """A paper book with no history has nothing to restate, and a fork setting
+    the desk up for the first time must be able to say what it is starting with."""
+    await set_config(pool, LIVE_ROW)
+    await orders(pool, "pending", "cancelled")
+
+    out = await desk_rules.save(pool, SAVE | {"capital": 250000})
+
+    assert out["capital_locked"] is False
+    assert (await td.load_rules(pool)).capital == 250_000.0
+
+
+async def test_the_page_is_told_whether_capital_is_still_editable(pool):
+    """So the form greys the field rather than letting someone type a number and
+    meet a 400 they could not have predicted."""
+    await set_config(pool, LIVE_ROW)
+    assert (await desk_rules.read(pool))["capital_locked"] is False
+
+    await orders(pool, "filled")
+
+    assert (await desk_rules.read(pool))["capital_locked"] is True

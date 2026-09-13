@@ -331,6 +331,11 @@ def desk_lines(desk: dict) -> list[str]:
             f"Days held back: {sum(held_back.values())} "
             f"({held_back.get('held_stale', 0)} stale, {held_back.get('held_suspect', 0)} suspect)."
         )
+    if desk.get("idle_weekdays"):
+        lines.append(
+            f"Idle weekdays: {desk['idle_weekdays']} — no new market day to act on "
+            "(a market holiday, or a day the price source did not serve)."
+        )
     for halt in desk.get("halts") or []:
         lines.append(f"Risk halt on {halt['day']}: the desk sold its whole book. {halt['note']}".strip())
     if desk["ansaar_prices"]:

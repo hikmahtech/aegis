@@ -14,8 +14,9 @@ import math
 import statistics
 from bisect import bisect_right
 from collections import defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -239,6 +240,47 @@ def last_trading_day(index_days: list[date], today: date) -> date | None:
     return max(before) if before else None
 
 
+def trading_week(market_days: Iterable[date]) -> set[int]:
+    """Which days of the week this market trades on, read off its own bars.
+
+    The shape of a week is part of a market, and the desk's market is
+    configuration: most exchanges trade Monday to Friday, a few Sunday to
+    Thursday. The calendar's own bars say which, so nothing here has to assume
+    anyone's weekend."""
+    return {d.weekday() for d in market_days}
+
+
+def last_expected_day(today: date, week: set[int]) -> date | None:
+    """The most recent day strictly before ``today`` that this market would
+    normally have traded on. None when its week is not known yet."""
+    if not week:
+        return None
+    day = today - timedelta(days=1)
+    for _ in range(7):
+        if day.weekday() in week:
+            return day
+        day -= timedelta(days=1)
+    return None
+
+
+def idle_days(market_days: set[date], first: date, last: date) -> list[date]:
+    """Days from ``first`` to ``last`` this market would normally have traded on
+    and has no bar for.
+
+    Two things look exactly like this and the desk cannot tell them apart, so it
+    counts both: a market holiday, and a day the price source simply did not
+    serve. The index's bars ARE the desk's calendar, which is why one of these
+    is normal and a run of them is not (#525)."""
+    week = trading_week(market_days)
+    out: list[date] = []
+    day = first
+    while day <= last:
+        if day.weekday() in week and day not in market_days:
+            out.append(day)
+        day += timedelta(days=1)
+    return out
+
+
 def check_decisions(
     rows: list[Decision], held_classes: set[str], rules: Rules, *, halted: bool = False
 ) -> Check:
@@ -452,8 +494,14 @@ def _consume(book: Book, f: Fill) -> None:
 
 
 def value(book: Book, bars: dict[str, list[Bar]], day: date) -> float:
-    """Cash plus holdings at the last close on or before ``day``. A holding with
-    no price at all counts at its cost; the daily run raises desk_price_missing."""
+    """Cash plus holdings at the last close on or before ``day``.
+
+    A holding whose price has gone dark keeps its LAST CLOSE, however old: that
+    is what ``close_on`` returns, and the daily run raises `desk_price_missing`
+    for it rather than writing it down. Cost is used only for a holding with no
+    stored close at all on or before ``day``, which a filled order normally
+    rules out. So a delisted position overstates the desk's value at its final
+    traded price until someone sells it (#524)."""
     total = book.cash
     for symbol, qty in book.held().items():
         px = close_on(bars.get(symbol, []), day)

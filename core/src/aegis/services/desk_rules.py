@@ -177,9 +177,9 @@ def validate(body: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _view(cfg: dict | None) -> dict[str, Any]:
-    """What the page shows: the effective settings, and what is still stored
-    under a retired key name."""
+def _view(cfg: dict | None, *, capital_locked: bool = False) -> dict[str, Any]:
+    """What the page shows: the effective settings, what is still stored under a
+    retired key name, and whether `capital` can still be changed."""
     rules = dm.Rules.from_config(cfg)
     values = {key: getattr(rules, key) for key in EDITABLE}
     values["long_term_exemption_classes"] = list(rules.long_term_exemption_classes)
@@ -189,13 +189,23 @@ def _view(cfg: dict | None) -> dict[str, Any]:
         # Named so the page can say "these are stored under an old name" rather
         # than the operator discovering it from a log line they never read.
         "retired_keys": dm.legacy_keys(cfg),
+        # So the form can grey the field out rather than letting someone type a
+        # number and meet a 400 they could not have predicted.
+        "capital_locked": capital_locked,
     }
+
+
+async def _has_filled_order(conn: Any) -> bool:
+    """Whether the paper book has any history to restate."""
+    return bool(await conn.fetchval("SELECT 1 FROM finance.desk_orders WHERE status = 'filled' LIMIT 1"))
 
 
 async def read(pool: asyncpg.Pool) -> dict[str, Any]:
     """The desk's effective market and tax settings."""
-    cfg = await pool.fetchval("SELECT config FROM activities WHERE slug = $1", DESK_SLUG)
-    return _view(cfg if isinstance(cfg, dict) else None)
+    async with pool.acquire() as conn:
+        cfg = await conn.fetchval("SELECT config FROM activities WHERE slug = $1", DESK_SLUG)
+        locked = await _has_filled_order(conn)
+    return _view(cfg if isinstance(cfg, dict) else None, capital_locked=locked)
 
 
 async def save(pool: asyncpg.Pool, body: dict[str, Any]) -> dict[str, Any]:
@@ -207,6 +217,14 @@ async def save(pool: asyncpg.Pool, body: dict[str, Any]) -> dict[str, Any]:
     same statement that writes their replacements, which is what turns the
     rename from a thing an operator must remember into a thing a save fixes.
 
+    One setting stops being editable: `capital`, once any paper order has
+    filled. The book has no deposits table, so `desk_math.replay` starts it from
+    this number on every past day — a new one would silently restate the whole
+    history, cash and value and weekly gap alike. Refusing is the honest answer
+    until a deposit is an event rather than a retrospective edit (#526). Every
+    other setting on the page still saves, and nothing at all is written when
+    this one is refused.
+
     Raises ValueError on bad input and LookupError when the desk has no row —
     a deployment that has never seeded one has nothing to configure yet.
     """
@@ -217,9 +235,19 @@ async def save(pool: asyncpg.Pool, body: dict[str, Any]) -> dict[str, Any]:
         )
         if cfg is None:
             raise LookupError(DESK_SLUG)
+        stored = dm.Rules.from_config(cfg if isinstance(cfg, dict) else None).capital
+        locked = await _has_filled_order(conn)
+        if locked and round(settings["capital"], 2) != round(stored, 2):
+            raise ValueError(
+                f"capital is {stored:g} and cannot be changed to {settings['capital']:g}: this desk "
+                "has already filled orders, and the paper book's whole history is replayed from this "
+                "number, so a new one would restate every past day. Reset the paper book (clear "
+                "finance.desk_orders and finance.desk_plans), or wait for the deposits table. "
+                "Everything else on this page still saves."
+            )
         merged = {k: v for k, v in (cfg if isinstance(cfg, dict) else {}).items() if k not in dm.RENAMED.values()}
         merged.update(settings)
         await conn.execute(
             "UPDATE activities SET config = $2, updated_at = now() WHERE slug = $1", DESK_SLUG, merged
         )
-    return _view(merged)
+    return _view(merged, capital_locked=locked)

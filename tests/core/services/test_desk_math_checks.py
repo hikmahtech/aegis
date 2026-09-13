@@ -4,7 +4,15 @@ from __future__ import annotations
 
 from datetime import date
 
-from aegis.services.desk_math import Decision, Rules, check_decisions, last_trading_day
+from aegis.services.desk_math import (
+    Decision,
+    Rules,
+    check_decisions,
+    idle_days,
+    last_expected_day,
+    last_trading_day,
+    trading_week,
+)
 
 
 def d(symbol, weight, cls="equity", rank=1, halal="COMPLIANT", direction="LONG", state="NORMAL", kill=""):
@@ -132,3 +140,36 @@ def test_a_vanished_class_is_fine_in_a_recovery_state():
 def test_a_held_class_the_desk_no_longer_trades_is_not_suspect():
     rules = Rules.from_config({"asset_classes": ["equity"]})
     assert check_decisions([d("TCS", 0.1)], {"etf"}, rules).outcome == "ok"
+
+
+# --- the days the market did not give (#525) ---------------------------------
+
+# A fortnight of an ordinary Monday-to-Friday market, with 2026-09-04 (Friday)
+# and 2026-09-10 (Thursday) missing.
+FORTNIGHT = {date(2026, 9, d) for d in (1, 2, 3, 7, 8, 9, 11, 14, 15)}
+
+
+def test_the_market_s_week_is_read_off_its_own_bars():
+    """The shape of a week is part of a market, and this repo ships nobody's.
+    A Sunday-to-Thursday exchange must not be told its Fridays are missing."""
+    assert trading_week(FORTNIGHT) == {0, 1, 2, 3, 4}
+    gulf = {date(2026, 9, d) for d in (6, 7, 8, 9, 10, 13)}  # Sunday to Thursday
+    assert trading_week(gulf) == {6, 0, 1, 2, 3}
+
+
+def test_the_last_expected_day_skips_the_market_s_own_weekend():
+    week = trading_week(FORTNIGHT)
+    assert last_expected_day(date(2026, 9, 15), week) == date(2026, 9, 14)
+    # Monday looks back past Saturday and Sunday to Friday.
+    assert last_expected_day(date(2026, 9, 14), week) == date(2026, 9, 11)
+    # A market whose week is not known yet is not asked to guess one.
+    assert last_expected_day(date(2026, 9, 15), set()) is None
+
+
+def test_idle_days_names_every_weekday_the_calendar_never_gave():
+    assert idle_days(FORTNIGHT, date(2026, 9, 1), date(2026, 9, 15)) == [
+        date(2026, 9, 4), date(2026, 9, 10),
+    ]
+    # Weekends are not idle, and neither is a range the market fully covered.
+    assert idle_days(FORTNIGHT, date(2026, 9, 7), date(2026, 9, 9)) == []
+    assert idle_days(FORTNIGHT, date(2026, 9, 5), date(2026, 9, 6)) == []

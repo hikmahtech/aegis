@@ -686,7 +686,7 @@ async def desk_state(request: Request) -> dict:
 
     month_first = today.replace(day=1)
     next_first = (month_first + timedelta(days=32)).replace(day=1)
-    score = await trading_desk.month_summary(pool, month_first, next_first)
+    score = await trading_desk.month_summary(pool, month_first, next_first, today=today)
 
     return {
         "as_of": today.isoformat(),
