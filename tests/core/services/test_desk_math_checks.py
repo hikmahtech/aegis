@@ -14,9 +14,9 @@ def d(symbol, weight, cls="equity", rank=1, halal="COMPLIANT", direction="LONG",
 def test_rules_from_config_merges_over_the_defaults():
     r = Rules.from_config({"capital": 50000, "tax_rate": {"etf": 0.2}, "asset_classes": ["equity"]})
     assert r.capital == 50000.0
-    assert r.tax_rate == {"equity": 0.20, "etf": 0.2}
+    assert r.tax_rate == {"etf": 0.2}
     assert r.asset_classes == ("equity",)
-    assert r.band_abs == 0.02 and r.mode == "paper" and r.benchmark == "SHARIABEES.NS"
+    assert r.band_abs == 0.02 and r.mode == "paper"
 
 
 def test_rules_from_no_config_are_the_defaults():

@@ -517,6 +517,64 @@ async def test_desk_history_pairs_each_day_with_its_orders_and_its_reasons(clien
     assert body["days"][0]["data_date"] == traded.isoformat()
 
 
+# ------------------------------------------------- the desk's market settings
+
+
+@pytest_asyncio.fixture(loop_scope="function")
+async def desk_config(pool):
+    """Restores the desk's own config row, which these tests write."""
+    original = await pool.fetchval("SELECT config FROM activities WHERE slug = $1", td.DESK_SLUG)
+    yield pool
+    await pool.execute("UPDATE activities SET config = $2 WHERE slug = $1", td.DESK_SLUG, original)
+
+
+async def test_the_settings_page_reads_what_the_desk_itself_reads(client, desk_config):
+    """The form shows `desk_math.Rules`, the same merge the daily run uses. A
+    second opinion of what the desk believes would be worse than no form."""
+    body = (await client.get("/api/admin/money/desk/rules")).json()
+    rules = await td.load_rules(desk_config)
+
+    assert body["configured"] is True
+    assert body["values"]["calendar_symbol"] == rules.calendar_symbol
+    assert body["values"]["market_tz"] == rules.market_tz
+    assert body["values"]["tax_rate"] == rules.tax_rate
+    assert body["retired_keys"] == []
+
+
+async def test_saving_a_setting_changes_what_the_desk_reads(client, desk_config):
+    current = (await client.get("/api/admin/money/desk/rules")).json()["values"]
+
+    res = await client.put(
+        "/api/admin/money/desk/rules", json=current | {"market_tz": "America/New_York"}
+    )
+
+    assert res.status_code == 200
+    assert (await td.load_rules(desk_config)).market_tz == "America/New_York"
+
+
+async def test_a_timezone_that_is_not_a_timezone_is_refused_loudly(client, desk_config):
+    """400, not a 200 that stores a typo and quietly falls back to UTC for
+    months. The read path is forgiving precisely so the write path can be strict."""
+    before = (await client.get("/api/admin/money/desk/rules")).json()["values"]
+
+    res = await client.put("/api/admin/money/desk/rules", json=before | {"market_tz": "Asia/Kolkatta"})
+
+    assert res.status_code == 400
+    assert "timezone" in res.json()["detail"]
+    assert (await client.get("/api/admin/money/desk/rules")).json()["values"] == before
+
+
+async def test_clearing_the_calendar_symbol_turns_the_desk_off(client, desk_config):
+    """A real answer, so it saves: the page then says the desk is not configured
+    and the daily run does nothing."""
+    current = (await client.get("/api/admin/money/desk/rules")).json()["values"]
+
+    res = await client.put("/api/admin/money/desk/rules", json=current | {"calendar_symbol": ""})
+
+    assert res.status_code == 200 and res.json()["configured"] is False
+    assert (await client.get("/api/admin/money/desk")).json()["configured"] is False
+
+
 def test_hledger_is_reachable_when_the_suite_claims_it_is():
     """A guard on the guard: `HAS_HLEDGER` decides whether the only test that
     exercises the real journal runs at all, so a broken binary must fail here
