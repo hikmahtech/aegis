@@ -27,6 +27,8 @@ on:
       - "tests/api/**"
       - "tests/integration/**"
       - "tests/conftest.py"
+      # Test-database names and clean-up; tests/conftest.py imports it (#325).
+      - "tests/pg_test_db.py"
       # A shared helper the notes tests import (#514); not under tests/core/.
       - "tests/notes_vault.py"
       # The chart of accounts the books tests post against (#560); same reason.
@@ -54,6 +56,8 @@ on:
       - "tests/api/**"
       - "tests/integration/**"
       - "tests/conftest.py"
+      # Test-database names and clean-up; tests/conftest.py imports it (#325).
+      - "tests/pg_test_db.py"
       # A shared helper the notes tests import (#514); not under tests/core/.
       - "tests/notes_vault.py"
       # The chart of accounts the books tests post against (#560); same reason.
@@ -112,7 +116,7 @@ jobs:
           pip install -e "core[dev,google]"
 
       - name: Lint
-        run: ruff check core/src/ tests/core/ tests/api/ tests/integration/ tests/conftest.py tests/notes_vault.py
+        run: ruff check core/src/ tests/core/ tests/api/ tests/integration/ tests/conftest.py tests/pg_test_db.py tests/notes_vault.py
 
       # tests/core/test_books.py exercises the real journal write protocol —
       # append, `hledger check --strict`, revert-on-failure, commit — against a

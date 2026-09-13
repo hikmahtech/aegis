@@ -48,7 +48,14 @@ ruff check core/src/ tests/core/                             # lint — CI lints
 **Do not run the whole suite in one process** — `pytest` with no arguments (and
 `pytest tests/worker/` without `-n`) deadlocks; it has always deadlocked, including on
 pristine `main`. `-n auto --dist loadfile` is what makes it terminate, and `tests/conftest.py`
-gives every xdist worker its own `aegis_test_<gwN>` database so parallel runs don't collide.
+gives every xdist worker its own `aegis_test_<run_id>_<gwN>` database (`tests/pg_test_db.py`).
+The run id is `<controller pid>_<host tag>`, so two pytest runs on one host no longer drop each
+other's databases (#325) and need no shared lock. A run drops its own databases at the end, and
+the next run sweeps any left by a killed run — only when that run's pid is gone from this host
+and nobody is connected. `AEGIS_TEST_RUN_ID` pins a fixed name (two runs sharing it still
+collide, and the second stops with a clear message); `AEGIS_TEST_KEEP_DB=1` keeps the databases
+for a look afterwards. Every test file also starts from the seeded `settings` table (#569), so
+a row one file leaves behind cannot break whichever file `--dist loadfile` puts after it.
 Lint the same way: CI runs `ruff check` **scoped per package** (`core/src/ tests/core/`, and
 the worker/comms equivalents), which is the gate your PR must pass. A bare `ruff check .` is
 also clean and equivalent — `docs/` is in ruff's `extend-exclude` (#236) because the Python
