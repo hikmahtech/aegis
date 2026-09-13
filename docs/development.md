@@ -74,8 +74,31 @@ ruff check .                                             # lint — see the cave
 ```
 
 pytest config lives in the root `pyproject.toml` (not under `core/`) because rootdir is the
-project root, and `tests/conftest.py` gives every xdist worker its own `aegis_test_<gwN>`
-database so parallel runs don't collide.
+project root.
+
+Each pytest run gets its own test databases on the shared Postgres, so you can run several at
+once on one host (#325). `tests/conftest.py` and `tests/pg_test_db.py` handle it:
+
+- **Names.** An xdist worker uses `aegis_test_<run_id>_<gwN>`; a run without xdist uses
+  `aegis_test_<run_id>`. The run id is `<controller pid>_<host tag>`. The controller makes it
+  once and hands it to its workers through xdist's `workerinput`.
+- **Clean-up.** A run drops its own databases when it ends, including after a failure or
+  Ctrl-C. A killed run leaves them behind, so every run starts by sweeping them. The sweep
+  drops a database only when all of these hold: the name is a generated one, it was made on this
+  host, no process with that pid exists here, and nobody is connected. The drop never uses
+  `FORCE`, so a client that connects in between keeps it alive.
+- **Fixed names.** `AEGIS_TEST_RUN_ID=<letters and digits>` pins the name. Two runs that share
+  it do collide; the second stops with one clear message instead of hundreds of errors.
+- **Keeping them.** `AEGIS_TEST_KEEP_DB=1` leaves this run's databases in place to inspect.
+  (A later run's sweep removes them once this run's process is gone.)
+- **Old names.** Databases named `aegis_test` or `aegis_test_gwN` come from the old scheme.
+  The sweep never touches them; drop them by hand once no checkout runs the old code.
+- **`TEST_DATABASE_URL`** still means a caller-managed database: nothing is created, migrated,
+  swept, reset or dropped.
+
+Every test file also starts from the seeded `settings` table (#569). A row one file leaves
+behind would otherwise break whichever file `--dist loadfile` happens to put after it on the
+same worker. Set `AEGIS_TEST_SETTINGS_LEAKS=<path>` to log each file that needed a reset.
 
 CI lints **scoped per package** (`ruff check core/src/ tests/core/ …`, see
 `.github/workflows/*.yml`), which is the gate your PR must pass; a bare `ruff check .` is

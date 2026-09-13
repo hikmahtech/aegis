@@ -139,3 +139,94 @@ async def test_broken_pool_never_raises():
     await record_connector_health(
         _BadPool(), _settings(), _CONNECTOR, ok=False, error="x", threshold=1
     )
+
+
+# --- #573: a failed ping says what failed -------------------------------------
+
+
+def _send_failures(logs):
+    return [e for e in logs if e.get("event") == "connector_health_event_send_failed"]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_a_timeout_is_logged_by_its_type(db_pool):
+    """httpx raises its timeouts with no message, so the warning said `error=`
+    and nothing else in production. It must name the exception."""
+    from structlog.testing import capture_logs
+
+    respx.post("http://comms:8081/api/deliver/message").mock(
+        side_effect=httpx.ReadTimeout("")
+    )
+    with capture_logs() as logs:
+        await record_connector_health(
+            db_pool, _settings(), _CONNECTOR, ok=False, error="down", threshold=1
+        )
+    [warning] = _send_failures(logs)
+    assert warning["error"] == "ReadTimeout"
+    assert (await _state(db_pool))["alerted"] is False
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_a_refused_reply_is_logged_not_silent(db_pool):
+    """A 401 (say, a missing API key) used to return False with no log line at
+    all — a quieter failure than the empty error."""
+    from structlog.testing import capture_logs
+
+    respx.post("http://comms:8081/api/deliver/message").mock(
+        return_value=httpx.Response(401, json={"detail": "Invalid API key"})
+    )
+    with capture_logs() as logs:
+        await record_connector_health(
+            db_pool, _settings(), _CONNECTOR, ok=False, error="down", threshold=1
+        )
+    [warning] = _send_failures(logs)
+    assert warning["error"] == "comms answered HTTP 401"
+    assert "Invalid API key" in warning["body"]
+    assert (await _state(db_pool))["alerted"] is False
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_an_ok_false_reply_is_logged_and_does_not_latch(db_pool):
+    from structlog.testing import capture_logs
+
+    respx.post("http://comms:8081/api/deliver/message").mock(
+        return_value=httpx.Response(200, json={"ok": False, "error": "not_in_channel"})
+    )
+    with capture_logs() as logs:
+        await record_connector_health(
+            db_pool, _settings(), _CONNECTOR, ok=False, error="down", threshold=1
+        )
+    [warning] = _send_failures(logs)
+    assert warning["error"] == "comms answered ok=false"
+    assert "not_in_channel" in warning["body"]
+    assert (await _state(db_pool))["alerted"] is False
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_the_send_allows_the_delivery_clients_timeout(db_pool):
+    """Comms posts to Slack and logs the dispatch before it answers, so the ping
+    gets the worker's own delivery bounds (30 s, 5 s to connect), not 10 s."""
+    seen = {}
+
+    def _reply(request):
+        seen.update(request.extensions["timeout"])
+        return httpx.Response(200, json={"ok": True})
+
+    respx.post("http://comms:8081/api/deliver/message").mock(side_effect=_reply)
+    await record_connector_health(
+        db_pool, _settings(), _CONNECTOR, ok=False, error="down", threshold=1
+    )
+    assert seen["read"] == 30.0 and seen["connect"] == 5.0
+    assert (await _state(db_pool))["alerted"] is True
+
+
+def test_error_text_is_never_empty():
+    from aegis.services.connector_health import _error_text
+
+    assert _error_text(httpx.ConnectTimeout("")) == "ConnectTimeout"
+    assert _error_text(RuntimeError("db down")) == "RuntimeError: db down"
+    assert len(_error_text(RuntimeError("x" * 500))) == 200
