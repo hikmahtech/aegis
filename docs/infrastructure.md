@@ -1051,15 +1051,13 @@ name, except that a restart of one service in a group problem does not count
 against another.
 
 The window is 60 minutes. Change it, or set `0` to restart every time as
-before, in the `alert_remediation` settings row. The worker reads it on every
-restart, so a change applies to the next alert; no restart. A value that is
-not a whole number of minutes counts as 60.
-
-```sql
-INSERT INTO settings (key, value)
-VALUES ('alert_remediation', '{"repeat_window_minutes": 60}')
-ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now();
-```
+before, on the admin **Problems** page → *Hub configuration* → *Automatic
+restart* (the `alert_remediation` settings row, `GET/PUT
+/api/admin/alert-remediation`, `services/alert_remediation.py`). The page
+refuses anything but a whole number of minutes from 0 to 1440, and every save
+is audited. The worker reads the row on every restart, so a change applies to
+the next alert; no restart. A stored value that is not a whole number of
+minutes counts as 60.
 
 Both changes are behind `workflow.patched` ids, `gate2-only-for-decisions`
 and `auto-restart-once-per-window`, so a run that was waiting on its card

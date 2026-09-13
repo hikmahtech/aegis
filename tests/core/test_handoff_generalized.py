@@ -9,8 +9,10 @@ from aegis.services.chat import TOOL_EXECUTORS, ToolContext, _assignee_labels
 
 @pytest.mark.asyncio
 async def test_assignee_labels_fallback_without_pool():
+    # No agents are known without a pool: only @me, never the example agents'
+    # labels, which a fork that renamed its agents would not have (#556).
     labels = await _assignee_labels(None)
-    assert labels == ["@me", "@sebas", "@raphael", "@maou", "@pandora"]
+    assert labels == ["@me"]
 
 
 @pytest.mark.asyncio

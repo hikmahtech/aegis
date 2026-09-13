@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import asyncpg
@@ -25,6 +26,9 @@ router = APIRouter(prefix="/api/agents", dependencies=[Depends(verify_auth)])
 
 # Persona editor endpoints (admin UI) — separate prefix, same auth.
 admin_router = APIRouter(prefix="/api/admin/agents", dependencies=[Depends(verify_auth)])
+
+# A Slack emoji shortcode, as `icon_emoji` takes it: `:books:`, `:+1:`.
+_SLACK_ICON_RE = re.compile(r"^:[a-z0-9_+'-]+:$")
 
 
 @admin_router.get("/{agent_id}/personality")
@@ -118,9 +122,11 @@ async def list_agents(request: Request, active: bool = True) -> list[dict[str, A
 
 @router.get("/meta/options")
 async def get_agent_options() -> dict[str, Any]:
-    """Vocabulary for the admin Behavior tab: behavior tags, chat tools, tiers."""
+    """Vocabulary for the admin Behavior tab: behavior tags, chat tools, tiers,
+    and the knowledge source types an agent's `knowledge_domains` can name."""
     from aegis.agent_tags import BEHAVIOR_TAGS
     from aegis.services.chat import CHAT_TOOLS
+    from aegis.services.source_types import SOURCE_TYPES
 
     tools = []
     for spec in CHAT_TOOLS:
@@ -131,6 +137,7 @@ async def get_agent_options() -> dict[str, Any]:
         "tags": [{"id": t, "description": d} for t, d in BEHAVIOR_TAGS.items()],
         "tools": sorted(tools, key=lambda t: t["name"]),
         "model_tiers": ["fast", "balanced", "smart"],
+        "source_types": sorted(SOURCE_TYPES),
     }
 
 
@@ -166,6 +173,24 @@ def _validate_agent_patch(body: dict[str, Any]) -> None:
     async_dispatch = metadata.get("async_dispatch")
     if async_dispatch is not None and not isinstance(async_dispatch, bool):
         raise HTTPException(status_code=400, detail="metadata.async_dispatch must be a boolean")
+
+    domains = metadata.get("knowledge_domains")
+    if domains is not None and (
+        not isinstance(domains, list) or not all(isinstance(d, str) and d.strip() for d in domains)
+    ):
+        raise HTTPException(
+            status_code=400, detail="metadata.knowledge_domains must be a list of source types"
+        )
+
+    # A Slack emoji shortcode such as :books:. Empty means the default robot.
+    icon = metadata.get("slack_icon")
+    if icon is not None and icon != "" and (
+        not isinstance(icon, str) or not _SLACK_ICON_RE.match(icon)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=f"metadata.slack_icon must be an emoji shortcode like :books:, got {icon!r}",
+        )
 
 
 @router.post("", status_code=201)

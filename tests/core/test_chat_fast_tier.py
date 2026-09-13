@@ -139,7 +139,9 @@ async def test_intent_routing_falls_back_to_settings_when_no_fast_tier_is_loaded
     llm = _router_llm()
     out = await classify_intent(_UNROUTABLE, llm, _settings(), pool=None)
     assert llm.think.await_args[1]["model"] == _STALE_ENV_FAST
-    assert out["agent_id"] == "sebas"
+    # No pool: no agents are known, so the LLM's pick is not routable and the
+    # default is "" (the caller's own fallback), never an example id (#556).
+    assert out == {"agent_id": "", "reason": "default", "method": "default"}
 
 
 @pytest.mark.asyncio

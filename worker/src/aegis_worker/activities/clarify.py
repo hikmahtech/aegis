@@ -168,15 +168,10 @@ async def get_content_routes(pool) -> list[dict]:
 #
 # The addressable list + assignee vocabulary + context-hook gating are all
 # DERIVED from the active agents (issue #36): mention_aliases give the labels,
-# capabilities give the behavior tag that picks the context pre-fetch. The
-# literals below are the shipped-seed fallback when there's no DB / the read
-# fails — behavior stays identical for the default 4-agent set.
-_DEFAULT_AGENT_REG: dict[str, dict] = {
-    "sebas": {"aliases": ["@sebas"], "caps": {"gtd"}},
-    "raphael": {"aliases": ["@raphael"], "caps": {"research"}},
-    "maou": {"aliases": ["@maou"], "caps": {"finance"}},
-    "pandoras-actor": {"aliases": ["@pandora"], "caps": {"infra"}},
-}
+# capabilities give the behavior tag that picks the context pre-fetch. There
+# is no list of example agent ids behind it (#556): with no pool or no active
+# agents nothing is addressable, and a failed read keeps the last registry
+# read, so a fork that renamed its agents never routes to one it lacks.
 
 _agent_reg_cache: dict = {"reg": None, "ts": 0.0}
 
@@ -199,10 +194,11 @@ def _decode_jsonish(value, empty):
 async def get_agent_registry(pool) -> dict[str, dict]:
     """Active agents as {id: {"aliases": [@label...], "caps": {tag...}}}, 30s
     cached. Aliases come from metadata.mention_aliases (default [id]); caps from
-    the capabilities column. Falls back to the shipped defaults without a pool
-    or on read failure — routing must never break."""
+    the capabilities column. Without a pool it is empty; a failed read returns
+    the last registry read (or empty) and is not cached, so classification never
+    breaks and the next call reads again."""
     if pool is None:
-        return _DEFAULT_AGENT_REG
+        return {}
     import time
 
     now = time.monotonic()
@@ -217,9 +213,9 @@ async def get_agent_registry(pool) -> dict[str, dict]:
             raw_aliases = md.get("mention_aliases") or [r["id"]]
             aliases = [f"@{str(a).lstrip('@')}" for a in raw_aliases]
             reg[r["id"]] = {"aliases": aliases, "caps": caps}
-        reg = reg or _DEFAULT_AGENT_REG
-    except Exception:  # noqa: BLE001 — never let a config read break classification
-        reg = _DEFAULT_AGENT_REG
+    except Exception as exc:  # noqa: BLE001 — never let a config read break classification
+        activity.logger.warning("clarify_agent_registry_read_failed err=%s", str(exc)[:200])
+        return _agent_reg_cache["reg"] or {}
     _agent_reg_cache.update(reg=reg, ts=now)
     return reg
 

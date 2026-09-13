@@ -10,7 +10,6 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
-from zoneinfo import ZoneInfo
 
 import structlog
 from aegis.api.models.money import MoneyEvent, payee_key
@@ -18,6 +17,7 @@ from aegis.services import books, books_chart, ledger_write, reconciled, trading
 from aegis.services import journal_index as ji
 from aegis.services.bank_parsers import has_money_shape, is_autopay, parse_any
 from aegis.services.books import instrument_account
+from aegis.services.user_time import user_now, user_zone
 from temporalio import activity
 
 from aegis_worker.activities import money_render
@@ -255,7 +255,8 @@ class MoneyActivities:
     ignored_mailboxes: frozenset[str] = frozenset()
     mailbox_entities: dict[str, str] = field(default_factory=dict)
     capture: Any = None  # CaptureActivities, for dues (set after construction in __main__)
-    home_tz: str = "Asia/Kolkata"
+    # "Today" and a mail's local date are the user's: the `user_timezone`
+    # settings row through `services/user_time.py` (UTC when unset).
     # FinanceConnector — keyless FX quotes for the books' price file. None =
     # no provider wired, and `refresh_fx_prices` reports itself disabled.
     finance: Any = None
@@ -508,7 +509,7 @@ class MoneyActivities:
             )
         if ev.occurred_on is None and ev.kind == "transaction" and receipt.get("received_at"):
             received = datetime.fromisoformat(receipt["received_at"])
-            ev.occurred_on = received.astimezone(ZoneInfo(self.home_tz)).date()
+            ev.occurred_on = received.astimezone(await user_zone(self.db_pool)).date()
         ev.payee_key = payee_key(ev.payee)
         # Does this mail say the money moves on its own? Read from the text
         # here, where the body still exists — `capture_due` sees only the
@@ -893,7 +894,7 @@ class MoneyActivities:
         """
         if self.finance is None or self.books_cfg is None:
             return {"written": 0, "errors": ["disabled"]}
-        today = datetime.now(ZoneInfo(self.home_tz)).date().isoformat()
+        today = (await user_now(self.db_pool)).date().isoformat()
         lines: list[str] = []
         errors: list[str] = []
         try:
@@ -929,7 +930,7 @@ class MoneyActivities:
         keeps an unconfigured or mid-clone checkout from silencing the lane.
         """
         chart = await books_chart.get_chart(self.db_pool)
-        today = datetime.now(ZoneInfo(self.home_tz)).date()
+        today = (await user_now(self.db_pool)).date()
         since = today - timedelta(days=days)
         end = (today + timedelta(days=1)).isoformat()
         brief: dict = {
@@ -1154,7 +1155,7 @@ class MoneyActivities:
         closed is the one BEFORE today's, and the income statement carries the
         month before that as its comparison column.
         """
-        today = datetime.now(ZoneInfo(self.home_tz)).date()
+        today = (await user_now(self.db_pool)).date()
         this_first = today.replace(day=1)
         last = this_first - timedelta(days=1)
         month_first = last.replace(day=1)

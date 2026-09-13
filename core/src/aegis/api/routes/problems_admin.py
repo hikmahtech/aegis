@@ -271,3 +271,32 @@ async def put_hub_settle_seconds_route(request: Request, body: dict[str, Any]) -
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     await _audit(request, "hub_settle_seconds_saved", "", {"overrides": out["overrides"]})
     return out
+
+
+@router.get("/alert-remediation")
+async def get_alert_remediation_route(request: Request) -> dict[str, Any]:
+    """The automatic restart's repeat window (`services/alert_remediation.py`,
+    #501): the effective minutes, the default under them and the cap."""
+    from aegis.services.alert_remediation import get_alert_remediation
+
+    return await get_alert_remediation(_pool(request))
+
+
+@router.put("/alert-remediation")
+async def put_alert_remediation_route(request: Request, body: dict[str, Any]) -> dict[str, Any]:
+    """Replace the repeat window. 400 on anything but a whole number of minutes
+    in range — this row gates `docker service update --force`, so a typo must
+    not save. `0` restarts every time."""
+    from aegis.services.alert_remediation import save_alert_remediation
+
+    try:
+        out = await save_alert_remediation(_pool(request), body)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    await _audit(
+        request,
+        "alert_remediation_saved",
+        "",
+        {"repeat_window_minutes": out["repeat_window_minutes"]},
+    )
+    return out

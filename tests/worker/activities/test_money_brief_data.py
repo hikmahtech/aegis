@@ -102,13 +102,25 @@ def _repo(
     return books.BooksConfig(path=root)
 
 
+# The user's clock, which `MoneyActivities` reads through services/user_time.py.
+# Pinned rather than left unset, so `_today()` and the activity agree even if a
+# sibling file left a different zone behind.
+_USER_TZ = "Asia/Kolkata"
+
+
 @pytest_asyncio.fixture(autouse=True, loop_scope="function")
 async def _clean(db_pool):
     await db_pool.execute("DELETE FROM finance.journal_index WHERE mailbox = 'brief-t'")
     await db_pool.execute("DELETE FROM todoist_tasks WHERE id LIKE 'brief-t-task-%'")
+    await db_pool.execute(
+        "INSERT INTO settings (key, value) VALUES ('user_timezone', $1) "
+        "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        _USER_TZ,
+    )
     yield
     await db_pool.execute("DELETE FROM finance.journal_index WHERE mailbox = 'brief-t'")
     await db_pool.execute("DELETE FROM todoist_tasks WHERE id LIKE 'brief-t-task-%'")
+    await db_pool.execute("DELETE FROM settings WHERE key = 'user_timezone'")
 
 
 async def _task(db_pool, task_id: str, *, completed: bool) -> None:
@@ -123,7 +135,8 @@ async def _task(db_pool, task_id: str, *, completed: bool) -> None:
 
 
 def _today() -> date:
-    """"Today" as `MoneyActivities` computes it — in its own `home_tz`.
+    """"Today" as `MoneyActivities` computes it — on the user's clock, the
+    `user_timezone` row this file's `_clean` fixture pins (`_USER_TZ`).
 
     NOT `date.today()`, which is the RUNNER's timezone. Every window in this
     file (`as_of`, the 7-day brief, the 14-day forecast, the month the close
@@ -140,7 +153,7 @@ def _today() -> date:
     (`tests/worker/activities/test_capture_due.py::_today` is the same fix on
     the same trap, one file over.)
     """
-    return datetime.now(ZoneInfo(MoneyActivities.home_tz)).date()
+    return datetime.now(ZoneInfo(_USER_TZ)).date()
 
 
 def _prev_month_last() -> date:

@@ -30,13 +30,10 @@ _logger = structlog.get_logger()
 # blocks/fallback stay comfortable and edits remain cheap.
 _SLACK_MAX_CHARS = 2800
 
-# Per-agent persona icon for chat:write.customize. Defaults to a robot.
-_AGENT_ICON = {
-    "sebas": ":bust_in_silhouette:",
-    "raphael": ":books:",
-    "maou": ":moneybag:",
-    "pandoras-actor": ":robot_face:",
-}
+# Persona icon for chat:write.customize: the agent's `metadata.slack_icon`
+# (admin Agents → Behavior; the example agents' icons are in
+# config/seed/agents.yaml). An agent without one, or a failed core lookup,
+# gets the robot — never an icon keyed on an agent id (#556).
 _DEFAULT_ICON = ":robot_face:"
 
 
@@ -165,13 +162,12 @@ class SlackAdapter:
         if agent_id in self._cache:
             return self._cache[agent_id]
 
-        icon = _AGENT_ICON.get(agent_id, _DEFAULT_ICON)
+        icon = _DEFAULT_ICON
         username = agent_id
         channel: str | None = None
         voice_id = ""
-        # Channel-name stem + icon are metadata-overridable; fall back to the
-        # shipped constants (so a custom agent isn't stuck with the robot icon
-        # or an id-based channel name).
+        # Channel-name stem + icon come from the agent's metadata
+        # (`mention_aliases[0]`, `slack_icon`).
         stem = _short_agent(agent_id)
         try:
             cfg = await self._fetch_agent(agent_id)
@@ -179,7 +175,7 @@ class SlackAdapter:
             channel = cfg.get("slack_channel_id") or None
             voice_id = cfg.get("elevenlabs_voice_id") or ""
             meta = cfg.get("metadata") or {}
-            icon = meta.get("slack_icon") or _AGENT_ICON.get(agent_id, _DEFAULT_ICON)
+            icon = meta.get("slack_icon") or _DEFAULT_ICON
             aliases = meta.get("mention_aliases") or []
             if aliases:
                 stem = str(aliases[0])

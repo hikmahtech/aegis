@@ -71,3 +71,22 @@ async def test_put_400s_on_bad_shape_instead_of_silently_dropping(app_client):
     assert "self_names" in r.json()["detail"]
     # Nothing was written.
     assert (await app_client.get(URL, auth=AUTH)).json() == {"self_names": []}
+
+
+async def test_put_writes_an_audit_row_and_a_refused_one_does_not(app_client, rules_pool):
+    """The Email triage page's field (#558): every save is audited, like the
+    other admin config PUTs."""
+    await rules_pool.execute("DELETE FROM audit_log WHERE action = 'meeting_rules_saved'")
+    try:
+        assert (await app_client.put(URL, auth=AUTH, json={"self_names": 3})).status_code == 400
+        assert await rules_pool.fetchval(
+            "SELECT count(*) FROM audit_log WHERE action = 'meeting_rules_saved'"
+        ) == 0
+        assert (await app_client.put(URL, auth=AUTH, json={"self_names": ["Sam"]})).status_code == 200
+        row = await rules_pool.fetchrow(
+            "SELECT actor, details FROM audit_log WHERE action = 'meeting_rules_saved'"
+        )
+        assert row["actor"] == "admin"
+        assert row["details"] == {"self_names": ["Sam"]}
+    finally:
+        await rules_pool.execute("DELETE FROM audit_log WHERE action = 'meeting_rules_saved'")

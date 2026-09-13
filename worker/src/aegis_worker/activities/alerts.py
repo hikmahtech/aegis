@@ -14,6 +14,7 @@ from typing import Any
 from aegis.llm import parse_llm_json
 from aegis.observability import log_audit
 from aegis.security import SPOTLIGHT_INSTRUCTION, assess_rule_of_two, spotlight
+from aegis.services import alert_remediation as _alert_remediation
 from aegis.services.infra_alert_routing import get_infra_alert_routing
 from temporalio import activity
 
@@ -127,12 +128,12 @@ _DIAGNOSTIC_ERROR_CHARS = 200
 
 # One automatic restart per problem per window (#501). A service that comes
 # back inside the window is not restarted again: the restart did not hold, and
-# the next one will not either. Stored in the `settings` row below as
-# {"repeat_window_minutes": 60}; 0 turns the check off, which restarts every
-# time, as before. Generic on purpose: an hour is what "it broke again right
-# after the restart" means on any cluster.
-ALERT_REMEDIATION_SETTINGS_KEY = "alert_remediation"
-DEFAULT_RESTART_REPEAT_WINDOW_MINUTES = 60
+# the next one will not either. Stored in the `alert_remediation` settings row
+# as {"repeat_window_minutes": 60}; 0 turns the check off, which restarts every
+# time, as before. The row's merge/validate pair is
+# `aegis.services.alert_remediation` (admin Problems page → Hub configuration).
+ALERT_REMEDIATION_SETTINGS_KEY = _alert_remediation.SETTINGS_KEY
+DEFAULT_RESTART_REPEAT_WINDOW_MINUTES = _alert_remediation.DEFAULT_REPEAT_WINDOW_MINUTES
 # How far back through a problem's timeline the lookup reads. A flapping
 # service adds a handful of events an hour, so this covers the window with
 # room to spare.
@@ -207,10 +208,11 @@ def remediation_target(alert: dict) -> str:
 
 
 async def restart_repeat_window_minutes(pool: Any) -> int:
-    """The window from the `alert_remediation` settings row. Read leniently:
-    no pool, no row, a failed read or a value that is not a whole number of
-    minutes all mean the default, because a config mistake must not change
-    what happens to a service that is down. 0 is a real value: off."""
+    """The window from the `alert_remediation` settings row. Read leniently
+    (`alert_remediation.merge`): no pool, no row, a failed read or a value that
+    is not a whole number of minutes all mean the default, because a config
+    mistake must not change what happens to a service that is down. 0 is a real
+    value: off."""
     if pool is None:
         return DEFAULT_RESTART_REPEAT_WINDOW_MINUTES
     try:
@@ -220,11 +222,7 @@ async def restart_repeat_window_minutes(pool: Any) -> int:
     except Exception as exc:  # noqa: BLE001 — a config read is never fatal
         activity.logger.warning("alert_remediation_settings_read_failed err=%s", str(exc)[:200])
         return DEFAULT_RESTART_REPEAT_WINDOW_MINUTES
-    value = row["value"] if row else None
-    minutes = value.get("repeat_window_minutes") if isinstance(value, dict) else None
-    if isinstance(minutes, bool) or not isinstance(minutes, int) or minutes < 0:
-        return DEFAULT_RESTART_REPEAT_WINDOW_MINUTES
-    return minutes
+    return _alert_remediation.merge(row["value"] if row else None)["repeat_window_minutes"]
 
 
 def _task_row(t: Any) -> dict | None:

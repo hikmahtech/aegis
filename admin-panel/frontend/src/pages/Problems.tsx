@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { api } from '../api/client';
+import RestartWindowPanel from '../components/RestartWindowPanel';
 
 // What the problem hub currently thinks is wrong, and the deploy or
 // maintenance windows that are keeping it quiet.
@@ -213,6 +214,8 @@ function HubConfig({ onError }: { onError: (msg: string) => void }) {
               </button>
             </div>
           </div>
+
+          <RestartWindowPanel />
 
           <div>
             <h4 style={{ marginBottom: 4 }}>Infra alerts</h4>

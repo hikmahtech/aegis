@@ -1,6 +1,7 @@
 """Issue #36 #5/#6 — the LLM intent-router prompt is built from active agents'
 metadata.intent_description (data-driven), so a renamed/added agent is reachable
-via LLM routing, not just keyword/@mention. Shipped descriptions are the fallback.
+via LLM routing, not just keyword/@mention. Since #556 the rows are the ONLY
+source: there are no shipped descriptions behind them.
 """
 
 from __future__ import annotations
@@ -9,20 +10,22 @@ import pytest_asyncio
 from aegis.services.chat import (
     _agent_intent_descriptions,
     _build_intent_prompt,
+    _generalists_of,
+    _routing_agents,
     classify_intent,
 )
 
 
-def test_intent_prompt_fallback_lists_seed_agents():
-    """With no descriptions, the prompt lists the 4 seed agents in precedence
-    order (byte-identical to the shipped prompt)."""
-    prompt = _build_intent_prompt("hello")
-    assert "- maou: finance, money, subscriptions, receipts, market" in prompt
-    assert "- pandoras-actor: infrastructure, servers, deploys, homelab, logs" in prompt
-    assert "- raphael: research, knowledge, learning, summarizing" in prompt
-    assert "- sebas: tasks, GTD, calendar, email, general (the default)" in prompt
-    # precedence order preserved
-    assert prompt.index("- maou:") < prompt.index("- sebas:")
+async def test_intent_prompt_lists_seeded_agents_generalist_last(db_pool):
+    """The seeded agents' own descriptions, specific agents first and the `gtd`
+    holder last — the order the old hardcoded precedence list gave."""
+    agents = await _routing_agents(db_pool)
+    descriptions = await _agent_intent_descriptions(db_pool)
+    prompt = _build_intent_prompt("hello", descriptions, _generalists_of(agents))
+    for aid in ("maou", "pandoras-actor", "raphael", "sebas"):
+        assert f"- {aid}: {descriptions[aid]}" in prompt
+    order = [prompt.index(f"- {aid}:") for aid in ("maou", "pandoras-actor", "raphael", "sebas")]
+    assert order == sorted(order)
 
 
 def test_intent_prompt_includes_custom_agent():
@@ -76,6 +79,6 @@ async def test_llm_route_accepts_description_only_agent(db_pool, custom_research
     assert out["method"] == "llm"
 
 
-async def test_intent_descriptions_fallback_without_pool():
-    descriptions = await _agent_intent_descriptions(None)
-    assert set(descriptions) == {"maou", "pandoras-actor", "raphael", "sebas"}
+async def test_intent_descriptions_empty_without_pool():
+    """No rows, no descriptions — never the example agents' names (#556)."""
+    assert await _agent_intent_descriptions(None) == {}

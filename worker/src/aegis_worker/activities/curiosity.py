@@ -288,7 +288,7 @@ class CuriosityActivities:
 
     @activity.defn
     async def find_curiosity_gaps(
-        self, agent_id: str = "sebas", limit: int = 5, thresholds: dict | None = None
+        self, agent_id: str = "", limit: int = 5, thresholds: dict | None = None
     ) -> list[dict]:
         """At most `limit` ranked gap candidates for `agent_id`.
 
@@ -807,7 +807,7 @@ class CuriosityActivities:
     # -------------------------------------------------------------------- A7
 
     @activity.defn
-    async def check_curiosity_budget(self, agent_id: str = "sebas", max_per_day: int = 1) -> dict:
+    async def check_curiosity_budget(self, agent_id: str = "", max_per_day: int = 1) -> dict:
         """Read-only gate the flow consults BEFORE it spawns anything.
 
         Three reasons to stay quiet, checked in this order:
@@ -916,7 +916,15 @@ class CuriosityActivities:
             )
         except Exception as exc:  # noqa: BLE001 — a malformed id must not lose the answer
             activity.logger.warning("curiosity_answer_lookup_failed err=%s", str(exc)[:200])
-        agent_id = (row["agent_id"] if row else None) or str(meta.get("agent_id") or "sebas")
+        agent_id = (row["agent_id"] if row else None) or str(meta.get("agent_id") or "")
+        if not agent_id:
+            # Nobody named on the card: the GTD agent's question (#556).
+            from aegis.services.agents import resolve_tag
+
+            agent_id = await resolve_tag(self.db_pool, "gtd") or ""
+        if not agent_id:
+            activity.logger.warning("curiosity_answer_no_owner id=%s", interaction_id)
+            return {"recorded": False, "reason": "no_gtd_agent"}
         question = str(meta.get("question") or (row["prompt"] if row else "") or "").strip()
         subject = str(meta.get("subject") or "").strip()
 

@@ -21,6 +21,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from aegis.api.auth import verify_auth
+from aegis.observability import log_audit
 from aegis.services.email_rules import (
     CATEGORIES,
     get_email_rules,
@@ -67,7 +68,17 @@ async def get_meeting_rules_route(request: Request) -> dict[str, Any]:
 @router.put("/meeting-rules")
 async def put_meeting_rules_route(request: Request, body: dict[str, Any]) -> dict[str, Any]:
     """Replace the rules. 400 (not a silent drop) on a malformed self_names."""
+    pool = request.app.state.db_pool
     try:
-        return await save_meeting_rules(request.app.state.db_pool, body)
+        rules = await save_meeting_rules(pool, body)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    await log_audit(
+        pool,
+        actor="admin",
+        action="meeting_rules_saved",
+        target_type="settings",
+        target_id="meeting_rules",
+        details=rules,
+    )
+    return rules

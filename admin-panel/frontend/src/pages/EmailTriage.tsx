@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { api } from '../api/client';
 import ErrorBanner from '../components/ErrorBanner';
+import MeetingNamesPanel from '../components/MeetingNamesPanel';
 
 // Email triage rules — the user-owned half of Gmail classification.
 //
@@ -232,6 +233,8 @@ export default function EmailTriage() {
         </button>
         {saved && <span className="meta" style={{ marginLeft: 12 }}>Saved. Applies from the next hourly run.</span>}
       </div>
+
+      <MeetingNamesPanel />
     </div>
   );
 }
