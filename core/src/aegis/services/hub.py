@@ -1423,7 +1423,8 @@ async def list_problems(
     rows = await pool.fetch(
         "SELECT p.id::text AS id, p.correlation_key, p.class, p.subject, p.subject_kind, "
         "       p.title, p.severity, p.status, p.first_seen_at, p.last_seen_at, p.occurrences, "
-        "       p.muted_until, p.resolved_at, p.closed_at, p.todoist_task_id, p.group_key "
+        "       p.muted_until, p.resolved_at, p.closed_at, p.todoist_task_id, p.group_key, "
+        "       p.metadata->'projection' AS projection "
         f"FROM problems p WHERE {' AND '.join(where)} "
         f"ORDER BY p.last_seen_at DESC LIMIT ${len(args) - 1} OFFSET ${len(args)}",
         *args,

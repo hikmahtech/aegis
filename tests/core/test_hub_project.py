@@ -558,6 +558,32 @@ async def test_project_pending_picks_missing_behind_and_temp_tasks_only(db_pool,
     assert not any("error" in r for r in results)
 
 
+async def test_the_sweep_notes_why_there_is_no_task_and_forgets_once_there_is(
+    db_pool, inbox, todoist
+):
+    """The admin page reads `metadata.projection` to say why a problem has no
+    task. Falsifiable: drop `_note_projection` and the first assert fails."""
+    s = _subject()
+    r = await ingest_event(db_pool, _occ(s, 1), now=NOW)
+    await db_pool.execute(
+        "UPDATE problems SET todoist_task_id = 'item-temp' WHERE id = $1::uuid", r.problem_id
+    )
+    await project_pending(db_pool, now=NOW)
+    note = (await get_problem(db_pool, r.problem_id))["metadata"]["projection"]
+    assert note["skipped"] == "task_pending_outbox" and note["at"] == NOW.isoformat()
+    # Same reason again: `at` keeps the first sighting.
+    await project_pending(db_pool, now=NOW + timedelta(minutes=5))
+    assert (await get_problem(db_pool, r.problem_id))["metadata"]["projection"]["at"] == NOW.isoformat()
+    await db_pool.execute(
+        "INSERT INTO todoist_capture_idempotency (source_tag, external_id, todoist_task_ref) "
+        "VALUES ('#alert', $1, 'T_REAL')",
+        f"problem-{r.problem_id}",
+    )
+    await project_pending(db_pool, now=NOW + timedelta(minutes=10))
+    p = await get_problem(db_pool, r.problem_id)
+    assert p["todoist_task_id"] == "T_REAL" and "projection" not in p["metadata"]
+
+
 async def test_project_pending_survives_one_bad_problem(db_pool, inbox, todoist, monkeypatch):
     s = _subject()
     r = await ingest_event(db_pool, _occ(s, 1), now=NOW)

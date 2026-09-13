@@ -203,6 +203,10 @@ def test_the_bot_user_agent_names_the_contact_url_when_there_is_one():
     assert bot_user_agent(
         SimpleNamespace(aegis_ui_url="https://aegis.example", bot_contact_url="https://c.example/bot")
     ) == "AegisBot/2.0 (+https://c.example/bot)"
+    # A LAN-only link host is no contact for the outside world.
+    assert bot_user_agent(
+        SimpleNamespace(aegis_ui_url="https://aegis-lan.example", aegis_public_url="https://aegis.example")
+    ) == "AegisBot/2.0 (+https://aegis.example)"
 
 
 def test_feed_readers_take_the_row_default_and_the_feed_still_wins():

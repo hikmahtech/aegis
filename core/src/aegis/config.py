@@ -339,8 +339,13 @@ class Settings(BaseSettings):
     # flows that explicitly call send_voice still no-op unless this is true.
     tts_enabled: bool = False
 
-    # AEGIS admin UI base URL (used for reauth links in chat cards)
+    # AEGIS admin UI base URL: where links in chat cards, tasks and mail send a
+    # person. May be a LAN/VPN-only host.
     aegis_ui_url: str = Field(default="", validation_alias="AEGIS_UI_URL")
+    # The host OAuth providers redirect back to (Gmail re-auth, X). Must be the
+    # one registered with the provider, which is usually the public host — so it
+    # is separate from the link host. Blank = aegis_ui_url.
+    aegis_public_url: str = Field(default="", validation_alias="AEGIS_PUBLIC_URL")
 
     # v3 seed directory (YAML files for agents, channels, resources, activities)
     seed_dir: str = "./config/seed"
