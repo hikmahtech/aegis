@@ -51,6 +51,28 @@ _TOPICS_TIMEOUT = timedelta(seconds=120)
 # Nothing to retry, nothing new stored.
 _SETTLED_UNSTORED = frozenset({"empty", "duplicate", "disabled", "refused"})
 
+# #584: the cursor is a `(published, external id)` pair. A run that started
+# before the change replays on the timestamp-only cursor it used.
+_CURSOR_TIES_PATCH = "rss-cursor-ties"
+
+
+def _external_id(entry: dict) -> str:
+    """The id an entry is claimed, recorded and placed by."""
+    return entry.get("id") or entry.get("link", "") or ""
+
+
+def _place(entry: dict, ties: bool) -> tuple[str, str]:
+    """Where an entry sits in its feed's order: `(published, external id)`.
+
+    arXiv publishes a day as ONE burst of 270-750 entries that all carry the
+    same timestamp, so a timestamp alone cannot say where a capped run
+    stopped: the cursor landed on the shared timestamp and `fetch_feed`
+    dropped the rest of the burst for good (#584, exactly 30 stored per
+    announcement day). The id breaks the tie. With `ties` off (a run that
+    started before the change) every entry has the id "", so the pair orders
+    and compares exactly as the bare timestamp did."""
+    return (entry.get("published") or "", _external_id(entry) if ties else "")
+
 
 def _parse_stamp(value: str | None) -> datetime | None:
     if not value:
@@ -215,11 +237,19 @@ class RssIngestFlow:
         )
         review = review_hour < 0 or now.hour == review_hour
         failing_after = int(cfg["failing_after"])
+        # Decided once per run, so a run that started before the change keeps
+        # the old cursor for every feed it polls (`_place`).
+        ties = workflow.patched(_CURSOR_TIES_PATCH)
 
         for ch in channels:
             identifier = ch["identifier"]
             config = ch.get("config") or {}
             since = config.get("last_cursor")
+            # The second half of the cursor. A channel whose cursor predates
+            # it has only `last_cursor`: "" is the lowest id, so the entries AT
+            # that timestamp are offered once more. The ones already stored
+            # resolve as known duplicates and the cursor moves past them.
+            since_id = str(config.get("last_cursor_id") or "") if ties else None
             label = feeds.feed_label(identifier, config)
             mode = feeds.ingest_mode(config, cfg["default_ingest"])
 
@@ -228,7 +258,7 @@ class RssIngestFlow:
             try:
                 result = await workflow.execute_activity(
                     "fetch_feed",
-                    FetchFeedInput(url=identifier, since_cursor=since),
+                    FetchFeedInput(url=identifier, since_cursor=since, since_cursor_id=since_id),
                     result_type=FetchFeedResult,
                     start_to_close_timeout=_FETCH_TIMEOUT,
                     retry_policy=NO_RETRY,
@@ -311,6 +341,10 @@ class RssIngestFlow:
             # prevent. Taking the oldest N leaves the remainder ABOVE the
             # cursor, so the next poll picks them up: a burst drains over
             # several hours instead of being lost or ingested all at once.
+            #
+            # "Oldest" is the `(published, external id)` order, not the
+            # timestamp alone: a burst shares ONE timestamp, and a cursor on
+            # that timestamp left nothing of the burst above it (#584).
             available = len(result.entries)
             cap = config.get("max_entries_per_run") or 0
             entries = result.entries
@@ -323,7 +357,7 @@ class RssIngestFlow:
                 cap = 0
             if cap > 0 and available > cap:
                 # "" (no timestamp) sorts first and so is never starved.
-                entries = sorted(result.entries, key=lambda e: e.get("published") or "")[:cap]
+                entries = sorted(result.entries, key=lambda e: _place(e, ties))[:cap]
                 workflow.logger.info(
                     "rss_throttled feed=%s took=%d of=%d", identifier, len(entries), available
                 )
@@ -344,19 +378,23 @@ class RssIngestFlow:
             # batch is not ordered by outcome. If entry A (10:00) fails and
             # entry B (11:00) resolves, the max is 11:00 and `fetch_feed`'s
             # `published_iso <= since_cursor` filter then excludes A for good.
-            # `earliest_failed_published` is the real ceiling: the cursor may
-            # only move to the newest resolved entry OLDER than the oldest
-            # failure. Measured cost of not doing this: 553 of 3835 arXiv
-            # entries (14%) lost over 14 days, in two large overnight batches.
-            latest_resolved_published: str | None = None
-            earliest_failed_published: str | None = None
+            # `earliest_failed` is the real ceiling: the cursor may only move
+            # to the newest resolved entry OLDER than the oldest failure.
+            # Measured cost of not doing this: 553 of 3835 arXiv entries (14%)
+            # lost over 14 days, in two large overnight batches.
+            #
+            # Both are `_place` pairs, the cursor's own order (#584), so a
+            # failure fences the entries that share its timestamp too: the
+            # cursor stops at the last resolved entry before it in that order.
+            latest_resolved: tuple[str, str] | None = None
+            earliest_failed: tuple[str, str] | None = None
             # A failure we cannot place in time can't be fenced by a timestamp
             # comparison, so the whole feed holds its cursor for this run
             # rather than risk stepping over it. Costs a re-fetch, never a drop.
             saw_untimed_failure = False
-            resolved_published_all: list[str] = []
+            resolved_all: list[tuple[str, str]] = []
             for entry in entries:
-                external_id = entry.get("id") or entry.get("link", "")
+                external_id = _external_id(entry)
                 if not external_id:
                     continue
 
@@ -366,10 +404,10 @@ class RssIngestFlow:
                     start_to_close_timeout=_ACT_TIMEOUT,
                     retry_policy=ACT_RETRY,
                 )
-                resolved_published: str | None = None
+                resolved = False
                 if not new:
                     # Known dup → no retry needed, cursor may advance.
-                    resolved_published = entry.get("published") or None
+                    resolved = True
                 else:
                     use_mode = mode
                     if mode == "gate":
@@ -427,7 +465,7 @@ class RssIngestFlow:
 
                     entry_ok = status == "ok" or status in _SETTLED_UNSTORED
                     if entry_ok:
-                        resolved_published = entry.get("published") or None
+                        resolved = True
                         if status == "ok":
                             # Only a real store counts. This used to increment
                             # unconditionally, so `ingested` counted failures
@@ -474,30 +512,27 @@ class RssIngestFlow:
                             start_to_close_timeout=_ACT_TIMEOUT,
                             retry_policy=ACT_RETRY,
                         )
-                        failed_published = entry.get("published") or None
-                        if not failed_published:
+                        failed_at = _place(entry, ties)
+                        if not failed_at[0]:
                             saw_untimed_failure = True
-                        elif (
-                            earliest_failed_published is None
-                            or failed_published < earliest_failed_published
-                        ):
-                            earliest_failed_published = failed_published
+                        elif earliest_failed is None or failed_at < earliest_failed:
+                            earliest_failed = failed_at
 
-                if resolved_published:
-                    resolved_published_all.append(resolved_published)
+                # An entry with no timestamp has no place to move the cursor to.
+                resolved_at = _place(entry, ties)
+                if resolved and resolved_at[0]:
+                    resolved_all.append(resolved_at)
 
             # Cursor ceiling: newest resolved entry strictly older than the
             # oldest failure. Computed after the loop because a failure can
             # appear after the resolved entry it has to fence.
             if saw_untimed_failure:
-                latest_resolved_published = None
+                latest_resolved = None
             else:
                 eligible = [
-                    p
-                    for p in resolved_published_all
-                    if earliest_failed_published is None or p < earliest_failed_published
+                    p for p in resolved_all if earliest_failed is None or p < earliest_failed
                 ]
-                latest_resolved_published = max(eligible) if eligible else None
+                latest_resolved = max(eligible) if eligible else None
 
             total_entries += len(entries)
             total_ingested += feed_ingested
@@ -520,14 +555,28 @@ class RssIngestFlow:
             # Cursor advances only past entries with a DEFINITE outcome
             # (stored OR known dup). Failed entries stay inside the next-tick
             # window for retry.
-            if latest_resolved_published:
+            if latest_resolved:
+                cursor_at, cursor_id = latest_resolved
+                if ties:
+                    # The id BEFORE the timestamp. A run that stops between
+                    # the two writes leaves the new id beside the old
+                    # timestamp, which only offers entries again (they resolve
+                    # as duplicates) or passes over ones this run resolved.
+                    # The other order could pair the new timestamp with an old,
+                    # larger id and pass over entries nothing ever stored.
+                    await workflow.execute_activity(
+                        "update_channel_config_key",
+                        args=["rss", identifier, "last_cursor_id", cursor_id],
+                        start_to_close_timeout=_ACT_TIMEOUT,
+                        retry_policy=ACT_RETRY,
+                    )
                 await workflow.execute_activity(
                     "update_channel_config_key",
                     args=[
                         "rss",
                         identifier,
                         "last_cursor",
-                        latest_resolved_published,
+                        cursor_at,
                     ],
                     start_to_close_timeout=_ACT_TIMEOUT,
                     retry_policy=ACT_RETRY,
@@ -553,7 +602,7 @@ class RssIngestFlow:
             # like a quiet feed rather than a batch that lost everything.
             if feed_failed:
                 entry_summary["failed"] = feed_failed
-                entry_summary["cursor_held"] = latest_resolved_published is None
+                entry_summary["cursor_held"] = latest_resolved is None
             per_feed.append(entry_summary)
             total_failed += feed_failed
 

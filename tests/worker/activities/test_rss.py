@@ -100,6 +100,57 @@ async def test_fetch_feed_respects_cursor(rss):
     assert result.entries[0]["title"] == "New"
 
 
+def _tied(*ids: str) -> MagicMock:
+    """Entries that all share one timestamp, as an arXiv burst does (#584)."""
+    parsed = MagicMock()
+    parsed.entries = [
+        MagicMock(
+            id=i,
+            title=i,
+            link=f"https://x/{i}",
+            summary="",
+            published_parsed=(2026, 9, 12, 4, 0, 0, 0, 0, 0),
+            updated_parsed=None,
+        )
+        for i in ids
+    ]
+    return parsed
+
+
+async def _fetch_tied(rss, since_cursor_id):
+    with patch("feedparser.parse", return_value=_tied("a", "b", "c")):
+        result = await ActivityEnvironment().run(
+            rss.fetch_feed,
+            FetchFeedInput(
+                url="https://x",
+                since_cursor="2026-09-12T04:00:00+00:00",
+                since_cursor_id=since_cursor_id,
+            ),
+        )
+    return [e["id"] for e in result.entries]
+
+
+@pytest.mark.asyncio
+async def test_fetch_feed_keeps_tied_entries_past_the_cursor_id(rss):
+    """The cursor is `(published, id)`: at the cursor's own timestamp, only
+    the entries after its id are new."""
+    assert await _fetch_tied(rss, "b") == ["c"]
+
+
+@pytest.mark.asyncio
+async def test_an_empty_cursor_id_offers_every_entry_at_the_cursor_timestamp(rss):
+    """A channel whose cursor predates the id: "" is the lowest id, so the
+    whole tied batch is offered once more."""
+    assert await _fetch_tied(rss, "") == ["a", "b", "c"]
+
+
+@pytest.mark.asyncio
+async def test_no_cursor_id_keeps_the_old_timestamp_rule(rss):
+    """A run that started before the change passes no id: an entry is new
+    only when its timestamp is later, exactly as before."""
+    assert await _fetch_tied(rss, None) == []
+
+
 # --------------------------------------------------------------------------
 # #511 — a failed fetch says so. A dead URL, a 404 or an HTML page used to
 # come back as an empty parse, which read as "quiet".

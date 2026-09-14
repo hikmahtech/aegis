@@ -40,6 +40,14 @@ logger = structlog.get_logger()
 class FetchFeedInput:
     url: str
     since_cursor: str | None = None  # ISO timestamp
+    # The external id of the entry the cursor stopped at (#584). With it the
+    # cursor is the pair `(since_cursor, since_cursor_id)` and an entry is new
+    # when its own `(published, id)` pair is greater, so entries that share
+    # the cursor's timestamp are not all dropped. "" is the lowest id: every
+    # entry AT the timestamp is offered again. None keeps the old rule, an
+    # entry is new only when its timestamp is later, for a run that started
+    # before the change.
+    since_cursor_id: str | None = None
 
 
 @dataclass
@@ -206,12 +214,20 @@ class RssActivities:
                 else:
                     published_iso = getattr(e, "published", "") or getattr(e, "updated", "")
 
-                if input.since_cursor and published_iso and published_iso <= input.since_cursor:
-                    continue
+                entry_id = getattr(e, "id", "") or getattr(e, "link", "")
+                if input.since_cursor and published_iso:
+                    if input.since_cursor_id is None:
+                        if published_iso <= input.since_cursor:
+                            continue
+                    elif (published_iso, entry_id) <= (
+                        input.since_cursor,
+                        input.since_cursor_id,
+                    ):
+                        continue
 
                 entries.append(
                     {
-                        "id": getattr(e, "id", "") or getattr(e, "link", ""),
+                        "id": entry_id,
                         "title": getattr(e, "title", ""),
                         "link": getattr(e, "link", ""),
                         "summary": getattr(e, "summary", "")[:500]

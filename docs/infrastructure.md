@@ -1987,6 +1987,17 @@ A `process_content` that returns `status: error` now counts as a failure. The
 entry's claim is released and the cursor is fenced, so the next run retries it
 instead of counting it as ingested.
 
+The cursor is a pair: `channels.config.last_cursor` (the entry's `published`
+timestamp) and `last_cursor_id` (its id, else its link). An entry is new when
+its `(published, id)` pair comes after the cursor's. Before #584 the cursor
+was the timestamp alone. arXiv publishes a whole day as one burst of entries
+that share one timestamp, so a capped run moved the cursor onto that
+timestamp and the rest of the burst was dropped: exactly 30 stored per
+announcement day. A channel with only `last_cursor` still works. A missing id
+counts as the lowest id, so the entries at that timestamp are offered once
+more. The ones already stored come back as duplicates, and the cursor moves
+past them. To make a feed start over, clear both keys, not just one.
+
 ### Retention (dry run only)
 
 `GET /api/admin/channels/retention-preview?older_than_days=N` counts what one

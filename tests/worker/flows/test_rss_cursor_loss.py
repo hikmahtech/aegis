@@ -163,7 +163,11 @@ async def test_cursor_advances_only_up_to_the_oldest_failure():
     so the feed still makes progress instead of stalling on every hiccup."""
     result = await _run(stub_content_entry2_fails, "rss-loss-2")
 
-    assert _calls["cursor"] == [(FEED, "last_cursor", "2026-04-18T10:00:00")]
+    # The id first, then the timestamp (#584): the pair is the cursor.
+    assert _calls["cursor"] == [
+        (FEED, "last_cursor_id", f"{FEED}#1"),
+        (FEED, "last_cursor", "2026-04-18T10:00:00"),
+    ]
     assert result["failed"] == 1
     assert result["ingested"] == 1
 
