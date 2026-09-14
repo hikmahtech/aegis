@@ -639,8 +639,11 @@ class AlertInvestigationFlow:
         # routing result the activity below already returns, so this needs no
         # patch: an old history replays a dict without the key and gets "".
         platform_hint = ""
-        # None = the pre-#498 built-in infra list, which is what a history
-        # recorded before the list moved to the DB must replay against.
+        # The effective infra list, from the `infra_alert_routing` settings
+        # row. None (an un-patched history) now matches no name at all — the
+        # frozen pre-#498 copy is gone (#504), and no such run can still be
+        # open. The patch stays: removing it would change the patch markers a
+        # recorded history replays against.
         infra_alertnames: list[str] | None = None
         if workflow.patched("infra-cluster-from-settings"):
             routing = await workflow.execute_activity_method(

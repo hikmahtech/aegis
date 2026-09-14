@@ -32,6 +32,9 @@ from temporalio import activity
 from temporalio.testing import ActivityEnvironment, WorkflowEnvironment
 from temporalio.worker import Worker
 
+# The effective list a deployment with no `infra_alert_routing` row gets.
+_DEFAULTS = sorted(DEFAULT_INFRA_ALERTNAMES)
+
 # ---------------------------------------------------------------------------
 # is_infra_alert — pure function
 # ---------------------------------------------------------------------------
@@ -42,7 +45,7 @@ def test_is_infra_alert_nodedown():
         "source": "alertmanager",
         "labels": {"alertname": "NodeDown", "cluster": "homelab-swarm"},
     }
-    assert is_infra_alert(alert) is True
+    assert is_infra_alert(alert, "", _DEFAULTS) is True
 
 
 def test_is_infra_alert_dockerservicedown():
@@ -50,7 +53,7 @@ def test_is_infra_alert_dockerservicedown():
         "source": "alertmanager",
         "labels": {"alertname": "DockerServiceDown"},
     }
-    assert is_infra_alert(alert) is True
+    assert is_infra_alert(alert, "", _DEFAULTS) is True
 
 
 def test_is_infra_alert_servicedownprolonged_without_cluster_label():
@@ -63,7 +66,7 @@ def test_is_infra_alert_servicedownprolonged_without_cluster_label():
         "source": "aegis-heartbeat",
         "labels": {"alertname": "ServiceDownProlonged", "service_name": "miniflux_miniflux"},
     }
-    assert is_infra_alert(alert) is True
+    assert is_infra_alert(alert, "", _DEFAULTS) is True
 
 
 def test_is_infra_alert_cluster_label_alone():
@@ -87,18 +90,18 @@ def test_is_infra_alert_cluster_label_off_by_default():
 
 def test_is_infra_alert_lokidown():
     alert = {"source": "alertmanager", "labels": {"alertname": "LokiDown"}}
-    assert is_infra_alert(alert) is True
+    assert is_infra_alert(alert, "", _DEFAULTS) is True
 
 
 def test_is_infra_alert_prometheusdown():
     alert = {"source": "alertmanager", "labels": {"alertname": "PrometheusDown"}}
-    assert is_infra_alert(alert) is True
+    assert is_infra_alert(alert, "", _DEFAULTS) is True
 
 
 def test_is_infra_alert_case_insensitive():
     """alertname matching is lowercased."""
     alert = {"source": "alertmanager", "labels": {"alertname": "NODEDOWN"}}
-    assert is_infra_alert(alert) is True
+    assert is_infra_alert(alert, "", _DEFAULTS) is True
 
 
 def test_is_infra_alert_sentry_not_infra():
@@ -126,15 +129,13 @@ def test_is_infra_alert_no_labels():
 
 def test_is_infra_alert_dagster_pipeline_failure_is_setup_config_not_a_default():
     """A Dagster alert is infra only because this deployment says so in the
-    `infra_alert_routing` row (#498). The code default names nobody's setup;
-    a history recorded before the move (no list) still replays as infra."""
+    `infra_alert_routing` row (#498). The code default names nobody's setup."""
     alert = {
         "source": "alertmanager",
         "labels": {"alertname": "Dagster Pipeline Failure"},
     }
-    assert is_infra_alert(alert, "", sorted(DEFAULT_INFRA_ALERTNAMES)) is False
+    assert is_infra_alert(alert, "", _DEFAULTS) is False
     assert is_infra_alert(alert, "", ["dagster pipeline failure"]) is True
-    assert is_infra_alert(alert) is True
 
 
 # ---------------------------------------------------------------------------
@@ -410,10 +411,12 @@ async def _stub_record_verdict_to_kg(
 
 @activity.defn(name="get_alert_routing_config")
 async def _stub_get_alert_routing_config() -> dict:
-    routing = {"infra_cluster": _flow_state.get("infra_cluster", "")}
-    # Absent unless a test sets it — the shape a pre-#498 history recorded.
-    if _flow_state.get("infra_alertnames") is not None:
-        routing["infra_alertnames"] = _flow_state["infra_alertnames"]
+    routing = {
+        "infra_cluster": _flow_state.get("infra_cluster", ""),
+        # The generic defaults unless a test names its own, which is what the
+        # real activity serves — it never returns an empty list.
+        "infra_alertnames": _flow_state.get("infra_alertnames") or sorted(DEFAULT_INFRA_ALERTNAMES),
+    }
     if _flow_state.get("platform_hint") is not None:
         routing["platform_hint"] = _flow_state["platform_hint"]
     return routing
