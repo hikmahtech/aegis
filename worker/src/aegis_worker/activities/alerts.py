@@ -80,38 +80,6 @@ _RECALL_SNIPPET_CHARS = 600
 # the `infra_alert_routing` settings row merged over a generic default
 # (`aegis.services.infra_alert_routing`, #498). The flow reads the effective
 # list through `get_alert_routing_config` and passes it to `is_infra_alert`.
-#
-# REPLAY ONLY — do not add to this, and do not read it for a new alert. It is
-# the built-in list as it stood before #498, frozen, for AlertInvestigationFlow
-# histories recorded before then: their routing config carried no list, and
-# replaying them against anything else would classify an alert differently,
-# schedule a different activity and wedge the workflow. Delete it once no run
-# started before #498 is open (the Gate-2 card times out after 48h).
-_PRE_498_INFRA_ALERTNAMES: frozenset[str] = frozenset(
-    {
-        "nodedown",
-        "dockerservicedown",
-        "servicedownprolonged",
-        "heartbeatcollectfailed",
-        "lokidown",
-        "criticalendpointdown",
-        "postgresqldown",
-        "clickhousedown",
-        "prometheusdown",
-        "alertmanagerdown",
-        "tempordown",
-        "gpucriticaltemperature",
-        "dagster pipeline failure",
-        "hostoutofmemory",
-        "hostmemorylimitreached",
-        "hostdiskspacefull",
-        "hostdiskreadlatency",
-        "hostdiskwritelatency",
-        "containermemorylimitreached",
-        "containerkilledbysigterm",
-        "containerkilledbysigkill",
-    }
-)
 
 # Infra alert classes safe to auto-remediate with a `service update --force`.
 # A force-restart reschedules a stuck/unplaced task (the DockerServiceDown /
@@ -165,8 +133,8 @@ def is_infra_alert(
     AEGIS_INFRA_CLUSTER env fallback; blank ⇒ cluster matching is off). Callers
     pass both explicitly — workflows fetch them once via
     AlertActivities.get_alert_routing_config since they can't read the DB.
-    `infra_alertnames=None` means a history recorded before the list moved to
-    the DB, and replays against `_PRE_498_INFRA_ALERTNAMES`.
+    No names (the default, or a history recorded before the list moved to the
+    DB) means nothing matches by name and only the cluster label can classify.
 
     Infra alerts have no application code repo, so they skip the repo match
     and go to the infra repo — unless a repository claims them by label
@@ -178,11 +146,7 @@ def is_infra_alert(
     cluster = (labels.get("cluster") or "").strip()
     if infra_cluster and cluster == infra_cluster:
         return True
-    names = (
-        _PRE_498_INFRA_ALERTNAMES
-        if infra_alertnames is None
-        else {str(n).strip().lower() for n in infra_alertnames}
-    )
+    names = {str(n).strip().lower() for n in infra_alertnames or ()}
     alertname = (labels.get("alertname") or "").strip().lower()
     return alertname in names
 
