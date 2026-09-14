@@ -70,6 +70,11 @@ class IntelligenceScanFlow:
         # 0. Topics tracked from chat (#508). `track_topic` wrote them to a
         # settings row that nothing read, so "added" changed no scan. A failed
         # read is not a failed scan: it runs on its configured topics and says so.
+        # A tracked topic arrives as its NAME and is searched once (#585): the
+        # scan used to search every match term (107 queries for 20 topics) and
+        # the configured topics, searched first, filled every result slot.
+        # `search_source` now gives each topic a turn. The commands this flow
+        # issues did not change, so there is no patch.
         try:
             tracked = await workflow.execute_activity(
                 "load_tracked_topics",

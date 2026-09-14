@@ -5,8 +5,9 @@ Spec: docs/superpowers/specs/2026-09-12-research-hub-design.md.
 
 **The registry is the `intelligence_topics` settings row** —
 ``{"topics": [{"name", "queries", "priority"}]}``, which `track_topic` has
-always written and which the intel scans (#508) and the RSS gate (#512) read
-for their search terms. It stays the registry because a topic's terms must
+always written and which the intel scans (#508) and the RSS gate (#512) read.
+A scan searches each topic once, by its name (#585); the gate, curiosity and
+the rounds match on its terms. It stays the registry because a topic's terms must
 outlive any one problem. Every change to it is a read-modify-write under one
 advisory lock, so `track_topic` from chat and a curiosity "yes" landing
 together cannot lose one of the two.
@@ -87,7 +88,9 @@ class Topic:
     @property
     def terms(self) -> tuple[str, ...]:
         """What an article must name to belong to the topic: its queries, or
-        its name when it has none — the same rule the scans search by."""
+        its name when it has none — the rule the rounds, the RSS gate and
+        curiosity match by. The intel scans do NOT search these: a scan
+        searches a topic once, by its name (#585)."""
         return self.queries or (self.name,)
 
     @property

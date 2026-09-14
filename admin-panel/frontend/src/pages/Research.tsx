@@ -169,6 +169,7 @@ export default function Research() {
         <h2 className="section-title">Tracked topics</h2>
         <p className="meta" style={{ marginBottom: 8 }}>
           The registry the intel scans search and the feed gate matches on (<code>settings.intelligence_topics</code>).
+          A scan searches each topic once, by its name; an article belongs to a topic when it names one of its match terms.
           Each topic keeps one open round of news on the hub; the round becomes a Todoist task once it holds
           the topic's threshold of items (its own number, else its priority's below). Saving replaces the list:
           a removed topic's round is closed, a new one's is opened.
@@ -177,7 +178,7 @@ export default function Research() {
           <table className="data-table">
             <thead>
               <tr>
-                <th>Topic</th><th>Search terms (comma-separated)</th>
+                <th>Topic</th><th>Match terms (comma-separated)</th>
                 <th style={{ width: 110 }}>Priority</th><th style={{ width: 90 }}>Threshold</th>
                 <th style={{ width: 220 }}>Round</th><th style={{ width: 50 }} />
               </tr>

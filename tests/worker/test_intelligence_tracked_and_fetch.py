@@ -11,6 +11,7 @@ from aegis_worker.activities.intelligence import (
     TRACKED_TOPICS_SETTING,
     IntelligenceActivities,
     tracked_search_terms,
+    tracked_topic_names,
 )
 from temporalio.testing import ActivityEnvironment
 
@@ -69,12 +70,52 @@ async def test_load_tracked_topics_reads_what_track_topic_writes(db_pool):
         },
     )
     try:
-        terms = await ActivityEnvironment().run(
+        names = await ActivityEnvironment().run(
             IntelligenceActivities(db_pool=db_pool).load_tracked_topics
         )
     finally:
         await db_pool.execute("DELETE FROM settings WHERE key = $1", TRACKED_TOPICS_SETTING)
-    assert terms == ["bitcoin", "ethereum", "rust"]
+    # #585: the scans search a topic by its name, not by each match term.
+    assert names == ["crypto", "rust"]
+
+
+# --------------------------------------------------------------------------
+# #585 — a scan searches each tracked topic once; the match terms are unchanged.
+# --------------------------------------------------------------------------
+
+
+def _twenty_topics() -> dict:
+    """Prod's shape on 2026-09-14: 20 topics, several match terms each."""
+    return {
+        "topics": [
+            {"name": f"topic {i}", "queries": [f"t{i} alpha", f"t{i} beta", f"t{i} gamma",
+                                                f"t{i} delta", f"t{i} epsilon"]}
+            for i in range(20)
+        ]
+    }
+
+
+def test_tracked_topic_names_is_one_entry_per_topic():
+    names = tracked_topic_names(_twenty_topics())
+    assert names == [f"topic {i}" for i in range(20)]
+
+
+@pytest.mark.parametrize("value", [None, "", "not json", [], {"topics": "x"}])
+def test_tracked_topic_names_never_raises_on_a_bad_row(value):
+    assert tracked_topic_names(value) == []
+
+
+def test_match_terms_are_unchanged_for_the_gate_and_the_rounds():
+    """The terms still decide what belongs to a topic: the RSS gate still
+    gets every one, and an article naming only a term (not the name) still
+    matches its topic."""
+    from aegis.services.research_topics import match_topics, parse_topics
+
+    value = _twenty_topics()
+    assert len(tracked_search_terms(value)) == 100
+    assert "t7 gamma" in tracked_search_terms(value)
+    matched = match_topics(parse_topics(value), "A story about T7 Gamma today")
+    assert [t.name for t in matched] == ["topic 7"]
 
 
 async def test_load_tracked_topics_with_no_row_is_no_topics(db_pool):

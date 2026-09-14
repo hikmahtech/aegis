@@ -2166,8 +2166,10 @@ A topic you ask Raphael to track (`track_topic`, or "yes" to a "track this?"
 card) is two things (#513, spec
 `docs/superpowers/specs/2026-09-12-research-hub-design.md`):
 
-- **Its search terms**, in the `intelligence_topics` settings row. The intel
-  scans search them and the RSS gate matches on them.
+- **Its entry**, in the `intelligence_topics` settings row: a name and its
+  match terms. The intel scans search the topic once, by its name, and give
+  each topic a fair share of the results they score (#585). The RSS gate and
+  the round match on the terms.
 - **Its round of news**, a hub problem: class `topic`, source `research`,
   owned by Raphael. Every intel-scan item or stored feed entry that names one
   of the terms (whole word, any case) is an occurrence, keyed on the URL, so

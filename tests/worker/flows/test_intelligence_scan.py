@@ -420,6 +420,48 @@ async def test_scan_keeps_its_configured_topics_when_the_tracked_read_fails():
 
 
 @pytest.mark.asyncio
+async def test_twenty_tracked_topics_are_twenty_queries_not_their_terms(db_pool):
+    """#585: prod tracks 20 topics with 107 match terms, and each scan sent a
+    query per term. Through the real `load_tracked_topics`, on Postgres, a scan
+    now searches each tracked topic once, by its name."""
+    from aegis_worker.activities.intelligence import (
+        TRACKED_TOPICS_SETTING,
+        IntelligenceActivities,
+    )
+
+    _reset()
+    await db_pool.execute(
+        "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW()) "
+        "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
+        TRACKED_TOPICS_SETTING,
+        {
+            "topics": [
+                {"name": f"topic {i}", "queries": [f"t{i} a", f"t{i} b", f"t{i} c", f"t{i} d"]}
+                for i in range(20)
+            ]
+        },
+    )
+    searched: list = []
+    try:
+        result = await _run_with(
+            [
+                _recording_search(searched),
+                IntelligenceActivities(db_pool=db_pool).load_tracked_topics,
+                stub_dedup,
+                stub_score,
+                stub_ingest,
+                stub_attach,
+            ],
+            IntelligenceScanInput(source="news", topics=["ai", "systems", "startups"]),
+            "is-tracked-names",
+        )
+    finally:
+        await db_pool.execute("DELETE FROM settings WHERE key = $1", TRACKED_TOPICS_SETTING)
+    assert searched == [["ai", "systems", "startups", *(f"topic {i}" for i in range(20))]]
+    assert result["tracked_topics"] == 20
+
+
+@pytest.mark.asyncio
 async def test_scan_reports_items_read_from_their_page():
     """`fetched` rides from the ingest activity into the run summary."""
     _reset()

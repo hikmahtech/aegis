@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 
 import httpx
 import structlog
@@ -33,12 +34,53 @@ def render_query(template: str, source: str, topic: str) -> str:
     return tpl.replace("{topic}", topic)
 
 
+def interleave(per_topic: list[list[dict]], limit: int, start: int = 0) -> list[dict]:
+    """Up to `limit` items taken one topic at a time, round-robin from topic
+    `start`, skipping a URL another topic already gave.
+
+    The scan used to keep the first `limit` results in the order it collected
+    them, so the topics searched first filled every slot: with three configured
+    topics ahead of the tracked ones, no tracked topic's result was ever scored
+    (#585). Taking turns gives every topic that returned something a share.
+    When there are more topics than slots, the ones after the cut get nothing
+    this run — which is why `start` rotates from run to run."""
+    n = len(per_topic)
+    if n == 0 or limit <= 0:
+        return []
+    order = [per_topic[(start + i) % n] for i in range(n)]
+    cursors = [0] * n
+    seen: set[str] = set()
+    out: list[dict] = []
+    while len(out) < limit:
+        took = False
+        for i, items in enumerate(order):
+            if len(out) >= limit:
+                break
+            while cursors[i] < len(items):
+                item = items[cursors[i]]
+                cursors[i] += 1
+                if item["url"] in seen:
+                    continue
+                seen.add(item["url"])
+                out.append(item)
+                took = True
+                break
+        if not took:
+            break
+    return out
+
+
 @dataclass
 class SearchSourceInput:
     source: str  # 'hn' | 'news' | 'finance'
     topics: list[str] = field(default_factory=list)
     max_results: int = 20
     query_template: str = ""
+    # Which topic the round-robin starts at. None (every scheduled run) means
+    # today's day number, so when there are more topics than result slots a
+    # different few miss out each day, not the same last-added ones every
+    # night. Tests pin it.
+    rotation: int | None = None
 
 
 @dataclass
@@ -67,13 +109,14 @@ class IntelScanActivities:
 
     @activity.defn
     async def search_source(self, input: SearchSourceInput) -> SearchSourceResult:
+        """One searxng query per topic, then a fair share of the results for
+        each topic (`interleave`), trimmed to `max_results`."""
         if not self.searxng_url:
             logger.warning("searxng_url_missing")
             return SearchSourceResult(items=[], source=input.source)
 
         client = self.http_client or httpx.AsyncClient()
-        seen_urls: set[str] = set()
-        merged: list[dict] = []
+        per_topic: list[list[dict]] = []
         failed_topics: list[str] = []
 
         try:
@@ -97,20 +140,18 @@ class IntelScanActivities:
                         error=error_text(exc),
                     )
                     continue
-                for r in data.get("results", []):
-                    url = r.get("url", "")
-                    if url in seen_urls:
-                        continue
-                    seen_urls.add(url)
-                    merged.append(
+                per_topic.append(
+                    [
                         {
                             "title": r.get("title", ""),
-                            "url": url,
+                            "url": r.get("url", ""),
                             "snippet": (r.get("content", "") or "")[:500],
                             "source": input.source,
                             "published": r.get("publishedDate", ""),
                         }
-                    )
+                        for r in data.get("results", [])
+                    ]
+                )
         finally:
             if self.http_client is None:
                 await client.aclose()
@@ -125,7 +166,10 @@ class IntelScanActivities:
                 f"for source={input.source}"
             )
 
-        trimmed = merged[: input.max_results]
+        rotation = input.rotation
+        if rotation is None:
+            rotation = datetime.now(UTC).date().toordinal()
+        trimmed = interleave(per_topic, input.max_results, rotation)
         logger.info(
             "intel_scan_done",
             source=input.source,
