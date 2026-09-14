@@ -118,7 +118,9 @@ def _stubs(
 
     @activity.defn(name="update_channel_config_key")
     async def cursor(kind, identifier, key, value) -> None:
-        rec.cursor.append(value)
+        # The timestamp half; the id half is test_rss_cursor_ties.py's.
+        if key == "last_cursor":
+            rec.cursor.append(value)
 
     @activity.defn(name="attach_topic_items")
     async def attach(items: list[dict], origin: str) -> dict:

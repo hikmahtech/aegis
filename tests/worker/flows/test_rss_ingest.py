@@ -163,7 +163,7 @@ async def test_rss_ingests_2_feeds():
     # ingest_claims is no longer called from rss_ingest — the broken metadata
     # claim was redundant with process_content's /api/content call.
     assert len(_calls["ingest"]) == 0
-    assert len(_calls["cursor"]) == 2
+    assert len([c for c in _calls["cursor"] if c[2] == "last_cursor"]) == 2
 
 
 @pytest.mark.asyncio
@@ -264,7 +264,7 @@ async def test_rss_cursor_does_not_advance_past_failed_entries():
     # successful entry's `published` (`10:00:00`), NOT the latest
     # `11:00:00`.
     assert result["errors"] == 0  # fetch_feed didn't fail
-    cursor_values = {call[3] for call in _calls["cursor"]}
+    cursor_values = {call[3] for call in _calls["cursor"] if call[2] == "last_cursor"}
     assert cursor_values == {"2026-04-18T10:00:00"}
 
 
@@ -294,5 +294,5 @@ async def test_rss_dedup_skips_ingest():
     assert result["ingested"] == 0  # all skipped as dups
     assert len(_calls["ingest"]) == 0
     # But cursor STILL advances (bookmark is read)
-    assert len(_calls["cursor"]) == 2
+    assert len([c for c in _calls["cursor"] if c[2] == "last_cursor"]) == 2
 
