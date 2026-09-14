@@ -144,7 +144,8 @@ class IntelligenceActivities:
 
     @activity.defn
     async def load_tracked_topics(self) -> list[str]:
-        """Search terms for the topics tracked from chat, in the order added.
+        """The names of the topics tracked from chat, in the order added —
+        what a scan searches, one query per topic (#585).
 
         `track_topic` writes them to the settings row `intelligence_topics`.
         Until #508 nothing read that row, so the tool answered "added" and no
@@ -156,7 +157,7 @@ class IntelligenceActivities:
         value = await self.db_pool.fetchval(
             "SELECT value FROM settings WHERE key = $1", TRACKED_TOPICS_SETTING
         )
-        return tracked_search_terms(value)
+        return tracked_topic_names(value)
 
     @activity.defn
     async def attach_topic_items(self, items: list[dict], origin: str) -> dict:
@@ -269,8 +270,9 @@ class IntelligenceActivities:
 
 
 def tracked_search_terms(value: Any) -> list[str]:
-    """The search terms in an `intelligence_topics` settings value: each
-    topic's queries, or its name when it has none.
+    """The match terms in an `intelligence_topics` settings value: each
+    topic's queries, or its name when it has none. The RSS gate matches on
+    these; the intel scans search `tracked_topic_names` instead.
 
     The row has one parser, `research_topics.parse_topics` — the one the
     hub's rounds read — so the scans, the RSS gate and the rounds agree on
@@ -279,3 +281,16 @@ def tracked_search_terms(value: Any) -> list[str]:
     config read.
     """
     return [term for topic in parse_topics(value) for term in topic.terms]
+
+
+def tracked_topic_names(value: Any) -> list[str]:
+    """The topic names in an `intelligence_topics` settings value, in the
+    order added: what an intel scan searches, one query per topic.
+
+    A scan used to search every match term instead — 107 queries for 20
+    topics, each scan, three scans a night — and the configured topics,
+    searched first, filled every result slot, so no tracked topic's result
+    was ever scored (#585). The terms decide what belongs to a topic, not
+    what to search. Lenient, like `tracked_search_terms`.
+    """
+    return [topic.name for topic in parse_topics(value)]
