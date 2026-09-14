@@ -292,7 +292,14 @@ class KnowledgeStore:
         max_sources: int = 5,
         min_confidence: float = 0.0,
     ) -> dict:
-        """RAG: retrieve top sources, synthesize an answer with the local LLM."""
+        """RAG: retrieve top sources, synthesize an answer.
+
+        The answer model is the `knowledge_ask` route in `config/models.yaml`
+        (category `write`), NOT the tier map and NOT `think()`'s default.
+        Embedding is a separate knob (`settings.embedding_model`) and must
+        stay on whatever embedded `knowledge_chunks` — the stored vectors
+        and the query vector have to come from one model.
+        """
         sources = await self.search(question, limit=max_sources)
         sources = [s for s in sources if s.get("similarity", 0) >= min_confidence]
         if not sources:

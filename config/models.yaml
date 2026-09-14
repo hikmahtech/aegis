@@ -51,6 +51,7 @@ routes:
     daylog_rollup: write
     alert_investigation: write                              # prose verdict, keyword-scanned
     briefing_frame: write                                   # the morning narrative, no JSON
+    knowledge_ask: write                                    # the Knowledge UI's RAG answer, read by a person
 
 litellm:
   # base_url is set by env: AEGIS_LITELLM_URL
