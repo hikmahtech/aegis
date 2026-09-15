@@ -72,8 +72,13 @@ class AnsaarClient(HTTPConnector):
         return list(body.get("data") or []), dict(body.get("meta") or {})
 
     async def prices(self, symbol: str, asset_class: str, start: date, end: date) -> list[dict]:
-        """Closes from ansaar's own price table, oldest first: the desk's fallback
-        when Yahoo has no bar. The endpoints return newest first."""
+        """Prices from ansaar's own price table, oldest first: the desk's fallback
+        when Yahoo has no bar. The endpoints return newest first.
+
+        Each row is ``{"day", "open", "close", ...}``. ansaar is END OF DAY, so
+        this can backfill a past session the desk missed but can never serve
+        today's open — for that, Yahoo is the only source.
+        """
         kind = "etfs" if asset_class == "etf" else "equities"
         path = (
             f"/api/etfs/{quote(symbol, safe='')}/prices"
@@ -82,8 +87,16 @@ class AnsaarClient(HTTPConnector):
         )
         body = await self._get(path, {"from": start.isoformat(), "to": end.isoformat(), "limit": 1000})
         out = [
-            {"day": date.fromisoformat(str(r["date"])[:10]), "close": float(r["close"]), "split_ratio": None, "dividend": None}
+            {
+                "day": date.fromisoformat(str(r["date"])[:10]),
+                "open": float(r["open"]) if r.get("open") is not None else None,
+                "close": float(r["close"]) if r.get("close") is not None else None,
+                "split_ratio": None,
+                "dividend": None,
+            }
             for r in body.get("data") or []
-            if r.get("close") is not None
+            # A row carrying either price is worth keeping: an open alone can
+            # still fill an order, a close alone can still value one.
+            if r.get("close") is not None or r.get("open") is not None
         ]
         return sorted(out, key=lambda b: b["day"])

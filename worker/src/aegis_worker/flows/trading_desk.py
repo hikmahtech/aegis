@@ -1,7 +1,9 @@
-"""TradingDeskFlow: one weekday-morning run of Maou's paper trading desk.
+"""TradingDeskFlow: one run of Maou's paper trading desk.
 
-Everything happens in the `desk_tick` activity, which is idempotent, so a retry
-or a manual re-run on the same day changes nothing.
+It fires several times a weekday — before the market opens to plan, after it
+opens to fill at that open, and later to retry a fill a source outage left
+undone — so more than one run a day is the normal case, not just a manual
+re-run. Everything happens in the `desk_tick` activity, which is idempotent.
 """
 
 from __future__ import annotations

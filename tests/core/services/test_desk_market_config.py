@@ -327,6 +327,8 @@ def test_an_empty_calendar_symbol_saves_because_it_is_a_real_answer():
         ({"tax_rate": {"equity": "lots"}}, "must be a number"),
         ({"long_term_rate": 2}, "between 0 and 1"),
         ({"long_term_exemption_classes": ["equity", ""]}, "empty asset class"),
+        ({"fill_at": "opening"}, "must be one of"),
+        ({"fill_at": "vwap"}, "must be one of"),
     ],
 )
 def test_a_setting_that_would_not_work_is_refused(body, says):
@@ -446,3 +448,35 @@ async def test_the_page_is_told_whether_capital_is_still_editable(pool):
     await orders(pool, "filled")
 
     assert (await desk_rules.read(pool))["capital_locked"] is True
+
+
+# --- which print the desk fills at -------------------------------------------
+
+
+@pytest.mark.parametrize("value, stored", [("open", "open"), ("close", "close"), ("OPEN", "open")])
+def test_fill_at_saves_either_print(value, stored):
+    out = desk_rules.validate(
+        {"fy_start_month": 1, "stale_calendar_days": 6, "stale_price_days": 7, "fill_at": value}
+    )
+    assert out["fill_at"] == stored
+
+
+def test_a_form_that_omits_fill_at_leaves_it_alone():
+    """A field the form did not send means "leave it alone", not "clear it" —
+    the same rule the day counts follow, so a partial body saves rather than
+    400s."""
+    out = desk_rules.validate({"fy_start_month": 1, "stale_calendar_days": 6, "stale_price_days": 7})
+    assert out["fill_at"] == dm.Rules().fill_at == "close"
+
+
+def test_the_read_path_stays_forgiving_where_the_write_path_is_strict():
+    """A junk value that somehow reached the stored row is read as the close, so
+    the desk keeps trading. That leniency is exactly why the write boundary
+    above has to refuse it — otherwise a typo saves with a 200 and then quietly
+    does something other than what the form said, for ever."""
+    junk = dm.Rules.from_config({"fill_at": "opening"})
+    assert junk.fill_at == "opening"
+    assert dm.fill_price_on([dm.Bar(date(2026, 9, 14), 100.0, open=90.0)], date(2026, 9, 14), junk) == (
+        100.0,
+        "close",
+    )

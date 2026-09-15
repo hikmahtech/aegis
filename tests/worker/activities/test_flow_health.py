@@ -174,6 +174,15 @@ def test_cron_interval_none_when_not_understood(cron):
     assert cron_interval_minutes(cron) is None
 
 
+def test_a_cron_written_in_market_time_is_understood():
+    """A `CRON_TZ=` prefix shifts when a fire lands, not how far apart two
+    fires are — but an unparseable cron leaves its schedule silently unwatched,
+    so the prefix must be dropped rather than tripping the parser."""
+    assert cron_interval_minutes("CRON_TZ=Asia/Kolkata 0 8,11,14 * * 1-5") == cron_interval_minutes(
+        "0 8,11,14 * * 1-5"
+    )
+
+
 def test_every_seeded_cron_is_understood():
     """The seed file is the real input to the stale detector — if a cron there
     is unparseable that schedule is silently unwatched."""

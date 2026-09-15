@@ -111,23 +111,49 @@ async def load_rules(pool: asyncpg.Pool) -> dm.Rules:
 
 
 async def _store_bars(pool: asyncpg.Pool, symbol: str, bars: list[dict], source: str, today: date) -> None:
-    """Store bars under ``symbol`` (Yahoo form). The first close seen for a day
-    wins, because Yahoo rewrites past closes after a split, and no bar for today
-    or later is kept, because it could be an intraday price (spec §3 step 3)."""
+    """Store bars under ``symbol`` (Yahoo form). The first price seen for a day
+    wins, because Yahoo rewrites past prices after a split (spec §3 step 3).
+
+    TODAY'S BAR IS KEPT, BUT ONLY ITS OPEN. The open is the session's first
+    trade: settled from the moment the market opens and unchanged for the rest
+    of the day, which is what lets the desk fill an order the same morning. The
+    close on that same bar is the LIVE price, still moving — and since a stored
+    close is never overwritten, storing it would pin an intraday number as the
+    day's close for ever and bend every valuation after it. So today's close is
+    dropped and a later run fills it in through the same COALESCE.
+    """
     rows = [
-        (symbol, b["day"], _n(b.get("close")), _n(b.get("split_ratio")), _n(b.get("dividend")), source)
+        (
+            symbol,
+            b["day"],
+            _n(b.get("close")) if b["day"] < today else None,
+            _n(b.get("split_ratio")),
+            _n(b.get("dividend")),
+            source,
+            _n(b.get("open")),
+        )
         for b in bars
-        if b["day"] < today
+        # A future-dated bar is never useful; today's is, for its open alone.
+        if b["day"] <= today
     ]
     if not rows:
         return
     await pool.executemany(
-        "INSERT INTO finance.desk_prices (symbol, date, close, split_ratio, dividend, source) "
-        "VALUES ($1, $2, $3, $4, $5, $6) "
+        "INSERT INTO finance.desk_prices (symbol, date, close, split_ratio, dividend, source, open) "
+        "VALUES ($1, $2, $3, $4, $5, $6, $7) "
         "ON CONFLICT (symbol, date) DO UPDATE SET "
-        "  source = CASE WHEN finance.desk_prices.close IS NULL AND EXCLUDED.close IS NOT NULL "
-        "           THEN EXCLUDED.source ELSE finance.desk_prices.source END, "
+        # A row is attributed to whoever supplied its CLOSE — the first branch,
+        # unchanged, so ansaar still gets the credit when it fills in a close
+        # Yahoo never published. Only while there is no close at all does the
+        # open's supplier name the row, which is the state today's bar sits in
+        # between the market opening and the next morning's run.
+        "  source = CASE "
+        "    WHEN finance.desk_prices.close IS NULL AND EXCLUDED.close IS NOT NULL THEN EXCLUDED.source "
+        "    WHEN finance.desk_prices.close IS NULL AND finance.desk_prices.open IS NULL "
+        "         AND EXCLUDED.open IS NOT NULL THEN EXCLUDED.source "
+        "    ELSE finance.desk_prices.source END, "
         "  close = COALESCE(finance.desk_prices.close, EXCLUDED.close), "
+        "  open = COALESCE(finance.desk_prices.open, EXCLUDED.open), "
         "  split_ratio = COALESCE(finance.desk_prices.split_ratio, EXCLUDED.split_ratio), "
         "  dividend = COALESCE(finance.desk_prices.dividend, EXCLUDED.dividend)",
         rows,
@@ -172,7 +198,10 @@ async def _refresh(
     ysym = rules.price_symbol(symbol)
     latest = await pool.fetchval("SELECT max(date) FROM finance.desk_prices WHERE symbol = $1", ysym)
     start = latest - timedelta(days=REFETCH_OVERLAP_DAYS) if latest else today - timedelta(days=FETCH_BACK_DAYS)
-    end = today - timedelta(days=1)
+    # Through today, not yesterday: a same-day fill needs today's open. What
+    # keeps an intraday price out of the record is `_store_bars`, which drops
+    # today's close — not this window.
+    end = today
     if start > end:
         return
     try:
@@ -221,13 +250,23 @@ async def _bars(pool: asyncpg.Pool, rules: dm.Rules, symbols: set[str]) -> dict[
     for s in symbols:
         by_yahoo[rules.price_symbol(s)].append(s)
     rows = await pool.fetch(
-        "SELECT symbol, date, close, split_ratio, dividend, source FROM finance.desk_prices "
+        "SELECT symbol, date, close, split_ratio, dividend, source, open FROM finance.desk_prices "
         "WHERE symbol = ANY($1::text[]) ORDER BY symbol, date",
         list(by_yahoo),
     )
     out: dict[str, list[dm.Bar]] = {s: [] for s in symbols}
     for r in rows:
-        stored = dm.Bar(r["date"], _f(r["close"]), _f(r["split_ratio"]), _f(r["dividend"]), r["source"])
+        # Keyword, not positional. Every field on Bar is `float | None` or
+        # defaulted, so a field added in the middle of that struct would load
+        # silently into the wrong slot here and raise nothing at all.
+        stored = dm.Bar(
+            day=r["date"],
+            close=_f(r["close"]),
+            split_ratio=_f(r["split_ratio"]),
+            dividend=_f(r["dividend"]),
+            source=r["source"],
+            open=_f(r["open"]),
+        )
         for name in by_yahoo[r["symbol"]]:
             out[name].append(stored)
     return out
@@ -307,9 +346,9 @@ async def _apply_fills(pool: asyncpg.Pool, results: list[dm.FillResult]) -> None
         if r.status == "filled":
             await pool.execute(
                 "UPDATE finance.desk_orders SET status = 'filled', fill_date = $2, fill_price = $3, "
-                "qty = $4, costs = $5, price_source = $6, filled_at = now() "
+                "qty = $4, costs = $5, price_source = $6, price_kind = $7, filled_at = now() "
                 "WHERE id = $1::uuid AND status = 'pending'",
-                r.order_id, r.fill_day, _n(r.price), r.qty, _n(r.costs), r.source,
+                r.order_id, r.fill_day, _n(r.price), r.qty, _n(r.costs), r.source, r.kind or None,
             )
         elif r.status == "cancelled":
             await pool.execute(
@@ -354,8 +393,16 @@ async def _write_plan(
 async def run_tick(
     pool: asyncpg.Pool, *, ansaar: Any, finance: Any, today: date | None = None, project: bool = True
 ) -> dict:
-    """One morning's run (spec §3). Idempotent: a second run on the same day
+    """One run of the desk (spec §3). Idempotent: another run on the same day
     changes nothing and raises the same problems.
+
+    The desk fires several times a day — before the market opens to plan, after
+    it opens to fill at that open, and later to retry a fill a source outage
+    left undone — so "another run on the same day" is the normal case now, not
+    just a manual rerun. What holds it together: the plan is written once per
+    decision date, the day's findings are re-read from that plan rather than
+    re-derived, a filled order can never re-fill, and the hub is told to count
+    all of today's runs as one occurrence.
 
     Which day it is is read off the market's own clock, so a run scheduled for
     the morning does not roll over a day early or late in a deployment whose
@@ -368,7 +415,12 @@ async def run_tick(
     # looked at nothing else, so resolving one of those problems would complete
     # its task and raise it again on the next good morning (spec §3).
     await hub_watch.reconcile_findings(
-        pool, source=SOURCE, subject_kind=SUBJECT_KIND, classes=checked, findings=unique, project=project
+        pool, source=SOURCE, subject_kind=SUBJECT_KIND, classes=checked, findings=unique, project=project,
+        # All of today's runs look at the same day's facts, so they are one
+        # occurrence, not three. Without this the count would say a fault
+        # happened three times a day whatever it did, and a problem cleared
+        # after the morning run would be reopened by the afternoon one.
+        once_per=today.isoformat(),
     )
     out["findings"] = sorted(f["klass"] for f in unique)
     return out
@@ -408,7 +460,20 @@ async def _tick(
                 "day to trade. Nothing was traded.",
             )
         ], []
-    index_days = [b.day for b in (await _bars(pool, rules, {index}))[index] if b.close is not None]
+    index_bars = (await _bars(pool, rules, {index}))[index]
+    # THE CALENDAR IS DAYS WITH A CLOSE, AND MUST STAY THAT WAY. It is what
+    # `day` below is read off — the session whose decisions the desk acts on —
+    # and a session that has not closed has no decisions yet. Let today in here
+    # because it has an open, and `day` becomes today, `ansaar.decisions(today)`
+    # returns nothing, and the desk reports `held_stale` and raises a task every
+    # single trading day. The same predicate guards valuation, the score and the
+    # staleness alarms, all of which want completed sessions too.
+    index_days = [b.day for b in index_bars if b.close is not None]
+    # Trading is the one thing that does not need a completed session. Today
+    # joins this list the moment it has an open, and it is used for nothing but
+    # deciding which day an order fills on.
+    opened_today = dm.open_on(index_bars, today) is not None
+    tradable_days = [*index_days, today] if opened_today else list(index_days)
     day = dm.last_trading_day(index_days, today)
     if day is None:
         return out | {"skipped": "no_market_day"}, [
@@ -430,21 +495,30 @@ async def _tick(
         ], []
     out["day"] = day.isoformat()
 
-    # 2. Copy.
+    # 2. Copy. Already planned means the decisions for this day are stored and
+    # acted on, so there is nothing to fetch and no reason to ask again — with
+    # several runs a day, asking again is how a day the desk planned perfectly
+    # well at 08:00 comes to report "can't reach ansaar" at 14:00, resolving and
+    # re-raising the same problem twice a day off one flaky call. The findings
+    # that belong to a planned day are the ones stored with its plan.
     findings: list[dict] = []
     ansaar_failure: dict | None = None
     halt: dict | None = None
-    try:
-        rows, meta = await ansaar.decisions(day)
-        await _store_decisions(pool, day, [r for r in rows if str(r.get("data_date") or "")[:10] == day.isoformat()])
-        halt = _halt(meta)
-    except AnsaarError as exc:
-        ansaar_failure = _finding(
-            "desk_source_error", "ansaar", "Trading desk: can't reach ansaar",
-            f"Fetching the decisions for {day} failed ({exc}). The desk held its positions and "
-            "traded nothing that day.",
-        )
-        findings.append(ansaar_failure)
+    already_planned = await pool.fetchval("SELECT 1 FROM finance.desk_plans WHERE data_date = $1", day)
+    if not already_planned:
+        try:
+            rows, meta = await ansaar.decisions(day)
+            await _store_decisions(
+                pool, day, [r for r in rows if str(r.get("data_date") or "")[:10] == day.isoformat()]
+            )
+            halt = _halt(meta)
+        except AnsaarError as exc:
+            ansaar_failure = _finding(
+                "desk_source_error", "ansaar", "Trading desk: can't reach ansaar",
+                f"Fetching the decisions for {day} failed ({exc}). The desk held its positions and "
+                "traded nothing that day.",
+            )
+            findings.append(ansaar_failure)
     decisions = await _decisions(pool, day)
 
     # 3. Prices. What the desk holds comes from a replay, never from counting
@@ -486,7 +560,7 @@ async def _tick(
     out["filled"] = 0
     if pending:
         book_now = dm.replay(fills, bars, rules.capital, today)
-        results = dm.fill_orders(pending, bars, index_days, book_now, rules, grace_days=PRICE_GRACE_DAYS)
+        results = dm.fill_orders(pending, bars, tradable_days, book_now, rules, grace_days=PRICE_GRACE_DAYS)
         await _apply_fills(pool, results)
         out["filled"] = sum(r.status == "filled" for r in results)
         fills = await _fills(pool)
@@ -497,7 +571,7 @@ async def _tick(
     # later. The names held back are named in the plan's `skipped` list, so the
     # row says which part of the day it did not act on, and their targets are
     # sized again tomorrow, because the pipeline rebuilds them daily.
-    planned = await pool.fetchval("SELECT 1 FROM finance.desk_plans WHERE data_date = $1", day)
+    planned = already_planned
     # A morning the desk had nothing new to act on. It happens when the newest
     # day the calendar has is one the desk has already planned AND the market's
     # last expected trading day has no bar — Yahoo drops a day, or sends one
@@ -508,16 +582,38 @@ async def _tick(
     # normal — a market holiday reads exactly the same — so it raises no
     # problem and no task; the six-day alarm is still what escalates. A rerun
     # on the same day is not idle: yesterday's bar is there.
+    #
+    # Only the run that would otherwise have planned can call the morning idle.
+    # `planned` is what separates them, and with several fires a day it is true
+    # on every run after the first — so without this the later runs would each
+    # report an idle weekday and log it again, and one day would disagree with
+    # itself. A run that plans, or that is too late in the day to plan, has
+    # nothing to say about it.
     expected = dm.last_expected_day(today, dm.trading_week(index_days))
-    out["idle_weekday"] = int(bool(planned) and expected is not None and expected not in set(index_days))
-    if out["idle_weekday"]:
+    idle = bool(planned) and not opened_today and expected is not None and expected not in set(index_days)
+    out["idle_weekday"] = int(idle)
+    if idle:
         logger.info(
             "trading_desk_idle_weekday",
             slug=DESK_SLUG,
             expected=expected.isoformat() if expected else None,
             last_market_day=day.isoformat(),
         )
-    if not planned:
+    # THE PLAN MUST BE MADE BEFORE THE MARKET OPENS. An order planned after the
+    # open would take today's open as its fill price — a print struck hours
+    # before the decision existed. That is not a lag, it is an execution nobody
+    # could have got, and it would quietly flatter every figure the desk
+    # reports. The pre-open run is the one that plans; a later one only fills.
+    #
+    # So this is a guard, not an assumption about the schedule. If the pre-open
+    # run fails, the day goes unplanned rather than being planned at a price
+    # from its own past. That costs a day's trading — the decisions are rebuilt
+    # daily and tomorrow's run sizes them again — and it costs nothing else:
+    # this run still fills, still values, and still raises every finding.
+    if not planned and opened_today:
+        out["skipped_plan"] = "after_open"
+        logger.info("trading_desk_plan_skipped_after_open", slug=DESK_SLUG, day=day.isoformat())
+    elif not planned:
         book = dm.replay(fills, bars, rules.capital, day)
         check = dm.check_decisions(decisions, book.held_classes(), rules, halted=halt is not None)
         plan_findings: list[dict] = []
