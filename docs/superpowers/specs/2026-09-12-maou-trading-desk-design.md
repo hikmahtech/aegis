@@ -57,8 +57,35 @@ nothing on this desk. Every number is computed by code.
 
 ## 3. The daily run
 
-`TradingDeskFlow` runs on weekdays at 08:00 IST (`30 2 * * 1-5`), before the market opens at 09:15.
-One idempotent activity does the steps below in order. Running it twice in a day changes nothing.
+`TradingDeskFlow` runs on weekdays at 08:00, 11:00 and 14:00 market time
+(`CRON_TZ=Asia/Kolkata 0 8,11,14 * * 1-5`). One idempotent activity does the steps below in order.
+Running it more than once in a day changes nothing.
+
+> **Amendment, 2026-09-15 (#591): fills move from the close to the open, and the run fires three
+> times a day.**
+>
+> A signal comes from the previous session's close. Filling at the NEXT close meant the desk sat on
+> it for a whole session — a systematic one-session lag in every figure it reports — and left every
+> order pending overnight. It now fills at the open, which is the earliest price that signal could
+> actually have bought.
+>
+> **08:00 plans, before the market opens. 11:00 fills at that open. 14:00 retries a fill a source
+> outage left undone.** The pre-open plan is not a scheduling preference, it is what makes the open
+> a legitimate fill price: an order planned at 11:00 and filled at that day's 09:15 open would have
+> paid a price struck before the decision existed. `_tick` enforces it rather than trusting the
+> cron — once today's index bar has an open, the plan step is skipped and the run reports
+> `skipped_plan: "after_open"`.
+>
+> **The trading calendar did not change.** `index_days` is still days with a *close*, because it is
+> what `day` is read off, and a session that has not closed has no decisions yet. Filling uses a
+> second, wider list that may include today. Widening the one calendar would make `day` become
+> today, and the desk would report `held_stale` every trading day.
+>
+> The schedule is written in market time via a `CRON_TZ=` prefix that `schedule_sync` passes to
+> Temporal, because the guard above is about 09:15 *there*. A cron with no prefix is still UTC.
+>
+> `fill_at` (`open` | `close`) is config, defaulting to `close` — so a deployment that has not opted
+> in is unchanged, and the switch is reversible without a deploy.
 
 1. **Find the day.** The last NSE trading day is the latest Yahoo bar date for `^NSEI` strictly
    before today (IST). This needs no holiday calendar. If Yahoo fails here, the run stops after
@@ -73,11 +100,14 @@ One idempotent activity does the steps below in order. Running it twice in a day
    `finance.desk_prices`. A stored close is **never overwritten**, because Yahoo rewrites past
    closes after a split: RELIANCE's 2024 bonus shows as about ₹1,338 for days that traded at about
    ₹2,677. So the first fetch of a day, made the morning after it, is the raw price the desk needs,
-   and a later fetch would be split-adjusted. A bar for today or later is never stored, because it
-   could be an intraday price. Split and dividend events are filled in if a later fetch has them
-   and the stored row doesn't.
-4. **Fill.** Fill each pending paper order at the close of its fill day (§6). If that close is not
-   out yet, leave the order pending.
+   and a later fetch would be split-adjusted. A bar dated after today is never stored. **Today's bar
+   is stored for its `open` alone**: the open is the session's first trade, settled from the moment
+   the market opens, while the `close` on that same bar is the live price and still moving — and a
+   stored close is never overwritten, so keeping it would pin an intraday number as the day's close
+   for ever. A later run fills the real close in. Split and dividend events are filled in if a later
+   fetch has them and the stored row doesn't.
+4. **Fill.** Fill each pending paper order on its fill day (§6), at the open under `fill_at: open`
+   and otherwise at the close. If no price is out yet, leave the order pending.
 5. **Plan.** If no plan exists yet for that date and no order is pending, run the checks (§5). If
    they pass, turn the decisions into orders (§4). Write one `finance.desk_plans` row for the date
    whatever the outcome, in the same transaction as its orders, so a date is acted on once.
@@ -156,12 +186,16 @@ the day out of the `held_back` count, which is for days the desk did nothing on.
 ## 6. Paper fills and valuation
 
 - **Fill day:** the first NSE trading day on or after the day the order was created. An order
-  created at 08:00 on a trading day fills at that day's close, and the next morning's run records
-  it.
+  created at 08:00 on a trading day fills at that day's open, and the 11:00 run records it the same
+  morning. Under `fill_at: close` it fills at that day's close instead, and the next morning's run
+  records it — the behaviour before #591.
 - **Fill order:** sells fill before buys. Prices move between planning and the fill, so a buy
   that would take cash below zero is cut to what fits. If no share fits, it is cancelled with the
   reason `no_cash`.
-- **Fill price:** Yahoo's raw close for the fill day. If Yahoo has no bar, use ansaar's price for
+- **Fill price:** Yahoo's raw **open** for the fill day under `fill_at: open`, else its raw close.
+  An open that never arrives falls back to that day's close rather than cancelling the order, and
+  `desk_orders.price_kind` records which print was actually used — without it a desk quietly filling
+  everything at the close would be indistinguishable from one filling at the open. If Yahoo has no bar, use ansaar's price for
   that date and set `price_source = 'ansaar'`. The ansaar prices endpoints return rows newest
   first and `volume` as a string. If neither source has a price three trading days after the fill
   day, cancel the order with the reason `price_missing` and raise `desk_price_missing` for that

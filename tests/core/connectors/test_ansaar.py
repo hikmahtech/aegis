@@ -77,9 +77,9 @@ async def test_prices_come_back_oldest_first_from_the_right_path():
             200,
             json={
                 "data": [
-                    {"date": "2026-09-11", "close": 3100.5, "volume": "123"},
-                    {"date": "2026-09-10", "close": 3050.0, "volume": "456"},
-                    {"date": "2026-09-09", "close": None, "volume": "0"},
+                    {"date": "2026-09-11", "open": 3090.0, "close": 3100.5, "volume": "123"},
+                    {"date": "2026-09-10", "open": 3040.0, "close": 3050.0, "volume": "456"},
+                    {"date": "2026-09-09", "open": None, "close": None, "volume": "0"},
                 ]
             },
         )
@@ -88,9 +88,30 @@ async def test_prices_come_back_oldest_first_from_the_right_path():
     client = AnsaarClient(BASE, "s")
     bars = await client.prices("M&M", "equity", date(2026, 9, 9), date(2026, 9, 11))
     assert bars == [
-        {"day": date(2026, 9, 10), "close": 3050.0, "split_ratio": None, "dividend": None},
-        {"day": date(2026, 9, 11), "close": 3100.5, "split_ratio": None, "dividend": None},
+        {"day": date(2026, 9, 10), "open": 3040.0, "close": 3050.0, "split_ratio": None, "dividend": None},
+        {"day": date(2026, 9, 11), "open": 3090.0, "close": 3100.5, "split_ratio": None, "dividend": None},
     ]
     assert eq.calls.last.request.url.params["from"] == "2026-09-09"
     assert eq.calls.last.request.url.params["to"] == "2026-09-11"
     assert await client.prices("GOLDBEES", "etf", date(2026, 9, 9), date(2026, 9, 11)) == []
+
+
+@respx.mock
+async def test_a_row_with_only_one_of_the_two_prices_is_still_kept():
+    """An open alone can fill an order; a close alone can value one. ansaar is
+    END OF DAY either way, so it can backfill a session the desk missed but can
+    never serve today's open — Yahoo is the only source for that."""
+    _token()
+    respx.get(f"{BASE}/api/equities/prices/TCS").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": [
+                    {"date": "2026-09-11", "open": 3090.0, "close": None},
+                    {"date": "2026-09-10", "open": None, "close": 3050.0},
+                ]
+            },
+        )
+    )
+    bars = await AnsaarClient(BASE, "s").prices("TCS", "equity", date(2026, 9, 10), date(2026, 9, 11))
+    assert [(b["day"].day, b["open"], b["close"]) for b in bars] == [(10, None, 3050.0), (11, 3090.0, None)]

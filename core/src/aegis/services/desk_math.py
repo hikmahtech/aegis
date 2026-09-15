@@ -83,6 +83,14 @@ class Rules:
     band_abs: float = 0.02
     band_rel: float = 0.25
     max_order_pct: float = 0.25
+    # Which print an order fills at: "open" (the session's first trade, the
+    # earliest price a signal from the previous close could actually have
+    # bought) or "close". Defaults to "close" because that is what every desk
+    # did before this knob existed, so a deployment that has not opted in keeps
+    # its arithmetic. Filling at the open only makes sense when the desk plans
+    # BEFORE its market opens — `trading_desk._tick` enforces that, and without
+    # it an order would fill at a price struck before it was decided.
+    fill_at: str = "close"
 
     # --- the tax model ------------------------------------------------------
     # Short-term rate per asset class. Empty means no tax model is configured,
@@ -181,6 +189,11 @@ class Rules:
             band_abs=num("band_abs"),
             band_rel=num("band_rel"),
             max_order_pct=num("max_order_pct"),
+            # Read leniently, like every other key here. `fill_price_on` treats
+            # anything that is not "open" as the close, so a typo degrades to
+            # the old behaviour rather than stopping the desk trading. The
+            # strict check lives at the write boundary, in `desk_rules.validate`.
+            fill_at=text("fill_at").lower(),
             tax_rate=rates,
             long_term_rate=num("long_term_rate"),
             long_term_exemption=num("long_term_exemption"),
@@ -334,13 +347,22 @@ def check_decisions(
 class Bar:
     """One stored day of prices (spec §6). ``close`` is the first close the desk
     saw for the day; ``split_ratio`` is new shares per old share from that day;
-    ``dividend`` is per share on its ex-date; ``source`` is ``yahoo`` or ``ansaar``."""
+    ``dividend`` is per share on its ex-date; ``source`` is ``yahoo`` or ``ansaar``.
+
+    ``open`` is the session's first print, and it sits LAST rather than beside
+    ``close`` where it reads better. Every field here is ``float | None`` or
+    defaulted, and ``trading_desk._bars`` builds this positionally, so a field
+    inserted mid-struct would silently load ``split_ratio`` into ``open`` and
+    ``source`` into ``dividend`` without raising anything. Appending is the only
+    placement the type system cannot catch getting wrong.
+    """
 
     day: date
     close: float | None
     split_ratio: float | None = None
     dividend: float | None = None
     source: str = "yahoo"
+    open: float | None = None
 
 
 @dataclass(frozen=True)
@@ -399,6 +421,18 @@ def bar_on(series: list[Bar], day: date) -> Bar | None:
     """The bar dated exactly ``day``, or None. ``series`` is sorted by day."""
     i = bisect_right(series, day, key=lambda b: b.day)
     return series[i - 1] if i and series[i - 1].day == day else None
+
+
+def open_on(series: list[Bar], day: date) -> float | None:
+    """The open dated EXACTLY ``day``, or None.
+
+    Deliberately not "the last known open on or before", the way `close_on`
+    works. A close carries forward because it is the best mark available for a
+    day the market did not price; an open does not, because it is a statement
+    about one session's first trade. Carrying yesterday's open into today would
+    fill an order at a price from a day that has closed."""
+    bar = bar_on(series, day)
+    return bar.open if bar else None
 
 
 def close_on(series: list[Bar], day: date) -> float | None:
@@ -577,6 +611,9 @@ class FillResult:
     costs: float = 0.0
     source: str | None = None
     reason: str = ""
+    # Which print the fill got: "open", or "close" when the open was missing and
+    # the desk fell back. Empty on a result that did not fill.
+    kind: str = ""
 
 
 def _costs(side: str, qty: int, price: float, rules: Rules) -> float:
@@ -674,24 +711,50 @@ def _split_factor(series: list[Bar], after: date, upto: date) -> float:
     return factor
 
 
+def fill_price_on(series: list[Bar], day: date, rules: Rules) -> tuple[float | None, str]:
+    """The price an order fills at on ``day``, and which print it is.
+
+    Under ``fill_at = "open"`` the desk pays the session's first price, which is
+    what a signal taken from the previous close could actually have bought. The
+    close is kept as a fallback rather than a cancel: an order the desk meant to
+    place should not be dropped because one source never published one field,
+    and a fill at the close is exactly what this desk did until now. Anything
+    other than ``"open"`` means the close, so a typo in config degrades to the
+    old behaviour instead of refusing to trade.
+    """
+    bar = bar_on(series, day)
+    if bar is None:
+        return None, ""
+    if rules.fill_at == "open" and bar.open is not None:
+        return bar.open, "open"
+    return (bar.close, "close") if bar.close is not None else (None, "")
+
+
 def fill_orders(
     pending: list[PendingOrder],
     bars: dict[str, list[Bar]],
-    index_days: list[date],
+    tradable_days: list[date],
     book: Book,
     rules: Rules,
     grace_days: int = 3,
 ) -> list[FillResult]:
-    """Fill pending paper orders at the close of their fill day (spec §6).
+    """Fill pending paper orders on their fill day (spec §6).
 
-    The fill day is the first market day on or after the day an order was
-    created. ``book`` is the desk before these fills. Sells fill before buys, and
-    ``seq`` orders each side; a buy that no longer fits the cash is cut, or cancelled
-    as ``no_cash``. Sells of one name share the holding, so each is capped by what
-    the earlier ones left. No price ``grace_days`` market days after the fill day
-    cancels the order as ``price_missing``.
+    The fill day is the first tradable day on or after the day an order was
+    created, and the price is `fill_price_on` — the open under `fill_at="open"`,
+    else the close. ``book`` is the desk before these fills. Sells fill before
+    buys, and ``seq`` orders each side; a buy that no longer fits the cash is
+    cut, or cancelled as ``no_cash``. Sells of one name share the holding, so
+    each is capped by what the earlier ones left. No price ``grace_days``
+    tradable days after the fill day cancels the order as ``price_missing``.
+
+    ``tradable_days`` is NOT the same list as the calendar the rest of the desk
+    runs on. It may include today, once today has an open — that is the whole
+    point of filling at the open. The calendar that decides which day's
+    decisions to act on stays strictly behind today, because a session that has
+    not closed has no decisions yet.
     """
-    days = sorted(index_days)
+    days = sorted(tradable_days)
     cash = book.cash
     sold: dict[str, int] = defaultdict(int)
     results: list[FillResult] = []
@@ -701,14 +764,14 @@ def fill_orders(
             results.append(FillResult(o.id, "pending"))
             continue
         series = bars.get(o.symbol, [])
-        bar = bar_on(series, fill_day)
-        if bar is None or bar.close is None:
+        px, print_used = fill_price_on(series, fill_day, rules)
+        if px is None:
             late = sum(1 for d in days if d > fill_day) >= grace_days
             results.append(
                 FillResult(o.id, "cancelled", reason="price_missing") if late else FillResult(o.id, "pending")
             )
             continue
-        px = bar.close
+        bar = bar_on(series, fill_day)
         qty = math.floor(o.qty * _split_factor(series, o.data_date, fill_day) + _EPS)
         if o.side == "sell":
             qty = min(qty, math.floor(book.qty(o.symbol) + _EPS) - sold[o.symbol])
@@ -726,7 +789,9 @@ def fill_orders(
                 continue
             costs = _costs("buy", qty, px, rules)
             cash -= qty * px + costs
-        results.append(FillResult(o.id, "filled", fill_day, qty, px, costs, bar.source))
+        results.append(
+            FillResult(o.id, "filled", fill_day, qty, px, costs, bar.source if bar else None, kind=print_used)
+        )
     return results
 
 
@@ -771,11 +836,18 @@ def desk_values(
 def benchmark_values(
     series: list[Bar], capital: float, cost_pct: float, days: list[date]
 ) -> list[tuple[date, float]]:
-    """``capital`` put into one instrument at the first day's close, paying one
-    buy cost, then held: splits adjust the units and dividends go to cash (spec §8)."""
+    """``capital`` put into one instrument on the first day, paying one buy cost,
+    then held: splits adjust the units and dividends go to cash (spec §8).
+
+    It buys at that day's OPEN when there is one, because the desk it is scored
+    against does. The whole point of the benchmark is "what the same money would
+    have earned doing nothing clever", and that comparison is only honest if
+    both sides enter on the same print — otherwise the gap carries a fixed
+    slice of one session's move that has nothing to do with the picking. Falls
+    back to the close, which is what every day before this change has."""
     if not days:
         return []
-    start = close_on(series, days[0])
+    start = open_on(series, days[0]) or close_on(series, days[0])
     if not start:
         return []
     units = capital * (1 - cost_pct) / start

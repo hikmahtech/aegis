@@ -760,7 +760,7 @@ async def desk_history(
         days = [p["data_date"] for p in plans]
         orders = await conn.fetch(
             "SELECT data_date, seq, created_day, symbol, asset_class, side, qty, ref_price, "
-            "       status, fill_date, fill_price, costs, price_source, reason "
+            "       status, fill_date, fill_price, costs, price_source, price_kind, reason "
             "FROM finance.desk_orders WHERE data_date = ANY($1::date[]) "
             "ORDER BY data_date DESC, seq",
             days,
@@ -780,6 +780,7 @@ async def desk_history(
             "fill_price": _round(float(o["fill_price"]), 4) if o["fill_price"] is not None else None,
             "costs": _round(float(o["costs"])) if o["costs"] is not None else None,
             "price_source": o["price_source"],
+            "price_kind": o["price_kind"],
             "reason": o["reason"],
         })
     return {

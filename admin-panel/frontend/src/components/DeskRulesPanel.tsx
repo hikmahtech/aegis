@@ -233,6 +233,18 @@ export default function DeskRulesPanel({ onSaved }: { onSaved?: () => void }) {
                   value={values.capital} onChange={e => num('capital')(e.target.value)}
                 />
               </Field>
+              <Field
+                label="Fills at"
+                hint="Which price an order gets. The open is the earliest one a signal from the previous close could actually have bought. It only works because the desk plans before the market opens — a plan made after the open is skipped rather than filled at a price struck before it."
+              >
+                <select
+                  style={BOX} value={values.fill_at}
+                  onChange={e => set('fill_at', e.target.value as 'open' | 'close')}
+                >
+                  <option value="open">The day's open</option>
+                  <option value="close">The day's close</option>
+                </select>
+              </Field>
               <Field label="Flat charge on a sell" hint="A fixed amount your broker takes on every sale, on top of the percentage. 0 if there is none.">
                 <input
                   type="number" style={BOX} min={0} step="any"

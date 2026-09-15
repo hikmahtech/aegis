@@ -45,6 +45,7 @@ EDITABLE = (
     "stale_calendar_days",
     "stale_price_days",
     "capital",
+    "fill_at",
     "sell_charge",
     "tax_rate",
     "long_term_rate",
@@ -102,6 +103,23 @@ def _whole(body: dict, key: str, *, low: int, high: int) -> int:
         raise ValueError(f"{key} must be a whole number") from exc
     if not low <= out <= high:
         raise ValueError(f"{key} must be between {low} and {high}")
+    return out
+
+
+def _choice(body: dict, key: str, allowed: tuple[str, ...]) -> str:
+    """One of ``allowed``, or the code default when the field was not sent.
+
+    Strict here on purpose, while `Rules.from_config` reads the same key
+    leniently. A junk value that reached the stored row would be read as the
+    default for ever, silently doing something other than what the form said —
+    so the write boundary is where it has to be refused, with a 400 the operator
+    can see."""
+    value = body.get(key)
+    if value in (None, ""):
+        return str(getattr(dm.Rules(), key))
+    out = str(value).strip().lower()
+    if out not in allowed:
+        raise ValueError(f"{key} must be one of {', '.join(allowed)}")
     return out
 
 
@@ -166,6 +184,7 @@ def validate(body: dict[str, Any]) -> dict[str, Any]:
         "stale_calendar_days": _whole(body, "stale_calendar_days", low=1, high=_MAX_STALE_DAYS),
         "stale_price_days": _whole(body, "stale_price_days", low=1, high=_MAX_STALE_DAYS),
         "capital": _number(body, "capital", low=0, high=1e12),
+        "fill_at": _choice(body, "fill_at", ("open", "close")),
         "sell_charge": _number(body, "sell_charge", low=0, high=1e9),
         "tax_rate": _tax_rate(body),
         "long_term_rate": _number(body, "long_term_rate", low=0, high=1),

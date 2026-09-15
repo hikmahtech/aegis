@@ -243,6 +243,10 @@ export type DeskOrder = {
   fill_price: number | null;
   costs: number | null;
   price_source: string | null;
+  /** Which print this fill actually got. `price_source` says WHERE the price
+   * came from; this says WHICH ONE. Null on every order filled before the desk
+   * started recording it — all closes, none of them saying so. */
+  price_kind: 'open' | 'close' | null;
   reason: string | null;
 };
 
@@ -265,6 +269,8 @@ export type DeskRuleValues = {
   stale_calendar_days: number;
   stale_price_days: number;
   capital: number;
+  /** Which print an order fills at: the session's open, or its close. */
+  fill_at: 'open' | 'close';
   sell_charge: number;
   tax_rate: Record<string, number>;
   long_term_rate: number;

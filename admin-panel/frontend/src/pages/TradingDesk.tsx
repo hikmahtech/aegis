@@ -359,9 +359,9 @@ export default function TradingDesk() {
         <section className="section">
           <h2 className="section-title">Waiting to fill</h2>
           <p className="meta" style={{ marginBottom: 10 }}>
-            Orders the desk has placed and not yet filled. Each one fills at the next close it
-            can price; the money for a buy is already set aside, so today&rsquo;s sizing cannot
-            spend it twice.
+            Orders the desk has placed and not yet filled. Each one fills on the next session it
+            can price, at whichever print the desk is set to use; the money for a buy is already
+            set aside, so today&rsquo;s sizing cannot spend it twice.
           </p>
           <div className="table-scroll">
             <table className="data-table">
@@ -496,6 +496,7 @@ export default function TradingDesk() {
                               {ord.fill_date && (
                                 <div className="meta" style={{ fontSize: 11 }}>
                                   {ord.fill_date}
+                                  {ord.price_kind ? ` · ${ord.price_kind}` : ''}
                                   {ord.price_source === 'ansaar' ? ' · ansaar price' : ''}
                                 </div>
                               )}

@@ -1,10 +1,16 @@
 # v3 activities seed. Loader upserts by slug.
 #
-# Every schedule_cron is UTC. Pick each one so it lands at the right local time
-# on YOUR clock — the `user_timezone` settings row (admin Vault page). Where a
-# comment below gives a local time, it is for a UTC+5:30 user, the example this
-# seed was written for; shift the crons by your own offset. Crons are DB-owned
-# once seeded: change them on /admin/flows, not here.
+# A schedule_cron is UTC unless the line starts with a `CRON_TZ=<zone>` prefix,
+# which schedule_sync strips and passes to Temporal as the schedule's timezone.
+# Prefer the prefix when the flow's own sense of time is not UTC — the trading
+# desk reads "today" from its market's clock and has to plan before that market
+# opens, so its schedule belongs on the same clock as the guard.
+#
+# For a bare UTC cron, pick each one so it lands at the right local time on YOUR
+# clock — the `user_timezone` settings row (admin Vault page). Where a comment
+# below gives a local time, it is for a UTC+5:30 user, the example this seed was
+# written for; shift the crons by your own offset. Crons are DB-owned once
+# seeded: change them on /admin/flows, not here.
 
 activities:
   # Sebas — email & calendar ingestion
@@ -142,7 +148,10 @@ activities:
   - slug: trading-desk-daily
     workflow_type: TradingDeskFlow
     agent_id: maou
-    schedule_cron: "30 2 * * 1-5"
+    # 08:00 plans (pre-open), 11:00 fills at that open, 14:00 retries a fill an
+    # outage left undone. In the market's own clock, because the pre-open guard
+    # depends on these straddling 09:15 THERE.
+    schedule_cron: "CRON_TZ=Asia/Kolkata 0 8,11,14 * * 1-5"
     # An EXAMPLE setup, not a default. The code names no market, no currency
     # and no tax law, because AEGIS is forked and configured; what follows is
     # one operator's desk (India, the NSE, rupees) so a reader can see the
@@ -168,6 +177,11 @@ activities:
       stale_price_days: 7
       # --- the money ---
       capital: 100000
+      # Which print an order fills at. "open" is the earliest price a signal
+      # taken from the previous close could actually have bought, and it only
+      # works because the 08:00 fire plans before the market opens — see the
+      # cron above. "close" is the other option, and what the desk did before.
+      fill_at: open
       asset_classes: [equity, etf]
       cost_pct_per_side: 0.002
       sell_charge: 16

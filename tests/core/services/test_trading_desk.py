@@ -39,8 +39,8 @@ async def pool(db_pool):
         await db_pool.execute("UPDATE activities SET config = $2 WHERE slug = $1", td.DESK_SLUG, original["config"])
 
 
-def bar(day, close, split=None, div=None):
-    return {"day": day, "close": close, "split_ratio": split, "dividend": div}
+def bar(day, close, split=None, div=None, open=None):
+    return {"day": day, "open": open, "close": close, "split_ratio": split, "dividend": div}
 
 
 def row(symbol, weight, day=FRI, cls="equity", rank=1, halal="COMPLIANT", state="NORMAL", kill=""):
@@ -101,6 +101,14 @@ def test_the_fakes_take_the_real_parameters():
         assert list(inspect.signature(getattr(fake, name)).parameters) == list(
             inspect.signature(getattr(real, name)).parameters
         )
+
+
+def test_the_fake_bar_has_every_field_the_real_one_does():
+    """The signature check above guards parameter NAMES, so a connector that
+    starts returning a new field passes it while every test here keeps feeding
+    the old shape — which is how a field could be added and never once
+    exercised. This pins the return shape instead."""
+    assert set(bar(FRI, 1.0)) == {"day", "open", "close", "split_ratio", "dividend"}
 
 
 INDEX_BARS = [bar(THU, 25000.0), bar(FRI, 25100.0), bar(MON, 25200.0), bar(TUE, 25300.0)]
@@ -267,9 +275,47 @@ async def test_a_stored_close_is_never_rewritten(pool):
     ]
 
 
-async def test_store_bars_never_keeps_today(pool):
-    await td._store_bars(pool, "TCS.NS", [bar(FRI, 3000.0), bar(MON, 3010.0)], "yahoo", MON)
-    assert await pool.fetchval("SELECT count(*) FROM finance.desk_prices WHERE symbol = 'TCS.NS'") == 1
+async def test_store_bars_keeps_todays_open_and_never_its_close(pool):
+    """Today's bar is worth storing for its open, which is settled the moment
+    the market opens. Its close is the live price and still moving — and since a
+    stored close is never overwritten, keeping it would pin an intraday number
+    as the day's close for ever."""
+    await td._store_bars(
+        pool, "TCS.NS", [bar(FRI, 3000.0, open=2990.0), bar(MON, 3010.0, open=3005.0)], "yahoo", MON
+    )
+    rows = await pool.fetch(
+        "SELECT date, open, close FROM finance.desk_prices WHERE symbol = 'TCS.NS' ORDER BY date"
+    )
+    assert [(r["date"], r["open"] and float(r["open"]), r["close"] and float(r["close"])) for r in rows] == [
+        (FRI, 2990.0, 3000.0),
+        (MON, 3005.0, None),
+    ]
+
+
+async def test_todays_close_is_filled_in_by_a_later_run(pool):
+    """The day after, that same bar is complete and its close lands through the
+    same COALESCE — while the open it was stored with stays put."""
+    await td._store_bars(pool, "TCS.NS", [bar(MON, 3010.0, open=3005.0)], "yahoo", MON)
+    await td._store_bars(pool, "TCS.NS", [bar(MON, 3020.0, open=3005.0)], "yahoo", TUE)
+    row_ = await pool.fetchrow("SELECT open, close FROM finance.desk_prices WHERE symbol = 'TCS.NS'")
+    assert (float(row_["open"]), float(row_["close"])) == (3005.0, 3020.0)
+
+
+async def test_a_row_is_attributed_to_whoever_supplied_its_close(pool):
+    """Two prices, one source column. The close decides, so ansaar still gets
+    the credit when it fills in a close Yahoo never published — only while
+    there is no close at all does the open's supplier name the row, which is
+    the state today's bar sits in until the next morning."""
+    await td._store_bars(pool, "TCS.NS", [bar(MON, 3010.0, open=3005.0)], "yahoo", MON)
+    assert await pool.fetchval("SELECT source FROM finance.desk_prices WHERE symbol = 'TCS.NS'") == "yahoo"
+
+    await td._store_bars(pool, "TCS.NS", [bar(MON, 3020.0)], "ansaar", TUE)
+    assert await pool.fetchval("SELECT source FROM finance.desk_prices WHERE symbol = 'TCS.NS'") == "ansaar"
+
+
+async def test_a_future_bar_is_never_stored(pool):
+    await td._store_bars(pool, "TCS.NS", [bar(MON, 3010.0, open=3005.0)], "yahoo", FRI)
+    assert await pool.fetchval("SELECT count(*) FROM finance.desk_prices WHERE symbol = 'TCS.NS'") == 0
 
 
 async def test_two_desk_names_for_one_yahoo_symbol_both_get_the_bars(pool):

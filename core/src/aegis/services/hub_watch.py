@@ -49,6 +49,7 @@ async def reconcile_findings(
     findings: list[dict[str, Any]],
     now: datetime | None = None,
     project: bool = True,
+    once_per: str = "",
 ) -> dict[str, Any]:
     """Record ``findings`` and resolve what is no longer found.
 
@@ -57,6 +58,16 @@ async def reconcile_findings(
     problem of one of them with no current finding is what "recovered" means.
     ``"record": False`` keeps a finding's problem live without adding an
     occurrence.
+
+    ``once_per`` is a stamp that makes a repeated sweep in the same period ONE
+    occurrence instead of several. The external id normally carries the exact
+    time of the call, so `ingest_event`'s duplicate claim can never fire and
+    every sweep counts again — which is right for a watchdog that runs every
+    half hour and whose occurrence count is a measure of how long a fault has
+    lasted. It is wrong for one that runs a handful of times a day over the same
+    facts: the count stops meaning "how often did this happen", and a problem
+    resolved between two sweeps of the same day is reopened by the next one.
+    Pass something that is constant within the period, such as today's date.
 
     Returns ``fresh`` (the findings that earned a card, each with its
     ``problem_id``), the counts of ``attached`` / ``muted`` / ``suppressed`` /
@@ -82,7 +93,7 @@ async def reconcile_findings(
             pool,
             Event(
                 source=source,
-                external_id=f"{source}:{klass}:{subject}@{now.isoformat()}",
+                external_id=f"{source}:{klass}:{subject}@{once_per or now.isoformat()}",
                 kind="occurrence",
                 title=str(f.get("title") or f"{klass}: {subject}")[:500],
                 subject=subject,
