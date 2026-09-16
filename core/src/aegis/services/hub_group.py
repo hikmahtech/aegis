@@ -60,6 +60,7 @@ from aegis.services.hub import (
     group_key,
     merge_problems,
     normalize_severity,
+    record_state_change,
     slug,
 )
 from aegis.services.settings_store import get_setting
@@ -458,14 +459,12 @@ async def upgrade(
 
     # One readable event for the whole upgrade. `merge_problems` writes a row
     # per member, which says how it happened; this says why.
-    await pool.execute(
-        "INSERT INTO problem_events (problem_id, source, external_id, kind, severity, "
-        "payload, occurred_at) VALUES ($1::uuid, 'hub', $2, 'state_change', $3, $4, $5) "
-        "ON CONFLICT (source, external_id) DO NOTHING",
+    await record_state_change(
+        pool,
         keeper_id,
         f"group:{gkey}:{now.isoformat()}",
-        severity,
-        {
+        severity=severity,
+        payload={
             "action": "grouped",
             "group_key": gkey,
             "by": by[:100],
@@ -474,7 +473,7 @@ async def upgrade(
             "member_count": len(folded),
             **({"reason": reason[:300]} if reason else {}),
         },
-        now,
+        occurred_at=now,
     )
     logger.info(
         "hub_problems_grouped",

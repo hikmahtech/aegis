@@ -10,31 +10,15 @@ from __future__ import annotations
 import asyncio
 import json
 import shlex
-from typing import Any
 
 import structlog
 
+from aegis.connectors._base import envelope
 from aegis.connectors._subprocess import kill_and_wait
 
 logger = structlog.get_logger()
 
 _DOCKER_TIMEOUT_S = 30
-
-
-def _envelope(
-    ok: bool,
-    data: Any = None,
-    error: str | None = None,
-    retryable: bool = False,
-    external_ref: str | None = None,
-) -> dict:
-    return {
-        "ok": ok,
-        "data": data,
-        "error": error,
-        "retryable": retryable,
-        "external_ref": external_ref,
-    }
 
 
 def _parse_replicas(s: str) -> tuple[int, int]:
@@ -87,7 +71,7 @@ class HomelabConnector:
         """
         rc, out, err = await self._docker("service", "ls", "--format", "{{json .}}")
         if rc != 0:
-            return _envelope(False, error=f"docker ls failed: {err[:200]}", retryable=True)
+            return envelope(False, error=f"docker ls failed: {err[:200]}", retryable=True)
         services = []
         for line in out.splitlines():
             line = line.strip()
@@ -111,7 +95,7 @@ class HomelabConnector:
                     "id": s.get("ID", ""),
                 }
             )
-        return _envelope(True, data=services)
+        return envelope(True, data=services)
 
     async def service_ps(self, service_name: str) -> dict:
         """Return recent task list for a service. Shape per item:
@@ -125,7 +109,7 @@ class HomelabConnector:
             "{{json .}}",
         )
         if rc != 0:
-            return _envelope(False, error=f"docker ps failed: {err[:200]}", retryable=True)
+            return envelope(False, error=f"docker ps failed: {err[:200]}", retryable=True)
         tasks = []
         for line in out.splitlines():
             line = line.strip()
@@ -145,14 +129,14 @@ class HomelabConnector:
                     "node": t.get("Node", ""),
                 }
             )
-        return _envelope(True, data=tasks)
+        return envelope(True, data=tasks)
 
     async def list_nodes(self) -> dict:
         """Return swarm nodes. Shape per item:
         {hostname, status, availability, manager}. status is Ready|Down."""
         rc, out, err = await self._docker("node", "ls", "--format", "{{json .}}")
         if rc != 0:
-            return _envelope(False, error=f"docker node ls failed: {err[:200]}", retryable=True)
+            return envelope(False, error=f"docker node ls failed: {err[:200]}", retryable=True)
         nodes = []
         for line in out.splitlines():
             line = line.strip()
@@ -170,7 +154,7 @@ class HomelabConnector:
                     "manager": n.get("ManagerStatus", ""),
                 }
             )
-        return _envelope(True, data=nodes)
+        return envelope(True, data=nodes)
 
     async def restart_service(self, service_name: str) -> dict:
         """Force-restart a swarm service (idempotent: reschedules its tasks
@@ -185,10 +169,10 @@ class HomelabConnector:
             "service", "update", "--force", "--detach", service_name
         )
         if rc != 0:
-            return _envelope(
+            return envelope(
                 False, error=f"docker service update --force failed: {err[:200]}", retryable=True
             )
-        return _envelope(True, data={"output": out[-500:]})
+        return envelope(True, data={"output": out[-500:]})
 
     async def probe_tls(self, domain: str, port: int = 443) -> dict:
         """Probe TLS and parse notAfter + serial via openssl x509."""
@@ -209,9 +193,9 @@ class HomelabConnector:
             try:
                 out, err = await asyncio.wait_for(proc.communicate(), timeout=20)
             except TimeoutError:
-                return _envelope(False, error="tls timeout", retryable=True)
+                return envelope(False, error="tls timeout", retryable=True)
             if proc.returncode != 0:
-                return _envelope(
+                return envelope(
                     False, error=f"tls probe failed: {err.decode()[:120]}", retryable=True
                 )
         finally:
@@ -230,5 +214,5 @@ class HomelabConnector:
             elif line.startswith("serial="):
                 serial = line.split("=", 1)[1].strip()
         if not_after is None or not serial:
-            return _envelope(False, error="tls parse failed", retryable=False)
-        return _envelope(True, data={"domain": domain, "not_after": not_after, "serial": serial})
+            return envelope(False, error="tls parse failed", retryable=False)
+        return envelope(True, data={"domain": domain, "not_after": not_after, "serial": serial})

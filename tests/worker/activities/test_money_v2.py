@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
-from aegis.services import books, reconciled
+from aegis.services import books
 from aegis.services import journal_index as ji
 from aegis_worker.activities.money import MoneyActivities
 from temporalio.testing import ActivityEnvironment
@@ -914,7 +914,7 @@ async def test_a_due_whose_task_will_not_close_is_still_marked_paid(db_pool, tmp
 async def test_transaction_inside_reconciled_period_is_indexed_not_posted(db_pool, tmp_path):
     cfg = _repo(tmp_path)
     act = _act(db_pool, cfg)
-    await reconciled.mark_reconciled(
+    await ji.mark_reconciled(
         db_pool, "hdfc-1225", date(2026, 9, 5), statement_id="stmt-test"
     )
     bank = _bank_event(occurred_on="2026-09-02")  # on or before the watermark
@@ -955,7 +955,7 @@ async def test_reconciled_period_still_links_a_match_but_not_a_fresh_block(db_po
     # Reconciled AFTER the block above was already written — this is the
     # realistic order: the statement arrives once both the original email
     # and its late counterpart could plausibly have shown up.
-    await reconciled.mark_reconciled(
+    await ji.mark_reconciled(
         db_pool, "axis-cc-1313", date(2026, 9, 5), statement_id="stmt-test"
     )
     bank = _bank_event(payee="ELEVENLABS", payee_key="elevenlabs", channel="card",
@@ -986,7 +986,7 @@ async def test_transaction_on_the_watermark_date_itself_is_gated_too(db_pool, tm
     # "Through" is inclusive — the statement's own closing date is covered by it.
     cfg = _repo(tmp_path)
     act = _act(db_pool, cfg)
-    await reconciled.mark_reconciled(
+    await ji.mark_reconciled(
         db_pool, "hdfc-1225", date(2026, 9, 2), statement_id="stmt-test"
     )
     bank = _bank_event(occurred_on="2026-09-02")
@@ -998,7 +998,7 @@ async def test_transaction_on_the_watermark_date_itself_is_gated_too(db_pool, tm
 async def test_transaction_after_the_watermark_posts_normally(db_pool, tmp_path):
     cfg = _repo(tmp_path)
     act = _act(db_pool, cfg)
-    await reconciled.mark_reconciled(
+    await ji.mark_reconciled(
         db_pool, "hdfc-1225", date(2026, 8, 31), statement_id="stmt-test"
     )
     bank = _bank_event(occurred_on="2026-09-02")  # after the watermark
@@ -1013,7 +1013,7 @@ async def test_transaction_with_no_instrument_is_never_gated(db_pool, tmp_path):
     # with none is never held back, no matter what any account's watermark is.
     cfg = _repo(tmp_path)
     act = _act(db_pool, cfg)
-    await reconciled.mark_reconciled(
+    await ji.mark_reconciled(
         db_pool, "hdfc-1225", date(2026, 12, 31), statement_id="stmt-test"
     )
     bank = _bank_event(instrument=None, occurred_on="2026-09-02")
@@ -1025,16 +1025,16 @@ async def test_transaction_with_no_instrument_is_never_gated(db_pool, tmp_path):
 async def test_unreadable_watermark_fails_open_and_posts(db_pool, tmp_path, monkeypatch):
     cfg = _repo(tmp_path)
     act = _act(db_pool, cfg)
-    await reconciled.mark_reconciled(
+    await ji.mark_reconciled(
         db_pool, "hdfc-1225", date(2026, 9, 5), statement_id="stmt-test"
     )
 
     async def _boom(pool, instrument):
         raise RuntimeError("watermark table unreachable")
 
-    monkeypatch.setattr(reconciled, "reconciled_through", _boom)
+    monkeypatch.setattr(ji, "reconciled_through", _boom)
     # money.py imports the module (`from aegis.services import ... reconciled`)
-    # and calls `reconciled.reconciled_through`, so patching the module
+    # and calls `ji.reconciled_through`, so patching the module
     # attribute reaches the call site.
     bank = _bank_event(occurred_on="2026-09-02")  # would be gated if the read worked
     r = await ActivityEnvironment().run(act.post_money_event, "rid1", "v2-personal", "m-bank", bank)

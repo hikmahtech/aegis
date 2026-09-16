@@ -305,41 +305,56 @@ class SlackCoreClient:
     def _headers(self) -> dict[str, str]:
         return {"X-API-Key": self._api_key} if self._api_key else {}
 
-    async def _post(
-        self, path: str, data: dict, timeout: float = 90, error_sink: dict | None = None
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json: dict | None = None,
+        timeout: float,
+        ok: tuple[int, ...] = (200,),
+        log_non_ok: bool = True,
+        error_sink: dict | None = None,
     ) -> Any:
-        """POST to Core. Returns the JSON body, or None on any failure.
+        """One call to Core. Returns the JSON body, or None on any failure.
 
         Pass `error_sink` to also capture WHY it failed (`reason` key) — Core
         puts the real cause (LLM auth error, tool crash, …) in the 500 body,
         and callers that report to a human should say that rather than a
-        generic "couldn't reach Core". A non-2xx response also fills in
+        generic "couldn't reach Core". A non-ok response also fills in
         `status_code` (int) so a caller can tell a deterministic 4xx (never
         worth retrying) from a transient 5xx/transport failure (issue #296);
         a transport failure leaves `status_code` unset.
+
+        `log_non_ok=False` is for a read whose "not there" answer is normal
+        and would otherwise log a warning on every poll.
         """
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
-                resp = await client.post(
+                resp = await client.request(
+                    method,
                     f"{self._core_url}{path}",
-                    json=data,
+                    json=json,
                     auth=self._auth,
                     headers=self._headers(),
                 )
-                if resp.status_code in (200, 202):
+                if resp.status_code in ok:
                     return resp.json()
-                logger.warning(
-                    "slack_core_post_non_2xx",
-                    path=path,
-                    status=resp.status_code,
-                    body=resp.text[:200],
-                )
+                if log_non_ok:
+                    logger.warning(
+                        "slack_core_non_ok",
+                        method=method,
+                        path=path,
+                        status=resp.status_code,
+                        body=resp.text[:200],
+                    )
                 if error_sink is not None:
                     error_sink["reason"] = f"Core API returned {resp.status_code}: {resp.text[:400]}"
                     error_sink["status_code"] = resp.status_code
         except Exception as exc:  # noqa: BLE001 — best-effort; caller degrades
             logger.warning(
-                "slack_core_post_failed",
+                "slack_core_request_failed",
+                method=method,
                 path=path,
                 error=error_text(exc, 500),
                 error_type=type(exc).__name__,
@@ -348,40 +363,19 @@ class SlackCoreClient:
                 error_sink["reason"] = f"Could not reach Core API: {type(exc).__name__}: {exc}"
         return None
 
+    async def _post(
+        self, path: str, data: dict, timeout: float = 90, error_sink: dict | None = None
+    ) -> Any:
+        """POST to Core. 202 counts: the async dispatch lane answers with one."""
+        return await self._request(
+            "POST", path, json=data, timeout=timeout, ok=(200, 202), error_sink=error_sink
+        )
+
     async def _patch(self, path: str, data: dict, timeout: float = 30) -> Any:
-        try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                resp = await client.patch(
-                    f"{self._core_url}{path}",
-                    json=data,
-                    auth=self._auth,
-                    headers=self._headers(),
-                )
-                if resp.status_code == 200:
-                    return resp.json()
-                logger.warning(
-                    "slack_core_patch_non_200",
-                    path=path,
-                    status=resp.status_code,
-                    body=resp.text[:200],
-                )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("slack_core_patch_failed", path=path, error=error_text(exc, 500))
-        return None
+        return await self._request("PATCH", path, json=data, timeout=timeout)
 
     async def _get(self, path: str, timeout: float = 15) -> Any:
-        try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                resp = await client.get(
-                    f"{self._core_url}{path}",
-                    auth=self._auth,
-                    headers=self._headers(),
-                )
-                if resp.status_code == 200:
-                    return resp.json()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("slack_core_get_failed", path=path, error=error_text(exc, 500))
-        return None
+        return await self._request("GET", path, timeout=timeout, log_non_ok=False)
 
     async def chat(
         self, *, agent_id: str, message: str, thread_id: str, delivery_ref: dict | None
@@ -654,11 +648,7 @@ class SlackInbound:
         assistant_message_id = result.get("assistant_message_id")
         answered_by = result.get("agent_id") or agent_id
 
-        send_result = await self._adapter.send_message(
-            agent_id=answered_by,
-            text=reply_text,
-            target={"channel": channel_id},
-        )
+        send_result = await self._reply(answered_by, channel_id, reply_text)
 
         if assistant_message_id and send_result.ok and send_result.ref is not None:
             await self._core.attach_delivery_ref(
@@ -929,11 +919,7 @@ class SlackInbound:
             if triggered is not None:
                 # Short ack so the user knows it's queued; pandora's kimi
                 # tools can legitimately run minutes.
-                await self._adapter.send_message(
-                    agent_id=agent_id,
-                    text=f"🤖 Routing to @{agent_id}…",
-                    target={"channel": channel_id},
-                )
+                await self._reply(agent_id, channel_id, f"🤖 Routing to @{agent_id}…")
                 return
             # Trigger failed (non-2xx or transport error) — fall back to sync
             # so the user still gets a reply rather than silence.
@@ -1173,20 +1159,16 @@ class SlackInbound:
             return
 
         if not name.lower().endswith(".pdf"):
-            await self._adapter.send_message(
-                agent_id=agent_id,
-                text=f"Unsupported file type: {name}. Only PDF and audio are supported.",
-                target={"channel": channel_id},
+            await self._reply(
+                agent_id,
+                channel_id,
+                f"Unsupported file type: {name}. Only PDF and audio are supported.",
             )
             return
 
         extracted = await self._download_and_extract_pdf(url)
         if not extracted:
-            await self._adapter.send_message(
-                agent_id=agent_id,
-                text="Could not extract text from PDF.",
-                target={"channel": channel_id},
-            )
+            await self._reply(agent_id, channel_id, "Could not extract text from PDF.")
             return
 
         # Attach the full extracted text back as a .txt so the user has the
@@ -1229,11 +1211,7 @@ class SlackInbound:
             delivery_ref={"adapter": "slack", "channel": channel_id},
         )
         reply = result.get("response", "No response from agent.")
-        await self._adapter.send_message(
-            agent_id=result.get("agent_id") or agent_id,
-            text=reply,
-            target={"channel": channel_id},
-        )
+        await self._reply(result.get("agent_id") or agent_id, channel_id, reply)
 
     async def _handle_audio_file(
         self, *, name: str, url: str | None, channel_id: str, caption: str
@@ -1250,20 +1228,16 @@ class SlackInbound:
             return
 
         if not self._elevenlabs_api_key:
-            await self._adapter.send_message(
-                agent_id=agent_id,
-                text="🎤 Voice notes need ElevenLabs configured (AEGIS_ELEVENLABS_API_KEY).",
-                target={"channel": channel_id},
+            await self._reply(
+                agent_id,
+                channel_id,
+                "🎤 Voice notes need ElevenLabs configured (AEGIS_ELEVENLABS_API_KEY).",
             )
             return
 
         audio = await self._download_private_file(url)
         if not audio:
-            await self._adapter.send_message(
-                agent_id=agent_id,
-                text="Could not download the voice note.",
-                target={"channel": channel_id},
-            )
+            await self._reply(agent_id, channel_id, "Could not download the voice note.")
             return
 
         from aegis_comms import elevenlabs
@@ -1275,19 +1249,11 @@ class SlackInbound:
             filename=name,
         )
         if not transcript:
-            await self._adapter.send_message(
-                agent_id=agent_id,
-                text="Could not transcribe the voice note.",
-                target={"channel": channel_id},
-            )
+            await self._reply(agent_id, channel_id, "Could not transcribe the voice note.")
             return
 
         # Echo what was heard so STT mishears are visible, then route it as text.
-        await self._adapter.send_message(
-            agent_id=agent_id,
-            text=f"🎤 <i>{transcript}</i>",
-            target={"channel": channel_id},
-        )
+        await self._reply(agent_id, channel_id, f"🎤 <i>{transcript}</i>")
 
         # "remember …" / "note to self …" is a filing instruction, not a
         # conversation opener: hand it to core's intent classifier instead of
@@ -1301,15 +1267,21 @@ class SlackInbound:
             result = await self._core.capture(
                 text=spoken_capture, external_id=ext_id, kind="auto"
             )
-            await self._adapter.send_message(
-                agent_id=agent_id,
-                text=capture_ack(result),
-                target={"channel": channel_id},
-            )
+            await self._reply(agent_id, channel_id, capture_ack(result))
             return
 
         message = f"{transcript}\n\n{caption}" if caption else transcript
         await self._route_and_dispatch(channel_id=channel_id, text=message)
+
+    async def _reply(self, agent_id: str, channel_id: str, text: str):
+        """Say `text` in `channel_id` as `agent_id`.
+
+        Every reply this handler sends goes out this way. The adapter's result
+        is returned for the one caller that attaches a delivery ref to it.
+        """
+        return await self._adapter.send_message(
+            agent_id=agent_id, text=text, target={"channel": channel_id}
+        )
 
     async def _download_private_file(self, url: str | None) -> bytes | None:
         """Download a Slack private file via the bot-token bearer auth."""

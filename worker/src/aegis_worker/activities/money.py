@@ -14,7 +14,7 @@ from typing import Any
 import structlog
 from aegis.api.models.money import MoneyEvent, payee_key
 from aegis.errors import error_text
-from aegis.services import books, books_chart, ledger_write, reconciled, trading_desk
+from aegis.services import books, books_chart, ledger_write, trading_desk
 from aegis.services import journal_index as ji
 from aegis.services.bank_parsers import has_money_shape, is_autopay, parse_any
 from aegis.services.books import instrument_account
@@ -573,7 +573,7 @@ class MoneyActivities:
             return None
         canon_instrument = books.canonical_instrument(ev.instrument, declared)
         try:
-            watermark = await reconciled.reconciled_through(self.db_pool, canon_instrument)
+            watermark = await ji.reconciled_through(self.db_pool, canon_instrument)
         except Exception as exc:  # noqa: BLE001 — fail open, see docstring
             activity.logger.warning(
                 "reconciled_watermark_unreadable instrument=%s error=%s — posting as normal",

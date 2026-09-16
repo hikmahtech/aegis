@@ -59,6 +59,7 @@ from io import BytesIO
 from typing import Any
 
 from aegis.services import books
+from aegis.services.bank_parsers import amount_from
 
 _CENT = Decimal("0.01")
 
@@ -418,7 +419,7 @@ def _infer_columns(page: str) -> _Columns | None:
 
 def _amount(token: str) -> Decimal:
     try:
-        return Decimal(token.replace(",", "")).quantize(_CENT)
+        return amount_from(token)
     except InvalidOperation as exc:  # pragma: no cover — the regex guarantees the shape
         raise StatementError(f"unreadable amount: {token!r}") from exc
 

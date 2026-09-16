@@ -18,7 +18,7 @@ from aegis.api.deps import get_settings
 from aegis.config import Settings
 from aegis.db import create_pool, run_migrations
 from aegis.errors import error_text
-from aegis.llm import LLMClient, set_model_tiers, set_routes
+from aegis.llm import LLMClient
 from aegis.services.chat import _validate_agent_tool_sets
 
 logger = structlog.get_logger()
@@ -97,21 +97,10 @@ async def lifespan(app: FastAPI):
     app.state.db_pool = pool
 
     # LLM client + tier map from the configurable backend (DB → env fallback).
-    from aegis.services.llm_backend import get_llm_backend
+    from aegis.services.llm_backend import get_llm_backend, install_llm_config
 
     backend = await get_llm_backend(pool, settings)
-    set_model_tiers(backend["tiers"])
-    logger.info("model_tiers_loaded", tiers=sorted(backend["tiers"]), source=backend["source"])
-    try:
-        routes = set_routes(backend.get("routes"))
-        logger.info(
-            "llm_routes_loaded",
-            categories=len(routes["categories"]),
-            purposes=len(routes["purposes"]),
-        )
-    except Exception as exc:  # noqa: BLE001 — a bad routing table must not block boot
-        set_routes(None)
-        logger.warning("llm_routes_invalid", error=error_text(exc))
+    install_llm_config(backend)
     app.state.llm_backend = backend
     llm = LLMClient(
         base_url=backend["base_url"],

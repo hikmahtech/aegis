@@ -56,17 +56,19 @@ from __future__ import annotations
 import re
 from collections.abc import Collection
 from dataclasses import dataclass, replace
-from datetime import date, datetime
+from datetime import date
 from decimal import Decimal, InvalidOperation
 from html.parser import HTMLParser
 from typing import Any
 
 from aegis.services import books
+from aegis.services.bank_parsers import amount_from
 from aegis.services.statements import (
     PARSED,
     REFUSED,
     UNIDENTIFIED,
     ParsedStatement,
+    _d,
     assign_row_ids,
     statement_id_for,
 )
@@ -206,10 +208,6 @@ class HdfcHeader:
     period_end: date
 
 
-def _d(text: str) -> date:
-    return datetime.strptime(text.replace("-", "/"), "%d/%m/%Y").date()
-
-
 def _label(text: str) -> str:
     return text.strip().rstrip(":").strip().casefold()
 
@@ -291,7 +289,7 @@ def _paired_value(texts: list[_Text], label: str, shape: re.Pattern[str]) -> Dec
 
 def _amount(token: str) -> Decimal:
     try:
-        return Decimal(token.replace(",", "")).quantize(_CENT)
+        return amount_from(token)
     except InvalidOperation as exc:  # pragma: no cover — the regex fixes the shape
         raise ValueError(f"unreadable amount: {token!r}") from exc
 

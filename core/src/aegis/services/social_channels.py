@@ -22,10 +22,10 @@ simply stops being re-confirmed — `updated_at` going stale is the signal.
 
 from __future__ import annotations
 
-import re
-
 import httpx
 import structlog
+
+from aegis.slugs import slugify
 
 logger = structlog.get_logger()
 
@@ -43,9 +43,9 @@ class PostizSyncError(RuntimeError):
 
 
 def slugify_label(name: str) -> str:
-    """Postiz display name → the `social_accounts.label` slug."""
-    slug = re.sub(r"[^a-z0-9_-]+", "-", (name or "").strip().lower())
-    return slug.strip("-")
+    """Postiz display name → the `social_accounts.label` slug. Underscores
+    survive: a label is an id, not a URL segment."""
+    return slugify(name, keep="_-")
 
 
 async def fetch_postiz_integrations(

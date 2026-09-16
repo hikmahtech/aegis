@@ -20,6 +20,8 @@ from aegis.services.infra_alert_routing import get_infra_alert_routing
 from aegis.services.settings_store import get_setting
 from temporalio import activity
 
+from aegis_worker.shared.jsonb import decode_jsonb
+
 # Cap on Kimi investigation output kept in the activity return value.
 _INVESTIGATION_OUTPUT_CAP = 8 * 1024
 
@@ -496,19 +498,12 @@ def _build_jira_scoping_prompt(
 
 
 def _decode_metadata(row: Any) -> dict:
-    """Decode a resource row's `metadata` column to a dict.
-
-    asyncpg's jsonb codec usually returns a dict already, but a string can
-    slip through (legacy double-encoded rows); decode defensively and fall
-    back to {} on anything unparseable.
-    """
-    m = row["metadata"]
-    if isinstance(m, str):
-        try:
-            return json.loads(m)
-        except Exception:
-            return {}
-    return m or {}
+    """A resource row's `metadata` as a dict, `{}` when it will not decode —
+    an unreadable row must not stop the alert being routed."""
+    try:
+        return decode_jsonb(row["metadata"], {})
+    except (ValueError, TypeError):
+        return {}
 
 
 def _coding_match(rid: Any, title: Any, meta: dict, confidence: float) -> dict:
@@ -878,7 +873,7 @@ class AlertActivities:
         from aegis.connectors.todoist import TodoistConnector
 
         if workflow_id:
-            from aegis_worker.shared.temporal_links import workflow_run_footer
+            from aegis_worker.activities.temporal_links import workflow_run_footer
 
             footer = workflow_run_footer(
                 self.temporal_ui_url, workflow_id, run_id or "", self.temporal_namespace
@@ -1815,7 +1810,7 @@ class AlertActivities:
         ask the user to pick the right repo when not.
 
         Fetches all repository resources, runs the pure scorer
-        (`aegis_worker.relevance.score_resources`), and enriches the returned
+        (`aegis_worker.activities.relevance.score_resources`), and enriches the returned
         candidates with full resource fields so the flow can rebuild its
         resources_list from the user's pick.
 
@@ -1854,7 +1849,7 @@ class AlertActivities:
         Shared by score_resource_relevance (no hint) and reresolve_with_hint
         (hint passed through). Returns (RelevanceResult, candidates).
         """
-        from aegis_worker import relevance
+        from aegis_worker.activities import relevance
 
         rows = await self.db_pool.fetch(
             "SELECT id, title, metadata FROM resources WHERE kind = 'repository'"

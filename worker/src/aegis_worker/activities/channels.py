@@ -13,22 +13,16 @@ from typing import Any
 
 from temporalio import activity
 
+from aegis_worker.shared.jsonb import decode_jsonb
+
 
 def _decode_config(raw) -> dict:
-    """Normalise asyncpg JSONB result to a plain dict.
-
-    When the JSONB codec is registered (create_pool sets it via set_type_codec),
-    asyncpg returns a Python dict.  If the codec is absent — or if the row was
-    inserted as a pre-serialised JSON string and the codec double-encoded it —
-    the result can be a plain string.  Handling both prevents
-    'dictionary update sequence element' errors at runtime.
+    """A channel's `config` jsonb as a plain dict — a copy, because callers
+    edit it and write it back. A value that will not parse raises: the
+    updater writes this dict back, so reading a broken row as empty would
+    wipe every other key in it.
     """
-    if not raw:
-        return {}
-    if isinstance(raw, dict):
-        return dict(raw)
-    # str (codec absent or double-encoded path)
-    return json.loads(raw)
+    return dict(decode_jsonb(raw, {}))
 
 
 @dataclass

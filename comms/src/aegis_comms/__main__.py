@@ -16,7 +16,7 @@ from typing import Any
 import httpx
 import structlog
 import uvicorn
-from fastapi import APIRouter, FastAPI, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel
 
 from aegis_comms.adapters.base import CardSpec, DeliveryRef
@@ -217,6 +217,16 @@ def create_delivery_app(adapter: SlackAdapter, settings: CommsSettings) -> FastA
     app.state.adapter = adapter
     app.state.settings = settings
 
+    async def require_api_key(
+        x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    ) -> None:
+        """Every delivery endpoint takes the same key. An unset `api_key` is a
+        documented open deployment (the service is overlay-only), so the check
+        is skipped rather than failing closed — changing that here would take
+        the fleet's delivery down on a missing env var."""
+        if settings.api_key and (not x_api_key or x_api_key != settings.api_key):
+            raise HTTPException(401, "Invalid API key")
+
     router = APIRouter()
 
     @router.get("/api/health")
@@ -250,19 +260,14 @@ def create_delivery_app(adapter: SlackAdapter, settings: CommsSettings) -> FastA
         }
         return body
 
-    @router.post("/api/deliver/message")
-    async def deliver(
-        req: DeliveryRequest,
-        x_api_key: str | None = Header(default=None, alias="X-API-Key"),
-    ) -> dict[str, Any]:
+    @router.post("/api/deliver/message", dependencies=[Depends(require_api_key)])
+    async def deliver(req: DeliveryRequest) -> dict[str, Any]:
         """Deliver a message to an agent's channel (called by worker flows).
 
         Every successful send is mirrored into chat_history as a
         role='dispatch' row so the agent's chat context can see what the
         user has been shown. See `_log_dispatch` for the contract.
         """
-        if settings.api_key and (not x_api_key or x_api_key != settings.api_key):
-            raise HTTPException(401, "Invalid API key")
 
         if req.system_event:
             send_result = await adapter.send_system_event(text=req.text)
@@ -305,14 +310,9 @@ def create_delivery_app(adapter: SlackAdapter, settings: CommsSettings) -> FastA
         )
         return {"ok": result.get("ok", False), "agent_id": agent_id, **result}
 
-    @router.post("/api/deliver/document")
-    async def deliver_document(
-        req: DocumentDeliveryRequest,
-        x_api_key: str | None = Header(default=None, alias="X-API-Key"),
-    ) -> dict[str, Any]:
+    @router.post("/api/deliver/document", dependencies=[Depends(require_api_key)])
+    async def deliver_document(req: DocumentDeliveryRequest) -> dict[str, Any]:
         """Deliver one or more document attachments to an agent's channel."""
-        if settings.api_key and (not x_api_key or x_api_key != settings.api_key):
-            raise HTTPException(401, "Invalid API key")
 
         agent_id = req.agent_id or await adapter.resolve_agent_id("")
         docs = [d.model_dump() for d in req.documents]
@@ -333,18 +333,13 @@ def create_delivery_app(adapter: SlackAdapter, settings: CommsSettings) -> FastA
             )
         return {"ok": ok, "agent_id": agent_id, "count": len(docs)}
 
-    @router.post("/api/deliver/voice")
-    async def deliver_voice(
-        req: VoiceDeliveryRequest,
-        x_api_key: str | None = Header(default=None, alias="X-API-Key"),
-    ) -> dict[str, Any]:
+    @router.post("/api/deliver/voice", dependencies=[Depends(require_api_key)])
+    async def deliver_voice(req: VoiceDeliveryRequest) -> dict[str, Any]:
         """Synthesize + upload a per-persona voice note to an agent's channel.
 
         Best-effort + additive: the worker already posted the text. A no-op
         (ok=False) when the agent has no voice_id or ElevenLabs isn't configured.
         """
-        if settings.api_key and (not x_api_key or x_api_key != settings.api_key):
-            raise HTTPException(401, "Invalid API key")
         agent_id = req.agent_id or await adapter.resolve_agent_id("")
         send_result = await adapter.send_voice(agent_id=agent_id, text=req.text)
         result = send_result.to_response()
@@ -413,18 +408,13 @@ def create_delivery_app(adapter: SlackAdapter, settings: CommsSettings) -> FastA
             "content_id": result.get("content_id"),
         }
 
-    @router.post("/api/deliver/card")
-    async def deliver_card(
-        req: CardDeliveryRequest,
-        x_api_key: str | None = Header(default=None, alias="X-API-Key"),
-    ) -> dict[str, Any]:
+    @router.post("/api/deliver/card", dependencies=[Depends(require_api_key)])
+    async def deliver_card(req: CardDeliveryRequest) -> dict[str, Any]:
         """Deliver a channel-neutral interaction card via the active adapter.
 
         The worker POSTs a neutral CardSpec body; the adapter renders the
         per-channel card (Slack Block Kit) and routes it to the agent's channel.
         """
-        if settings.api_key and (not x_api_key or x_api_key != settings.api_key):
-            raise HTTPException(401, "Invalid API key")
 
         agent_id = req.agent_id or await adapter.resolve_agent_id("")
         spec = CardSpec(
@@ -446,13 +436,8 @@ def create_delivery_app(adapter: SlackAdapter, settings: CommsSettings) -> FastA
         )
         return {"ok": result.get("ok", False), "agent_id": agent_id, **result}
 
-    @router.post("/api/comms/delete")
-    async def delete_dispatch(
-        req: DeleteRequest,
-        x_api_key: str | None = Header(default=None, alias="X-API-Key"),
-    ) -> dict[str, Any]:
-        if settings.api_key and (not x_api_key or x_api_key != settings.api_key):
-            raise HTTPException(401, "Invalid API key")
+    @router.post("/api/comms/delete", dependencies=[Depends(require_api_key)])
+    async def delete_dispatch(req: DeleteRequest) -> dict[str, Any]:
         try:
             ref = DeliveryRef.from_dict(req.delivery_ref)
             ok = await adapter.delete_message(ref=ref)
