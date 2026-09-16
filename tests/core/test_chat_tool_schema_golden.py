@@ -1,20 +1,18 @@
 """Golden-schema regression gate for the chat tool surface (issue #316).
 
-`services/chat.py` exposes 52 hand-written OpenAI-style tool schemas
-(`CHAT_TOOLS`) and their dispatch table (`TOOL_EXECUTORS`). Issue #316 is
-migrating those executors, domain by domain, onto the `@aegis_tool` decorator
-(`services/tools/registry.py`), which GENERATES the schema from a typed
-signature + docstring instead of a hand-written dict. That migration is only
-safe if the generated schema is byte-for-byte identical to what it replaces —
+`services/chat.py` once carried the OpenAI-style tool schemas (`CHAT_TOOLS`)
+as hand-written dicts. Issues #316 and #599 moved every executor onto the
+`@aegis_tool` decorator (`services/tools/registry.py`), which GENERATES the
+schema from a typed signature + docstring. That migration was only safe
+because the generated schema is byte-for-byte identical to what it replaced —
 a description that loses a sentence, an enum that drops a value, or a
 `default` that goes missing would silently change what the LLM is told a tool
 does, with no test failing.
 
 `fixtures/chat_tools_golden.json` is a full dump of `CHAT_TOOLS` as of the
 last point the whole file was still hand-written. This test locks the live
-schema to that snapshot, per tool, so a diff during the migration fails
-loudly and names the offending tool instead of surfacing as a production
-behavior change.
+schema to that snapshot, per tool, so a diff fails loudly and names the
+offending tool instead of surfacing as a production behavior change.
 
 ONE rule for updating the fixture: a *deliberate* change to a tool's schema
 (new parameter, reworded description, adjusted enum, etc.) regenerates the

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Annotated
+from typing import Annotated, Literal
 
 import asyncpg
 import structlog
@@ -124,21 +124,35 @@ async def _exec_paper_read(
     return json.dumps(await rs.paper_read(paper_id, max_chars=max_chars, api_key=_s2_key(ctx)))
 
 
-async def _exec_research_topic(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
-    """Hand a research question to `ResearchFlow` and relay its answer.
+@aegis_tool
+async def _exec_research_topic(
+    pool: asyncpg.Pool,
+    ctx: ToolContext,
+    *,
+    query: str,
+    depth: Literal["quick", "thorough"] | None = None,
+    domains: list[str] | None = None,
+) -> str:
+    """Research a question: search the knowledge store, the web and (for academic questions) papers, read the best sources, and answer with numbered citations. Runs in the background as a research flow and waits a short while for it; a longer run posts its answer to the channel when it is ready. The answer is saved, replacing any earlier answer to the same question.
 
-    Never raises. Three outcomes: the run finished inside the wait and its
-    answer comes back; it did not, and the model is told it is still running
-    (the flow posts the answer to the agent's channel when it lands); or it
-    could not be started at all, in which case nothing ran.
+    Args:
+        query: What to research
+        depth: Search depth (default: quick)
+        domains: Limit web search to specific domains
+
+    Returns:
+        Never raises. Three outcomes: the run finished inside the wait and its
+        answer comes back; it did not, and the model is told it is still running
+        (the flow posts the answer to the agent's channel when it lands); or it
+        could not be started at all, in which case nothing ran.
     """
     from temporalio.exceptions import WorkflowAlreadyStartedError
 
-    question = str(args.get("query") or "").strip()
+    question = str(query or "").strip()
     if not question:
         return json.dumps({"error": "query is required"})
-    depth = args.get("depth") if args.get("depth") in rs.DEPTHS else "quick"
-    domains = rs.clean_domains(args.get("domains"))
+    depth = depth if depth in rs.DEPTHS else "quick"
+    domains = rs.clean_domains(domains)
     client = ctx.temporal_client
     if client is None:
         return json.dumps(

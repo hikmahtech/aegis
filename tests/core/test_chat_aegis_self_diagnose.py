@@ -85,7 +85,11 @@ def test_build_prompt_fix_mode_requests_branch_and_pr():
 @pytest.mark.asyncio
 async def test_exec_rejects_missing_issue():
     ctx = ToolContext(settings=_settings(), remote_script_connector=MagicMock())
-    out = json.loads(await _exec_aegis_self_diagnose(MagicMock(), {"mode": "investigate"}, ctx))
+    # Blank, not absent: the schema's `required` stops an absent `issue` before
+    # the executor, so blank is the shape a model can get this far with.
+    out = json.loads(
+        await _exec_aegis_self_diagnose(MagicMock(), {"issue": "  ", "mode": "investigate"}, ctx)
+    )
     assert "error" in out
     assert "issue is required" in out["error"]
 
@@ -157,11 +161,13 @@ async def test_exec_returns_completed_when_kimi_emits_status_footer():
 async def test_exec_returns_still_running_on_polling_timeout(monkeypatch):
     """If kimi never emits STATUS within the max-wait window, the tool returns
     `still_running` with whatever transcript is available."""
-    # Speed up the polling loop so the test doesn't sit for 8 minutes.
-    import aegis.services.chat as chat_mod
+    # Speed up the polling loop so the test doesn't sit for 8 minutes. Patch the
+    # module the executor READS the constants from — `chat.py` only re-exports
+    # them, so patching there would leave the real 8-minute wait in place.
+    import aegis.services.tools.agents as agents_mod
 
-    monkeypatch.setattr(chat_mod, "_AEGIS_SELF_DIAGNOSE_MAX_WAIT", 1.0)
-    monkeypatch.setattr(chat_mod, "_AEGIS_SELF_DIAGNOSE_POLL", 0.2)
+    monkeypatch.setattr(agents_mod, "_AEGIS_SELF_DIAGNOSE_MAX_WAIT", 1.0)
+    monkeypatch.setattr(agents_mod, "_AEGIS_SELF_DIAGNOSE_POLL", 0.2)
 
     mock_connector = MagicMock()
     mock_connector.start_kimi_run = AsyncMock(
@@ -199,11 +205,11 @@ async def test_exec_returns_within_budget_when_fetch_hangs(monkeypatch):
     (preserving run_id/output_file) well inside its budget rather than being
     guillotined by the outer tool-timeout (which loses the run_id).
     """
-    import aegis.services.chat as chat_mod
+    import aegis.services.tools.agents as agents_mod
 
-    monkeypatch.setattr(chat_mod, "_AEGIS_SELF_DIAGNOSE_MAX_WAIT", 0.5)
-    monkeypatch.setattr(chat_mod, "_AEGIS_SELF_DIAGNOSE_POLL", 0.1)
-    monkeypatch.setattr(chat_mod, "_AEGIS_SELF_DIAGNOSE_FETCH_TIMEOUT", 0.15)
+    monkeypatch.setattr(agents_mod, "_AEGIS_SELF_DIAGNOSE_MAX_WAIT", 0.5)
+    monkeypatch.setattr(agents_mod, "_AEGIS_SELF_DIAGNOSE_POLL", 0.1)
+    monkeypatch.setattr(agents_mod, "_AEGIS_SELF_DIAGNOSE_FETCH_TIMEOUT", 0.15)
 
     mock_connector = MagicMock()
     mock_connector.start_kimi_run = AsyncMock(

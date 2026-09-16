@@ -49,7 +49,9 @@ async def test_get_quote_missing_symbols():
     pool = AsyncMock()
     fin = AsyncMock()
     ctx = ToolContext(finance_connector=fin)
-    result = await _execute_tool(pool, "get_quote", {}, ctx=ctx)
+    # Empty, not absent: the schema's `required` stops an absent `symbols`
+    # before the executor, so these are the shapes a model can get this far with.
+    result = await _execute_tool(pool, "get_quote", {"symbols": []}, ctx=ctx)
     assert "error" in json.loads(result)
     result = await _execute_tool(pool, "get_quote", {"symbols": [" ", ""]}, ctx=ctx)
     assert "error" in json.loads(result)
@@ -122,7 +124,7 @@ async def test_get_finance_news_limit_capped():
 async def test_get_finance_news_missing_query():
     pool = AsyncMock()
     ctx = ToolContext(search_connector=AsyncMock())
-    result = await _execute_tool(pool, "get_finance_news", {}, ctx=ctx)
+    result = await _execute_tool(pool, "get_finance_news", {"query": "  "}, ctx=ctx)
     assert "error" in json.loads(result)
 
 

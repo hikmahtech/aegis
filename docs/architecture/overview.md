@@ -291,9 +291,9 @@ When a `todoist_task_id` is on the alert (pandora APP-<n>: clarify path, or the 
 
 ## Chat with Tool Calling
 
-`POST /api/chat` (non-streaming) and `POST /api/chat/stream` (SSE). 59 tools in `CHAT_TOOLS`, gated per-agent by `agents.metadata.tool_set` (the runtime source of truth, edited on the admin **Behavior** tab); `AGENT_TOOL_SETS` in `core/src/aegis/services/chat.py` is only the seed-time default for the four example agents, and an agent with no configured tool set falls back to the minimal read-only `_FALLBACK_TOOL_SET`.
+`POST /api/chat` (non-streaming) and `POST /api/chat/stream` (SSE). 78 tools in `CHAT_TOOLS`, gated per-agent by `agents.metadata.tool_set` (the runtime source of truth, edited on the admin **Behavior** tab); `AGENT_TOOL_SETS` in `core/src/aegis/services/chat.py` is only the seed-time default for the four example agents, and an agent with no configured tool set falls back to the minimal read-only `_FALLBACK_TOOL_SET`.
 
-`CHAT_TOOLS` and `TOOL_EXECUTORS` stay in `chat.py` as the single registry, but the executor *bodies* for extracted domains live in `core/src/aegis/services/tools/<domain>.py` (today `infra.py`, `vercel.py` and `ledger.py`); `ToolContext` lives in `services/tools/base.py` and is re-exported from `chat.py`.
+`CHAT_TOOLS` and `TOOL_EXECUTORS` stay in `chat.py` as the single registry, but every executor *body* lives in `core/src/aegis/services/tools/<domain>.py`, decorated with `@aegis_tool` so its advertised schema is generated from its typed signature and docstring (`tools/registry.py`); `CHAT_TOOLS` is a hand-ordered list of `_registry_schema("<name>")` calls. `ToolContext` lives in `services/tools/base.py` and is re-exported from `chat.py`.
 
 Tool loop: max iterations bounded by the service config; per-tool timeout via `asyncio.wait_for` (default `tool_timeout_seconds`, with per-tool overrides in `_TOOL_TIMEOUT_OVERRIDES` for long-running tools like `aegis_self_diagnose`); result truncation per `max_bytes`. Every tool call recorded to `chat_tool_calls`.
 

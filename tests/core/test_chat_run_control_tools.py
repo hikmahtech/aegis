@@ -89,7 +89,7 @@ async def test_stop_explains_a_missing_run_without_sounding_broken():
 
 async def test_stop_requires_a_run_id():
     ctx = ToolContext(remote_script_connector=_Connector({}))
-    out = await _exec_stop_agent_run(None, {}, ctx)
+    out = await _exec_stop_agent_run(None, {"run_id": "  "}, ctx)
     assert "run_id is required" in out
 
 
