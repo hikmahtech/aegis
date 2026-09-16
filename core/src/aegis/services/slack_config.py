@@ -21,6 +21,7 @@ import structlog
 
 from aegis.crypto import decrypt_secret, encrypt_secret
 from aegis.errors import error_text
+from aegis.services.settings_store import get_setting, put_setting
 
 logger = structlog.get_logger()
 
@@ -37,9 +38,8 @@ async def resolve_slack_config(pool: Any, settings: Any) -> dict[str, Any]:
     app_token = ""
     channel = ""
     try:
-        row = await pool.fetchrow("SELECT value FROM settings WHERE key = $1", SETTINGS_KEY)
-        if row and row["value"]:
-            v = row["value"]
+        v = await get_setting(pool, SETTINGS_KEY)
+        if v:
             bot_token = decrypt_secret(v.get("bot_token_enc"), settings.secret_key)
             app_token = decrypt_secret(v.get("app_token_enc"), settings.secret_key)
             channel = v.get("channel") or ""
@@ -80,8 +80,7 @@ async def save_slack_config(
     existing encrypted value (so a blank admin-UI field never wipes a saved
     secret) — mirrors ``save_llm_backend``/``save_todoist_config``.
     """
-    row = await pool.fetchrow("SELECT value FROM settings WHERE key = $1", SETTINGS_KEY)
-    existing = (row["value"] if row and row["value"] else {}) or {}
+    existing = (await get_setting(pool, SETTINGS_KEY)) or {}
 
     bot_token_enc = existing.get("bot_token_enc")
     if bot_token:
@@ -100,20 +99,15 @@ async def save_slack_config(
         "app_token_enc": app_token_enc or {"value": "", "encrypted": False},
         "channel": new_channel,
     }
-    await pool.execute(
-        "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW()) "
-        "ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()",
-        SETTINGS_KEY,
-        value,
-    )
+    await put_setting(pool, SETTINGS_KEY, value)
     return await slack_config_status(pool, settings)
 
 
 async def slack_config_status(pool: Any, settings: Any) -> dict[str, Any]:
     """For the admin UI: is each field set + from where. Never cleartext."""
     resolved = await resolve_slack_config(pool, settings)
-    row = await pool.fetchrow("SELECT value FROM settings WHERE key = $1", SETTINGS_KEY)
-    if row and row["value"] and (row["value"].get("bot_token_enc") or {}).get("value"):
+    stored = await get_setting(pool, SETTINGS_KEY)
+    if stored and (stored.get("bot_token_enc") or {}).get("value"):
         source = "db"
     elif os.environ.get("AEGIS_SLACK_BOT_TOKEN") or os.environ.get("AEGIS_SLACK_APP_TOKEN"):
         source = "env"

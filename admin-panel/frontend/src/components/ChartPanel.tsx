@@ -19,20 +19,8 @@
  */
 
 import { useEffect, useState } from 'react';
+import { BOX, Field } from '../lib/formFields';
 import { moneyApi, type BooksChart, type ChartEntity } from '../lib/moneyApi';
-
-/** One labelled field, with the sentence that says what it is for. */
-function Field({ label, hint, children }: { label: string; hint: string; children: React.ReactNode }) {
-  return (
-    <label style={{ display: 'block', marginBottom: 14 }}>
-      <span style={{ display: 'block', fontWeight: 600, marginBottom: 2 }}>{label}</span>
-      <span className="meta" style={{ display: 'block', marginBottom: 4 }}>{hint}</span>
-      {children}
-    </label>
-  );
-}
-
-const BOX: React.CSSProperties = { width: '100%', maxWidth: 320 };
 
 const BLANK_ENTITY: ChartEntity = {
   label: '',

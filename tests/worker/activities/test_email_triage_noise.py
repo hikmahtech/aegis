@@ -47,9 +47,9 @@ class _FakePool:
     def __init__(self, rules: dict | None = None):
         self._rules = rules
 
-    async def fetchrow(self, query: str, *args):
+    async def fetchval(self, query: str, *args):
         if "email_triage_rules" in str(args):
-            return {"value": self._rules} if self._rules is not None else None
+            return self._rules
         return None
 
 

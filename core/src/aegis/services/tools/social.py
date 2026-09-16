@@ -16,6 +16,7 @@ from itertools import zip_longest
 import asyncpg
 
 from aegis.errors import error_text
+from aegis.services.settings_store import get_setting
 from aegis.services.tools.base import ToolContext
 from aegis.services.tools.registry import aegis_tool
 
@@ -226,13 +227,9 @@ async def _exec_list_social_channels(pool: asyncpg.Pool, ctx: ToolContext) -> st
         "SELECT platform, label, meta, expires_at FROM social_accounts "
         "ORDER BY platform, label"
     )
-    label_map = await pool.fetchval(
-        "SELECT value FROM settings WHERE key = 'social_platform_labels'"
-    )
+    label_map = await get_setting(pool, "social_platform_labels")
     label_map = label_map if isinstance(label_map, dict) else {}
-    enabled = await pool.fetchval(
-        "SELECT value FROM settings WHERE key = 'social_publishing_enabled'"
-    )
+    enabled = await get_setting(pool, "social_publishing_enabled")
 
     channels: list[dict] = []
     used = 0

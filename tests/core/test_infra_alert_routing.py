@@ -33,9 +33,9 @@ _SETUP_SPECIFIC = {
 
 @pytest.fixture(autouse=True)
 def _fresh_cache():
-    iar._cache.update(value=None, ts=0.0)
+    iar.ROW.clear_cache()
     yield
-    iar._cache.update(value=None, ts=0.0)
+    iar.ROW.clear_cache()
 
 
 # ── defaults ──────────────────────────────────────────────────────────────
@@ -135,7 +135,7 @@ def test_the_platform_hint_is_kept_and_bounded():
 
 async def _clear(db_pool) -> None:
     await db_pool.execute("DELETE FROM settings WHERE key = $1", iar.SETTINGS_KEY)
-    iar._cache.update(value=None, ts=0.0)
+    iar.ROW.clear_cache()
 
 
 async def test_round_trip(db_pool):

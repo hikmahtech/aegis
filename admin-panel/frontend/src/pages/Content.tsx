@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api } from '../api/client';
+import DataTable from '../components/DataTable';
 
 const ACTIVE_STATUSES = new Set(['pending', 'accepted', 'running', 'processing', 'queued']);
 const POLL_INTERVAL_MS = 5000;
@@ -54,46 +55,31 @@ export default function Content() {
       </p>
 
       <div className="table-scroll">
-        <table className="data-table">
-          <thead>
-            <tr>
-              <th>Title</th>
-              <th>Source Type</th>
-              <th>Chunks</th>
-              <th>Triples</th>
-              <th>Status</th>
-              <th>Ingested</th>
-            </tr>
-          </thead>
-          <tbody>
-            {items.map(c => {
-              const id = c.content_id || c.id;
-              return (
-                <tr key={id}>
-                  <td>
-                    {id ? (
-                      <Link to={`/content/${encodeURIComponent(id)}`}>
-                        <strong>{c.title || id}</strong>
-                      </Link>
-                    ) : (
-                      <strong>{c.title || '\u2014'}</strong>
-                    )}
-                  </td>
-                  <td>{c.source_type || '\u2014'}</td>
-                  <td className="mono">{c.chunks_total ?? c.chunks ?? '\u2014'}</td>
-                  <td className="mono">{c.triples_created ?? c.triples ?? '\u2014'}</td>
-                  <td>{c.status || '\u2014'}</td>
-                  <td>{c.created_at ? new Date(c.created_at).toLocaleString() : '\u2014'}</td>
-                </tr>
-              );
-            })}
-            {items.length === 0 && (
-              <tr>
-                <td colSpan={6} className="empty">No content ingested yet</td>
-              </tr>
-            )}
-          </tbody>
-        </table>
+        <DataTable
+          rows={items}
+          rowKey={c => c.content_id || c.id}
+          emptyText="No content ingested yet"
+          columns={[
+            {
+              header: 'Title',
+              cell: c => {
+                const id = c.content_id || c.id;
+                return id ? (
+                  <Link to={`/content/${encodeURIComponent(id)}`}>
+                    <strong>{c.title || id}</strong>
+                  </Link>
+                ) : (
+                  <strong>{c.title || '\u2014'}</strong>
+                );
+              },
+            },
+            { header: 'Source Type', cell: c => c.source_type || '\u2014' },
+            { header: 'Chunks', td: { className: 'mono' }, cell: c => c.chunks_total ?? c.chunks ?? '\u2014' },
+            { header: 'Triples', td: { className: 'mono' }, cell: c => c.triples_created ?? c.triples ?? '\u2014' },
+            { header: 'Status', cell: c => c.status || '\u2014' },
+            { header: 'Ingested', cell: c => (c.created_at ? new Date(c.created_at).toLocaleString() : '\u2014') },
+          ]}
+        />
       </div>
     </div>
   );

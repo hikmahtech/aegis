@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 
 from aegis.api.auth import verify_auth
 from aegis.observability import log_audit
+from aegis.services import settings_store
 
 router = APIRouter(prefix="/api/settings", dependencies=[Depends(verify_auth)])
 
@@ -47,11 +48,7 @@ async def get_setting(key: str, request: Request) -> dict[str, Any]:
     if _is_hidden(key):
         raise HTTPException(status_code=403, detail="Managed on its own page; not readable here.")
     pool = request.app.state.db_pool
-    row = await pool.fetchrow("SELECT value FROM settings WHERE key = $1", key)
-    if not row:
-        return {"key": key, "value": None}
-    value = row["value"]
-    return {"key": key, "value": value}
+    return {"key": key, "value": await settings_store.get_setting(pool, key)}
 
 
 @router.put("/{key}")
@@ -61,12 +58,7 @@ async def put_setting(key: str, request: Request, body: dict[str, Any]) -> dict[
         raise HTTPException(status_code=403, detail="Managed on its own page; edit it there.")
     pool = request.app.state.db_pool
     value = body.get("value", body)
-    await pool.execute(
-        "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW()) "
-        "ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()",
-        key,
-        value,
-    )
+    await settings_store.put_setting(pool, key, value)
     await log_audit(
         pool,
         actor="api:settings",

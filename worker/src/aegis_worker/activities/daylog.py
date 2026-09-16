@@ -45,6 +45,7 @@ from typing import Any
 
 from aegis.errors import error_text
 from aegis.services import notes
+from aegis.services.settings_store import put_setting
 from aegis.services.user_time import user_zone
 from aegis.services.vault_layout import DEFAULT_LANGUAGE, DEFAULT_LAYOUT, Layout, get_layout
 from temporalio import activity
@@ -603,8 +604,4 @@ class DayLogActivities:
         """Persist the day-log cursor. Called ONLY after a successful ingest."""
         if not self.db_pool:
             return
-        await self.db_pool.execute(
-            "INSERT INTO settings (key, value) VALUES ('daylog_state', $1) "
-            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
-            state,
-        )
+        await put_setting(self.db_pool, "daylog_state", state)

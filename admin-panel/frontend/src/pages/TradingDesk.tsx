@@ -24,8 +24,15 @@ import {
   type DeskHistory,
   type DeskState,
 } from '../lib/moneyApi';
+import DataTable from '../components/DataTable';
 
 /** What the desk decided on a day, said the way a person would say it. */
+// Money columns: right-aligned and monospaced, the same pair on every table here.
+const RIGHT_MONO = {
+  th: { style: { textAlign: 'right' as const } },
+  td: { className: 'mono', style: { textAlign: 'right' as const } },
+};
+
 const OUTCOME: Record<string, { label: string; badge: string }> = {
   orders: { label: 'placed orders', badge: 'success' },
   no_change: { label: 'nothing to change', badge: 'neutral' },
@@ -146,20 +153,20 @@ function ScoreCard({ desk }: { desk: DeskState }) {
             price rather than a real move.
           </p>
           <div className="table-scroll">
-            <table className="data-table">
-              <thead>
-                <tr><th>Symbol</th><th>Day</th><th style={{ textAlign: 'right' }}>Move</th></tr>
-              </thead>
-              <tbody>
-                {s.moves.map(m => (
-                  <tr key={`${m.symbol}-${m.day}`}>
-                    <td className="mono">{m.symbol}</td>
-                    <td className="mono">{m.day}</td>
-                    <td className="mono" style={{ textAlign: 'right' }}>{fmtSignedPct(m.move, 1)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+            <DataTable
+              rows={s.moves}
+              rowKey={m => `${m.symbol}-${m.day}`}
+              columns={[
+                { header: 'Symbol', td: { className: 'mono' }, cell: m => m.symbol },
+                { header: 'Day', td: { className: 'mono' }, cell: m => m.day },
+                {
+                  header: 'Move',
+                  th: { style: { textAlign: 'right' } },
+                  td: { className: 'mono', style: { textAlign: 'right' } },
+                  cell: m => fmtSignedPct(m.move, 1),
+                },
+              ]}
+            />
           </div>
         </section>
       )}
@@ -364,34 +371,29 @@ export default function TradingDesk() {
             set aside, so today&rsquo;s sizing cannot spend it twice.
           </p>
           <div className="table-scroll">
-            <table className="data-table">
-              <thead>
-                <tr>
-                  <th>Placed</th>
-                  <th>Symbol</th>
-                  <th>Side</th>
-                  <th style={{ textAlign: 'right' }}>Shares</th>
-                  <th style={{ textAlign: 'right' }}>Priced at</th>
-                  <th style={{ textAlign: 'right' }}>About</th>
-                </tr>
-              </thead>
-              <tbody>
-                {desk.pending.map(o => (
-                  <tr key={o.id}>
-                    <td className="mono" style={{ whiteSpace: 'nowrap' }}>{o.created_day}</td>
-                    <td><strong>{o.symbol}</strong></td>
-                    <td>
-                      <span className={`badge badge-${o.side === 'buy' ? 'info' : 'pending'}`}>
-                        {o.side}
-                      </span>
-                    </td>
-                    <td className="mono" style={{ textAlign: 'right' }}>{o.qty}</td>
-                    <td className="mono" style={{ textAlign: 'right' }}>{money(o.ref_price)}</td>
-                    <td className="mono" style={{ textAlign: 'right' }}>{money(o.est_value)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+            <DataTable
+              rows={desk.pending}
+              rowKey={o => o.id}
+              columns={[
+                {
+                  header: 'Placed',
+                  td: { className: 'mono', style: { whiteSpace: 'nowrap' } },
+                  cell: o => o.created_day,
+                },
+                { header: 'Symbol', cell: o => <strong>{o.symbol}</strong> },
+                {
+                  header: 'Side',
+                  cell: o => (
+                    <span className={`badge badge-${o.side === 'buy' ? 'info' : 'pending'}`}>
+                      {o.side}
+                    </span>
+                  ),
+                },
+                { header: 'Shares', ...RIGHT_MONO, cell: o => o.qty },
+                { header: 'Priced at', ...RIGHT_MONO, cell: o => money(o.ref_price) },
+                { header: 'About', ...RIGHT_MONO, cell: o => money(o.est_value) },
+              ]}
+            />
           </div>
         </section>
       )}

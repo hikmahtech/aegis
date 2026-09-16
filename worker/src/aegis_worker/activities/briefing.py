@@ -10,6 +10,7 @@ from typing import Any
 import httpx
 from aegis.errors import error_text
 from aegis.services.health import HEALTH_SOURCE
+from aegis.services.settings_store import get_setting, put_setting
 from temporalio import activity
 
 # How old `settings.current_place` (written by the location webhook, B5) may
@@ -290,15 +291,9 @@ class BriefingActivities:
         prior: dict = {}
         if self.db_pool:
             try:
-                row = await self.db_pool.fetchrow(
-                    "SELECT value FROM settings WHERE key='briefing_state'"
-                )
-                if row and row["value"]:
-                    prior = (
-                        json.loads(row["value"])
-                        if isinstance(row["value"], str)
-                        else row["value"]
-                    )
+                value = await get_setting(self.db_pool, "briefing_state")
+                if value:
+                    prior = json.loads(value) if isinstance(value, str) else value
             except Exception as exc:
                 activity.logger.warning("briefing_state_read_failed err=%s", error_text(exc))
 
@@ -513,10 +508,7 @@ class BriefingActivities:
         place: dict = {}
         if self.db_pool:
             try:
-                prow = await self.db_pool.fetchrow(
-                    "SELECT value FROM settings WHERE key='current_place'"
-                )
-                raw = prow["value"] if prow else None
+                raw = await get_setting(self.db_pool, "current_place")
                 current = json.loads(raw) if isinstance(raw, str) else raw
                 if not isinstance(current, dict):
                     current = {}
@@ -814,11 +806,7 @@ class BriefingActivities:
         """Persist the new briefing snapshot (cursor + counts + seen ids)."""
         if not self.db_pool:
             return
-        await self.db_pool.execute(
-            "INSERT INTO settings (key, value) VALUES ('briefing_state', $1) "
-            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
-            state,
-        )
+        await put_setting(self.db_pool, "briefing_state", state)
 
     @activity.defn
     async def ingest_briefing(self, briefing_text: str, date: str) -> bool:

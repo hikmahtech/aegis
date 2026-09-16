@@ -24,6 +24,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from aegis.services.config_rows import SettingsRow
+
 SETTINGS_KEY = "content_routes"
 MATCH_MODES = ("prefix", "contains", "regex")
 
@@ -133,15 +135,25 @@ def active_patterns(routes: list[dict]) -> list[str]:
     return pats
 
 
+def merge(value: Any) -> list[dict]:
+    """The lenient READ: the stored routes, or empty on anything malformed.
+
+    Same normalisation as the write — one rule cannot mean two things — but a
+    bad list drops out of classification rather than raising, because a typo in
+    one route must never stop the Inbox being clarified."""
+    try:
+        return validate_routes(value if isinstance(value, list) else [])
+    except ValueError:
+        return []
+
+
+ROW = SettingsRow(SETTINGS_KEY, merge, validate_routes)
+
+
 async def get_content_routes(pool: Any) -> list[dict]:
     """Effective content routes (validated). Empty list when unset or on any read/parse
     error — a bad config must never break classification."""
-    try:
-        row = await pool.fetchrow("SELECT value FROM settings WHERE key = $1", SETTINGS_KEY)
-        raw = row["value"] if row and row["value"] else []
-        return validate_routes(raw)
-    except Exception:  # noqa: BLE001 — routing config is best-effort, never fatal
-        return []
+    return await ROW.get(pool)
 
 
 async def save_content_routes(pool: Any, routes: Any) -> list[dict]:
@@ -159,10 +171,4 @@ async def save_content_routes(pool: Any, routes: Any) -> list[dict]:
             await pool.fetchval("SELECT ''::text ~ $1", pat)
         except asyncpg.PostgresError as exc:
             raise ValueError(f"route {r['key']!r}: pattern rejected by database: {exc}") from exc
-    await pool.execute(
-        "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW()) "
-        "ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()",
-        SETTINGS_KEY,
-        validated,
-    )
-    return validated
+    return await ROW.save(pool, validated)

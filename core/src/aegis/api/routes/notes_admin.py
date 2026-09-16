@@ -20,6 +20,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from aegis.api.auth import verify_auth
+from aegis.api.settings_routes import settings_row_routes
 from aegis.services import notes
 from aegis.services import vault_layout as vl
 
@@ -30,27 +31,24 @@ router = APIRouter(
 )
 
 
-@router.get("/layout")
-async def get_layout_route(request: Request) -> dict[str, Any]:
-    """The effective layout (stored row merged over the defaults), the
-    defaults themselves and the vocabularies the page's selects need."""
-    return {
-        "layout": await vl.get_layout_value(request.app.state.db_pool),
+settings_row_routes(
+    router,
+    "/layout",
+    get=vl.get_layout_value,
+    save=vl.save_layout,
+    view=lambda _pool, layout: {
+        "layout": layout,
         "defaults": vl.merge({}),
         "options": _options(),
-    }
-
-
-@router.put("/layout")
-async def put_layout_route(request: Request, body: dict[str, Any]) -> dict[str, Any]:
-    """Replace the layout. 400 (not a silent drop) on any bad key. The layout
-    in force before a change is kept as `previous`, so a day written under it
-    is still recognised and never written twice."""
-    try:
-        layout = await vl.save_layout(request.app.state.db_pool, body)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"layout": layout, "defaults": vl.merge({}), "options": _options()}
+    },
+    doc=(
+        "The effective vault layout (the stored row merged over the defaults), the defaults "
+        "themselves and the vocabularies the page's selects need. The PUT replaces the layout "
+        "and answers 400 — not a silent drop — on any bad key; the layout in force before a "
+        "change is kept as `previous`, so a day written under it is still recognised and never "
+        "written twice."
+    ),
+)
 
 
 @router.get("/layout/preview")

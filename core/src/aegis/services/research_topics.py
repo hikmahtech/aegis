@@ -54,6 +54,7 @@ from aegis.services.hub import (
     set_status,
     slug,
 )
+from aegis.services.settings_store import get_setting, put_setting
 
 logger = structlog.get_logger()
 
@@ -191,9 +192,7 @@ def validate_registry(value: Any) -> list[dict[str, Any]]:
 
 
 async def load_topics(pool: asyncpg.Pool) -> list[Topic]:
-    return parse_topics(
-        await pool.fetchval("SELECT value FROM settings WHERE key = $1", TOPICS_SETTING)
-    )
+    return parse_topics(await get_setting(pool, TOPICS_SETTING))
 
 
 def _pattern(topic: Topic) -> re.Pattern[str]:
@@ -299,16 +298,11 @@ async def ensure_round(
 
 
 async def _save_registry(db: Any, topics: list[dict[str, Any]]) -> None:
-    await db.execute(
-        "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW()) "
-        "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
-        TOPICS_SETTING,
-        {"topics": topics},
-    )
+    await put_setting(db, TOPICS_SETTING, {"topics": topics})
 
 
 async def _raw_registry(db: Any) -> list[dict[str, Any]]:
-    value = await db.fetchval("SELECT value FROM settings WHERE key = $1", TOPICS_SETTING)
+    value = await get_setting(db, TOPICS_SETTING)
     if isinstance(value, dict) and isinstance(value.get("topics"), list):
         return [t for t in value["topics"] if isinstance(t, dict)]
     return []

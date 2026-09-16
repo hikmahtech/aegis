@@ -19,6 +19,8 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from aegis.services.settings_store import get_setting
+
 # Matches the "*_failed" / "error" / "permanent_error" convention flows use in
 # result_summary->>'status' when they finish WITHOUT raising (workflow_runs.
 # status stays 'completed') but the real outcome was a failure — the audit's
@@ -75,10 +77,7 @@ async def get_status_digest(pool: Any, hours: int = 24) -> dict[str, Any]:
         "SELECT COUNT(*) FROM interactions WHERE status = 'pending'"
     )
 
-    heartbeat_row = await pool.fetchrow(
-        "SELECT value FROM settings WHERE key = 'infra_heartbeat_state'"
-    )
-    heartbeat = heartbeat_row["value"] if heartbeat_row and heartbeat_row["value"] else {}
+    heartbeat = await get_setting(pool, "infra_heartbeat_state")
     if not isinstance(heartbeat, dict):
         heartbeat = {}
 

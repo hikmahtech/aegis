@@ -1,42 +1,9 @@
 import { useEffect, useState } from 'react';
-import { api } from '../api/client';
 import ErrorBanner from '../components/ErrorBanner';
 import ChartPanel from '../components/ChartPanel';
 import MoneyAccounting from '../components/MoneyAccounting';
 import { fmtMoney } from '../lib/money';
-
-type MoneyEvent = {
-  message_id: string;
-  mailbox: string;
-  entity: string;
-  kind: string;
-  direction: string | null;
-  amount: string | null;
-  currency: string | null;
-  payee: string | null;
-  account: string | null;
-  channel: string | null;
-  instrument: string | null;
-  occurred_on: string | null;
-  due_on: string | null;
-  parser: string | null;
-  confidence: number | null;
-  source_class: string | null;
-  journal_file: string | null;
-  linked_message_id: string | null;
-  todoist_ref: string | null;
-};
-
-type MoneyState = {
-  events: MoneyEvent[];
-  unknown_count: number;
-  dues_open: number;
-  unpushed_commits: number;
-  books_configured: boolean;
-  home_currency?: string;
-};
-
-type Digest = { path: string; markdown: string };
+import { moneyApi, type MoneyDigest, type MoneyState } from '../lib/moneyApi';
 
 const KIND_BADGE: Record<string, string> = {
   transaction: 'success',
@@ -52,7 +19,7 @@ function todoistHref(ref: string): string | null {
 
 export default function Money() {
   const [data, setData] = useState<MoneyState | null>(null);
-  const [digest, setDigest] = useState<Digest | null>(null);
+  const [digest, setDigest] = useState<MoneyDigest | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<Error | null>(null);
   const [running, setRunning] = useState<string | null>(null);
@@ -62,8 +29,8 @@ export default function Money() {
     setError(null);
     try {
       const [state, digestResp] = await Promise.all([
-        api.moneyState(),
-        api.moneyDigest(),
+        moneyApi.state(),
+        moneyApi.digest(),
       ]);
       setData(state);
       setDigest(digestResp?.digest ?? null);
@@ -77,7 +44,7 @@ export default function Money() {
   async function recheck(flow: string) {
     setRunning(flow);
     try {
-      await api.moneyRunFlow(flow);
+      await moneyApi.runFlow(flow);
       await load();
     } catch (e: any) {
       setError(e);

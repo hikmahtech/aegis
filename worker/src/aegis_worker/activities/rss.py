@@ -26,6 +26,7 @@ from typing import Any
 import httpx
 import structlog
 from aegis.services import feeds, feeds_config
+from aegis.services.settings_store import get_setting
 from aegis.services.url_guard import UnsafeURLError, guarded_hooks
 from aegis.services.user_agent import bot_user_agent
 from temporalio import activity
@@ -255,9 +256,7 @@ class RssActivities:
         for r in rows:
             topics = _decode_config(r["config"]).get("topics") or []
             terms += [t for t in topics if isinstance(t, str)] if isinstance(topics, list) else []
-        value = await self.db_pool.fetchval(
-            "SELECT value FROM settings WHERE key = $1", TRACKED_TOPICS_SETTING
-        )
+        value = await get_setting(self.db_pool, TRACKED_TOPICS_SETTING)
         terms += tracked_search_terms(value)
         seen: set[str] = set()
         out: list[str] = []

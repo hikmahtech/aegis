@@ -66,6 +66,7 @@ from aegis.services.hub import (
     set_status,
     verify_seconds_for,
 )
+from aegis.services.settings_store import get_setting
 from aegis.services.todoist_config import resolve_todoist_api_key
 from aegis.services.tools.gtd import _capture_to_inbox_impl
 
@@ -447,9 +448,7 @@ async def _books_project(pool: asyncpg.Pool, entity: str) -> str | None:
     row first, then the env, then None — the Inbox. Never raises."""
     raw = ""
     try:
-        stored = await pool.fetchval(
-            "SELECT value FROM settings WHERE key = $1", _BOOKS_PROJECTS_SETTING
-        )
+        stored = await get_setting(pool, _BOOKS_PROJECTS_SETTING)
         if isinstance(stored, dict):
             raw = str(stored.get("val") or "")
     except Exception as exc:  # noqa: BLE001 — a project lookup must never block a task

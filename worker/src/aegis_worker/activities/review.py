@@ -18,6 +18,7 @@ from typing import Any
 import asyncpg
 from aegis.errors import error_text
 from aegis.llm import parse_llm_json
+from aegis.services.settings_store import get_setting
 from temporalio import activity
 
 # review-copilot thresholds; override live via settings key 'review_config'.
@@ -132,9 +133,7 @@ class ReviewActivities:
         if self.db_pool is None:
             return empty
         async with self.db_pool.acquire() as conn:
-            managed = await conn.fetchval(
-                "SELECT value FROM settings WHERE key='todoist_managed_project_ids'"
-            )
+            managed = await get_setting(conn, "todoist_managed_project_ids")
             if not isinstance(managed, dict):
                 return empty
             inbox_id = managed.get("inbox")
@@ -250,9 +249,7 @@ class ReviewActivities:
         if self.db_pool is None:
             return empty
         async with self.db_pool.acquire() as conn:
-            managed = await conn.fetchval(
-                "SELECT value FROM settings WHERE key='todoist_managed_project_ids'"
-            )
+            managed = await get_setting(conn, "todoist_managed_project_ids")
             if not isinstance(managed, dict):
                 return empty
             inbox_id = managed.get("inbox")
@@ -395,16 +392,12 @@ class ReviewActivities:
         if self.db_pool is None:
             return base
         async with self.db_pool.acquire() as conn:
-            cfg_raw = await conn.fetchval(
-                "SELECT value FROM settings WHERE key='review_config'"
-            )
+            cfg_raw = await get_setting(conn, "review_config")
             cfg = {**_REVIEW_DEFAULTS,
                    **(cfg_raw if isinstance(cfg_raw, dict) else {})}
             base["_top_n"] = int(cfg["top_n"])
             # Inbox id for the claimed-stale detector below (None-safe).
-            managed = await conn.fetchval(
-                "SELECT value FROM settings WHERE key='todoist_managed_project_ids'"
-            )
+            managed = await get_setting(conn, "todoist_managed_project_ids")
             inbox_id = managed.get("inbox") if isinstance(managed, dict) else None
 
             # Stalled: leaf work-stream project (has a parent AREA project;
@@ -736,9 +729,7 @@ class ReviewActivities:
         if self.db_pool is None:
             return []
         async with self.db_pool.acquire() as conn:
-            managed = await conn.fetchval(
-                "SELECT value FROM settings WHERE key='todoist_managed_project_ids'"
-            )
+            managed = await get_setting(conn, "todoist_managed_project_ids")
             # Someday is the @someday label now (Todoist restructure, 2026-07),
             # already covered by the _STATE_LABELS exclusion below — only
             # Inbox is still a managed-project id to exclude.
@@ -787,9 +778,7 @@ class ReviewActivities:
         if self.db_pool is None:
             return []
         async with self.db_pool.acquire() as conn:
-            cfg_raw = await conn.fetchval(
-                "SELECT value FROM settings WHERE key='review_config'"
-            )
+            cfg_raw = await get_setting(conn, "review_config")
             cfg = {**_REVIEW_DEFAULTS,
                    **(cfg_raw if isinstance(cfg_raw, dict) else {})}
             lead_days = int(cfg.get("key_dates_lead_days",

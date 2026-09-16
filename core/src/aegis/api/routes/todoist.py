@@ -15,10 +15,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from aegis.api.auth import verify_auth
 from aegis.api.deps import get_settings
+from aegis.api.settings_routes import settings_row_routes
 from aegis.api.sql_filters import build_where
 from aegis.config import Settings
 from aegis.errors import error_text
 from aegis.observability import log_audit
+from aegis.services import agent_task_verbs, content_routes, gtd_rules, project_repo_map
+from aegis.services.settings_store import get_setting
 
 router = APIRouter(
     prefix="/api/admin/todoist",
@@ -51,104 +54,78 @@ async def put_todoist_config(
     return await todoist_config_status(pool, settings)
 
 
-@router.get("/gtd-rules")
-async def get_gtd_rules_route(request: Request) -> dict[str, Any]:
-    """The GTD clarify taxonomy (source-tag → assignee / contexts / skip-inbox)."""
-    from aegis.services.gtd_rules import SOURCE_TAGS, get_gtd_rules
+settings_row_routes(
+    router,
+    "/gtd-rules",
+    get=gtd_rules.get_gtd_rules,
+    save=gtd_rules.save_gtd_rules,
+    view=lambda _pool, rules: {"source_tags": gtd_rules.SOURCE_TAGS, **rules},
+    doc=(
+        "The GTD clarify taxonomy: source tag → assignee / contexts / skip-inbox "
+        "(`services/gtd_rules.py`). The PUT replaces the three maps and returns them merged "
+        "over the defaults; 400 on a malformed map rather than a silent drop."
+    ),
+)
 
-    return {"source_tags": SOURCE_TAGS, **await get_gtd_rules(request.app.state.db_pool)}
+settings_row_routes(
+    router,
+    "/content-routes",
+    get=content_routes.get_content_routes,
+    save=content_routes.save_content_routes,
+    body=lambda body: body.get("routes") or [],
+    view=lambda _pool, routes: {
+        "match_modes": list(content_routes.MATCH_MODES),
+        "routes": routes,
+    },
+    doc=(
+        "Content-routing rules: regex/prefix/contains on the task title → assignee / contexts "
+        "/ gate. Complements gtd-rules, which routes by source_tag. The PUT replaces the "
+        "ordered list; 400 on a malformed rule or regex."
+    ),
+)
 
-
-@router.put("/gtd-rules")
-async def put_gtd_rules_route(request: Request, body: dict[str, Any]) -> dict[str, Any]:
-    """Save the GTD taxonomy (assignee/contexts/skip_inbox maps); returns merged."""
-    from aegis.services.gtd_rules import SOURCE_TAGS, save_gtd_rules
-
-    return {"source_tags": SOURCE_TAGS, **await save_gtd_rules(request.app.state.db_pool, body)}
-
-
-@router.get("/content-routes")
-async def get_content_routes_route(request: Request) -> dict[str, Any]:
-    """Content-routing rules: regex/prefix/contains on the task title → assignee /
-    contexts / gate. Complements gtd-rules (which routes by source_tag)."""
-    from aegis.services.content_routes import MATCH_MODES, get_content_routes
-
-    routes = await get_content_routes(request.app.state.db_pool)
-    return {"match_modes": list(MATCH_MODES), "routes": routes}
-
-
-@router.put("/content-routes")
-async def put_content_routes_route(request: Request, body: dict[str, Any]) -> dict[str, Any]:
-    """Replace the ordered content-routing rules. 400 on a malformed rule/regex."""
-    from aegis.services.content_routes import MATCH_MODES, save_content_routes
-
-    try:
-        routes = await save_content_routes(request.app.state.db_pool, body.get("routes") or [])
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"match_modes": list(MATCH_MODES), "routes": routes}
-
-
-@router.get("/project-repo-map")
-async def get_project_repo_map_route(request: Request) -> dict[str, Any]:
-    """Todoist project name → GitHub repo, the coding lane's tier-1 resolver.
-
-    Ships empty; each deployment maps its own projects (issue #345)."""
-    from aegis.services.project_repo_map import get_project_repo_map
-
-    return {"project_repo_map": await get_project_repo_map(request.app.state.db_pool)}
-
-
-@router.put("/project-repo-map")
-async def put_project_repo_map_route(request: Request, body: dict[str, Any]) -> dict[str, Any]:
-    """Replace the project→repo mapping. 400 on a bad project name or repo."""
-    from aegis.services.project_repo_map import save_project_repo_map
-
-    try:
-        mapping = await save_project_repo_map(
-            request.app.state.db_pool, body.get("project_repo_map") or {}
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    await log_audit(
+settings_row_routes(
+    router,
+    "/project-repo-map",
+    get=project_repo_map.get_project_repo_map,
+    save=project_repo_map.save_project_repo_map,
+    body=lambda body: body.get("project_repo_map") or {},
+    view=lambda _pool, mapping: {"project_repo_map": mapping},
+    audit=lambda request, mapping: log_audit(
         request.app.state.db_pool,
         actor="admin",
         action="project_repo_map_saved",
         target_type="settings",
         target_id="project_repo_map",
         details={"project_repo_map": mapping},
-    )
-    return {"project_repo_map": mapping}
+    ),
+    doc=(
+        "Todoist project name → GitHub repo, the coding lane's tier-1 resolver. Ships empty; "
+        "each deployment maps its own projects (issue #345). 400 on a bad project name or repo."
+    ),
+)
 
-
-@router.get("/agent-task-verbs")
-async def get_agent_task_verbs_route(request: Request) -> dict[str, Any]:
-    """Source tag → the agent-task lane's verb (`services/agent_task_verbs.py`):
-    your overrides, the effective table, the defaults under it and the verbs."""
-    from aegis.services.agent_task_verbs import get_agent_task_verbs
-
-    return await get_agent_task_verbs(request.app.state.db_pool)
-
-
-@router.put("/agent-task-verbs")
-async def put_agent_task_verbs_route(request: Request, body: dict[str, Any]) -> dict[str, Any]:
-    """Replace the overrides. 400 on a bad tag or an unknown verb; `null` leaves
-    a tag's tasks to you; `{}` returns every tag to its default."""
-    from aegis.services.agent_task_verbs import save_agent_task_verbs
-
-    try:
-        out = await save_agent_task_verbs(request.app.state.db_pool, body.get("overrides", body))
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    await log_audit(
+settings_row_routes(
+    router,
+    "/agent-task-verbs",
+    get=agent_task_verbs.get_agent_task_verbs,
+    save=agent_task_verbs.save_agent_task_verbs,
+    body=lambda body: body.get("overrides", body),
+    audit=lambda request, out: log_audit(
         request.app.state.db_pool,
         actor="admin",
         action="agent_task_verbs_saved",
         target_type="settings",
         target_id="agent_task_verbs",
         details={"overrides": out["overrides"]},
-    )
-    return out
+    ),
+    doc=(
+        "Source tag → the agent-task lane's verb (`services/agent_task_verbs.py`): your "
+        "overrides, the effective table, the defaults under it and the verbs. The PUT replaces "
+        "the overrides — 400 on a bad tag or an unknown verb; `null` leaves a tag's tasks to "
+        "you; `{}` returns every tag to its default."
+    ),
+)
 
 
 @router.post("/content-routes/preview")
@@ -261,9 +238,7 @@ async def todoist_state(request: Request) -> dict:
             "FROM todoist_outbox WHERE status='failed' "
             "ORDER BY created_at DESC LIMIT 50"
         )
-        managed = await conn.fetchval(
-            "SELECT value FROM settings WHERE key='todoist_managed_project_ids'"
-        )
+        managed = await get_setting(conn, "todoist_managed_project_ids")
         open_tasks = await conn.fetchval(
             "SELECT count(*) FROM todoist_tasks WHERE NOT is_completed"
         )

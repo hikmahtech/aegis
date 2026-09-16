@@ -1,7 +1,10 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo, useState } from 'react';
 import { api } from '../api/client';
+import { useConfigRow } from '../lib/useConfigRow';
 import ErrorBanner from '../components/ErrorBanner';
 import MeetingNamesPanel from '../components/MeetingNamesPanel';
+import EmailTaskLinksPanel from '../components/EmailTaskLinksPanel';
+import DataTable from '../components/DataTable';
 
 // Email triage rules — the user-owned half of Gmail classification.
 //
@@ -39,45 +42,34 @@ export default function EmailTriage() {
   const [overrides, setOverrides] = useState<Rule[]>([]);
   const [markers, setMarkers] = useState<string[]>([]);
   const [senders, setSenders] = useState<Sender[]>([]);
-  const [error, setError] = useState<Error | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
 
-  async function load() {
-    setError(null); setLoading(true);
-    try {
-      const r = await api.getEmailTriageRules();
-      setCategories(r.categories || []);
-      setOverrides(toRules(r.sender_overrides));
-      setMarkers(r.extra_notification_markers || []);
-      setSenders(r.known_senders || []);
-    } catch (e: any) { setError(e); }
-    finally { setLoading(false); }
-  }
-  useEffect(() => { void load(); }, []);
+  const { error, setError, loading, saving, save: saveRow } = useConfigRow(async () => {
+    const r = await api.getEmailTriageRules();
+    setCategories(r.categories || []);
+    setOverrides(toRules(r.sender_overrides));
+    setMarkers(r.extra_notification_markers || []);
+    setSenders(r.known_senders || []);
+  });
 
-  async function save() {
-    setError(null); setSaving(true); setSaved(false);
-    try {
-      const sender_overrides: Record<string, { category: string; tags: string[] }> = {};
-      for (const [addr, cat, tags] of overrides) {
-        if (addr.trim()) sender_overrides[addr.trim().toLowerCase()] = {
-          category: cat,
-          tags: tags.split(',').map(t => t.trim().toLowerCase()).filter(Boolean),
-        };
-      }
-      const r = await api.saveEmailTriageRules({
-        sender_overrides,
-        extra_notification_markers: markers.map(m => m.trim()).filter(Boolean),
-      });
-      setOverrides(toRules(r.sender_overrides));
-      setMarkers(r.extra_notification_markers || []);
-      setSenders(r.known_senders || []);
-      setSaved(true);
-    } catch (e: any) { setError(e); }
-    finally { setSaving(false); }
-  }
+  const save = () => saveRow(async () => {
+    setSaved(false);
+    const sender_overrides: Record<string, { category: string; tags: string[] }> = {};
+    for (const [addr, cat, tags] of overrides) {
+      if (addr.trim()) sender_overrides[addr.trim().toLowerCase()] = {
+        category: cat,
+        tags: tags.split(',').map(t => t.trim().toLowerCase()).filter(Boolean),
+      };
+    }
+    const r = await api.saveEmailTriageRules({
+      sender_overrides,
+      extra_notification_markers: markers.map(m => m.trim()).filter(Boolean),
+    });
+    setOverrides(toRules(r.sender_overrides));
+    setMarkers(r.extra_notification_markers || []);
+    setSenders(r.known_senders || []);
+    setSaved(true);
+  });
 
   const ruled = useMemo(
     () => new Set(overrides.map(([a]) => a.trim().toLowerCase())),
@@ -107,29 +99,25 @@ export default function EmailTriage() {
             is the <strong>only</strong> thing that changes them. Click one to add a rule.
           </p>
           <div className="table-scroll">
-            <table className="data-table">
-              <thead>
-                <tr><th>Sender</th><th style={{ width: 150 }}>Cached as</th>
-                  <th style={{ width: 60 }}>n</th><th style={{ width: 80 }}>conf</th>
-                  <th style={{ width: 90 }} /></tr>
-              </thead>
-              <tbody>
-                {stuck.slice(0, 20).map(s => (
-                  <tr key={s.email_addr}>
-                    <td><code>{s.email_addr}</code></td>
-                    <td>{s.state}</td>
-                    <td>{s.n}</td>
-                    <td>{s.confidence}</td>
-                    <td>
-                      <button
-                        className="btn btn-sm"
-                        onClick={() => setOverrides(o => [...o, [s.email_addr, 'informational', '']])}
-                      >+ Rule</button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+            <DataTable
+              rows={stuck.slice(0, 20)}
+              rowKey={s => s.email_addr}
+              columns={[
+                { header: 'Sender', cell: s => <code>{s.email_addr}</code> },
+                { header: 'Cached as', th: { style: { width: 150 } }, cell: s => s.state },
+                { header: 'n', th: { style: { width: 60 } }, cell: s => s.n },
+                { header: 'conf', th: { style: { width: 80 } }, cell: s => s.confidence },
+                {
+                  th: { style: { width: 90 } },
+                  cell: s => (
+                    <button
+                      className="btn btn-sm"
+                      onClick={() => setOverrides(o => [...o, [s.email_addr, 'informational', '']])}
+                    >+ Rule</button>
+                  ),
+                },
+              ]}
+            />
           </div>
         </div>
       )}
@@ -235,6 +223,8 @@ export default function EmailTriage() {
       </div>
 
       <MeetingNamesPanel />
+
+      <EmailTaskLinksPanel />
     </div>
   );
 }

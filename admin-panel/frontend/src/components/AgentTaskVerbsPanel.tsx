@@ -1,8 +1,8 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { api } from '../api/client';
 import { DEFAULT, NONE, describe, toOverrides, toRows, type VerbRow } from '../lib/agentTaskVerbs';
+import { useConfigRow } from '../lib/useConfigRow';
 import ErrorBanner from './ErrorBanner';
-import { toast } from './Toast';
 
 // Source tag → the agent-task lane's verb (`agent_task_verbs`, #344/#558).
 // When a task is assigned to an agent, the lane works it by the verb its
@@ -12,25 +12,19 @@ import { toast } from './Toast';
 export default function AgentTaskVerbsPanel() {
   const [cfg, setCfg] = useState<Awaited<ReturnType<typeof api.getAgentTaskVerbs>> | null>(null);
   const [rows, setRows] = useState<VerbRow[]>([]);
-  const [error, setError] = useState<Error | null>(null);
-  const [saving, setSaving] = useState(false);
 
   function apply(r: NonNullable<typeof cfg>) {
     setCfg(r);
     setRows(toRows(r.defaults || {}, r.overrides || {}));
   }
 
-  useEffect(() => {
-    api.getAgentTaskVerbs().then(apply).catch((e: any) => setError(e));
-  }, []);
+  const { error, setError, saving, save } = useConfigRow(async () => {
+    apply(await api.getAgentTaskVerbs());
+  });
 
-  async function save() {
-    setSaving(true); setError(null);
-    try {
-      apply(await api.saveAgentTaskVerbs(toOverrides(rows)));
-      toast.ok('Agent task verbs saved. The next sweep uses them.');
-    } catch (e: any) { setError(e); } finally { setSaving(false); }
-  }
+  const onSave = () => save(async () => {
+    apply(await api.saveAgentTaskVerbs(toOverrides(rows)));
+  }, 'Agent task verbs saved. The next sweep uses them.');
 
   const defaults = cfg?.defaults || {};
   const label = (v: string | null | undefined) => (v === null ? 'left to you' : v ?? 'none');
@@ -87,7 +81,7 @@ export default function AgentTaskVerbsPanel() {
       <button className="btn" style={{ marginTop: 8 }} onClick={() => setRows(rs => [...rs, { tag: '', choice: 'ask' }])}>
         + Add tag
       </button>
-      <button className="btn btn-primary" style={{ marginTop: 8, marginLeft: 8 }} disabled={saving || !cfg} onClick={save}>
+      <button className="btn btn-primary" style={{ marginTop: 8, marginLeft: 8 }} disabled={saving || !cfg} onClick={onSave}>
         {saving ? 'Saving…' : 'Save verbs'}
       </button>
     </div>

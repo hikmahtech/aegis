@@ -19,6 +19,7 @@ import structlog
 
 from aegis.crypto import decrypt_secret, encrypt_secret
 from aegis.errors import error_text
+from aegis.services.settings_store import get_setting, put_setting
 
 logger = structlog.get_logger()
 
@@ -289,7 +290,7 @@ async def read_integration(pool: Any, settings: Any, key: str) -> str:
     without a restart, since the worker applies the overlay only at boot. Never raises."""
     spec = _BY_KEY[key]
     try:
-        stored = await pool.fetchval("SELECT value FROM settings WHERE key = $1", _skey(key))
+        stored = await get_setting(pool, _skey(key))
     except Exception as exc:  # noqa: BLE001 — a config read must never break a run
         logger.warning("integration_read_failed", key=key, error=error_text(exc))
         stored = None
@@ -376,9 +377,4 @@ async def save_integration(pool: Any, settings: Any, key: str, value: str) -> No
         stored = {"enc": encrypt_secret(value, settings.secret_key)}
     else:
         stored = {"val": value}
-    await pool.execute(
-        "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW()) "
-        "ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()",
-        _skey(key),
-        stored,
-    )
+    await put_setting(pool, _skey(key), stored)

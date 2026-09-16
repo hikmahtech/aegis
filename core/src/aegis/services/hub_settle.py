@@ -29,6 +29,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from aegis.services.config_rows import SettingsRow
 from aegis.services.hub import (
     _VERIFY_SECONDS,
     SETTLE_SETTINGS_KEY,
@@ -91,12 +92,14 @@ def validate(raw: Any) -> dict[str, int]:
     return out
 
 
+ROW = SettingsRow(SETTLE_SETTINGS_KEY, merge, validate)
+
+
 async def get_settle_seconds(pool: Any) -> dict[str, Any]:
     """What the admin page shows: the effective overrides plus the code
     defaults they sit on, so an operator can see what a blank field means."""
-    row = await pool.fetchrow("SELECT value FROM settings WHERE key = $1", SETTLE_SETTINGS_KEY)
     return {
-        "overrides": merge(row["value"] if row else None),
+        "overrides": await ROW.get(pool),
         "defaults": dict(sorted(DEFAULTS.items())),
         "default_seconds": VERIFY_SECONDS_DEFAULT,
         "max_seconds": MAX_SECONDS,
@@ -109,15 +112,10 @@ async def save_settle_seconds(pool: Any, raw: Any) -> dict[str, Any]:
     would now return."""
     stored = validate(raw)
     if stored:
-        await pool.execute(
-            "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW()) "
-            "ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()",
-            SETTLE_SETTINGS_KEY,
-            stored,
-        )
+        await ROW.save(pool, stored)
     else:
         # An empty object means "no overrides": delete the row rather than
         # storing `{}`, so the effective config is the code defaults and
         # nothing suggests an override that is not there.
-        await pool.execute("DELETE FROM settings WHERE key = $1", SETTLE_SETTINGS_KEY)
+        await ROW.delete(pool)
     return await get_settle_seconds(pool)

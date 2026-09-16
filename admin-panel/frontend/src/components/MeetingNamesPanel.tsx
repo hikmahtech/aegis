@@ -1,7 +1,7 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { api } from '../api/client';
+import { useConfigRow } from '../lib/useConfigRow';
 import ErrorBanner from './ErrorBanner';
-import { toast } from './Toast';
 
 // Who "you" are in a meeting transcript (`meeting_rules.self_names`, #558).
 // Empty means meeting notes are filed but the self-review is skipped, so this
@@ -9,23 +9,14 @@ import { toast } from './Toast';
 
 export default function MeetingNamesPanel() {
   const [names, setNames] = useState<string[]>([]);
-  const [error, setError] = useState<Error | null>(null);
-  const [saving, setSaving] = useState(false);
+  const { error, setError, saving, save } = useConfigRow(async () => {
+    setNames((await api.getMeetingRules()).self_names || []);
+  });
 
-  useEffect(() => {
-    api.getMeetingRules()
-      .then(r => setNames(r.self_names || []))
-      .catch((e: any) => setError(e));
-  }, []);
-
-  async function save() {
-    setSaving(true); setError(null);
-    try {
-      const r = await api.saveMeetingRules({ self_names: names.map(n => n.trim()).filter(Boolean) });
-      setNames(r.self_names || []);
-      toast.ok('Meeting names saved. The next meeting notes use them.');
-    } catch (e: any) { setError(e); } finally { setSaving(false); }
-  }
+  const onSave = () => save(async () => {
+    const r = await api.saveMeetingRules({ self_names: names.map(n => n.trim()).filter(Boolean) });
+    setNames(r.self_names || []);
+  }, 'Meeting names saved. The next meeting notes use them.');
 
   return (
     <div className="card" style={{ marginTop: 16 }}>
@@ -48,7 +39,7 @@ export default function MeetingNamesPanel() {
       <button className="btn" style={{ marginTop: 8 }} onClick={() => setNames(x => [...x, ''])}>
         + Add name
       </button>
-      <button className="btn btn-primary" style={{ marginTop: 8, marginLeft: 8 }} disabled={saving} onClick={save}>
+      <button className="btn btn-primary" style={{ marginTop: 8, marginLeft: 8 }} disabled={saving} onClick={onSave}>
         {saving ? 'Saving…' : 'Save names'}
       </button>
     </div>

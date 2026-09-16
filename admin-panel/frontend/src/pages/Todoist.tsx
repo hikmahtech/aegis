@@ -4,6 +4,7 @@ import AgentTaskVerbsPanel from '../components/AgentTaskVerbsPanel';
 import ErrorBanner from '../components/ErrorBanner';
 import ProjectRepoMapPanel from '../components/ProjectRepoMapPanel';
 import { toast } from '../components/Toast';
+import DataTable from '../components/DataTable';
 
 type TodoistState = {
   sync: { key: string; last_full_sync_at: string | null; last_incremental_at: string | null } | null;
@@ -777,31 +778,18 @@ export default function Todoist() {
           Failed outbox commands {failedCount > 0 && <span className="badge badge-error">lost writes</span>}
         </h2>
         <div className="table-scroll">
-          <table className="data-table">
-            <thead>
-              <tr>
-                <th>ID</th>
-                <th>Command</th>
-                <th>Attempts</th>
-                <th>Last attempt</th>
-                <th>Created</th>
-              </tr>
-            </thead>
-            <tbody>
-              {(data?.outbox?.failed_recent?.length ?? 0) === 0 && (
-                <tr><td colSpan={5} className="empty">No failed commands ✨</td></tr>
-              )}
-              {data?.outbox?.failed_recent?.map((r: any) => (
-                <tr key={r.id}>
-                  <td>{r.id}</td>
-                  <td><strong>{r.command_type}</strong></td>
-                  <td>{r.attempt_count}</td>
-                  <td>{r.last_attempt_at ? new Date(r.last_attempt_at).toLocaleString() : '—'}</td>
-                  <td>{r.created_at ? new Date(r.created_at).toLocaleString() : '—'}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+          <DataTable
+            rows={(data?.outbox?.failed_recent ?? []) as any[]}
+            rowKey={r => r.id}
+            emptyText="No failed commands ✨"
+            columns={[
+              { header: 'ID', cell: r => r.id },
+              { header: 'Command', cell: r => <strong>{r.command_type}</strong> },
+              { header: 'Attempts', cell: r => r.attempt_count },
+              { header: 'Last attempt', cell: r => (r.last_attempt_at ? new Date(r.last_attempt_at).toLocaleString() : '—') },
+              { header: 'Created', cell: r => (r.created_at ? new Date(r.created_at).toLocaleString() : '—') },
+            ]}
+          />
         </div>
       </section>
     </div>

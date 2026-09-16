@@ -1,11 +1,13 @@
 import { useEffect, useMemo, useState } from 'react';
 import { api } from '../api/client';
+import { useConfigRow } from '../lib/useConfigRow';
 import ErrorBanner from '../components/ErrorBanner';
 import { toast } from '../components/Toast';
 import {
   changedKeys, joinList, KINDS, splitList, toSaveBody,
   type Kind, type VaultLayout,
 } from '../lib/vaultLayout';
+import DataTable from '../components/DataTable';
 
 // The vault layout — where the journal notes go, what an entry looks like —
 // and the user's clock. AEGIS ships one vault's conventions as the defaults;
@@ -50,22 +52,14 @@ export default function Vault() {
   const [date, setDate] = useState(today());
   const [timezone, setTimezone] = useState('');
   const [effectiveTz, setEffectiveTz] = useState('UTC');
-  const [error, setError] = useState<Error | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
   const [showWording, setShowWording] = useState(false);
 
-  async function load() {
-    setError(null); setLoading(true);
-    try {
-      const r = await api.getVaultLayout();
-      setLayout(r.layout); setDefaults(r.defaults); setOptions(r.options || {});
-      const tz = await api.getTimezone();
-      setTimezone(tz.timezone || ''); setEffectiveTz(tz.effective || 'UTC');
-    } catch (e: any) { setError(e); }
-    finally { setLoading(false); }
-  }
-  useEffect(() => { void load(); }, []);
+  const { error, setError, loading, saving, save: saveRow } = useConfigRow(async () => {
+    const r = await api.getVaultLayout();
+    setLayout(r.layout); setDefaults(r.defaults); setOptions(r.options || {});
+    const tz = await api.getTimezone();
+    setTimezone(tz.timezone || ''); setEffectiveTz(tz.effective || 'UTC');
+  });
 
   // Live preview of the layout AS EDITED, debounced; a layout that does not
   // validate shows the server's reason instead of a stale preview.
@@ -82,16 +76,11 @@ export default function Vault() {
     return () => clearTimeout(handle);
   }, [layout, date]);
 
-  async function save() {
-    if (!layout) return;
-    setError(null); setSaving(true);
-    try {
-      const r = await api.saveVaultLayout(toSaveBody(layout));
-      setLayout(r.layout);
-      toast.ok('Vault layout saved — applies within ~30s. Existing notes stay where they are.');
-    } catch (e: any) { setError(e); }
-    finally { setSaving(false); }
-  }
+  // The guard stays outside `saveRow`: with no layout loaded there is nothing
+  // to write, and nothing to say was saved.
+  const save = () => layout && saveRow(async () => {
+    setLayout((await api.saveVaultLayout(toSaveBody(layout))).layout);
+  }, 'Vault layout saved — applies within ~30s. Existing notes stay where they are.');
 
   async function saveTz() {
     setError(null);
@@ -183,21 +172,24 @@ export default function Vault() {
             {previewError && <ErrorBanner error={previewError} />}
             {preview && !previewError && (
               <div className="table-scroll">
-                <table className="data-table">
-                  <thead>
-                    <tr><th style={{ width: 90 }}>Note</th><th>Filed at</th><th>Live note (appended to when it exists)</th><th>Section</th></tr>
-                  </thead>
-                  <tbody>
-                    {KINDS.map(k => (
-                      <tr key={k} style={{ opacity: preview[k].enabled ? 1 : 0.5 }}>
-                        <td>{k}{!preview[k].enabled && ' (off)'}</td>
-                        <td><code>{preview[k].path}</code></td>
-                        <td><code>{preview[k].live_path || '—'}</code></td>
-                        <td>{preview[k].sections.join(' / ')}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+                <DataTable
+                  rows={[...KINDS]}
+                  rowKey={k => k}
+                  tr={k => ({ style: { opacity: preview[k].enabled ? 1 : 0.5 } })}
+                  columns={[
+                    {
+                      header: 'Note',
+                      th: { style: { width: 90 } },
+                      cell: k => <>{k}{!preview[k].enabled && ' (off)'}</>,
+                    },
+                    { header: 'Filed at', cell: k => <code>{preview[k].path}</code> },
+                    {
+                      header: 'Live note (appended to when it exists)',
+                      cell: k => <code>{preview[k].live_path || '—'}</code>,
+                    },
+                    { header: 'Section', cell: k => preview[k].sections.join(' / ') },
+                  ]}
+                />
                 <pre style={{ marginTop: 8, fontSize: 12 }}>{preview.sample_block}</pre>
               </div>
             )}

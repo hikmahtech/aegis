@@ -89,7 +89,7 @@ async def _set_routing(db_pool, value: dict | None) -> None:
             iar.SETTINGS_KEY,
             value,
         )
-    iar._cache.update(value=None, ts=0.0)
+    iar.ROW.clear_cache()
 
 
 @pytest_asyncio.fixture(loop_scope="function")

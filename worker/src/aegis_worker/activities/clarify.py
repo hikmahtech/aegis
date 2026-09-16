@@ -82,6 +82,7 @@ from aegis.services.gtd_rules import (
 from aegis.services.hub_project import FEEDS_SOURCE_TAG, MONEY_SOURCE_TAG, RESEARCH_SOURCE_TAG
 from aegis.services.hub_project import SOURCE_TAG as HUB_SOURCE_TAG
 from aegis.services.knowledge import _content_id_for
+from aegis.services.settings_store import get_setting
 
 
 class _RuleSet:
@@ -769,7 +770,7 @@ class ClarifyActivities:
         if self.db_pool is None:
             return default
         async with self.db_pool.acquire() as conn:
-            raw = await conn.fetchval("SELECT value FROM settings WHERE key=$1", key)
+            raw = await get_setting(conn, key)
         if raw is None:
             return default
         if isinstance(raw, bool):
@@ -1130,7 +1131,7 @@ class ClarifyActivities:
         if self.db_pool is None:
             return default
         async with self.db_pool.acquire() as conn:
-            raw = await conn.fetchval("SELECT value FROM settings WHERE key=$1", key)
+            raw = await get_setting(conn, key)
         if isinstance(raw, str):
             return raw
         return default

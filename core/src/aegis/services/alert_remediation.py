@@ -28,6 +28,9 @@ from __future__ import annotations
 
 from typing import Any
 
+from aegis.services.config_rows import SettingsRow
+from aegis.services.settings_store import setting_exists
+
 SETTINGS_KEY = "alert_remediation"
 DEFAULT_REPEAT_WINDOW_MINUTES = 60
 # A day. A longer window means "a service that broke again tomorrow is not
@@ -75,26 +78,29 @@ def validate(raw: Any) -> dict[str, int]:
     return {"repeat_window_minutes": minutes}
 
 
+ROW = SettingsRow(SETTINGS_KEY, merge, validate)
+
+
 async def get_alert_remediation(pool: Any) -> dict[str, Any]:
     """What the admin page shows: the effective window, the default under it,
-    the cap, and whether a row is stored at all."""
-    row = await pool.fetchrow("SELECT value FROM settings WHERE key = $1", SETTINGS_KEY)
+    the cap, and whether a row is stored at all.
+
+    Read through :meth:`SettingsRow.raw` rather than ``get``, and asked twice:
+    ``stored`` is a fact about the ROW, which no merged value can carry — a row
+    holding exactly the default reads the same as no row. Neither call
+    swallows, so a database that is down answers 500 here rather than 200 with
+    the defaults and ``stored: false``, which would read as "nothing is
+    configured"."""
     return {
-        **merge(row["value"] if row else None),
+        **merge(await ROW.raw(pool)),
         "defaults": dict(DEFAULTS),
         "max_minutes": MAX_MINUTES,
-        "stored": row is not None,
+        "stored": await setting_exists(pool, SETTINGS_KEY),
     }
 
 
 async def save_alert_remediation(pool: Any, raw: Any) -> dict[str, Any]:
     """Replace the row (validated); returns what :func:`get_alert_remediation`
     would now return."""
-    stored = validate(raw)
-    await pool.execute(
-        "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW()) "
-        "ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()",
-        SETTINGS_KEY,
-        stored,
-    )
+    await ROW.save(pool, raw)
     return await get_alert_remediation(pool)

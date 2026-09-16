@@ -36,6 +36,7 @@ from typing import Any
 import structlog
 
 from aegis.errors import error_text
+from aegis.services.settings_store import get_setting, put_setting
 
 logger = structlog.get_logger()
 
@@ -828,8 +829,7 @@ def invalidate_cache() -> None:
 
 async def get_layout_value(pool: Any) -> dict:
     """The merged row as the admin API returns it (with `previous` when set)."""
-    row = await pool.fetchrow("SELECT value FROM settings WHERE key = $1", SETTINGS_KEY)
-    return merge(row["value"] if row and row["value"] else {})
+    return merge(await get_setting(pool, SETTINGS_KEY) or {})
 
 
 async def get_layout(pool: Any) -> Layout:
@@ -867,12 +867,7 @@ async def save_layout(pool: Any, value: Any) -> dict:
             normalised["previous"] = current["previous"]
     else:
         normalised["previous"] = {k: v for k, v in current.items() if k != "previous"}
-    await pool.execute(
-        "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW()) "
-        "ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()",
-        SETTINGS_KEY,
-        normalised,
-    )
+    await put_setting(pool, SETTINGS_KEY, normalised)
     invalidate_cache()
     return await get_layout_value(pool)
 

@@ -16,6 +16,7 @@ from typing import Any
 import httpx
 import structlog
 from aegis.errors import error_text
+from aegis.services.settings_store import get_setting, put_setting
 from temporalio import activity
 
 from aegis_worker.activities.delivery import safe_send_message
@@ -522,24 +523,16 @@ class HomelabActivities:
     async def read_heartbeat_state(self) -> dict:
         if not self.db_pool:
             return self._default_heartbeat_state()
-        row = await self.db_pool.fetchrow(
-            "SELECT value FROM settings WHERE key = $1", self._HEARTBEAT_STATE_KEY
-        )
-        if not row or not row["value"]:
+        value = await get_setting(self.db_pool, self._HEARTBEAT_STATE_KEY)
+        if not value:
             return self._default_heartbeat_state()
-        value = row["value"]
         return {**self._default_heartbeat_state(), **value} if isinstance(value, dict) else self._default_heartbeat_state()
 
     @activity.defn
     async def write_heartbeat_state(self, state: dict) -> None:
         if not self.db_pool:
             return
-        await self.db_pool.execute(
-            "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW()) "
-            "ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()",
-            self._HEARTBEAT_STATE_KEY,
-            state,
-        )
+        await put_setting(self.db_pool, self._HEARTBEAT_STATE_KEY, state)
 
     @activity.defn
     async def ping_deadman(self) -> dict:

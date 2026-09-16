@@ -585,6 +585,23 @@ def _load_model_tiers_for_tests() -> None:
 
 
 @pytest.fixture(autouse=True)
+def _clear_settings_row_caches():
+    """Every `SettingsRow` holds a 30s per-process cache of its merged value.
+
+    A test that writes a settings row straight to the database — rather than
+    through `save`, which clears its own row — would otherwise read whatever
+    the previous test in the same process left cached. That is an
+    order-dependent flake, and `--dist loadfile` changes the order whenever a
+    file is added, so clear the lot around every test instead of remembering to
+    do it per file."""
+    from aegis.services.config_rows import clear_all_caches
+
+    clear_all_caches()
+    yield
+    clear_all_caches()
+
+
+@pytest.fixture(autouse=True)
 def _isolate_model_tiers():
     """aegis#250: `set_model_tiers` installs a process-global map, so a test that
     installs a real backend map (e.g. a worker test exercising llm_backend) leaks

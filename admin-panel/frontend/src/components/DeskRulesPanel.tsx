@@ -17,25 +17,13 @@
  */
 
 import { useEffect, useState } from 'react';
+import { BOX, Field } from '../lib/formFields';
 import { moneyApi, type DeskRuleValues, type DeskRules } from '../lib/moneyApi';
 
 const MONTHS = [
   'January', 'February', 'March', 'April', 'May', 'June',
   'July', 'August', 'September', 'October', 'November', 'December',
 ];
-
-/** One labelled field, with the sentence that says what it is for. */
-function Field({ label, hint, children }: { label: string; hint: string; children: React.ReactNode }) {
-  return (
-    <label style={{ display: 'block', marginBottom: 14 }}>
-      <span style={{ display: 'block', fontWeight: 600, marginBottom: 2 }}>{label}</span>
-      <span className="meta" style={{ display: 'block', marginBottom: 4 }}>{hint}</span>
-      {children}
-    </label>
-  );
-}
-
-const BOX: React.CSSProperties = { width: '100%', maxWidth: 320 };
 
 export default function DeskRulesPanel({ onSaved }: { onSaved?: () => void }) {
   const [rules, setRules] = useState<DeskRules | null>(null);

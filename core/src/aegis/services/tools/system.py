@@ -21,6 +21,7 @@ from aegis.agent_tags import GENERALIST_TAG
 from aegis.errors import error_text
 from aegis.observability import log_audit
 from aegis.services.agents import resolve_tag
+from aegis.services.settings_store import get_setting, put_setting
 from aegis.services.tools.base import ToolContext
 from aegis.services.tools.registry import aegis_tool
 
@@ -241,14 +242,14 @@ async def _exec_configure_triage(
         return json.dumps({"error": f"Unknown setting: {setting}"})
 
     db_key = _TRIAGE_SETTING_KEYS[setting]
-    row = await pool.fetchrow("SELECT value FROM settings WHERE key = $1", db_key)
+    stored = await get_setting(pool, db_key)
 
     if action == "get":
-        current = row["value"] if row else ([] if setting in _TRIAGE_LIST_SETTINGS else None)
+        current = stored if stored is not None else ([] if setting in _TRIAGE_LIST_SETTINGS else None)
         return json.dumps({"setting": setting, "current": current})
 
     if setting in _TRIAGE_LIST_SETTINGS:
-        current = (row["value"] if row else None) or []
+        current = stored or []
         if not isinstance(current, list):
             current = []
         if action == "add":
@@ -271,12 +272,7 @@ async def _exec_configure_triage(
             return json.dumps({"error": "value required for set"})
         new_val = value
 
-    await pool.execute(
-        "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW()) "
-        "ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()",
-        db_key,
-        new_val,
-    )
+    await put_setting(pool, db_key, new_val)
     return json.dumps({"ok": True, "setting": setting, "action": action, "current": new_val})
 
 

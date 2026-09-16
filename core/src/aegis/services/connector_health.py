@@ -36,6 +36,7 @@ import structlog
 
 from aegis.errors import error_text
 from aegis.services.hub_watch import reconcile_findings
+from aegis.services.settings_store import get_setting, put_setting
 
 logger = structlog.get_logger()
 
@@ -81,8 +82,8 @@ async def _record(
     pool: Any, settings: Any, connector: str, *, ok: bool, error: str, threshold: int
 ) -> None:
     key = _KEY_PREFIX + connector
-    row = await pool.fetchrow("SELECT value FROM settings WHERE key = $1", key)
-    state = dict(row["value"]) if row else {}
+    value = await get_setting(pool, key)
+    state = dict(value) if value is not None else {}
     failures = int(state.get("consecutive_failures") or 0)
     alerted = bool(state.get("alerted"))
 
@@ -115,12 +116,7 @@ async def _record(
                 f"fetch(es) and needs attention.\nLast error: {error[:300]}",
             )
 
-    await pool.execute(
-        "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW()) "
-        "ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()",
-        key,
-        state,
-    )
+    await put_setting(pool, key, state)
     # Its own guard: a hub failure must not be reported as a failure to record.
     try:
         await _reconcile(pool)

@@ -10,6 +10,7 @@ from aegis.llm import parse_llm_json
 from aegis.services.content_extract import fetch_and_extract
 from aegis.services.knowledge import _content_id_for
 from aegis.services.research_topics import TOPICS_SETTING, parse_topics
+from aegis.services.settings_store import get_setting
 from temporalio import activity
 
 from aegis_worker.activities.content import _MIN_CONTENT_LENGTH, detect_content_type
@@ -154,9 +155,7 @@ class IntelligenceActivities:
         """
         if not self.db_pool:
             return []
-        value = await self.db_pool.fetchval(
-            "SELECT value FROM settings WHERE key = $1", TRACKED_TOPICS_SETTING
-        )
+        value = await get_setting(self.db_pool, TRACKED_TOPICS_SETTING)
         return tracked_topic_names(value)
 
     @activity.defn
