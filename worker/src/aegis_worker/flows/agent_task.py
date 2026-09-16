@@ -508,6 +508,7 @@ class AgentTaskFlow:
                 # The other verbs read input.task directly; keep the two views
                 # of the task identical rather than threading a second one.
                 input.task = task
+
             step = "load_task_context"
             context = await workflow.execute_activity(
                 "load_task_context",
