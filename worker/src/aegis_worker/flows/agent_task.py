@@ -89,6 +89,15 @@ _TURN_OUTPUT_TAIL = 6000
 # a run that never concluded, not an answer.
 _TURN_TIMEOUT_TAIL = 3000
 
+# Retired `workflow.patched` ids. The old branches are gone; the markers
+# stay one release longer as `workflow.deprecate_patch`, because a run that
+# RECORDED one is wedged by a worker whose code no longer mentions it at all
+# ("[TMPRL1100] Non-deprecated patch marker encountered"). Drop the calls and
+# these ids in the release after next — see #614.
+# One call covers both of #344's old sites: the SDK records a marker once per
+# id per run, and the first site is on every path that reached the second.
+_PATCH_344 = "agent-task-344-verbs-by-kind"
+
 
 def _cut(text: str, cap: int = _FIELD_CAP) -> str:
     """`text`, cut to `cap` characters with a visible mark when it was cut."""
@@ -516,6 +525,8 @@ class AgentTaskFlow:
                 start_to_close_timeout=TIMEOUT_FAST,
                 retry_policy=ACT_RETRY,
             )
+            # deprecate_patch: remove after the next release, see #614
+            workflow.deprecate_patch(_PATCH_344)
             # The activity resolved it against the `agent_task_verbs` setting,
             # which this workflow cannot read.
             verb = str((context or {}).get("verb") or "unknown")

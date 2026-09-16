@@ -259,6 +259,8 @@ class InfraHeartbeatFlow:
         # existed.
         ingress_failing = bool(prior.get("ingress_failing"))
         ingress_fails = int(prior.get("ingress_fails") or 0)
+        # deprecate_patch: remove after the next release, see #614
+        workflow.deprecate_patch("ingress-canary")
         if config.ingress_url:
             try:
                 probe = await workflow.execute_activity_method(

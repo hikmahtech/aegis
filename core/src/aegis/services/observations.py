@@ -42,9 +42,6 @@ _SELECT_COLS = (
     "id, source, metric, value::float8 AS value, observed_at, metadata, created_at"
 )
 
-# Upper bound on rows returned by a single trend query — a year of one-minute
-# sensor readings is half a million rows and no caller wants them all.
-
 
 def normalize_key(value: Any) -> str:
     """Strip + lowercase a metric or source name. '' for None/blank."""

@@ -87,6 +87,20 @@ with workflow.unsafe.imports_passed_through():
 # default seeds that resolves to `pandoras-actor`, so behavior is unchanged.
 _MAX_HINT_ROUNDS = 3
 
+# Retired `workflow.patched` ids. The old branches are gone; the markers stay
+# one release longer as `workflow.deprecate_patch`, because a run that RECORDED
+# one is wedged by a worker whose code no longer mentions it at all
+# ("[TMPRL1100] Non-deprecated patch marker encountered"). A run here can wait
+# 48h on its Gate-2 card, so some always are. Drop the calls and these ids in
+# the release after next — see #614.
+#
+# #500: no Gate-2 card for a verdict with nothing to decide.
+_PATCH_NO_CARD = "gate2-only-for-decisions"
+# #501: look the problem up before an automatic restart; record every attempt.
+_PATCH_RESTART_ONCE = "auto-restart-once-per-window"
+# #502: the verdict goes to the knowledge store once the operator has decided.
+_PATCH_KG_AFTER_DECISION = "kg-verdict-after-decision"
+
 
 def _safe_workflow_id_segment(text: str, max_len: int = 60) -> str:
     """Replace characters illegal in Temporal workflow IDs with dashes."""
@@ -620,6 +634,8 @@ class AlertInvestigationFlow:
         # cluster in the operator's own words (#505) and the effective infra
         # list from the `infra_alert_routing` settings row (#498) come off the
         # same result; a missing key is "" or None, which matches no name.
+        # deprecate_patch: remove after the next release, see #614
+        workflow.deprecate_patch("infra-cluster-from-settings")
         routing = await workflow.execute_activity_method(
             AlertActivities.get_alert_routing_config,
             start_to_close_timeout=TIMEOUT_FAST,
@@ -628,6 +644,8 @@ class AlertInvestigationFlow:
         infra_cluster = routing.get("infra_cluster") or ""
         owner_mention = routing.get("slack_owner_member_id") or ""
         platform_hint = str(routing.get("platform_hint") or "").strip()
+        # deprecate_patch: remove after the next release, see #614
+        workflow.deprecate_patch("infra-alertnames-from-settings")
         infra_alertnames: list[str] | None = routing.get("infra_alertnames")
 
         # ── Step 3: Verification delay ──
@@ -706,6 +724,8 @@ class AlertInvestigationFlow:
             #
             # The `item-` clause also upgrades an outbox temp id to the real one
             # once the drain has committed it; `project()` resolves those.
+            # deprecate_patch: remove after the next release, see #614
+            workflow.deprecate_patch("task-id-after-delay")
             if not track_task_id or track_task_id.startswith("item-"):
                 with logged_failure("alert_project_after_delay_failed", logger=workflow.logger):
                     projected = await workflow.execute_activity_method(
@@ -739,6 +759,10 @@ class AlertInvestigationFlow:
             # evidence.
             record_restart = bool(problem_id and is_remediable_alert(alert))
             if record_restart:
+                # Guarded, not bare: the marker sat at the end of an `and`
+                # chain, so it was recorded only when this branch was taken.
+                # deprecate_patch: remove after the next release, see #614
+                workflow.deprecate_patch(_PATCH_RESTART_ONCE)
                 restart_repeat = await self._recent_auto_restart(problem_id, alert)
             if restart_repeat is not None:
                 await self._safe_event(
@@ -831,6 +855,9 @@ class AlertInvestigationFlow:
         # explicit mapping and the content scorer cannot confirm it.
         claimed = resource.get("source") == "label_claim"
         if claimed:
+            # Guarded: the marker was the second operand of an `and`.
+            # deprecate_patch: remove after the next release, see #614
+            workflow.deprecate_patch("alert-label-claims")
             _is_infra = False
 
         # ── Step 4.4: Gate-0 — confirm the repo is relevant before kimi ──
@@ -961,6 +988,8 @@ class AlertInvestigationFlow:
         # is what lifts the deferral, so the id exists only now. Learn it, or
         # every comment below posts to an empty id and is dropped — the task
         # would carry the occurrence text and nothing the investigation found.
+        # deprecate_patch: remove after the next release, see #614
+        workflow.deprecate_patch("task-id-from-projection")
         track_task_id = track_task_id or minted or None
 
         # ── Step 4.5: Post start-comment on the track-task ──
@@ -1230,6 +1259,9 @@ class AlertInvestigationFlow:
             verdict_status = "actionable"
             verdict["status"] = "actionable"
 
+        # deprecate_patch: remove after the next release, see #614
+        workflow.deprecate_patch(_PATCH_KG_AFTER_DECISION)
+
         # ── Step 7.5: Gate 2 — post-verdict decision gate ──
         # A card only when there is a decision (#500): a fix branch to open,
         # an actionable verdict's proposed commands to run (#518), an
@@ -1275,6 +1307,9 @@ class AlertInvestigationFlow:
             verdict_status=verdict_status,
         )
         if no_decision_card:
+            # Guarded: the marker was the last operand of an `and`.
+            # deprecate_patch: remove after the next release, see #614
+            workflow.deprecate_patch(_PATCH_NO_CARD)
             gate_skipped = True
             workflow.logger.info("alert_gate2_no_decision_no_card verdict=%s", verdict_status)
         # What the operator answered on the card ("" when none went out), and

@@ -51,6 +51,15 @@ _TOPICS_TIMEOUT = timedelta(seconds=120)
 # Nothing to retry, nothing new stored.
 _SETTLED_UNSTORED = frozenset({"empty", "duplicate", "disabled", "refused"})
 
+# Retired `workflow.patched` ids. The old branches are gone; the markers
+# stay one release longer as `workflow.deprecate_patch`, because a run that
+# RECORDED one is wedged by a worker whose code no longer mentions it at all
+# ("[TMPRL1100] Non-deprecated patch marker encountered"). Drop the calls and
+# these ids in the release after next — see #614.
+# A capped arXiv run makes 30 content calls of up to 180s each, so a deploy
+# lands mid-run often.
+_CURSOR_TIES_PATCH = "rss-cursor-ties"
+
 
 def _external_id(entry: dict) -> str:
     """The id an entry is claimed, recorded and placed by."""
@@ -231,6 +240,9 @@ class RssIngestFlow:
         )
         review = review_hour < 0 or now.hour == review_hour
         failing_after = int(cfg["failing_after"])
+        # Once per run, where the old `ties = workflow.patched(...)` read was.
+        # deprecate_patch: remove after the next release, see #614
+        workflow.deprecate_patch(_CURSOR_TIES_PATCH)
         for ch in channels:
             identifier = ch["identifier"]
             config = ch.get("config") or {}

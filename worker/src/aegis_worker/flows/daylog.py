@@ -94,6 +94,13 @@ class DayLogConfig:
 
 _ROLLUP_MODES = ("weekly", "monthly")
 
+# Retired `workflow.patched` ids. The old branches are gone; the markers
+# stay one release longer as `workflow.deprecate_patch`, because a run that
+# RECORDED one is wedged by a worker whose code no longer mentions it at all
+# ("[TMPRL1100] Non-deprecated patch marker encountered"). Drop the calls and
+# these ids in the release after next — see #614.
+_LOCAL_DATE_PATCH = "daylog-local-date"
+
 def logged_day(local_today: date, day_offset: int = 0) -> date:
     """The day a run logs: the most recent complete day on the user's clock
     (`local_today` minus one), `day_offset` days further back. With the
@@ -298,6 +305,8 @@ class DayLogFlow:
         clock lookup falls back to the run's own UTC date, so a day is still
         logged."""
         now = workflow.now()
+        # deprecate_patch: remove after the next release, see #614
+        workflow.deprecate_patch(_LOCAL_DATE_PATCH)
         try:
             clock = await workflow.execute_activity_method(
                 DayLogActivities.daylog_local_day,

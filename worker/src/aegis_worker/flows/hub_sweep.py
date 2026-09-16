@@ -51,6 +51,17 @@ with workflow.unsafe.imports_passed_through():
 # calls at once.
 _MAX_JUDGED_PER_TICK = 2
 
+# Retired `workflow.patched` ids. The old branches are gone; the markers
+# stay one release longer as `workflow.deprecate_patch`, because a run that
+# RECORDED one is wedged by a worker whose code no longer mentions it at all
+# ("[TMPRL1100] Non-deprecated patch marker encountered"). Drop the calls and
+# these ids in the release after next — see #614.
+# The sweep runs every five minutes, so a worker deployed mid-run always has
+# some in flight.
+PATCH_COMPLETED_TASKS = "hub-sweep-completed-tasks"
+PATCH_FIX_VERIFICATION = "hub-sweep-fix-verification"
+PATCH_ALERTMANAGER_RECONCILE = "hub-sweep-alertmanager-reconcile"
+
 @dataclass
 class HubSweepConfig:
     agent_id: str = "pandoras-actor"
@@ -84,6 +95,8 @@ class HubSweepFlow:
         # Then read completions back: a task a person ticked off resolves its
         # problem, before projection, so the resolve reaches the task in this
         # tick. FAST retries are safe — nothing is touched twice.
+        # deprecate_patch: remove after the next release, see #614
+        workflow.deprecate_patch(PATCH_COMPLETED_TASKS)
         completed = await workflow.execute_activity_method(
             HubActivities.reconcile_completed_tasks,
             start_to_close_timeout=TIMEOUT_FAST,
@@ -94,6 +107,8 @@ class HubSweepFlow:
         # logged, not raised: projection matters more than a verdict that
         # the next tick can reach just as well.
         verified: dict = {}
+        # deprecate_patch: remove after the next release, see #614
+        workflow.deprecate_patch(PATCH_FIX_VERIFICATION)
         with logged_failure("hub_sweep_verify_fixes_failed", logger=workflow.logger):
             verified = await workflow.execute_activity_method(
                 HubActivities.verify_fixes,
@@ -112,6 +127,8 @@ class HubSweepFlow:
         # on an unreachable or freshly-restarted alertmanager, and projection
         # matters more than a reconciliation the next tick can do just as well.
         reconciled: dict = {}
+        # deprecate_patch: remove after the next release, see #614
+        workflow.deprecate_patch(PATCH_ALERTMANAGER_RECONCILE)
         if config.alertmanager_url:
             with logged_failure("hub_sweep_alertmanager_reconcile_failed", logger=workflow.logger):
                 reconciled = await workflow.execute_activity_method(

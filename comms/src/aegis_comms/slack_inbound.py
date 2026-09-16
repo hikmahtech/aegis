@@ -310,13 +310,20 @@ class SlackCoreClient:
         method: str,
         path: str,
         *,
+        non_ok_event: str | None,
+        failed_event: str,
         json: dict | None = None,
         timeout: float,
         ok: tuple[int, ...] = (200,),
-        log_non_ok: bool = True,
         error_sink: dict | None = None,
     ) -> Any:
         """One call to Core. Returns the JSON body, or None on any failure.
+
+        The two log event names are the CALLER's, not this function's. A log
+        event name is an interface — Loki queries and dashboards select on it —
+        so `_post`, `_patch` and `_get` each keep the exact names they emitted
+        before they shared a body. `non_ok_event=None` is a read whose "not
+        there" answer is normal and logged nothing.
 
         Pass `error_sink` to also capture WHY it failed (`reason` key) — Core
         puts the real cause (LLM auth error, tool crash, …) in the 500 body,
@@ -325,9 +332,6 @@ class SlackCoreClient:
         `status_code` (int) so a caller can tell a deterministic 4xx (never
         worth retrying) from a transient 5xx/transport failure (issue #296);
         a transport failure leaves `status_code` unset.
-
-        `log_non_ok=False` is for a read whose "not there" answer is normal
-        and would otherwise log a warning on every poll.
         """
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
@@ -340,10 +344,9 @@ class SlackCoreClient:
                 )
                 if resp.status_code in ok:
                     return resp.json()
-                if log_non_ok:
+                if non_ok_event:
                     logger.warning(
-                        "slack_core_non_ok",
-                        method=method,
+                        non_ok_event,
                         path=path,
                         status=resp.status_code,
                         body=resp.text[:200],
@@ -353,8 +356,7 @@ class SlackCoreClient:
                     error_sink["status_code"] = resp.status_code
         except Exception as exc:  # noqa: BLE001 — best-effort; caller degrades
             logger.warning(
-                "slack_core_request_failed",
-                method=method,
+                failed_event,
                 path=path,
                 error=error_text(exc, 500),
                 error_type=type(exc).__name__,
@@ -368,14 +370,34 @@ class SlackCoreClient:
     ) -> Any:
         """POST to Core. 202 counts: the async dispatch lane answers with one."""
         return await self._request(
-            "POST", path, json=data, timeout=timeout, ok=(200, 202), error_sink=error_sink
+            "POST",
+            path,
+            non_ok_event="slack_core_post_non_2xx",
+            failed_event="slack_core_post_failed",
+            json=data,
+            timeout=timeout,
+            ok=(200, 202),
+            error_sink=error_sink,
         )
 
     async def _patch(self, path: str, data: dict, timeout: float = 30) -> Any:
-        return await self._request("PATCH", path, json=data, timeout=timeout)
+        return await self._request(
+            "PATCH",
+            path,
+            non_ok_event="slack_core_patch_non_200",
+            failed_event="slack_core_patch_failed",
+            json=data,
+            timeout=timeout,
+        )
 
     async def _get(self, path: str, timeout: float = 15) -> Any:
-        return await self._request("GET", path, timeout=timeout, log_non_ok=False)
+        return await self._request(
+            "GET",
+            path,
+            non_ok_event=None,
+            failed_event="slack_core_get_failed",
+            timeout=timeout,
+        )
 
     async def chat(
         self, *, agent_id: str, message: str, thread_id: str, delivery_ref: dict | None
