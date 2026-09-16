@@ -1,8 +1,8 @@
 """CaptureActivities — shared Todoist capture helper.
 
 Every ingest flow reaches Todoist through `_capture`: `capture_to_inbox` for
-the managed Inbox, `capture_task` for any project with an optional due date,
-`capture_due` for a books bill or failed payment (spec §7.1). The helper owns:
+the managed Inbox and `capture_due` for a books bill or failed payment
+(spec §7.1). The helper owns:
 
 - kill switch read (settings.todoist_capture_enabled)
 - inbox project lookup (settings.todoist_managed_project_ids['inbox']) when
@@ -201,22 +201,6 @@ class CaptureActivities:
         """Idempotent Inbox capture. See module docstring."""
         return await self._capture(
             source_tag, external_id, title, description, extra_labels, None, None
-        )
-
-    @activity.defn
-    async def capture_task(
-        self,
-        source_tag: str,
-        external_id: str,
-        title: str,
-        description: str | None = None,
-        labels: list[str] | None = None,
-        project_id: str | None = None,
-        due_date: str | None = None,
-    ) -> str | None:
-        """Idempotent capture into any project with an optional due date (spec §7.1)."""
-        return await self._capture(
-            source_tag, external_id, title, description, labels, project_id, due_date
         )
 
     @activity.defn

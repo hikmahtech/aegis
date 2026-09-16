@@ -1026,7 +1026,6 @@ class LLMClient:
 # modules are leaves (they import nothing from `aegis.llm`), so the names are
 # resolved from module globals by the time `think()` runs.
 from aegis.llm.routes import (  # noqa: E402
-    get_routes,
     merge_routes,
     route_for_purpose,
     set_routes,
@@ -1041,7 +1040,6 @@ __all__ = [
     "LLMClient",
     "LLMKillSwitchError",
     "LLMTruncationError",
-    "get_routes",
     "merge_routes",
     "parse_llm_json",
     "resolve_model_for_agent",

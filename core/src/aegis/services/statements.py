@@ -103,12 +103,11 @@ def _pdftotext(data: bytes) -> str:
     return proc.stdout.decode("utf-8", "replace")
 
 
-def pdf_text(data: bytes, passwords: Sequence[str] = ()) -> str:
-    """PDF bytes -> `pdftotext -layout` text, decrypting in memory if needed.
+def pdf_text(data: bytes) -> str:
+    """PDF bytes -> `pdftotext -layout` text, read from stdin and never a file.
 
-    `passwords` is the ordered candidate list from `statement_passwords`. The
-    decrypted PDF is never written to disk and a candidate is never logged or
-    raised: a failure is `StatementLocked`, and the caller reports the account.
+    An encrypted statement is `StatementLocked`, and the caller reports the
+    account. AEGIS holds no statement passwords, so there is nothing to try.
     """
     import pikepdf
 
@@ -116,19 +115,9 @@ def pdf_text(data: bytes, passwords: Sequence[str] = ()) -> str:
         with pikepdf.open(BytesIO(data)):
             return _pdftotext(data)
     except pikepdf.PasswordError:
-        pass
+        raise StatementLocked("the statement could not be opened") from None
     except pikepdf.PdfError as exc:
         raise StatementError("not a readable PDF") from exc
-
-    for password in passwords:
-        try:
-            with pikepdf.open(BytesIO(data), password=password) as pdf:
-                buf = BytesIO()
-                pdf.save(buf)
-        except pikepdf.PasswordError:
-            continue
-        return _pdftotext(buf.getvalue())
-    raise StatementLocked("the statement could not be opened")
 
 
 # ------------------------------------------------------------------- §6.1 anchors

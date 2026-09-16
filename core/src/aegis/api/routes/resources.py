@@ -50,19 +50,6 @@ async def list_resources(request: Request, kind: str | None = None) -> list[dict
     return [dict(r) for r in rows]
 
 
-@router.get("/{resource_id}")
-async def get_resource(request: Request, resource_id: UUID) -> dict:
-    pool = request.app.state.db_pool
-    row = await pool.fetchrow(
-        "SELECT id, kind, slug, title, url, content, tags, metadata, infra_id, created_at, updated_at "
-        "FROM resources WHERE id = $1",
-        resource_id,
-    )
-    if not row:
-        raise HTTPException(404, "Resource not found")
-    return dict(row)
-
-
 @router.post("", status_code=201)
 async def create_resource(request: Request, body: ResourceCreate) -> dict:
     pool = request.app.state.db_pool

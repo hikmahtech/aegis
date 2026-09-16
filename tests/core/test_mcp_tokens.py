@@ -10,11 +10,18 @@ from __future__ import annotations
 from aegis.services.mcp_tokens import (
     DEFAULT_TTL_SECONDS,
     mint_mount_token,
-    verify_mount_token,
+    read_mount_token,
 )
 
 SECRET = "test-secret-key"
 OTHER_SECRET = "a-different-secret"
+
+
+def verify_mount_token(token, agent_id, secret, *, gated=False, now=None) -> bool:
+    """What `mcp_server._enforce_mount_token_binding` asks of a presented token:
+    does it authorise exactly this agent, in this mode, right now."""
+    read = read_mount_token(token, secret, now=now)
+    return read is not None and read == (agent_id, gated)
 
 
 def test_round_trip():

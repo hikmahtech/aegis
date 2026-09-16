@@ -16,10 +16,6 @@ Currently covers:
     that AEGIS's own GitHub webhook is registered and reports the ones
     that aren't as a **delta against the previous run**, not as a level.
     Detection only; see `check_github_webhooks`.
-
-`upsert_resources_batch` inserts new rows and union-merges tags /
-shallow-merges metadata on existing rows. Title and URL are insert-only
-so hand-curated values survive a sync tick.
 """
 
 from __future__ import annotations
@@ -56,11 +52,6 @@ class WorkspaceReposInput:
     items: list[dict] = field(default_factory=list)  # [{"path", "origin_url"}]
 
 
-@dataclass
-class UpsertResourcesBatchInput:
-    items: list[dict] = field(default_factory=list)
-
-
 # =====================================================================
 # Activity dataclass
 # =====================================================================
@@ -94,9 +85,9 @@ class InventoryActivities:
     async def reconcile_workspace_resources(self, input: WorkspaceReposInput) -> dict:
         """Upsert one `kind='repository'` row per scanned repo; delete the rest.
 
-        Upsert mirrors `upsert_resources_batch` semantics (title/url
-        insert-only, tags union, metadata shallow-merge — so the scan's
-        `path` always overwrites). Rows of kind='repository' whose slug is
+        Title and URL are insert-only so hand-curated values survive a sync
+        tick, tags are unioned and metadata shallow-merged — so the scan's
+        `path` always overwrites. Rows of kind='repository' whose slug is
         not in this batch are DELETED: the workspace is the source of truth,
         and stale rows are pure noise for the alert→resource matcher.
         """
@@ -343,60 +334,6 @@ class InventoryActivities:
             "skipped": len(inconclusive),
             "webhook_check_status": "ok",
         }
-
-    # ------------------------------------------------------------------
-    # Upsert
-    # ------------------------------------------------------------------
-
-    @activity.defn
-    async def upsert_resources_batch(
-        self, input: UpsertResourcesBatchInput
-    ) -> dict:
-        """Insert-or-merge each item in a single transaction.
-
-        Update policy (per the design decision):
-          * `kind`, `slug` — identity.
-          * `title`, `url` — insert-only (never overwritten on update).
-            Preserves hand-curated values in config/seed/resources.yaml.
-          * `tags` — UNION (array_agg DISTINCT over old || new).
-          * `metadata` — JSONB shallow merge (right wins on key collision),
-            so right-side keys overwrite but left-side keys outside the new
-            set are preserved.
-
-        Returns {inserted, updated, total}.
-        """
-        if not input.items:
-            return {"inserted": 0, "updated": 0, "total": 0}
-
-        inserted = 0
-        updated = 0
-        async with self.db_pool.acquire() as conn, conn.transaction():
-            for item in input.items:
-                is_inserted = await conn.fetchval(
-                    """
-                    INSERT INTO resources (kind, slug, title, url, tags, metadata, updated_at)
-                    VALUES ($1, $2, $3, $4, $5, $6, NOW())
-                    ON CONFLICT (slug) DO UPDATE SET
-                      tags = (
-                        SELECT COALESCE(array_agg(DISTINCT t), '{}')
-                        FROM unnest(resources.tags || EXCLUDED.tags) AS t
-                      ),
-                      metadata = resources.metadata || EXCLUDED.metadata,
-                      updated_at = NOW()
-                    RETURNING (xmax = 0) AS inserted
-                    """,
-                    item["kind"],
-                    item["slug"],
-                    item.get("title", ""),
-                    item.get("url", ""),
-                    list(item.get("tags") or []),
-                    item.get("metadata") or {},
-                )
-                if is_inserted:
-                    inserted += 1
-                else:
-                    updated += 1
-        return {"inserted": inserted, "updated": updated, "total": inserted + updated}
 
 
 # =====================================================================
