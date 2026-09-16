@@ -28,6 +28,7 @@ from aegis.errors import error_text
 from aegis.observability import log_audit
 from aegis.services import social_channels
 from aegis.services.hub_watch import mute_hint, reconcile_findings
+from aegis.services.settings_store import get_setting
 from temporalio import activity
 
 from aegis_worker.activities.delivery import safe_send_message
@@ -212,7 +213,7 @@ class SocialActivities:
     async def _setting(self, key: str, default):
         if self.db_pool is None:
             return default
-        val = await self.db_pool.fetchval("SELECT value FROM settings WHERE key = $1", key)
+        val = await get_setting(self.db_pool, key)
         return default if val is None else val
 
     async def _connected_platforms(self) -> set[str]:

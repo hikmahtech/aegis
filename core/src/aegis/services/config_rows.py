@@ -29,6 +29,7 @@ from typing import Any
 import structlog
 
 from aegis.errors import error_text
+from aegis.services.settings_store import get_setting, put_setting
 
 logger = structlog.get_logger()
 
@@ -55,7 +56,7 @@ class SettingsRow:
         value: Any = None
         if pool is not None:
             try:
-                value = await pool.fetchval("SELECT value FROM settings WHERE key = $1", self.key)
+                value = await get_setting(pool, self.key)
             except Exception as exc:  # noqa: BLE001 — a config read must never break a run
                 logger.warning("config_row_read_failed", key=self.key, error=error_text(exc))
         merged = self.merge(value)
@@ -65,12 +66,7 @@ class SettingsRow:
     async def save(self, pool: Any, value: Any) -> dict:
         """Validate, persist, return the effective config. Raises ValueError."""
         normalised = self.validate(value)
-        await pool.execute(
-            "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW()) "
-            "ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()",
-            self.key,
-            normalised,
-        )
+        await put_setting(pool, self.key, normalised)
         self.clear_cache()
         return await self.get(pool, fresh=True)
 

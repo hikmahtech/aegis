@@ -24,6 +24,7 @@ import structlog
 
 from aegis.crypto import decrypt_secret, encrypt_secret
 from aegis.errors import error_text
+from aegis.services.settings_store import get_setting, put_setting
 
 logger = structlog.get_logger()
 
@@ -48,9 +49,9 @@ async def resolve_api_key(pool: Any, settings: Any, *, use_cache: bool = True) -
         return _cache["key"]
     key = ""
     try:
-        row = await pool.fetchrow("SELECT value FROM settings WHERE key = $1", SETTINGS_KEY)
-        if row and row["value"]:
-            key = decrypt_secret(row["value"].get("key_enc"), settings.secret_key)
+        stored = await get_setting(pool, SETTINGS_KEY)
+        if stored:
+            key = decrypt_secret(stored.get("key_enc"), settings.secret_key)
     except Exception as exc:  # noqa: BLE001 — auth must not 500 on a settings read
         logger.warning("api_key_read_failed", error=error_text(exc))
         return ""
@@ -66,12 +67,7 @@ async def generate_api_key(pool: Any, settings: Any) -> str:
     """
     new_key = secrets.token_urlsafe(32)
     value = {"key_enc": encrypt_secret(new_key, settings.secret_key)}
-    await pool.execute(
-        "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW()) "
-        "ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()",
-        SETTINGS_KEY,
-        value,
-    )
+    await put_setting(pool, SETTINGS_KEY, value)
     invalidate_api_key_cache()
     return new_key
 

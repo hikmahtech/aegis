@@ -62,6 +62,7 @@ from aegis.services.hub import (
     normalize_severity,
     slug,
 )
+from aegis.services.settings_store import get_setting
 
 logger = structlog.get_logger()
 
@@ -318,7 +319,7 @@ async def recent_verdict(
     are three problems, but the tenth one is evidence of something shared.
     """
     now = now or _utcnow()
-    row = await pool.fetchval("SELECT value FROM settings WHERE key = $1", _VERDICT_KEY)
+    row = await get_setting(pool, _VERDICT_KEY)
     entry = row.get(gkey) if isinstance(row, dict) else None
     if not isinstance(entry, dict):
         return None

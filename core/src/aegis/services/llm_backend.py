@@ -23,6 +23,7 @@ import yaml
 from aegis.crypto import decrypt_secret, encrypt_secret
 from aegis.errors import error_text
 from aegis.llm.routes import merge_routes
+from aegis.services.settings_store import get_setting, put_setting
 
 logger = structlog.get_logger()
 
@@ -87,11 +88,8 @@ async def _db_routes(pool: Any) -> dict[str, Any] | None:
     """The `llm_routes` settings row, or None. Never raises — a bad config read
     must not stop the process booting."""
     try:
-        row = await pool.fetchrow(
-            "SELECT value FROM settings WHERE key = $1", ROUTES_SETTINGS_KEY
-        )
-        if row and row["value"]:
-            value = row["value"]
+        value = await get_setting(pool, ROUTES_SETTINGS_KEY)
+        if value:
             if isinstance(value, str):  # pool without a jsonb codec
                 import json
 
@@ -120,9 +118,8 @@ async def get_llm_backend(pool: Any, settings: Any, *, use_cache: bool = True) -
         return _cache["data"]
     data: dict[str, Any] | None = None
     try:
-        row = await pool.fetchrow("SELECT value FROM settings WHERE key = $1", SETTINGS_KEY)
-        if row and row["value"]:
-            v = row["value"]
+        v = await get_setting(pool, SETTINGS_KEY)
+        if v:
             api_key = decrypt_secret(v.get("api_key_enc"), settings.secret_key)
             tiers = {str(k): str(val) for k, val in (v.get("tiers") or {}).items()}
             data = {
@@ -154,8 +151,7 @@ async def save_llm_backend(
     api_key: str | None = None,
 ) -> None:
     """Upsert the backend. ``api_key=None`` keeps the existing key (write-only field)."""
-    row = await pool.fetchrow("SELECT value FROM settings WHERE key = $1", SETTINGS_KEY)
-    existing = (row["value"] if row and row["value"] else {}) or {}
+    existing = (await get_setting(pool, SETTINGS_KEY)) or {}
     api_key_enc = existing.get("api_key_enc")
     if api_key is not None:
         api_key_enc = encrypt_secret(api_key, settings.secret_key)
@@ -165,12 +161,7 @@ async def save_llm_backend(
         "tiers": {str(k): str(v) for k, v in (tiers or {}).items()},
         "api_key_enc": api_key_enc or {"value": "", "encrypted": False},
     }
-    await pool.execute(
-        "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW()) "
-        "ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()",
-        SETTINGS_KEY,
-        value,
-    )
+    await put_setting(pool, SETTINGS_KEY, value)
     invalidate()
 
 

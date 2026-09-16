@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import asyncpg
+from aegis.services.settings_store import get_setting
 from temporalio import activity
 
 from aegis_worker.shared.todoist_write import submit_or_queue
@@ -71,9 +72,7 @@ class CaptureActivities:
 
         async with self.db_pool.acquire() as conn:
             # Kill switch
-            kill = await conn.fetchval(
-                "SELECT value FROM settings WHERE key = 'todoist_capture_enabled'"
-            )
+            kill = await get_setting(conn, "todoist_capture_enabled")
             if kill is False or (isinstance(kill, dict) and kill.get("value") is False):
                 return None
             # When the seed inserted 'true' as a bare boolean JSONB scalar,
@@ -82,9 +81,7 @@ class CaptureActivities:
 
             # Inbox project id — only when the caller named no project.
             if project_id is None:
-                managed = await conn.fetchval(
-                    "SELECT value FROM settings WHERE key = 'todoist_managed_project_ids'"
-                )
+                managed = await get_setting(conn, "todoist_managed_project_ids")
                 inbox_id = (managed or {}).get("inbox") if isinstance(managed, dict) else None
                 if not inbox_id:
                     activity.logger.warning(

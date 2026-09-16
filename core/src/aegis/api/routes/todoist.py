@@ -19,6 +19,7 @@ from aegis.api.sql_filters import build_where
 from aegis.config import Settings
 from aegis.errors import error_text
 from aegis.observability import log_audit
+from aegis.services.settings_store import get_setting
 
 router = APIRouter(
     prefix="/api/admin/todoist",
@@ -261,9 +262,7 @@ async def todoist_state(request: Request) -> dict:
             "FROM todoist_outbox WHERE status='failed' "
             "ORDER BY created_at DESC LIMIT 50"
         )
-        managed = await conn.fetchval(
-            "SELECT value FROM settings WHERE key='todoist_managed_project_ids'"
-        )
+        managed = await get_setting(conn, "todoist_managed_project_ids")
         open_tasks = await conn.fetchval(
             "SELECT count(*) FROM todoist_tasks WHERE NOT is_completed"
         )

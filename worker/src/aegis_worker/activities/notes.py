@@ -36,6 +36,7 @@ from aegis.services import notes
 from aegis.services import notes_write as nw
 from aegis.services.agents import resolve_tag
 from aegis.services.knowledge import _content_id_for
+from aegis.services.settings_store import get_setting, put_setting
 from aegis.services.user_time import user_now
 from aegis.services.vault_layout import Layout, get_layout
 from temporalio import activity
@@ -169,18 +170,11 @@ class NotesActivities:
     # ------------------------------------------------------------- index
 
     async def _state(self) -> dict:
-        value = await self.db_pool.fetchval(
-            "SELECT value FROM settings WHERE key = $1", INDEX_STATE_KEY
-        )
+        value = await get_setting(self.db_pool, INDEX_STATE_KEY)
         return value if isinstance(value, dict) else {}
 
     async def _save_state(self, state: dict) -> None:
-        await self.db_pool.execute(
-            "INSERT INTO settings (key, value) VALUES ($1, $2) "
-            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
-            INDEX_STATE_KEY,
-            state,
-        )
+        await put_setting(self.db_pool, INDEX_STATE_KEY, state)
 
     async def _delete(self, content_id: str, what: str) -> int:
         try:

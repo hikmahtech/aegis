@@ -33,6 +33,8 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from aegis.services.settings_store import get_setting, put_setting
+
 SETTINGS_KEY = "books_chart"
 
 #: An entity id. It is a JSON key, a journal DIRECTORY name (`hikmah/2026.journal`)
@@ -432,15 +434,14 @@ def validate(body: dict[str, Any]) -> dict[str, Any]:
 
 async def get_chart(pool: Any) -> Chart:
     """The effective chart: the `books_chart` settings row, read leniently."""
-    row = await pool.fetchrow("SELECT value FROM settings WHERE key = $1", SETTINGS_KEY)
-    return Chart.from_dict(merge(row["value"] if row else None))
+    return Chart.from_dict(merge(await get_setting(pool, SETTINGS_KEY)))
 
 
 async def read(pool: Any) -> dict[str, Any]:
     """What the admin page shows: the chart the money lane reads, and whether
     it is configured or still the code default."""
-    row = await pool.fetchrow("SELECT value FROM settings WHERE key = $1", SETTINGS_KEY)
-    return {"stored": bool(row and row["value"]), "chart": merge(row["value"] if row else None)}
+    stored = await get_setting(pool, SETTINGS_KEY)
+    return {"stored": bool(stored), "chart": merge(stored)}
 
 
 async def save_chart(pool: Any, body: dict[str, Any]) -> dict[str, Any]:
@@ -451,10 +452,5 @@ async def save_chart(pool: Any, body: dict[str, Any]) -> dict[str, Any]:
     the operator removed, and merging would make removing anything impossible.
     """
     stored = validate(body)
-    await pool.execute(
-        "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW()) "
-        "ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()",
-        SETTINGS_KEY,
-        stored,
-    )
+    await put_setting(pool, SETTINGS_KEY, stored)
     return await read(pool)

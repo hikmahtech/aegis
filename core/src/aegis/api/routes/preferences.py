@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from aegis.api.auth import verify_auth
+from aegis.services.settings_store import get_setting, put_setting
 from aegis.services.user_time import SETTING, user_zone
 
 router = APIRouter(
@@ -46,8 +47,8 @@ def validate_timezone(name: Any) -> str:
 async def get_timezone_route(request: Request) -> dict[str, Any]:
     """The effective zone — what `user_zone` resolves, UTC when unset."""
     pool = request.app.state.db_pool
-    row = await pool.fetchrow("SELECT value FROM settings WHERE key = $1", SETTING)
-    stored = row["value"] if row and isinstance(row["value"], str) else ""
+    value = await get_setting(pool, SETTING)
+    stored = value if isinstance(value, str) else ""
     return {"timezone": stored, "effective": str((await user_zone(pool)).key)}
 
 
@@ -60,12 +61,7 @@ async def put_timezone_route(request: Request, body: dict[str, Any]) -> dict[str
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if name:
-        await pool.execute(
-            "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW()) "
-            "ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()",
-            SETTING,
-            name,
-        )
+        await put_setting(pool, SETTING, name)
     else:
         await pool.execute("DELETE FROM settings WHERE key = $1", SETTING)
     return {"timezone": name, "effective": str((await user_zone(pool)).key)}

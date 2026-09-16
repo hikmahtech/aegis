@@ -28,7 +28,7 @@ AUTH_HEADERS = _auth_headers()
 async def test_get_setting_exists(app, mock_db_pool):
     """Returns key and value when setting exists."""
     topics = {"topics": [{"name": "ai", "queries": ["LLM"], "priority": "high"}]}
-    mock_db_pool.fetchrow = AsyncMock(return_value={"value": topics})
+    mock_db_pool.fetchval = AsyncMock(return_value=topics)
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -42,7 +42,7 @@ async def test_get_setting_exists(app, mock_db_pool):
 
 async def test_get_setting_not_found(app, mock_db_pool):
     """Returns key with null value when setting does not exist."""
-    mock_db_pool.fetchrow = AsyncMock(return_value=None)
+    mock_db_pool.fetchval = AsyncMock(return_value=None)
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -65,7 +65,7 @@ async def test_get_setting_requires_auth(app):
 
 async def test_get_setting_string_value(app, mock_db_pool):
     """Returns a simple string value correctly."""
-    mock_db_pool.fetchrow = AsyncMock(return_value={"value": "enabled"})
+    mock_db_pool.fetchval = AsyncMock(return_value="enabled")
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -79,7 +79,7 @@ async def test_get_setting_string_value(app, mock_db_pool):
 
 async def test_get_setting_boolean_value(app, mock_db_pool):
     """Returns a boolean value correctly."""
-    mock_db_pool.fetchrow = AsyncMock(return_value={"value": True})
+    mock_db_pool.fetchval = AsyncMock(return_value=True)
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:

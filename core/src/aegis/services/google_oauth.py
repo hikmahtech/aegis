@@ -18,6 +18,7 @@ import structlog
 
 from aegis.crypto import decrypt_secret, encrypt_secret
 from aegis.errors import error_text
+from aegis.services.settings_store import get_setting, put_setting
 
 logger = structlog.get_logger()
 
@@ -30,9 +31,8 @@ async def get_google_client_config(pool: Any, settings: Any) -> dict | None:
     """A ``Flow.from_client_config`` dict, DB-first then the credentials file.
     Returns None when no client is configured."""
     try:
-        row = await pool.fetchrow("SELECT value FROM settings WHERE key = $1", SETTINGS_KEY)
-        if row and row["value"]:
-            v = row["value"]
+        v = await get_setting(pool, SETTINGS_KEY)
+        if v:
             client_id = v.get("client_id")
             secret = decrypt_secret(v.get("client_secret_enc"), settings.secret_key)
             if client_id and secret:
@@ -60,8 +60,7 @@ async def save_google_client(
     pool: Any, settings: Any, *, client_id: str, client_secret: str | None = None
 ) -> None:
     """Upsert the OAuth client. ``client_secret=None`` keeps the existing secret."""
-    row = await pool.fetchrow("SELECT value FROM settings WHERE key = $1", SETTINGS_KEY)
-    existing = (row["value"] if row and row["value"] else {}) or {}
+    existing = (await get_setting(pool, SETTINGS_KEY)) or {}
     secret_enc = existing.get("client_secret_enc")
     if client_secret is not None:
         secret_enc = encrypt_secret(client_secret, settings.secret_key)
@@ -69,19 +68,14 @@ async def save_google_client(
         "client_id": client_id,
         "client_secret_enc": secret_enc or {"value": "", "encrypted": False},
     }
-    await pool.execute(
-        "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW()) "
-        "ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()",
-        SETTINGS_KEY,
-        value,
-    )
+    await put_setting(pool, SETTINGS_KEY, value)
 
 
 async def google_client_status(pool: Any, settings: Any) -> dict:
     """For the admin UI: is a client configured, its client_id, and the source."""
-    row = await pool.fetchrow("SELECT value FROM settings WHERE key = $1", SETTINGS_KEY)
-    if row and row["value"] and row["value"].get("client_id"):
-        return {"configured": True, "client_id": row["value"]["client_id"], "source": "db"}
+    stored = await get_setting(pool, SETTINGS_KEY)
+    if stored and stored.get("client_id"):
+        return {"configured": True, "client_id": stored["client_id"], "source": "db"}
     cfg = await get_google_client_config(pool, settings)
     if cfg:
         node = cfg.get("web") or cfg.get("installed") or {}

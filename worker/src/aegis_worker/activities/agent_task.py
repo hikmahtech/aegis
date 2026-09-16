@@ -26,6 +26,7 @@ from aegis.services.agent_task_verbs import (
 from aegis.services.agent_task_verbs import SETTINGS_KEY as VERBS_SETTING
 from aegis.services.agent_task_verbs import merge as merge_verbs
 from aegis.services.project_repo_map import get_project_repo_map, lookup
+from aegis.services.settings_store import get_setting
 from temporalio import activity
 
 # Assignee labels this flow will act on. @me is deliberately absent: a task the
@@ -84,7 +85,7 @@ async def load_verbs(pool: Any) -> dict[str, str | None]:
     if pool is None:
         return dict(DEFAULT_VERBS)
     try:
-        value = await pool.fetchval("SELECT value FROM settings WHERE key = $1", VERBS_SETTING)
+        value = await get_setting(pool, VERBS_SETTING)
     except Exception as exc:  # noqa: BLE001 — routing must never break on a config read
         activity.logger.warning("agent_task_verbs_read_failed err=%s", error_text(exc))
         return dict(DEFAULT_VERBS)

@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 import structlog
+from aegis.services.settings_store import get_setting
 from temporalio import activity
 
 logger = structlog.get_logger()
@@ -52,7 +53,7 @@ async def _folder_config(pool: Any) -> dict:
     An unconfigured lane is not an error — a fork of AEGIS has no Drive folder
     and must not fail a scheduled flow to say so.
     """
-    raw = await pool.fetchval("SELECT value FROM settings WHERE key = $1", FOLDER_SETTING)
+    raw = await get_setting(pool, FOLDER_SETTING)
     if raw is None:
         return {}
     cfg = raw if isinstance(raw, dict) else json.loads(raw)
@@ -660,7 +661,7 @@ async def _due_digest(
     delivery decision that belongs to the flow.
     """
     month = today.strftime("%Y-%m")
-    if await pool.fetchval("SELECT value FROM settings WHERE key = $1", DIGEST_SETTING) == month:
+    if await get_setting(pool, DIGEST_SETTING) == month:
         return ""
     digest = findings_mod.monthly_digest(run, period=month, statements=statements)
     await pool.execute(
