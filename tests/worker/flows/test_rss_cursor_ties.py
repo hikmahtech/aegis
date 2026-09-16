@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import random
 import uuid
-from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -27,7 +26,7 @@ from temporalio.worker import Replayer, Worker
 
 with workflow.unsafe.imports_passed_through():
     from aegis_worker.activities import rss as rss_mod
-    from aegis_worker.activities.rss import FetchFeedInput, FetchFeedResult, RssActivities
+    from aegis_worker.activities.rss import RssActivities
     from aegis_worker.flows.rss_ingest import RssIngestFlow, RssIngestInput
 
 FEED = "https://arxiv.org/rss/cs.AI"
@@ -275,60 +274,9 @@ async def test_a_legacy_cursor_drains_the_rest_of_its_batch_without_looping(monk
 
 # --------------------------------------------------------------------------
 # Replay. RssIngestFlow runs hourly and a capped arXiv run makes 30 content
-# calls of up to 180 s each, so a deploy can land mid-run. The new cursor
-# write is behind `workflow.patched("rss-cursor-ties")`.
+# calls of up to 180 s each, so a deploy can land mid-run: the flow has to
+# replay its own history unchanged.
 # --------------------------------------------------------------------------
-
-
-@workflow.defn(name="RssIngestFlow")
-class _RssIngestBeforeTies:
-    """The activities RssIngestFlow scheduled before #584, for one feed whose
-    entries are all new and all store: `last_cursor` written, no
-    `last_cursor_id`. Kept so a history it wrote can be replayed against
-    today's flow."""
-
-    @workflow.run
-    async def run(self, input: RssIngestInput) -> dict:
-        t = timedelta(seconds=60)
-        channels = await workflow.execute_activity(
-            "list_active_channels", "rss", start_to_close_timeout=t
-        )
-        await workflow.execute_activity("load_feeds_config", start_to_close_timeout=t)
-        await workflow.execute_activity("load_gate_terms", start_to_close_timeout=t)
-        ch = channels[0]
-        result = await workflow.execute_activity(
-            "fetch_feed",
-            FetchFeedInput(url=ch["identifier"], since_cursor=None),
-            result_type=FetchFeedResult,
-            start_to_close_timeout=t,
-        )
-        rows = []
-        for e in result.entries:
-            await workflow.execute_activity(
-                "ingest_idempotency_claim", args=["rss", e["id"]], start_to_close_timeout=t
-            )
-            await workflow.execute_activity(
-                "process_content",
-                args=[e["link"], e["title"], "rss", e["summary"]],
-                start_to_close_timeout=t,
-            )
-            rows.append({"external_id": e["id"], "link": e["link"], "mode": "full"})
-        await workflow.execute_activity(
-            "record_feed_entries", args=[ch["id"], rows], start_to_close_timeout=t
-        )
-        await workflow.execute_activity(
-            "update_channel_config_key",
-            args=["rss", ch["identifier"], "last_cursor", result.entries[0]["published"]],
-            start_to_close_timeout=t,
-        )
-        await workflow.execute_activity(
-            "record_feed_run", args=[ch["id"], {"ok": True, "backlog": 0}], start_to_close_timeout=t
-        )
-        await workflow.execute_activity(
-            "attach_topic_items", args=[[], "rss"], start_to_close_timeout=t
-        )
-        await workflow.execute_activity("reconcile_findings", args=[{}], start_to_close_timeout=t)
-        return {}
 
 
 async def _history(flow, feed: Feed, monkeypatch):
@@ -350,16 +298,6 @@ async def _history(flow, feed: Feed, monkeypatch):
         )
         await handle.result()
         return await handle.fetch_history()
-
-
-@pytest.mark.asyncio
-async def test_a_run_started_before_the_change_replays_on_the_new_flow(monkeypatch):
-    """Falsifiable: write `last_cursor_id` without the `patched` guard and
-    this replay raises a nondeterminism error, because the old history has
-    `record_feed_run` where the new flow schedules its second cursor write."""
-    feed = Feed([_paper(1), _paper(2)], config={"last_cursor": None})
-    history = await _history(_RssIngestBeforeTies, feed, monkeypatch)
-    await Replayer(workflows=[RssIngestFlow]).replay_workflow(history)
 
 
 @pytest.mark.asyncio

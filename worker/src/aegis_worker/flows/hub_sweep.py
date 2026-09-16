@@ -50,12 +50,6 @@ with workflow.unsafe.imports_passed_through():
 # and a sweep that runs every five minutes has no reason to spend four model
 # calls at once.
 _MAX_JUDGED_PER_TICK = 2
-# The patch ids for steps 2 and 3. The sweep runs every five minutes, so a
-# worker deployed mid-run replays a history that has no such activity in it.
-PATCH_COMPLETED_TASKS = "hub-sweep-completed-tasks"
-PATCH_FIX_VERIFICATION = "hub-sweep-fix-verification"
-PATCH_ALERTMANAGER_RECONCILE = "hub-sweep-alertmanager-reconcile"
-
 
 @dataclass
 class HubSweepConfig:
@@ -90,28 +84,25 @@ class HubSweepFlow:
         # Then read completions back: a task a person ticked off resolves its
         # problem, before projection, so the resolve reaches the task in this
         # tick. FAST retries are safe — nothing is touched twice.
-        completed: dict = {}
-        if workflow.patched(PATCH_COMPLETED_TASKS):
-            completed = await workflow.execute_activity_method(
-                HubActivities.reconcile_completed_tasks,
-                start_to_close_timeout=TIMEOUT_FAST,
-                retry_policy=FAST,
-            )
+        completed = await workflow.execute_activity_method(
+            HubActivities.reconcile_completed_tasks,
+            start_to_close_timeout=TIMEOUT_FAST,
+            retry_policy=FAST,
+        )
         # Then settle merged fixes, also before projection, so the resolve or
         # the "it came back" reaches the task in this tick. A failure here is
         # logged, not raised: projection matters more than a verdict that
         # the next tick can reach just as well.
         verified: dict = {}
-        if workflow.patched(PATCH_FIX_VERIFICATION):
-            try:
-                verified = await workflow.execute_activity_method(
-                    HubActivities.verify_fixes,
-                    args=[config.fix_verify_hours, config.fix_grace_hours],
-                    start_to_close_timeout=TIMEOUT_FAST,
-                    retry_policy=FAST,
-                )
-            except Exception as exc:  # noqa: BLE001
-                workflow.logger.warning("hub_sweep_verify_fixes_failed err=%s", error_text(exc))
+        try:
+            verified = await workflow.execute_activity_method(
+                HubActivities.verify_fixes,
+                args=[config.fix_verify_hours, config.fix_grace_hours],
+                start_to_close_timeout=TIMEOUT_FAST,
+                retry_policy=FAST,
+            )
+        except Exception as exc:  # noqa: BLE001
+            workflow.logger.warning("hub_sweep_verify_fixes_failed err=%s", error_text(exc))
         # Then ask alertmanager what it is still holding, and resolve the live
         # problems it no longer lists (#551). Alertmanager keeps its alerts in
         # memory, so a restart loses every `resolved` webhook it owed — and that
@@ -123,7 +114,7 @@ class HubSweepFlow:
         # on an unreachable or freshly-restarted alertmanager, and projection
         # matters more than a reconciliation the next tick can do just as well.
         reconciled: dict = {}
-        if workflow.patched(PATCH_ALERTMANAGER_RECONCILE) and config.alertmanager_url:
+        if config.alertmanager_url:
             try:
                 reconciled = await workflow.execute_activity_method(
                     HubActivities.reconcile_alertmanager,

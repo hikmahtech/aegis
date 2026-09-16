@@ -1059,10 +1059,6 @@ is audited. The worker reads the row on every restart, so a change applies to
 the next alert; no restart. A stored value that is not a whole number of
 minutes counts as 60.
 
-Both changes are behind `workflow.patched` ids, `gate2-only-for-decisions`
-and `auto-restart-once-per-window`, so a run that was waiting on its card
-when the worker was redeployed finishes the way it started.
-
 ### After Open PR: following the fix to a verified fix
 
 **Pandora follows the PRs it opens (#502).** When you pick **Open PR(s)** on a

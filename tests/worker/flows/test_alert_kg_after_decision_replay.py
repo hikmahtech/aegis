@@ -1,21 +1,16 @@
-"""Runs in flight across the #502 deploy replay through the new flow.
+"""Every Gate-2 outcome replays through the flow that recorded it (#502).
 
-#502 moved the verdict's knowledge-store write from Step 7b — before the
-Gate-2 card — to where the outcome is known, behind the
-`kg-verdict-after-decision` patch. An AlertInvestigationFlow run can wait 48
+#502 put the verdict's knowledge-store write where the outcome is known
+rather than before the card went out, so each answer writes at a different
+point in the command sequence. An AlertInvestigationFlow run can wait 48
 hours on its card, so some are always in flight when the worker is
-redeployed, and the worker replays each one's history through the new code.
+redeployed and the worker replays their histories.
 
-Each history below is recorded by the flow as it was before this change
-(`_alert_investigation_pre502.py`, a frozen copy) and replayed through the
-current flow. Between them they walk every place the patch changed the
-command sequence: no card; each answer that carries on (ack, mute, Open PR
-with and without a PR); each answer that ends the run (discard, run fix, the
-self-resolved race); a card nobody answered; a Jira scoping run; and a card
-still open, plain and escalating, which is where a run in flight actually is.
-Remove the guard and every one fails but the Jira run: with no card and no
-no-card marker between the old write and the new one, its write lands on the
-same command either way.
+The scenarios walk every one of those points: no card; each answer that
+carries on (ack, mute, Open PR with and without a PR); each answer that ends
+the run (discard, run fix, the self-resolved race); a card nobody answered; a
+Jira scoping run; and a card still open, plain and escalating, which is where
+a run in flight actually is.
 """
 
 from __future__ import annotations
@@ -24,7 +19,6 @@ import pytest
 from aegis_worker.flows.alert_investigation import AlertInvestigationFlow
 
 from tests.worker.flows import _alert_flow_harness as h
-from tests.worker.flows._alert_investigation_pre502 import AlertInvestigationFlowPre502
 from tests.worker.flows.test_alert_investigation_replay import OpenCard, _record, _replays
 
 pytestmark = pytest.mark.asyncio
@@ -79,15 +73,6 @@ SCENARIOS = [
     "open_card",
     "open_escalating_card",
 ]
-
-
-@pytest.mark.parametrize("scenario", SCENARIOS)
-async def test_a_run_recorded_before_502_replays_through_the_new_flow(scenario):
-    alert, kwargs = _scenario(scenario)
-    history = await _record(AlertInvestigationFlowPre502, alert, **kwargs)
-    # The old flow stored every verdict before its card, untagged.
-    assert [k["outcome"] for k in h.S.kg] == [""]
-    await _replays(history)
 
 
 @pytest.mark.parametrize("scenario", SCENARIOS)

@@ -93,9 +93,6 @@ class DayLogConfig:
 
 
 _ROLLUP_MODES = ("weekly", "monthly")
-# The change of rule: a run started before it replays the UTC date it used.
-_LOCAL_DATE_PATCH = "daylog-local-date"
-
 
 def logged_day(local_today: date, day_offset: int = 0) -> date:
     """The day a run logs: the most recent complete day on the user's clock
@@ -297,13 +294,10 @@ class DayLogFlow:
 
     async def _anchor(self, day_offset: int) -> date:
         """The day this run is about, on the user's clock: the most recent
-        complete local day, `day_offset` days back (`logged_day`). A run that
-        started under the old rule replays the UTC date it used (the patch);
-        a failed clock lookup falls back to that rule too, so a day is still
+        complete local day, `day_offset` days back (`logged_day`). A failed
+        clock lookup falls back to the run's own UTC date, so a day is still
         logged."""
         now = workflow.now()
-        if not workflow.patched(_LOCAL_DATE_PATCH):
-            return (now - timedelta(days=day_offset)).date()
         try:
             clock = await workflow.execute_activity_method(
                 DayLogActivities.daylog_local_day,

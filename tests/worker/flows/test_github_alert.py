@@ -3,8 +3,6 @@ fix PR an investigation opened (#502)."""
 
 from __future__ import annotations
 
-from datetime import timedelta
-
 import pytest
 from temporalio import activity, workflow
 from temporalio.testing import WorkflowEnvironment
@@ -169,42 +167,6 @@ async def test_a_closed_pr_goes_to_the_hub(merged):
         ("https://github.com/youruser/aegis/pull/42", merged)
     ]
     assert _notify_calls == []
-
-
-@workflow.defn(name="GitHubAlertFlow")
-class _GitHubAlertFlowBefore502:
-    """GitHubAlertFlow as it was before #502: a closed PR was filtered out
-    without any command. Kept so a history it wrote replays against today's
-    flow."""
-
-    @workflow.run
-    async def run(self, input: GitHubAlertInput) -> dict:
-        if input.event != "pull_request" or input.payload.get("action") not in {
-            "opened",
-            "reopened",
-            "ready_for_review",
-        }:
-            return {"notified": False, "reason": "filtered"}
-        return await workflow.execute_activity(
-            "notify_pr_event",
-            args=[_pr_from_payload(input.payload)],
-            start_to_close_timeout=timedelta(seconds=15),
-        )
-
-
-@pytest.mark.asyncio
-async def test_a_close_filtered_before_the_deploy_replays_on_the_new_worker():
-    """The follow-up is behind `workflow.patched`: a closed-PR run the old
-    worker filtered replays through the new flow without the activity.
-
-    Falsifiable: drop the guard and the replay raises a nondeterminism error.
-    """
-    inp = GitHubAlertInput(event="pull_request", delivery_id="d5", payload=_pr_payload("closed", merged=True))
-    result, history = await _run_with_history(
-        inp, [stub_follow_fix_pr], "gh-before", workflows=(_GitHubAlertFlowBefore502,)
-    )
-    assert result == {"notified": False, "reason": "filtered"}
-    await Replayer(workflows=[GitHubAlertFlow]).replay_workflow(history)
 
 
 @pytest.mark.asyncio

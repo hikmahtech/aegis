@@ -259,7 +259,7 @@ class InfraHeartbeatFlow:
         # existed.
         ingress_failing = bool(prior.get("ingress_failing"))
         ingress_fails = int(prior.get("ingress_fails") or 0)
-        if workflow.patched("ingress-canary") and config.ingress_url:
+        if config.ingress_url:
             try:
                 probe = await workflow.execute_activity_method(
                     HomelabActivities.probe_ingress,

@@ -51,27 +51,21 @@ _TOPICS_TIMEOUT = timedelta(seconds=120)
 # Nothing to retry, nothing new stored.
 _SETTLED_UNSTORED = frozenset({"empty", "duplicate", "disabled", "refused"})
 
-# #584: the cursor is a `(published, external id)` pair. A run that started
-# before the change replays on the timestamp-only cursor it used.
-_CURSOR_TIES_PATCH = "rss-cursor-ties"
-
 
 def _external_id(entry: dict) -> str:
     """The id an entry is claimed, recorded and placed by."""
     return entry.get("id") or entry.get("link", "") or ""
 
 
-def _place(entry: dict, ties: bool) -> tuple[str, str]:
+def _place(entry: dict) -> tuple[str, str]:
     """Where an entry sits in its feed's order: `(published, external id)`.
 
     arXiv publishes a day as ONE burst of 270-750 entries that all carry the
     same timestamp, so a timestamp alone cannot say where a capped run
     stopped: the cursor landed on the shared timestamp and `fetch_feed`
     dropped the rest of the burst for good (#584, exactly 30 stored per
-    announcement day). The id breaks the tie. With `ties` off (a run that
-    started before the change) every entry has the id "", so the pair orders
-    and compares exactly as the bare timestamp did."""
-    return (entry.get("published") or "", _external_id(entry) if ties else "")
+    announcement day). The id breaks the tie."""
+    return (entry.get("published") or "", _external_id(entry))
 
 
 def _parse_stamp(value: str | None) -> datetime | None:
@@ -237,10 +231,6 @@ class RssIngestFlow:
         )
         review = review_hour < 0 or now.hour == review_hour
         failing_after = int(cfg["failing_after"])
-        # Decided once per run, so a run that started before the change keeps
-        # the old cursor for every feed it polls (`_place`).
-        ties = workflow.patched(_CURSOR_TIES_PATCH)
-
         for ch in channels:
             identifier = ch["identifier"]
             config = ch.get("config") or {}
@@ -249,7 +239,7 @@ class RssIngestFlow:
             # it has only `last_cursor`: "" is the lowest id, so the entries AT
             # that timestamp are offered once more. The ones already stored
             # resolve as known duplicates and the cursor moves past them.
-            since_id = str(config.get("last_cursor_id") or "") if ties else None
+            since_id = str(config.get("last_cursor_id") or "")
             label = feeds.feed_label(identifier, config)
             mode = feeds.ingest_mode(config, cfg["default_ingest"])
 
@@ -357,7 +347,7 @@ class RssIngestFlow:
                 cap = 0
             if cap > 0 and available > cap:
                 # "" (no timestamp) sorts first and so is never starved.
-                entries = sorted(result.entries, key=lambda e: _place(e, ties))[:cap]
+                entries = sorted(result.entries, key=lambda e: _place(e))[:cap]
                 workflow.logger.info(
                     "rss_throttled feed=%s took=%d of=%d", identifier, len(entries), available
                 )
@@ -512,14 +502,14 @@ class RssIngestFlow:
                             start_to_close_timeout=_ACT_TIMEOUT,
                             retry_policy=ACT_RETRY,
                         )
-                        failed_at = _place(entry, ties)
+                        failed_at = _place(entry)
                         if not failed_at[0]:
                             saw_untimed_failure = True
                         elif earliest_failed is None or failed_at < earliest_failed:
                             earliest_failed = failed_at
 
                 # An entry with no timestamp has no place to move the cursor to.
-                resolved_at = _place(entry, ties)
+                resolved_at = _place(entry)
                 if resolved and resolved_at[0]:
                     resolved_all.append(resolved_at)
 
@@ -557,19 +547,18 @@ class RssIngestFlow:
             # window for retry.
             if latest_resolved:
                 cursor_at, cursor_id = latest_resolved
-                if ties:
-                    # The id BEFORE the timestamp. A run that stops between
-                    # the two writes leaves the new id beside the old
-                    # timestamp, which only offers entries again (they resolve
-                    # as duplicates) or passes over ones this run resolved.
-                    # The other order could pair the new timestamp with an old,
-                    # larger id and pass over entries nothing ever stored.
-                    await workflow.execute_activity(
-                        "update_channel_config_key",
-                        args=["rss", identifier, "last_cursor_id", cursor_id],
-                        start_to_close_timeout=_ACT_TIMEOUT,
-                        retry_policy=ACT_RETRY,
-                    )
+                # The id BEFORE the timestamp. A run that stops between the
+                # two writes leaves the new id beside the old timestamp, which
+                # only offers entries again (they resolve as duplicates) or
+                # passes over ones this run resolved. The other order could
+                # pair the new timestamp with an old, larger id and pass over
+                # entries nothing ever stored.
+                await workflow.execute_activity(
+                    "update_channel_config_key",
+                    args=["rss", identifier, "last_cursor_id", cursor_id],
+                    start_to_close_timeout=_ACT_TIMEOUT,
+                    retry_policy=ACT_RETRY,
+                )
                 await workflow.execute_activity(
                     "update_channel_config_key",
                     args=[
