@@ -37,7 +37,7 @@ from temporalio import workflow
 from temporalio.exceptions import ApplicationError, WorkflowAlreadyStartedError
 
 with workflow.unsafe.imports_passed_through():
-    from aegis.errors import error_text
+    from aegis.errors import error_text, logged_failure
 
     from aegis_worker.activities.agent_registry import AgentRegistryActivities
     from aegis_worker.activities.curiosity import TRACK_CHOICES, CuriosityActivities
@@ -178,7 +178,7 @@ class CuriosityCardFlow:
             step = "resolve_agents"
             tag = _GAP_TAG.get(str(top.get("gap_type") or ""), "gtd")
             target = owner
-            try:
+            with logged_failure("curiosity_agent_resolve_failed", logger=workflow.logger):
                 resolved = await workflow.execute_activity_method(
                     AgentRegistryActivities.resolve_agents,
                     args=[[tag]],
@@ -186,8 +186,6 @@ class CuriosityCardFlow:
                     retry_policy=NO_RETRY,
                 )
                 target = (resolved or {}).get(tag) or owner
-            except Exception as exc:  # noqa: BLE001 — routing is a nicety
-                workflow.logger.warning("curiosity_agent_resolve_failed err=%s", error_text(exc))
 
             step = "spawn_card"
             novelty_key = str(top.get("novelty_key") or "")

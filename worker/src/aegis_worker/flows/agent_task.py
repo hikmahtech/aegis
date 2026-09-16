@@ -30,7 +30,7 @@ from temporalio.exceptions import ApplicationError, WorkflowAlreadyStartedError
 
 with workflow.unsafe.imports_passed_through():
     from aegis.connectors.remote_script import _PROMPT_CAP_BYTES
-    from aegis.errors import error_text
+    from aegis.errors import error_text, logged_failure
     from aegis.services.research import task_workflow_id, urls_in
 
     from aegis_worker.activities.agent_run import AgentRunActivities
@@ -386,14 +386,12 @@ class AgentTaskSweepFlow:
         return {"found": len(tasks), "spawned": spawned, "resumed": resumed}
 
     async def _reconcile_sessions(self) -> None:
-        try:
+        with logged_failure("work_sessions_reconcile_failed", logger=workflow.logger):
             await workflow.execute_activity(
                 "reconcile_work_sessions",
                 start_to_close_timeout=TIMEOUT_STANDARD,
                 retry_policy=NO_RETRY,
             )
-        except Exception as exc:  # noqa: BLE001
-            workflow.logger.warning("work_sessions_reconcile_failed err=%s", error_text(exc))
 
     async def _due_turns(self, limit: int) -> list:
         """Tasks whose newest user comment is newer than their last turn.

@@ -53,7 +53,7 @@ from temporalio import workflow
 with workflow.unsafe.imports_passed_through():
     from html import escape as _html_escape
 
-    from aegis.errors import error_text
+    from aegis.errors import error_text, logged_failure
     from aegis.personalities import voice_line
 
     from aegis_worker.activities.agent_registry import AgentRegistryActivities
@@ -707,7 +707,7 @@ class AlertInvestigationFlow:
             # The `item-` clause also upgrades an outbox temp id to the real one
             # once the drain has committed it; `project()` resolves those.
             if not track_task_id or track_task_id.startswith("item-"):
-                try:
+                with logged_failure("alert_project_after_delay_failed", logger=workflow.logger):
                     projected = await workflow.execute_activity_method(
                         HubActivities.project_problem,
                         args=[problem_id],
@@ -715,10 +715,6 @@ class AlertInvestigationFlow:
                         retry_policy=NO_RETRY,
                     )
                     track_task_id = projected.get("task_id") or track_task_id or None
-                except Exception as exc:  # noqa: BLE001
-                    workflow.logger.warning(
-                        "alert_project_after_delay_failed err=%s", error_text(exc)
-                    )
 
         # ── Step 4: Resolve to resource ──
         # Infra/swarm alerts (NodeDown, DockerServiceDown, cluster=homelab-swarm, ...)
@@ -1898,15 +1894,13 @@ class AlertInvestigationFlow:
         voice_text = f"Investigation complete for {title}. Status: {final_status}."
         if preview_src:
             voice_text += f" {preview_src[:600]}"
-        try:
+        with logged_failure("alert_verdict_voice_failed", logger=workflow.logger):
             await workflow.execute_activity_method(
                 DeliveryActivities.send_voice,
                 args=[agent_id, voice_text],
                 start_to_close_timeout=TIMEOUT_FAST,
                 retry_policy=NO_RETRY,
             )
-        except Exception as exc:
-            workflow.logger.warning("alert_verdict_voice_failed err=%s", error_text(exc))
 
         # ── Step 10: Record the outcome on the problem ──
         # `resolved` closes the problem; an opened fix PR keeps it `fixing`

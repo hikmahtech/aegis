@@ -12,7 +12,7 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any
 
-from aegis.errors import error_text
+from aegis.errors import error_text, logged_failure
 from aegis.services import library, library_config, notes, research_config, topics_config
 from aegis.services import research as rs
 from aegis.services.user_time import user_now
@@ -152,7 +152,7 @@ class ResearchActivities:
             workflow_id = activity.info().workflow_id
         except RuntimeError:
             workflow_id = ""
-        try:
+        with logged_failure("research_retrieval_log_failed", logger=activity.logger):
             await self.db_pool.execute(
                 "INSERT INTO knowledge_injection_log "
                 "(agent_id, thread_id, workflow_run_id, source, content_ids, triples_used) "
@@ -161,8 +161,6 @@ class ResearchActivities:
                 ids,
                 {"workflow_id": workflow_id, "question": question[:300]},
             )
-        except Exception as exc:  # noqa: BLE001 — the log is bookkeeping, not the answer
-            activity.logger.warning("research_retrieval_log_failed err=%s", error_text(exc))
 
     async def _notes_first(
         self, question: str, kg: list[dict], errors: list[str], used: list[str], limit: int = 3
@@ -292,7 +290,7 @@ class ResearchActivities:
                 "sources": public,
             }
         answer = ""
-        try:
+        with logged_failure("research_synthesis_failed", logger=activity.logger):
             # db_pool + purpose + agent_id ⇒ think() writes the llm_calls row
             # for every outcome, a failure included.
             result = await self.llm_client.think(
@@ -307,8 +305,6 @@ class ResearchActivities:
                 agent_id=self.agent_id or None,
             )
             answer = str(result.get("response") or "").strip()
-        except Exception as exc:  # noqa: BLE001 — the run still answers, saying it failed
-            activity.logger.warning("research_synthesis_failed err=%s", error_text(exc))
         if not answer:
             return {
                 "answer": f"I gathered {len(sources)} sources but the synthesis failed.",

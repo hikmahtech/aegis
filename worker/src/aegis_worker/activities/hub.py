@@ -19,7 +19,7 @@ from typing import Any
 
 import asyncpg
 import httpx
-from aegis.errors import error_text
+from aegis.errors import error_text, logged_failure
 from aegis.services import hub, hub_fix, hub_group, hub_project, hub_watch
 from temporalio import activity
 
@@ -721,10 +721,8 @@ class HubActivities:
                 activity.logger.warning(
                     "hub_group_retire_failed task_id=%s error=%s", task_id, error_text(exc)
                 )
-        try:
+        with logged_failure("hub_group_project_failed", logger=activity.logger, field="error"):
             await hub_project.project(self.db_pool, result["problem_id"])
-        except Exception as exc:  # noqa: BLE001 — the sweep re-projects
-            activity.logger.warning("hub_group_project_failed error=%s", error_text(exc))
 
         subjects = [s for s in result["subjects"] if s]
         body = (

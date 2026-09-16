@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import httpx
-from aegis.errors import error_text
+from aegis.errors import error_text, logged_failure
 
 
 def test_an_exception_with_no_message_is_named_by_its_type():
@@ -29,3 +29,55 @@ def test_the_limit_covers_the_whole_string():
     assert len(error_text(RuntimeError("x" * 900), 500)) == 500
     # A short message is not padded or cut.
     assert error_text(KeyError("k"), 500) == "KeyError: 'k'"
+
+
+# --------------------------------------------------------------- logged_failure
+
+
+class _Recorder:
+    """A logger that keeps what it was handed, unrendered."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+
+    def warning(self, *args) -> None:
+        self.calls.append(args)
+
+
+def test_logged_failure_swallows_an_exception_and_names_the_event():
+    log = _Recorder()
+    with logged_failure("gather_calendar_failed", logger=log):
+        raise RuntimeError("db down")
+    # The rendered line is what the hand-written handler produced, unchanged.
+    fmt, *rest = log.calls[0]
+    assert fmt % tuple(rest) == "gather_calendar_failed err=RuntimeError: db down"
+
+
+def test_the_field_label_is_the_call_sites_own():
+    log = _Recorder()
+    with logged_failure("gather_calendar_failed", logger=log, field="error"):
+        raise RuntimeError("db down")
+    fmt, *rest = log.calls[0]
+    assert fmt % tuple(rest) == "gather_calendar_failed error=RuntimeError: db down"
+
+
+def test_a_block_that_succeeds_logs_nothing():
+    log = _Recorder()
+    done = []
+    with logged_failure("never", logger=log):
+        done.append(1)
+    assert done == [1] and log.calls == []
+
+
+def test_a_cancellation_is_not_a_degradation():
+    """`BaseException` goes straight through: a cancelled activity must not
+    read as a step that quietly did nothing."""
+    log = _Recorder()
+    try:
+        with logged_failure("never", logger=log):
+            raise KeyboardInterrupt
+    except KeyboardInterrupt:
+        pass
+    else:  # pragma: no cover — the assert below says what went wrong
+        raise AssertionError("logged_failure swallowed a BaseException")
+    assert log.calls == []

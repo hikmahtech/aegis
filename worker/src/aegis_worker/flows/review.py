@@ -14,7 +14,7 @@ from temporalio import workflow
 from temporalio.exceptions import ApplicationError
 
 with workflow.unsafe.imports_passed_through():
-    from aegis.errors import error_text
+    from aegis.errors import error_text, logged_failure
 
     from aegis_worker.activities.delivery import DeliveryActivities
     from aegis_worker.activities.review import (
@@ -99,19 +99,15 @@ class DailyReviewFlow:
             )
             preview = format_daily_preview(digest)
             step = "send_message"
-            try:
+            with logged_failure("daily_review_delivery_failed", logger=workflow.logger):
                 await workflow.execute_activity_method(
                     DeliveryActivities.send_message,
                     args=[config.agent_id, preview],
                     start_to_close_timeout=TIMEOUT_FAST,
                     retry_policy=NO_RETRY,
                 )
-            except Exception as exc:  # noqa: BLE001
-                workflow.logger.warning(
-                    "daily_review_delivery_failed err=%s", error_text(exc)
-                )
             step = "today_focus"
-            try:
+            with logged_failure("daily_today_focus_failed", logger=workflow.logger):
                 focus = await workflow.execute_activity_method(
                     ReviewActivities.gather_today_focus,
                     start_to_close_timeout=TIMEOUT_FAST,
@@ -122,10 +118,6 @@ class DailyReviewFlow:
                     args=[config.agent_id, format_today_focus(focus)],
                     start_to_close_timeout=TIMEOUT_FAST,
                     retry_policy=NO_RETRY,
-                )
-            except Exception as exc:  # noqa: BLE001
-                workflow.logger.warning(
-                    "daily_today_focus_failed err=%s", error_text(exc)
                 )
             step = "spawn_review_interaction"
             interaction_id = await _spawn_review_interaction(
@@ -256,16 +248,12 @@ class WeeklyReviewFlow:
             if meeting_block:
                 narrative = f"{narrative}\n\n{meeting_block}"
             step = "send_message"
-            try:
+            with logged_failure("weekly_review_delivery_failed", logger=workflow.logger):
                 await workflow.execute_activity_method(
                     DeliveryActivities.send_message,
                     args=[config.agent_id, narrative],
                     start_to_close_timeout=TIMEOUT_FAST,
                     retry_policy=NO_RETRY,
-                )
-            except Exception as exc:  # noqa: BLE001
-                workflow.logger.warning(
-                    "weekly_review_delivery_failed err=%s", error_text(exc)
                 )
             step = "spawn_decisions"
             for i, decision in enumerate(decisions):

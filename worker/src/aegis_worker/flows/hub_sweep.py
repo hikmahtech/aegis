@@ -34,7 +34,7 @@ from dataclasses import dataclass
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
-    from aegis.errors import error_text
+    from aegis.errors import logged_failure
 
     from aegis_worker.activities.hub import HubActivities
     from aegis_worker.shared.retry import (
@@ -94,15 +94,13 @@ class HubSweepFlow:
         # logged, not raised: projection matters more than a verdict that
         # the next tick can reach just as well.
         verified: dict = {}
-        try:
+        with logged_failure("hub_sweep_verify_fixes_failed", logger=workflow.logger):
             verified = await workflow.execute_activity_method(
                 HubActivities.verify_fixes,
                 args=[config.fix_verify_hours, config.fix_grace_hours],
                 start_to_close_timeout=TIMEOUT_FAST,
                 retry_policy=FAST,
             )
-        except Exception as exc:  # noqa: BLE001
-            workflow.logger.warning("hub_sweep_verify_fixes_failed err=%s", error_text(exc))
         # Then ask alertmanager what it is still holding, and resolve the live
         # problems it no longer lists (#551). Alertmanager keeps its alerts in
         # memory, so a restart loses every `resolved` webhook it owed — and that
@@ -115,16 +113,12 @@ class HubSweepFlow:
         # matters more than a reconciliation the next tick can do just as well.
         reconciled: dict = {}
         if config.alertmanager_url:
-            try:
+            with logged_failure("hub_sweep_alertmanager_reconcile_failed", logger=workflow.logger):
                 reconciled = await workflow.execute_activity_method(
                     HubActivities.reconcile_alertmanager,
                     args=[config.alertmanager_url, config.alertmanager_min_uptime_seconds],
                     start_to_close_timeout=TIMEOUT_STANDARD,
                     retry_policy=FAST,
-                )
-            except Exception as exc:  # noqa: BLE001
-                workflow.logger.warning(
-                    "hub_sweep_alertmanager_reconcile_failed err=%s", error_text(exc)
                 )
         # Then project: a problem promoted a moment ago gets its task in the
         # same tick, and any comment a producer's inline projection could not

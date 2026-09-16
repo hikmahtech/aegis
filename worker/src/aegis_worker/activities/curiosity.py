@@ -49,7 +49,7 @@ from decimal import Decimal
 from html import escape
 from typing import Any
 
-from aegis.errors import error_text
+from aegis.errors import error_text, logged_failure
 from temporalio import activity
 
 from aegis_worker.activities.delivery import safe_send_message
@@ -792,7 +792,7 @@ class CuriosityActivities:
             activity.logger.warning("curiosity_phrasing_failed err=%s", error_text(exc))
             return candidates
 
-        try:
+        with logged_failure("curiosity_phrasing_parse_failed", logger=activity.logger):
             parsed = parse_llm_json(result.get("response", ""))
             for item in parsed or []:
                 if not isinstance(item, dict):
@@ -801,8 +801,6 @@ class CuriosityActivities:
                 text = (item.get("question") or "").strip()
                 if text and 0 <= idx < len(candidates):
                     candidates[idx]["question"] = text
-        except Exception as exc:  # noqa: BLE001
-            activity.logger.warning("curiosity_phrasing_parse_failed err=%s", error_text(exc))
         return candidates
 
     # -------------------------------------------------------------------- A7
@@ -910,13 +908,11 @@ class CuriosityActivities:
             return {"recorded": False, "reason": "empty"}
 
         row = None
-        try:
+        with logged_failure("curiosity_answer_lookup_failed", logger=activity.logger):
             row = await self.db_pool.fetchrow(
                 "SELECT agent_id, prompt FROM interactions WHERE id = $1::uuid",
                 interaction_id,
             )
-        except Exception as exc:  # noqa: BLE001 — a malformed id must not lose the answer
-            activity.logger.warning("curiosity_answer_lookup_failed err=%s", error_text(exc))
         agent_id = (row["agent_id"] if row else None) or str(meta.get("agent_id") or "")
         if not agent_id:
             # Nobody named on the card: the GTD agent's question (#556).
