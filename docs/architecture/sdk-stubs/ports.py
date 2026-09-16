@@ -125,7 +125,7 @@ class TranscriptionProvider(Protocol):
 @runtime_checkable
 class McpGateway(Protocol):
     """Generic 'call any tool on any configured MCP server'. A kernel-managed extension
-    surface (today's mcp_manager + /api/mcp), exposed to capabilities as a port so a
+    surface, exposed to capabilities as a port so a
     plugin can lean on external MCP tools without bespoke connectors."""
 
     async def list_tools(self, server: str) -> list[dict]: ...

@@ -220,16 +220,6 @@ CONFIG_REGISTRY: list[ConfigKey] = [
         "Restart the worker after enabling.",
     ),
     ConfigKey(
-        "mcp_enabled", "MCP client (external tool servers)", "Features", False,
-        boolean=True,
-        help="Lets AEGIS call tools on EXTERNAL MCP servers listed in AEGIS_MCP_SERVERS "
-        "(env-only JSON: name -> {url, auth_token, timeout_s}). Only the streamable-http "
-        "transport is supported; stdio entries are rejected because they would spawn "
-        "local processes. Off = no MCP server is contacted at all. Turning it on does "
-        "NOT let any agent call these tools — that is granted separately. Core restart "
-        "required.",
-    ),
-    ConfigKey(
         "books_repo_url", "Repo URL (git@github.com:org/books.git)", "Books", False,
         help="The hledger books repo Maou writes to. Empty = books disabled (money mail is "
         "indexed, never posted). SSH form; the deploy key below must have write access. "

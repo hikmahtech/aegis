@@ -32,7 +32,6 @@ from aegis.services.tools import vercel as tools_vercel
 EXPECTED_TOOL_NAMES = [
     "aegis_self_diagnose",
     "ask_knowledge",
-    "call_mcp_tool",
     "capture_to_inbox",
     "cloud_identity",
     "comment_on_task",

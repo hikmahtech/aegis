@@ -122,7 +122,6 @@ async def lifespan(app: FastAPI):
     app.state.llm = llm
 
     from aegis.connectors.search import SearchConnector
-    from aegis.mcp_manager import MCPManager
     from aegis.services.knowledge import KnowledgeStore
 
     # Native pgvector knowledge subsystem — always available (it's just our DB).
@@ -187,13 +186,6 @@ async def lifespan(app: FastAPI):
     )
     app.state.remote_script_connector = remote_script_connector
 
-    # MCP client for external tool servers. Constructing it contacts nothing;
-    # a bad server entry is rejected + logged at ERROR here (never a silent
-    # None downstream — issue #205) and connections happen lazily on first use.
-    mcp_manager = MCPManager(
-        server_configs=settings.mcp_servers or {}, enabled=settings.mcp_enabled
-    )
-    app.state.mcp_manager = mcp_manager
     app.state.settings = settings
 
     # Temporal client (best-effort — don't block startup if unreachable)
@@ -233,7 +225,6 @@ async def lifespan(app: FastAPI):
     sc = getattr(app.state, "search_connector", None)
     if sc:
         await sc.close()
-    await mcp_manager.close()
     await llm.close()
     await pool.close()
     logger.info("aegis_v2_stopped")
@@ -291,7 +282,6 @@ def create_app(run_lifespan: bool = True, settings: Settings | None = None) -> F
         knowledge,
         llm_backend,
         market,
-        mcp,
         mcp_server,
         money,
         notes_admin,
@@ -379,7 +369,6 @@ def create_app(run_lifespan: bool = True, settings: Settings | None = None) -> F
     app.include_router(interactions.router)
     app.include_router(webhooks.router)
     app.include_router(capture.router)
-    app.include_router(mcp.router)
     app.include_router(mcp_server.router)
     app.include_router(market.router)
     app.include_router(overview.router)

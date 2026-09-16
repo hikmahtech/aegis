@@ -257,19 +257,10 @@ class Settings(BaseSettings):
     # owner's personal data store.
     life_webhook_secret: str = ""  # X-Aegis-Signature + X-Aegis-Timestamp
 
-    # MCP — client for EXTERNAL tool servers. Off by default: an MCP server is
-    # a remote party that defines and executes tools, so the subsystem stays
-    # closed until an operator explicitly opens it. Off = no server is ever
-    # contacted, whatever mcp_servers says.
-    mcp_enabled: bool = False
-    # {"<name>": {"transport": "streamable-http", "url": "https://…/mcp",
-    #             "auth_token": "…", "timeout_s": 30, "max_response_bytes": …}}
-    # stdio is deliberately unsupported (it would spawn local processes).
-    mcp_servers: dict = {}
     # MCP — SERVER side (api/routes/mcp_server.py): serve AEGIS's own chat tools
     # to external MCP clients (claude/kimi CLI, Claude Desktop) at
-    # POST /api/mcp-server/{agent_id}. Off by default, same default-deny posture
-    # as the client above — this door lets an outside harness run AEGIS tools.
+    # POST /api/mcp-server/{agent_id}. Off by default, default-deny posture —
+    # this door lets an outside harness run AEGIS tools.
     mcp_server_enabled: bool = False
     # Escape hatch for `mcp_server_enabled` + `auth_disabled` together. That
     # pair serves every agent's tools with NO credential: auth_disabled makes

@@ -10,9 +10,6 @@ The split under test:
     "operator hasn't set this up" state to degrade to.
   * everything else boots DEGRADED — ERROR log + `deps.connector_errors` +
     a stand-in that raises `ConnectorUnavailableError` at first use.
-
-Shaped after B8's MCPManager (`core/src/aegis/mcp_manager.py`), which handles
-a bad server entry the same way.
 """
 
 from __future__ import annotations

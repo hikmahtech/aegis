@@ -21,13 +21,8 @@ _SRC = pathlib.Path(__file__).resolve().parents[2] / "core" / "src"
 _BAD = re.compile(r"\bstr\((?:exc|e)\)\[:|\berror=str\((?:exc|e)\)")
 
 # (path under core/src, text on the line) -> why the site keeps str(exc).
-_ALLOWED: dict[tuple[str, str], str] = {
-    (
-        "aegis/services/chat.py",
-        '"reason": str(exc)[:_MCP_ERROR_CHARS]',
-    ): "the MCP error envelope names the type in `kind`; `reason` is the remote "
-    "server's own message, bounded",
-}
+# Empty today: every core site reports through `error_text`.
+_ALLOWED: dict[tuple[str, str], str] = {}
 
 
 def test_no_bare_str_exc_error_reporting_in_core():

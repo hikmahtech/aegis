@@ -28,9 +28,8 @@ class ConnectorUnavailableError(RuntimeError):
 class _UnavailableConnector:
     """Stand-in for a connector whose constructor raised.
 
-    Mirrors ``MCPManager``'s handling of a bad server entry (B8,
-    ``core/src/aegis/mcp_manager.py``): log at ERROR once, keep booting, record
-    why, and raise a typed error the moment anyone actually reaches for it.
+    Log at ERROR once, keep booting, record why, and raise a typed error the
+    moment anyone actually reaches for it.
 
     Deliberately **truthy**, which is the whole behaviour change. Activities
     guard with ``if not self.remote_script: return``, meaning a falsy stand-in

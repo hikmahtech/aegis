@@ -29,15 +29,13 @@ PATH = f"/api/mcp-server/{AGENT}"
 AUTH = {"X-API-Key": "test-key"}
 
 # Every `_UNSERVED_TOOLS` member is granted in the DB on purpose: the endpoint
-# must strip all of them. `call_mcp_tool` would re-enter AEGIS's MCP client; the
-# next three each launch another CLI run, which mounts this same server again;
-# `stop_agent_run` and `comment_on_task` are operator actions; the three
-# `ledger_*` writers change a financial ledger (the membership test below
-# spells out why each one is withheld).
+# must strip all of them. The first three each launch another CLI run, which
+# mounts this same server again; `stop_agent_run` and `comment_on_task` are
+# operator actions; the three `ledger_*` writers change a financial ledger (the
+# membership test below spells out why each one is withheld).
 TOOL_SET = [
     "whats_next",
     "capture_to_inbox",
-    "call_mcp_tool",
     "dispatch_agent_run",
     "aegis_self_diagnose",
     "investigate_resource",
@@ -362,7 +360,6 @@ async def test_unserved_tools_cannot_be_invoked_even_though_they_are_granted(cli
     `dispatch_agent_run` / `aegis_self_diagnose` / `investigate_resource` each
     START ANOTHER CLI RUN, and a run mounts this endpoint with the same tool
     set — serving them is unbounded recursion with no depth counter anywhere.
-    `call_mcp_tool` re-enters AEGIS's MCP *client* (confused deputy).
     """
     assert name in TOOL_SET, "the DB grant is what makes this test non-vacuous"
 
@@ -376,7 +373,7 @@ async def test_unserved_tools_cannot_be_invoked_even_though_they_are_granted(cli
     assert "result" not in body  # nothing ran
 
 
-async def test_the_unserved_set_is_exactly_these_ten(client):
+async def test_the_unserved_set_is_exactly_these_nine(client):
     """A closed list, asserted by name: adding a run-spawning tool to an agent's
     `tool_set` without adding it here silently re-opens the recursion door, and
     the only way to notice is a test that pins the membership.
@@ -405,7 +402,6 @@ async def test_the_unserved_set_is_exactly_these_ten(client):
     could only mark its own task done; and a merge hides a problem, which is a
     person's call."""
     assert set(mcp_server_mod._UNSERVED_TOOLS) == {
-        "call_mcp_tool",
         "dispatch_agent_run",
         "aegis_self_diagnose",
         "investigate_resource",
