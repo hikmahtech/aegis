@@ -17,6 +17,7 @@ from aegis.observability import log_audit
 from aegis.security import SPOTLIGHT_INSTRUCTION, assess_rule_of_two, spotlight
 from aegis.services import alert_remediation as _alert_remediation
 from aegis.services.infra_alert_routing import get_infra_alert_routing
+from aegis.services.settings_store import get_setting
 from temporalio import activity
 
 # Cap on Kimi investigation output kept in the activity return value.
@@ -181,13 +182,11 @@ async def restart_repeat_window_minutes(pool: Any) -> int:
     if pool is None:
         return DEFAULT_RESTART_REPEAT_WINDOW_MINUTES
     try:
-        row = await pool.fetchrow(
-            "SELECT value FROM settings WHERE key = $1", ALERT_REMEDIATION_SETTINGS_KEY
-        )
+        value = await get_setting(pool, ALERT_REMEDIATION_SETTINGS_KEY)
     except Exception as exc:  # noqa: BLE001 — a config read is never fatal
         activity.logger.warning("alert_remediation_settings_read_failed err=%s", error_text(exc))
         return DEFAULT_RESTART_REPEAT_WINDOW_MINUTES
-    return _alert_remediation.merge(row["value"] if row else None)["repeat_window_minutes"]
+    return _alert_remediation.merge(value)["repeat_window_minutes"]
 
 
 def _task_row(t: Any) -> dict | None:

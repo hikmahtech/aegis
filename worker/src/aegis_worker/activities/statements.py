@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 import structlog
-from aegis.services.settings_store import get_setting
+from aegis.services.settings_store import get_setting, put_setting
 from temporalio import activity
 
 logger = structlog.get_logger()
@@ -664,15 +664,10 @@ async def _due_digest(
     if await get_setting(pool, DIGEST_SETTING) == month:
         return ""
     digest = findings_mod.monthly_digest(run, period=month, statements=statements)
-    await pool.execute(
-        "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW()) "
-        "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
-        DIGEST_SETTING,
-        # The bare string: the pool's jsonb codec applies `json.dumps` itself,
-        # and pre-dumping it here lands a double-encoded scalar that never
-        # compares equal to the month on the next tick.
-        month,
-    )
+    # The bare string: the pool's jsonb codec applies `json.dumps` itself, and
+    # pre-dumping it here lands a double-encoded scalar that never compares
+    # equal to the month on the next tick.
+    await put_setting(pool, DIGEST_SETTING, month)
     return digest
 
 
