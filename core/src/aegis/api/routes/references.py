@@ -16,20 +16,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, Query, Request
 
 from aegis.api.auth import verify_auth
 from aegis.api.deps import get_knowledge_connector as _get_connector
+from aegis.api.deps import get_pool
 from aegis.clarify_note import CLARIFY_NOTE_PREFIX
 
 router = APIRouter(prefix="/api/references", dependencies=[Depends(verify_auth)])
-
-
-def _get_pool(request: Request):
-    pool = getattr(request.app.state, "db_pool", None)
-    if pool is None:
-        raise HTTPException(status_code=503, detail="Database not available")
-    return pool
 
 
 def _extract_source_tag(item: dict) -> str | None:
@@ -86,7 +80,7 @@ async def list_failures(request: Request, limit: int = Query(100, ge=1, le=500))
     includes the demotion comment when available so the UI can surface
     the reason raphael couldn't file it.
     """
-    pool = _get_pool(request)
+    pool = get_pool(request)
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """

@@ -38,6 +38,7 @@ from temporalio.client import Client as TemporalClient
 from aegis.api.auth import verify_auth
 from aegis.api.deps import get_settings
 from aegis.api.routes._flow_trigger import require_temporal_client, start_named_workflow
+from aegis.api.settings_routes import settings_row_routes
 from aegis.config import Settings
 from aegis.errors import error_text
 from aegis.services import books, books_chart, desk_math, desk_rules, trading_desk
@@ -799,30 +800,22 @@ async def desk_history(
     }
 
 
-@router.get("/chart")
-async def books_chart_state(request: Request) -> dict:
-    """The chart of accounts, as the money lane itself reads it.
-
-    Through `books_chart.merge`, the same lenient read every post goes through,
-    so the form can never show a second opinion of where a transaction will be
-    filed. `stored` is false while a deployment is still on the code default.
-    """
-    return await books_chart.read(request.app.state.db_pool)
-
-
-@router.put("/chart")
-async def put_books_chart(request: Request, body: dict[str, Any]) -> dict:
-    """Save the chart of accounts. 400 on anything that would not work, rather
-    than a 200 that stores a typo and then misfiles transactions for months.
-
-    A REPLACEMENT, not a merge: an entity or a category the form did not send
-    is one the operator removed. Nothing is written when the check fails, and
-    the money lane re-reads the row on every post, so a save needs no deploy.
-    """
-    try:
-        return await books_chart.save_chart(request.app.state.db_pool, body)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+settings_row_routes(
+    router,
+    "/chart",
+    get=books_chart.read,
+    save=books_chart.save_chart,
+    doc=(
+        "The chart of accounts, as the money lane itself reads it — through `books_chart.merge`, "
+        "the same lenient read every post goes through, so the form can never show a second "
+        "opinion of where a transaction will be filed. `stored` is false while a deployment is "
+        "still on the code default. The PUT is a REPLACEMENT, not a merge: an entity or a "
+        "category the form did not send is one the operator removed. 400 on anything that would "
+        "not work, rather than a 200 that stores a typo and then misfiles transactions for "
+        "months; nothing is written when the check fails, and the money lane re-reads the row "
+        "on every post, so a save needs no deploy."
+    ),
+)
 
 
 @router.get("/desk/rules")
