@@ -26,7 +26,17 @@ logger = structlog.get_logger()
 DESK_SLUG = "trading-desk-daily"
 SOURCE = "money"
 SUBJECT_KIND = "trading_desk"
-DAILY_CLASSES = ["desk_decisions_stale", "desk_decisions_suspect", "desk_source_error", "desk_price_missing"]
+DAILY_CLASSES = [
+    "desk_decisions_stale",
+    "desk_decisions_suspect",
+    "desk_source_error",
+    "desk_price_missing",
+    # Raised by a post-open run that found no plan for the day, resolved by the
+    # next run that plans — which is what listing it here does, since
+    # `reconcile_findings` resolves any class named here that a run stops
+    # finding (#593).
+    "desk_plan_skipped",
+]
 MONTHLY_CLASSES = ["desk_below_expectation"]
 # Which market, which currency and which tax law are NOT here: they are the
 # desk's own config (`desk_math.Rules`), because this repo is forked and
@@ -613,6 +623,23 @@ async def _tick(
     if not planned and opened_today:
         out["skipped_plan"] = "after_open"
         logger.info("trading_desk_plan_skipped_after_open", slug=DESK_SLUG, day=day.isoformat())
+        # A lost trading day is a problem, not a log line (#593). Where the
+        # pre-open run fired and failed, its own finding already says so; this
+        # is for the run that never started — worker down, schedule missed, a
+        # deploy rolling at that minute — which is otherwise a key in a JSON
+        # column nobody reads. One occurrence a day however many later runs
+        # see it (`once_per`), gone the morning a run plans again.
+        findings.append(
+            _finding(
+                "desk_plan_skipped", "plan", f"Trading desk: {day} was never planned",
+                f"The market had already opened when the desk first saw {day}'s decisions, so "
+                f"it did not plan them: an order placed now would fill at today's open, a "
+                f"price struck before the decision existed. Nothing was traded today. The "
+                f"pre-open run did not run — check the worker and the schedule for the "
+                f"{DESK_SLUG} activity around its first fire time. Tomorrow's decisions are "
+                f"sized fresh, so nothing carries over.",
+            )
+        )
     elif not planned:
         book = dm.replay(fills, bars, rules.capital, day)
         check = dm.check_decisions(decisions, book.held_classes(), rules, halted=halt is not None)

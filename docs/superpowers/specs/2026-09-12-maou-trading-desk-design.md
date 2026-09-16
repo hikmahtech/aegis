@@ -74,7 +74,9 @@ Running it more than once in a day changes nothing.
 > a legitimate fill price: an order planned at 11:00 and filled at that day's 09:15 open would have
 > paid a price struck before the decision existed. `_tick` enforces it rather than trusting the
 > cron — once today's index bar has an open, the plan step is skipped and the run reports
-> `skipped_plan: "after_open"`.
+> `skipped_plan: "after_open"`. That skip also raises a `desk_plan_skipped` finding (#593): a
+> day the pre-open run never fired is a lost trading day, and it should be a problem the hub
+> owns rather than a key in `result_summary`. The next run that plans resolves it.
 >
 > **The trading calendar did not change.** `index_days` is still days with a *close*, because it is
 > what `day` is read off, and a session that has not closed has no decisions yet. Filling uses a
