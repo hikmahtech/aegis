@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from contextlib import asynccontextmanager
 
 import aegis_worker.activities.review as activities_review
 import pytest
@@ -15,9 +16,25 @@ from aegis_worker.flows.review import (
     WeeklyReviewFlow,
 )
 from temporalio import activity
-from temporalio.client import Client
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
+
+
+@asynccontextmanager
+async def _review_worker(*, task_queue: str, workflows: list, activities: list):
+    """A time-skipping environment with one worker up, yielding its client.
+
+    Every assertion stays INSIDE the block: these flows spawn an ABANDONED
+    InteractionFlow child that is still working when the parent returns, so
+    tearing the worker down before asserting would race it.
+    """
+    async with await WorkflowEnvironment.start_time_skipping() as env, Worker(
+        env.client,
+        task_queue=task_queue,
+        workflows=workflows,
+        activities=activities,
+    ):
+        yield env.client
 
 
 def _stub_digest_daily() -> dict:
@@ -112,34 +129,31 @@ def _build_stubs(digest: dict, kind: str):
 
 @pytest.mark.asyncio
 async def test_daily_review_flow_sends_digest_and_logs() -> None:
-    async with await WorkflowEnvironment.start_time_skipping() as env:
-        client: Client = env.client
-        activities, sent, logs = _build_stubs(_stub_digest_daily(), "daily")
-        async with Worker(
-            client,
+    activities, sent, logs = _build_stubs(_stub_digest_daily(), "daily")
+    async with _review_worker(
+        task_queue="aegis-review-daily-test",
+        workflows=[DailyReviewFlow, InteractionFlow],
+        activities=activities,
+    ) as client:
+        result = await client.execute_workflow(
+            DailyReviewFlow.run,
+            DailyReviewConfig(),
+            id=f"daily-review-{uuid.uuid4()}",
             task_queue="aegis-review-daily-test",
-            workflows=[DailyReviewFlow, InteractionFlow],
-            activities=activities,
-        ):
-            result = await client.execute_workflow(
-                DailyReviewFlow.run,
-                DailyReviewConfig(),
-                id=f"daily-review-{uuid.uuid4()}",
-                task_queue="aegis-review-daily-test",
-            )
-            assert result["kind"] == "daily"
-            # Counts threaded through unchanged
-            assert result["counts"]["inbox_count"] == 3
-            # The chat channel got the daily preview and today's focus shortlist
-            assert len(sent) == 2
-            assert "Daily review" in sent[0]
-            assert "Today's focus" in sent[1]
-            # log_review_digest was called with kind='daily'
-            assert len(logs) == 1
-            assert logs[0]["kind"] == "daily"
-            # interaction_id is the child workflow id (or None if spawn failed,
-            # but we expect success in the test worker)
-            assert logs[0]["interaction_id"] is not None
+        )
+        assert result["kind"] == "daily"
+        # Counts threaded through unchanged
+        assert result["counts"]["inbox_count"] == 3
+        # The chat channel got the daily preview and today's focus shortlist
+        assert len(sent) == 2
+        assert "Daily review" in sent[0]
+        assert "Today's focus" in sent[1]
+        # log_review_digest was called with kind='daily'
+        assert len(logs) == 1
+        assert logs[0]["kind"] == "daily"
+        # interaction_id is the child workflow id (or None if spawn failed,
+        # but we expect success in the test worker)
+        assert logs[0]["interaction_id"] is not None
 
 
 @pytest.mark.asyncio
@@ -191,114 +205,108 @@ async def test_weekly_review_flow_sends_digest_and_logs() -> None:
     async def check_key_dates():
         return []
 
-    async with await WorkflowEnvironment.start_time_skipping() as env:
-        client = env.client
-        async with Worker(
-            client,
+    async with _review_worker(
+        task_queue="aegis-review-weekly-test",
+        workflows=[WeeklyReviewFlow, InteractionFlow],
+        activities=[
+            gather_weekly_state,
+            frame_review,
+            send_message,
+            log_review_digest,
+            insert_interaction,
+            send_card,
+            resolve,
+            timeout,
+            apply_dec,
+            check_key_dates,
+            stub_gather_meeting_week,
+        ],
+    ) as client:
+        result = await client.execute_workflow(
+            WeeklyReviewFlow.run,
+            WeeklyReviewConfig(),
+            id=f"weekly-review-{uuid.uuid4()}",
             task_queue="aegis-review-weekly-test",
-            workflows=[WeeklyReviewFlow, InteractionFlow],
-            activities=[
-                gather_weekly_state,
-                frame_review,
-                send_message,
-                log_review_digest,
-                insert_interaction,
-                send_card,
-                resolve,
-                timeout,
-                apply_dec,
-                check_key_dates,
-                stub_gather_meeting_week,
-            ],
-        ):
-            result = await client.execute_workflow(
-                WeeklyReviewFlow.run,
-                WeeklyReviewConfig(),
-                id=f"weekly-review-{uuid.uuid4()}",
-                task_queue="aegis-review-weekly-test",
-            )
-            assert result["kind"] == "weekly"
-            assert result["counts"]["stale_next_actions_count"] == 5
-            assert len(sent) == 1
-            assert "Weekly review" in sent[0]
-            assert logs[0]["kind"] == "weekly"
-            assert result["decisions"] == 0
-            # Nothing upcoming ⇒ no people block bolted onto the narrative.
-            assert "Coming up" not in sent[0]
+        )
+        assert result["kind"] == "weekly"
+        assert result["counts"]["stale_next_actions_count"] == 5
+        assert len(sent) == 1
+        assert "Weekly review" in sent[0]
+        assert logs[0]["kind"] == "weekly"
+        assert result["decisions"] == 0
+        # Nothing upcoming ⇒ no people block bolted onto the narrative.
+        assert "Coming up" not in sent[0]
 
 
 @pytest.mark.asyncio
 async def test_daily_review_flow_continues_when_delivery_fails() -> None:
     """Delivery error shouldn't abort the flow — interaction + log still
     happen so the audit row is preserved."""
-    async with await WorkflowEnvironment.start_time_skipping() as env:
-        client = env.client
-        sent = []
-        log_calls = []
+    sent = []
+    log_calls = []
 
-        @activity.defn(name="gather_daily_digest")
-        async def gather():
-            return _stub_digest_daily()
+    @activity.defn(name="gather_daily_digest")
+    async def gather():
+        return _stub_digest_daily()
 
-        @activity.defn(name="send_message")
-        async def send_message(*a, **kw):
-            sent.append(a)
-            raise RuntimeError("simulated delivery outage")
+    @activity.defn(name="send_message")
+    async def send_message(*a, **kw):
+        sent.append(a)
+        raise RuntimeError("simulated delivery outage")
 
-        @activity.defn(name="log_review_digest")
-        async def log(kind, counts, preview, interaction_id):
-            log_calls.append({"kind": kind, "interaction_id": interaction_id})
-            return 1
+    @activity.defn(name="log_review_digest")
+    async def log(kind, counts, preview, interaction_id):
+        log_calls.append({"kind": kind, "interaction_id": interaction_id})
+        return 1
 
-        @activity.defn(name="insert_interaction")
-        async def insert(*a, **kw):
-            return {"interaction_id": "22222222-2222-2222-2222-222222222222"}
+    @activity.defn(name="insert_interaction")
+    async def insert(*a, **kw):
+        return {"interaction_id": "22222222-2222-2222-2222-222222222222"}
 
-        @activity.defn(name="send_interaction_card")
-        async def card(*a, **kw):
-            return {"ok": True, "message_id": 0}
+    @activity.defn(name="send_interaction_card")
+    async def card(*a, **kw):
+        return {"ok": True, "message_id": 0}
 
-        @activity.defn(name="resolve_interaction")
-        async def resolve(*a, **kw):
-            return {"already_resolved": False}
+    @activity.defn(name="resolve_interaction")
+    async def resolve(*a, **kw):
+        return {"already_resolved": False}
 
-        @activity.defn(name="apply_interaction_timeout")
-        async def to(*a, **kw):
-            return None
+    @activity.defn(name="apply_interaction_timeout")
+    async def to(*a, **kw):
+        return None
 
-        @activity.defn(name="apply_review_acknowledgement")
-        async def ack(*a, **kw):
-            return {}
+    @activity.defn(name="apply_review_acknowledgement")
+    async def ack(*a, **kw):
+        return {}
 
-        @activity.defn(name="gather_today_focus")
-        async def gather_focus():
-            return [{"task_id": "X", "content": "do x", "due_date": None}]
+    @activity.defn(name="gather_today_focus")
+    async def gather_focus():
+        return [{"task_id": "X", "content": "do x", "due_date": None}]
 
-        async with Worker(
-            client,
+    async with _review_worker(
+        task_queue="aegis-review-tg-fail",
+        workflows=[DailyReviewFlow, InteractionFlow],
+        activities=[
+            gather,
+            send_message,
+            log,
+            insert,
+            card,
+            resolve,
+            to,
+            ack,
+            gather_focus,
+        ],
+    ) as client:
+        result = await client.execute_workflow(
+            DailyReviewFlow.run,
+            DailyReviewConfig(),
+            id=f"daily-tgfail-{uuid.uuid4()}",
             task_queue="aegis-review-tg-fail",
-            workflows=[DailyReviewFlow, InteractionFlow],
-            activities=[
-                gather,
-                send_message,
-                log,
-                insert,
-                card,
-                resolve,
-                to,
-                ack,
-                gather_focus,
-            ],
-        ):
-            result = await client.execute_workflow(
-                DailyReviewFlow.run,
-                DailyReviewConfig(),
-                id=f"daily-tgfail-{uuid.uuid4()}",
-                task_queue="aegis-review-tg-fail",
-            )
-            assert result["kind"] == "daily"
-            assert len(log_calls) == 1
-            assert log_calls[0]["kind"] == "daily"
+        )
+        assert result["kind"] == "daily"
+        assert len(log_calls) == 1
+        assert log_calls[0]["kind"] == "daily"
 
 
 # ── Issue #36: review flows send as their own config.agent_id, not "sebas" ──
@@ -348,26 +356,22 @@ async def test_daily_review_addresses_config_agent_id() -> None:
     async def gather_today_focus():
         return [{"task_id": "X", "content": "do x", "due_date": None}]
 
-    async with (
-        await WorkflowEnvironment.start_time_skipping() as env,
-        Worker(
-            env.client,
-            task_queue="aegis-review-agentid-test",
-            workflows=[DailyReviewFlow, InteractionFlow],
-            activities=[
-                gather_daily,
-                send_message,
-                log_review_digest,
-                insert_interaction,
-                send_card,
-                resolve,
-                timeout,
-                apply_ack,
-                gather_today_focus,
-            ],
-        ),
-    ):
-        await env.client.execute_workflow(
+    async with _review_worker(
+        task_queue="aegis-review-agentid-test",
+        workflows=[DailyReviewFlow, InteractionFlow],
+        activities=[
+            gather_daily,
+            send_message,
+            log_review_digest,
+            insert_interaction,
+            send_card,
+            resolve,
+            timeout,
+            apply_ack,
+            gather_today_focus,
+        ],
+    ) as client:
+        await client.execute_workflow(
             DailyReviewFlow.run,
             DailyReviewConfig(agent_id="custom-gtd"),
             id=f"daily-review-{uuid.uuid4()}",

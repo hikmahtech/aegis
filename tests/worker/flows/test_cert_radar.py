@@ -35,6 +35,8 @@ from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment, WorkflowEnvironment
 from temporalio.worker import Replayer, Worker
 
+from tests.delivery_stub import FakeDelivery
+
 with workflow.unsafe.imports_passed_through():
     from aegis_worker.flows.cert_radar import CertRadarConfig, CertRadarFlow
     from aegis_worker.shared.retry import FAST, NO_RETRY, TIMEOUT_FAST, TIMEOUT_STANDARD
@@ -252,24 +254,6 @@ class FakeHomelab:
         return _envelope(
             True, data={"domain": domain, "not_after": c["not_after"], "serial": c["serial"]}
         )
-
-
-class FakeDelivery:
-    """`DeliveryActivities.send_message`: records the card, answers ok."""
-
-    def __init__(self) -> None:
-        self.sent: list[str] = []
-
-    async def send_message(
-        self,
-        agent_id: str,
-        message: str,
-        chat_id: int = 0,
-        thread_ref: dict | None = None,
-        thread_overflow: bool = False,
-    ) -> dict:
-        self.sent.append(message)
-        return {"ok": True}
 
 
 @pytest_asyncio.fixture(loop_scope="function")

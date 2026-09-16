@@ -23,7 +23,7 @@ from aegis.api.models.money import payee_key
 from aegis_worker.activities.curiosity import CuriosityActivities
 from temporalio.testing import ActivityEnvironment
 
-from tests.llm_stub import StubbedLLMClient
+from tests.llm_stub import RecordingFakeLLM, StubbedLLMClient
 
 AGENT = "sebas"
 # The index is keyed on nothing this file owns, and the test databases are
@@ -736,24 +736,6 @@ async def test_broken_detector_does_not_kill_the_run(clean_db, monkeypatch):
 # ------------------------------------------------------------------------- LLM
 
 
-class _FakeLLM:
-    def __init__(self, response=None, exc=None):
-        self.response = response
-        self.exc = exc
-        self.calls: list[dict] = []
-
-    async def think(self, **kwargs):
-        self.calls.append(kwargs)
-        if self.exc:
-            raise self.exc
-        return {
-            "response": self.response,
-            "model": "fake-model",
-            "prompt_tokens": 11,
-            "completion_tokens": 7,
-        }
-
-
 async def test_llm_absent_gives_deterministic_question(clean_db):
     await _add_unknown(clean_db, "Framer")
 
@@ -765,7 +747,7 @@ async def test_llm_absent_gives_deterministic_question(clean_db):
 
 async def test_llm_failure_degrades_to_template(clean_db):
     await _add_unknown(clean_db, "Framer")
-    llm = _FakeLLM(exc=RuntimeError("proxy down"))
+    llm = RecordingFakeLLM(raises=RuntimeError("proxy down"))
 
     out = await _run(clean_db, llm_client=llm)
 
@@ -805,7 +787,7 @@ async def test_llm_rephrases_and_logs_the_call(clean_db):
 async def test_llm_unparseable_response_keeps_template(clean_db):
     """parse_llm_json returns None on prose — the guards must absorb that."""
     await _add_unknown(clean_db, "Framer")
-    llm = _FakeLLM(response="not json at all")
+    llm = RecordingFakeLLM(response="not json at all")
 
     out = await _run(clean_db, llm_client=llm)
 
@@ -816,7 +798,7 @@ async def test_llm_unparseable_response_keeps_template(clean_db):
 async def test_llm_blank_question_keeps_template(clean_db):
     """A well-formed response with an empty question must not blank the card."""
     await _add_unknown(clean_db, "Framer")
-    llm = _FakeLLM(response='[{"index": 0, "question": "   "}]')
+    llm = RecordingFakeLLM(response='[{"index": 0, "question": "   "}]')
 
     out = await _run(clean_db, llm_client=llm)
 
@@ -829,14 +811,14 @@ async def test_all_candidates_suppressed_makes_no_llm_call(clean_db):
     LLM call on an empty list."""
     await _add_unknown(clean_db, "Framer")
     await _add_interaction(clean_db, "payee:framer")
-    llm = _FakeLLM(response="[]")
+    llm = RecordingFakeLLM(response="[]")
 
     assert await _run(clean_db, llm_client=llm) == []
     assert llm.calls == []
 
 
 async def test_no_gaps_at_all_makes_no_llm_call(clean_db):
-    llm = _FakeLLM(response="[]")
+    llm = RecordingFakeLLM(response="[]")
 
     assert await _run(clean_db, llm_client=llm) == []
     assert llm.calls == []

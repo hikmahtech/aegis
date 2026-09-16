@@ -13,74 +13,8 @@ from aegis_worker.activities.gmail import (
 )
 from temporalio.testing import ActivityEnvironment
 
+from tests.gmail_stub import FakeGmailService
 from tests.llm_stub import StubbedLLMClient
-
-
-class _FakeGmailRequest:
-    def __init__(self, payload, raise_auth):
-        self._payload = payload
-        self._raise_auth = raise_auth
-
-    def execute(self):
-        if self._raise_auth:
-            from google.auth.exceptions import RefreshError
-
-            raise RefreshError("invalid_grant")
-        return self._payload
-
-
-class _FakeLabelsEndpoint:
-    """Stand-in for svc.users().labels()."""
-
-    def __init__(self, labels: list[dict]):
-        self._labels = labels
-
-    def list(self, **kwargs):
-        return _FakeGmailRequest({"labels": self._labels}, False)
-
-
-class _FakeGmailService:
-    """Stand-in for the googleapiclient build() result."""
-
-    def __init__(
-        self,
-        messages: list[dict],
-        raise_auth: bool = False,
-        labels: list[dict] | None = None,
-    ):
-        self._messages = messages
-        self._raise_auth = raise_auth
-        # Default: each test label_id present in messages maps to a name of
-        # the same shape, so tests can opt in to lane derivation by setting
-        # `labelIds: ["Label_forwarded_acme"]` on a message and
-        # supplying a matching label dict.
-        self._labels = labels or []
-        # Verbatim kwargs of every messages().modify() call, so a test can
-        # assert the wire payload rather than merely that a call happened.
-        self.modify_calls: list[dict] = []
-
-    def users(self):
-        return self
-
-    def messages(self):
-        return self
-
-    def labels(self):
-        return _FakeLabelsEndpoint(self._labels)
-
-    def list(self, **kwargs):
-        return _FakeGmailRequest(
-            {"messages": [{"id": m["id"]} for m in self._messages]},
-            self._raise_auth,
-        )
-
-    def get(self, id, **kwargs):
-        match = next((m for m in self._messages if m["id"] == id), None)
-        return _FakeGmailRequest(match or {}, self._raise_auth)
-
-    def modify(self, **kwargs):
-        self.modify_calls.append(kwargs)
-        return _FakeGmailRequest({"id": kwargs.get("id", "")}, self._raise_auth)
 
 
 @pytest.fixture
@@ -122,7 +56,7 @@ def gmail(tmp_path):
 
 @pytest.mark.asyncio
 async def test_fetch_emails_returns_messages(gmail, monkeypatch):
-    fake_service = _FakeGmailService(
+    fake_service = FakeGmailService(
         [
             {
                 "id": "msg-1",
@@ -173,7 +107,7 @@ async def test_fetch_emails_derives_lane_from_forwarded_label(gmail, monkeypatch
     (e.g. `forwarded/acme`, `forwarded/freelance`) so the downstream
     classifier + Todoist description can surface forwarding provenance.
     """
-    fake_service = _FakeGmailService(
+    fake_service = FakeGmailService(
         [
             {
                 "id": "msg-stp-1",
@@ -221,7 +155,7 @@ async def test_fetch_emails_first_forwarded_label_wins(gmail, monkeypatch):
     """If more than one `forwarded/<lane>` label is somehow present, the
     first one in labelIds order is the lane. Defensive against future
     Gmail filter changes that might tag a message twice."""
-    fake_service = _FakeGmailService(
+    fake_service = FakeGmailService(
         [
             {
                 "id": "msg-mix",
@@ -263,7 +197,7 @@ async def test_fetch_emails_first_forwarded_label_wins(gmail, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_fetch_emails_raises_auth_expired(gmail, monkeypatch):
-    fake_service = _FakeGmailService([{"id": "x"}], raise_auth=True)
+    fake_service = FakeGmailService([{"id": "x"}], raise_auth=True)
     monkeypatch.setattr(
         "aegis_worker.activities.gmail._build_gmail_service",
         lambda *a, **k: fake_service,
@@ -286,7 +220,7 @@ async def test_fetch_emails_raises_auth_expired(gmail, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_apply_label_ok(gmail, monkeypatch):
-    fake_service = _FakeGmailService([{"id": "msg-1"}])
+    fake_service = FakeGmailService([{"id": "msg-1"}])
     monkeypatch.setattr(
         "aegis_worker.activities.gmail._build_gmail_service",
         lambda *a, **k: fake_service,
@@ -307,7 +241,7 @@ async def test_apply_label_read_verdict_strips_important(gmail, monkeypatch):
     "user correction" nobody made. Asserts the literal wire payload — the
     thing Gmail actually receives — not that a mock was called.
     """
-    fake_service = _FakeGmailService([{"id": "msg-1"}])
+    fake_service = FakeGmailService([{"id": "msg-1"}])
     monkeypatch.setattr(
         "aegis_worker.activities.gmail._build_gmail_service",
         lambda *a, **k: fake_service,
@@ -330,7 +264,7 @@ async def test_apply_label_other_verdicts_unchanged(gmail, monkeypatch):
     ADD it. Guards against a blanket "always drop IMPORTANT" regression, which
     would silently disarm the important side of the feedback loop.
     """
-    fake_service = _FakeGmailService([{"id": "msg-2"}])
+    fake_service = FakeGmailService([{"id": "msg-2"}])
     monkeypatch.setattr(
         "aegis_worker.activities.gmail._build_gmail_service",
         lambda *a, **k: fake_service,

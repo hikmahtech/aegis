@@ -2,21 +2,31 @@
 
 from __future__ import annotations
 
+import inspect
+
 import pytest_asyncio
-from aegis_worker.activities.delivery import safe_send_message
+from aegis_worker.activities.delivery import DeliveryActivities, safe_send_message
+
+from tests.delivery_stub import FakeDelivery
 
 
-class _FakeDelivery:
-    def __init__(self, pool, *, enabled, budget):
-        self.db_pool = pool
-        self.budget_enabled = enabled
-        self.daily_budget = budget
-        self.channel = "slack"  # budget gate only applies on the slack push path
-        self.sent: list[str] = []
+def test_fake_delivery_matches_the_real_class():
+    """The shared `tests/delivery_stub.py` fake must expose what
+    safe_send_message actually reads off the real DeliveryActivities: a
+    `channel` attribute, a `db_pool` attribute and send_message(agent_id,
+    message, chat_id).
 
-    async def send_message(self, *, agent_id, message, chat_id):
-        self.sent.append(message)
-        return {"ok": True}
+    One pin for one shared class — every file that used to carry its own copy
+    of this test now imports that class, so a drift here fails everywhere.
+    """
+    real = inspect.signature(DeliveryActivities.send_message).parameters
+    fake = inspect.signature(FakeDelivery.send_message).parameters
+    for name in ("agent_id", "message", "chat_id"):
+        assert name in real, f"DeliveryActivities.send_message lost {name}"
+        assert name in fake, f"FakeDelivery.send_message lost {name}"
+    fields = set(DeliveryActivities.__dataclass_fields__)
+    assert {"channel", "db_pool"} <= fields
+    assert hasattr(FakeDelivery, "channel") and hasattr(FakeDelivery, "db_pool")
 
 
 @pytest_asyncio.fixture(loop_scope="function")
@@ -27,21 +37,21 @@ async def clean_notif(db_pool):
 
 
 async def test_defers_when_over_budget(clean_notif):
-    d = _FakeDelivery(clean_notif, enabled=True, budget=0)  # cap 0 → always over
+    d = FakeDelivery(db_pool=clean_notif, budget_enabled=True, daily_budget=0)  # cap 0 → always over
     await safe_send_message(d, agent_id="sebas", message="hi", log_event="e")
     assert d.sent == []  # deferred, not sent
     assert await clean_notif.fetchval("SELECT count(*) FROM notification_log WHERE NOT sent") == 1
 
 
 async def test_sends_and_records_when_under_budget(clean_notif):
-    d = _FakeDelivery(clean_notif, enabled=True, budget=5)
+    d = FakeDelivery(db_pool=clean_notif, budget_enabled=True, daily_budget=5)
     await safe_send_message(d, agent_id="sebas", message="hi", log_event="e")
     assert d.sent == ["hi"]
     assert await clean_notif.fetchval("SELECT count(*) FROM notification_log WHERE sent") == 1
 
 
 async def test_disabled_always_sends(clean_notif):
-    d = _FakeDelivery(clean_notif, enabled=False, budget=0)
+    d = FakeDelivery(db_pool=clean_notif, budget_enabled=False, daily_budget=0)
     await safe_send_message(d, agent_id="sebas", message="hi", log_event="e")
     assert d.sent == ["hi"]
 
@@ -98,7 +108,7 @@ async def test_raised_exception_records_as_not_sent(clean_notif):
 async def test_success_records_unsuffixed_log_event(clean_notif):
     """A true success keeps the caller's log_event name as-is — only failure
     paths get a distinguishing suffix."""
-    d = _FakeDelivery(clean_notif, enabled=False, budget=0)
+    d = FakeDelivery(db_pool=clean_notif, budget_enabled=False, daily_budget=0)
     await safe_send_message(d, agent_id="sebas", message="hi", log_event="renewal_notify_failed")
     row = await clean_notif.fetchrow(
         "SELECT sent, log_event FROM notification_log ORDER BY id DESC LIMIT 1"

@@ -10,8 +10,6 @@ Covers:
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
-
 import pytest
 from aegis.services import infra_alert_routing
 from aegis.services.infra_alert_routing import DEFAULT_INFRA_ALERTNAMES
@@ -168,14 +166,6 @@ async def test_get_alert_routing_config_activity():
 # ---------------------------------------------------------------------------
 # resolve_infra_resource — activity
 # ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def mock_db_pool():
-    pool = AsyncMock()
-    pool.fetchrow.return_value = None
-    pool.execute.return_value = "OK"
-    return pool
 
 
 async def _infra_routing(db_pool, repo: str) -> None:

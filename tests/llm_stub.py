@@ -98,3 +98,67 @@ class StubbedLLMClient(LLMClient):
     @property
     def call_count(self) -> int:
         return len(self.calls)
+
+
+class RecordingFakeLLM:
+    """A fake `think()` that records the kwargs it was called with.
+
+    Reach for this ONLY when the assertion is about what the CALLER handed
+    `think()` — `purpose`, `agent_id`, the `db_pool` it passes to the ledger,
+    the prompt text — or about an `llm_calls` row NOT being written. A fake
+    replaces `think()`, so it records nothing: that absence is the point of the
+    tests asserting the table stayed empty, and it is why `StubbedLLMClient` is
+    the wrong tool for them. Anything asserting a row WAS written must use
+    `StubbedLLMClient`, which drives the real recording path.
+
+    `response` is the reply text, or a LIST consumed one per call whose last
+    entry then repeats — a retry that keeps getting garbage is what the
+    terminal case looks like in production. `by_purpose` answers one specific
+    `purpose` and falls back to `response`; `responder(think_kwargs) -> str`
+    covers a reply that has to be computed from the call; `raises` makes the
+    call blow up.
+    """
+
+    def __init__(
+        self,
+        response: Any = None,
+        *,
+        raises: BaseException | None = None,
+        by_purpose: dict[str, str] | None = None,
+        responder: Any = None,
+        model: str = "fake-model",
+        prompt_tokens: int = 11,
+        completion_tokens: int = 22,
+    ):
+        self._responses = list(response) if isinstance(response, list) else [response]
+        self._raises = raises
+        self._by_purpose = by_purpose or {}
+        self._responder = responder
+        self._model = model
+        self._prompt_tokens = prompt_tokens
+        self._completion_tokens = completion_tokens
+        self.calls: list[dict] = []
+
+    async def think(self, prompt: Any = None, **kwargs) -> dict[str, Any]:
+        kwargs.setdefault("prompt", prompt)
+        self.calls.append(kwargs)
+        if self._raises is not None:
+            raise self._raises
+        if self._responder is not None:
+            response = self._responder(kwargs)
+        elif kwargs.get("purpose") in self._by_purpose:
+            response = self._by_purpose[kwargs["purpose"]]
+        else:
+            response = self._responses[min(len(self.calls), len(self._responses)) - 1]
+        return {
+            "response": response,
+            "model": self._model,
+            "prompt_tokens": self._prompt_tokens,
+            "completion_tokens": self._completion_tokens,
+        }
+
+    def prompt_for(self, purpose: str) -> str:
+        """The prompt of the first call made with `purpose` (empty if none)."""
+        return next(
+            (str(c.get("prompt") or "") for c in self.calls if c.get("purpose") == purpose), ""
+        )

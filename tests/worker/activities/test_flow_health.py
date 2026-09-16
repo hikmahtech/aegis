@@ -10,19 +10,19 @@ a whole table.
 from __future__ import annotations
 
 import datetime as dt
-import inspect
 
 import pytest
 import structlog
 from aegis.db import run_migrations
 from aegis.services.hub import get_problem, mute_problem
-from aegis_worker.activities.delivery import DeliveryActivities
 from aegis_worker.activities.flow_health import (
     LLM_SUBJECT_PREFIX,
     FlowHealthActivities,
     cron_interval_minutes,
 )
 from temporalio.testing import ActivityEnvironment
+
+from tests.delivery_stub import FakeDelivery
 
 UTC = dt.UTC
 TYPE_A = "zzwd-type-a"
@@ -104,40 +104,8 @@ async def _llm_row(
         )
 
 
-class FakeDelivery:
-    """Stand-in for DeliveryActivities as `safe_send_message` uses it.
-
-    `test_fake_delivery_matches_the_real_class` pins this against the real
-    class so the fake cannot drift into testing nothing.
-    """
-
-    channel = "slack"
-    db_pool = None  # skips the notification-budget path in safe_send_message
-
-    def __init__(self):
-        self.sent: list[str] = []
-
-    async def send_message(self, *, agent_id: str, message: str, chat_id: int = 0) -> dict:
-        self.sent.append(message)
-        return {"ok": True}
-
-
 def _acts(db_pool, delivery=None):
     return FlowHealthActivities(db_pool=db_pool, delivery=delivery)
-
-
-def test_fake_delivery_matches_the_real_class():
-    """The fake must expose what safe_send_message actually reads off the real
-    DeliveryActivities: a `channel` attribute, a `db_pool` attribute and a
-    keyword-only send_message(agent_id, message, chat_id)."""
-    real = inspect.signature(DeliveryActivities.send_message).parameters
-    fake = inspect.signature(FakeDelivery.send_message).parameters
-    for name in ("agent_id", "message", "chat_id"):
-        assert name in real, f"DeliveryActivities.send_message lost {name}"
-        assert name in fake, f"FakeDelivery.send_message lost {name}"
-    fields = set(DeliveryActivities.__dataclass_fields__)
-    assert {"channel", "db_pool"} <= fields
-    assert hasattr(FakeDelivery, "channel") and hasattr(FakeDelivery, "db_pool")
 
 
 # ---------------------------------------------------------------------------
