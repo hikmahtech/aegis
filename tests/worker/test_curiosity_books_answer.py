@@ -14,7 +14,6 @@ does reach the write.
 
 from __future__ import annotations
 
-import inspect
 import shutil
 import subprocess
 from datetime import date
@@ -28,7 +27,6 @@ from aegis.api.models.money import MoneyEvent, payee_key
 from aegis.services import books
 from aegis.services import journal_index as ji
 from aegis_worker.activities.curiosity import CuriosityActivities
-from aegis_worker.activities.delivery import DeliveryActivities
 from temporalio.testing import ActivityEnvironment
 
 from tests.books_chart_data import CHART
@@ -212,21 +210,6 @@ def _meta(**over) -> dict:
     }
     meta.update(over)
     return meta
-
-
-def test_fake_delivery_matches_the_real_class():
-    """The shared `tests/delivery_stub.py` fake must expose what
-    safe_send_message actually reads off the real DeliveryActivities: a
-    `channel` attribute, a `db_pool` attribute and send_message(agent_id,
-    message, chat_id)."""
-    real = inspect.signature(DeliveryActivities.send_message).parameters
-    fake = inspect.signature(FakeDelivery.send_message).parameters
-    for name in ("agent_id", "message", "chat_id"):
-        assert name in real, f"DeliveryActivities.send_message lost {name}"
-        assert name in fake, f"FakeDelivery.send_message lost {name}"
-    fields = set(DeliveryActivities.__dataclass_fields__)
-    assert {"channel", "db_pool"} <= fields
-    assert hasattr(FakeDelivery, "channel") and hasattr(FakeDelivery, "db_pool")
 
 
 async def _apply(pool, cfg, llm, meta=None, answer="that's my grocer", delivery=None):

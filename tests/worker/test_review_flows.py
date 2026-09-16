@@ -356,26 +356,22 @@ async def test_daily_review_addresses_config_agent_id() -> None:
     async def gather_today_focus():
         return [{"task_id": "X", "content": "do x", "due_date": None}]
 
-    async with (
-        await WorkflowEnvironment.start_time_skipping() as env,
-        Worker(
-            env.client,
-            task_queue="aegis-review-agentid-test",
-            workflows=[DailyReviewFlow, InteractionFlow],
-            activities=[
-                    gather_daily,
-                    send_message,
-                    log_review_digest,
-                    insert_interaction,
-                    send_card,
-                    resolve,
-                    timeout,
-                    apply_ack,
-                    gather_today_focus,
+    async with _review_worker(
+        task_queue="aegis-review-agentid-test",
+        workflows=[DailyReviewFlow, InteractionFlow],
+        activities=[
+            gather_daily,
+            send_message,
+            log_review_digest,
+            insert_interaction,
+            send_card,
+            resolve,
+            timeout,
+            apply_ack,
+            gather_today_focus,
         ],
-        ),
-    ):
-        await env.client.execute_workflow(
+    ) as client:
+        await client.execute_workflow(
             DailyReviewFlow.run,
             DailyReviewConfig(agent_id="custom-gtd"),
             id=f"daily-review-{uuid.uuid4()}",

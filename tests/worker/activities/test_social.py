@@ -13,7 +13,6 @@ from aegis.config import Settings
 from aegis.connectors.social import SocialConnector
 from aegis.crypto import decrypt_secret, encrypt_secret
 from aegis.services.hub import mute_problem
-from aegis_worker.activities.delivery import DeliveryActivities
 from aegis_worker.activities.social import (
     CLOSE_ACTION,
     SocialActivities,
@@ -1332,17 +1331,6 @@ async def test_drain_social_outbox_posts_via_postiz_end_to_end(social_env):
 # therefore the audit target_id / mute_key), so nothing here can perturb
 # another test sharing the same xdist-worker database.
 # ============================================================================
-
-
-def test_stuck_fake_delivery_matches_the_real_class():
-    real = inspect.signature(DeliveryActivities.send_message).parameters
-    fake = inspect.signature(FakeDelivery.send_message).parameters
-    for name in ("agent_id", "message", "chat_id"):
-        assert name in real, f"DeliveryActivities.send_message lost {name}"
-        assert name in fake, f"FakeDelivery.send_message lost {name}"
-    fields = set(DeliveryActivities.__dataclass_fields__)
-    assert {"channel", "db_pool"} <= fields
-    assert hasattr(FakeDelivery, "channel") and hasattr(FakeDelivery, "db_pool")
 
 
 @pytest_asyncio.fixture(loop_scope="function")

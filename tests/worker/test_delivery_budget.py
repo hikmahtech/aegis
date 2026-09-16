@@ -2,10 +2,31 @@
 
 from __future__ import annotations
 
+import inspect
+
 import pytest_asyncio
-from aegis_worker.activities.delivery import safe_send_message
+from aegis_worker.activities.delivery import DeliveryActivities, safe_send_message
 
 from tests.delivery_stub import FakeDelivery
+
+
+def test_fake_delivery_matches_the_real_class():
+    """The shared `tests/delivery_stub.py` fake must expose what
+    safe_send_message actually reads off the real DeliveryActivities: a
+    `channel` attribute, a `db_pool` attribute and send_message(agent_id,
+    message, chat_id).
+
+    One pin for one shared class — every file that used to carry its own copy
+    of this test now imports that class, so a drift here fails everywhere.
+    """
+    real = inspect.signature(DeliveryActivities.send_message).parameters
+    fake = inspect.signature(FakeDelivery.send_message).parameters
+    for name in ("agent_id", "message", "chat_id"):
+        assert name in real, f"DeliveryActivities.send_message lost {name}"
+        assert name in fake, f"FakeDelivery.send_message lost {name}"
+    fields = set(DeliveryActivities.__dataclass_fields__)
+    assert {"channel", "db_pool"} <= fields
+    assert hasattr(FakeDelivery, "channel") and hasattr(FakeDelivery, "db_pool")
 
 
 @pytest_asyncio.fixture(loop_scope="function")
