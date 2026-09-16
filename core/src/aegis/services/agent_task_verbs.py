@@ -42,6 +42,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from aegis.services.config_rows import SettingsRow
+
 SETTINGS_KEY = "agent_task_verbs"
 UNTAGGED = "untagged"  # the key for a task with no source tag
 
@@ -120,10 +122,17 @@ def validate(raw: Any) -> dict[str, str | None]:
     return out
 
 
+ROW = SettingsRow(SETTINGS_KEY, merge, validate)
+
+
 async def get_agent_task_verbs(pool: Any) -> dict[str, Any]:
     """What the admin page shows: the overrides, the effective table, the
-    defaults under them and the verb vocabulary."""
-    value = await pool.fetchval("SELECT value FROM settings WHERE key = $1", SETTINGS_KEY)
+    defaults under them and the verb vocabulary.
+
+    One :meth:`SettingsRow.raw` read, not two: the page shows the stored
+    overrides beside the merged table, and taking them from the same value is
+    what keeps the form from showing an override the table below it lacks."""
+    value = await ROW.raw(pool)
     return {
         "overrides": overrides_of(value),
         "effective": merge(value),
@@ -138,12 +147,7 @@ async def save_agent_task_verbs(pool: Any, raw: Any) -> dict[str, Any]:
     is the defaults and nothing suggests an override that is not there."""
     stored = validate(raw)
     if stored:
-        await pool.execute(
-            "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW()) "
-            "ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()",
-            SETTINGS_KEY,
-            stored,
-        )
+        await ROW.save(pool, stored)
     else:
-        await pool.execute("DELETE FROM settings WHERE key = $1", SETTINGS_KEY)
+        await ROW.delete(pool)
     return await get_agent_task_verbs(pool)

@@ -37,6 +37,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from aegis.services.config_rows import SettingsRow
+
 SETTINGS_KEY = "email_triage_rules"
 
 CATEGORIES = ("important_action", "important_read", "informational", "useless")
@@ -137,22 +139,17 @@ def validate(value: dict | None) -> dict:
     return merge(v)
 
 
+ROW = SettingsRow(SETTINGS_KEY, merge, validate)
+
+
 async def get_email_rules(pool: Any) -> dict:
     """The effective rules: DB override (settings.email_triage_rules) over defaults."""
-    row = await pool.fetchrow("SELECT value FROM settings WHERE key = $1", SETTINGS_KEY)
-    return merge(row["value"] if row and row["value"] else {})
+    return await ROW.get(pool)
 
 
 async def save_email_rules(pool: Any, rules: dict) -> dict:
     """Validate then persist. Returns the merged result. Raises ValueError on bad input."""
-    normalised = validate(rules)
-    await pool.execute(
-        "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW()) "
-        "ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()",
-        SETTINGS_KEY,
-        normalised,
-    )
-    return await get_email_rules(pool)
+    return await ROW.save(pool, rules)
 
 
 async def known_senders(pool: Any, limit: int = 200) -> list[dict]:

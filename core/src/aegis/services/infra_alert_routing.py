@@ -45,8 +45,9 @@ investigated, but a typo must not save and then silently do nothing.
 from __future__ import annotations
 
 import re
-import time
 from typing import Any
+
+from aegis.services.config_rows import SettingsRow
 
 SETTINGS_KEY = "infra_alert_routing"
 
@@ -89,9 +90,6 @@ _HINT_CAP = 1000
 # What GET adds on top of the stored row. Accepted and ignored on PUT so the
 # admin page can send back what it read.
 _COMPUTED_KEYS = frozenset({"alertnames", "default_alertnames"})
-
-_CACHE_SECONDS = 30.0
-_cache: dict = {"value": None, "ts": 0.0}
 
 
 def _norm(name: str) -> str:
@@ -153,31 +151,15 @@ def merge(value: Any) -> dict:
     }
 
 
+ROW = SettingsRow(SETTINGS_KEY, merge, validate)
+
+
 async def get_infra_alert_routing(pool: Any, *, cached: bool = True) -> dict:
     """The effective routing, cached for 30s. The defaults when there is no pool
     or the read fails: routing config must never stop an alert being handled."""
-    if pool is None:
-        return merge(None)
-    now = time.monotonic()
-    if cached and _cache["value"] is not None and now - _cache["ts"] < _CACHE_SECONDS:
-        return _cache["value"]
-    try:
-        row = await pool.fetchrow("SELECT value FROM settings WHERE key = $1", SETTINGS_KEY)
-    except Exception:  # noqa: BLE001 — a config read is best-effort, never fatal
-        return merge(None)
-    value = merge(row["value"] if row else None)
-    _cache.update(value=value, ts=now)
-    return value
+    return await ROW.get(pool, fresh=not cached)
 
 
 async def save_infra_alert_routing(pool: Any, raw: Any) -> dict:
     """Replace the row (validated); returns the effective routing."""
-    stored = validate(raw)
-    await pool.execute(
-        "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW()) "
-        "ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()",
-        SETTINGS_KEY,
-        stored,
-    )
-    _cache.update(value=None, ts=0.0)
-    return merge(stored)
+    return await ROW.save(pool, raw)

@@ -145,9 +145,9 @@ def test_is_infra_alert_dagster_pipeline_failure_is_setup_config_not_a_default()
 def _fresh_routing_cache():
     """The infra routing read is cached 30s per process; never let one test's
     row leak into the next."""
-    infra_alert_routing._cache.update(value=None, ts=0.0)
+    infra_alert_routing.ROW.clear_cache()
     yield
-    infra_alert_routing._cache.update(value=None, ts=0.0)
+    infra_alert_routing.ROW.clear_cache()
 
 
 async def test_get_alert_routing_config_activity():
@@ -175,7 +175,7 @@ async def _infra_routing(db_pool, repo: str) -> None:
             "INSERT INTO settings (key, value, updated_at) VALUES ('infra_alert_routing', $1, NOW())",
             {"repo": repo},
         )
-    infra_alert_routing._cache.update(value=None, ts=0.0)
+    infra_alert_routing.ROW.clear_cache()
 
 
 async def test_resolve_infra_resource_found(db_pool):

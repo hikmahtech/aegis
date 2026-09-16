@@ -13,9 +13,9 @@ from temporalio.testing import ActivityEnvironment
 def _fresh_routing_cache():
     """The infra routing read is cached 30s per process; never let one test's
     row answer another's question."""
-    infra_alert_routing._cache.update(value=None, ts=0.0)
+    infra_alert_routing.ROW.clear_cache()
     yield
-    infra_alert_routing._cache.update(value=None, ts=0.0)
+    infra_alert_routing.ROW.clear_cache()
 
 
 def _routing_fetchrow(repo: str, repo_row: dict | None):

@@ -50,9 +50,12 @@ class _RulesPool:
     def __init__(self, names):
         self._names = names
 
-    async def fetchrow(self, sql, *args):
+    async def fetchval(self, sql, *args):
         if "settings" in sql:
-            return {"value": {"self_names": self._names}}
+            return {"self_names": self._names}
+        return None
+
+    async def fetchrow(self, sql, *args):
         return None
 
 
