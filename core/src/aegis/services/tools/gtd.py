@@ -19,6 +19,7 @@ import asyncpg
 import structlog
 
 from aegis.errors import error_text
+from aegis.services.settings_store import get_setting
 from aegis.services.todoist_config import resolve_todoist_api_key
 from aegis.services.tools.base import ToolContext
 from aegis.services.tools.registry import aegis_tool
@@ -56,14 +57,10 @@ async def _capture_to_inbox_impl(
     if pool is None:
         return None
     async with pool.acquire() as conn:
-        kill = await conn.fetchval(
-            "SELECT value FROM settings WHERE key = 'todoist_capture_enabled'"
-        )
+        kill = await get_setting(conn, "todoist_capture_enabled")
         if kill is False or (isinstance(kill, dict) and kill.get("value") is False):
             return None
-        managed = await conn.fetchval(
-            "SELECT value FROM settings WHERE key = 'todoist_managed_project_ids'"
-        )
+        managed = await get_setting(conn, "todoist_managed_project_ids")
         inbox_id = (managed or {}).get("inbox") if isinstance(managed, dict) else None
         target = project_id or inbox_id
         if not target:
@@ -432,9 +429,7 @@ async def _exec_whats_next(
     ]
     params: list = []
     async with pool.acquire() as conn:
-        managed = await conn.fetchval(
-            "SELECT value FROM settings WHERE key='todoist_managed_project_ids'"
-        )
+        managed = await get_setting(conn, "todoist_managed_project_ids")
         # Someday is excluded via the @someday state label above; only Inbox
         # is still a managed-project id to exclude.
         exclude = []

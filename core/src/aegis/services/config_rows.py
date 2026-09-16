@@ -44,6 +44,12 @@ Merge = Callable[[Any], Any]
 #: Every row built in this process, so tests can clear the lot in one call.
 _ROWS: list[SettingsRow] = []
 
+#: Returned by `SettingsRow._read` when the row could not be read AT ALL — the
+#: query failed, or there is no pool. Deliberately distinct from None, which
+#: means "there is no such row": both merge to the defaults, but only the
+#: second is an answer worth caching.
+_UNREADABLE: Any = object()
+
 
 def _copy(value: Any) -> Any:
     """A shallow copy of a merged value, so a caller cannot mutate the cache."""
@@ -66,29 +72,46 @@ class SettingsRow:
     def clear_cache(self) -> None:
         self._cached = None
 
-    async def raw(self, pool: Any) -> Any:
-        """The stored value, unmerged, or None when there is no row.
-
-        For the handful of admin views that have to say whether a row exists at
-        all, or show the operator's overrides beside the effective config — a
-        merged read cannot tell "stored the default" from "stored nothing".
-        Never raises, and never cached: it backs a form, not a hot path.
-        """
+    async def _read(self, pool: Any) -> Any:
+        """The stored value, None for no row, :data:`_UNREADABLE` when the read
+        itself failed (or there was no pool). Never raises."""
         if pool is None:
-            return None
+            return _UNREADABLE
         try:
             return await get_setting(pool, self.key)
         except Exception as exc:  # noqa: BLE001 — a config read must never break a run
             logger.warning("config_row_read_failed", key=self.key, error=error_text(exc))
-            return None
+            return _UNREADABLE
+
+    async def raw(self, pool: Any) -> Any:
+        """The stored value, unmerged, or None when there is no row.
+
+        For the handful of admin views that have to show the operator's
+        overrides beside the effective config — a merged read cannot tell
+        "stored the default" from "stored nothing". Never cached, and — unlike
+        :meth:`get` — it does NOT swallow a failed read: a form that reports
+        what is stored must say the database was unreachable, not answer
+        "nothing is".
+        """
+        return await get_setting(pool, self.key)
 
     async def get(self, pool: Any, *, fresh: bool = False) -> Any:
         """The effective config: the row merged over the defaults. Never raises;
-        an unreadable row reads as the defaults (and is logged)."""
+        an unreadable row reads as the defaults (and is logged).
+
+        A failed read is answered but NOT cached. These rows are read on hot
+        paths — every mail classified, every task clarified — and caching a
+        blip's answer would hold "no sender overrides" for `ttl` seconds after
+        the database came back, which is how a run silently loses the
+        `financial`/`payments` tags an override carries. The next call retries.
+        """
         now = time.monotonic()
         if not fresh and self._cached and now - self._cached[0] < self.ttl:
             return _copy(self._cached[1])
-        merged = self.merge(await self.raw(pool))
+        value = await self._read(pool)
+        if value is _UNREADABLE:
+            return self.merge(None)
+        merged = self.merge(value)
         self._cached = (now, _copy(merged))
         return merged
 

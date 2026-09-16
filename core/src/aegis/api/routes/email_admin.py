@@ -88,12 +88,22 @@ settings_row_routes(
     ),
 )
 
+def _links_body(body: dict[str, Any]) -> Any:
+    """The rules out of the request body. A body that does not carry `links` is
+    a mistake, not an empty list: `{"link": [...]}` or `{"links": null}` would
+    otherwise save `[]` with a 200 and wipe every rule the operator had."""
+    links = body.get("links")
+    if links is None:
+        raise ValueError('links is required - send {"links": [...]}, or [] to remove every rule')
+    return links
+
+
 settings_row_routes(
     router,
     "/task-links",
     get=email_task_links.get_email_task_links,
     save=email_task_links.save_email_task_links,
-    body=lambda body: body.get("links") or [],
+    body=_links_body,
     view=lambda _pool, links: {"actions": list(email_task_links.ACTIONS), "links": links},
     audit=lambda request, links: log_audit(
         get_pool(request),

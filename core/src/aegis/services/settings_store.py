@@ -41,3 +41,14 @@ async def get_setting(pool: Any, key: str) -> Any:
 async def put_setting(pool: Any, key: str, value: Any) -> None:
     """Store `value` under `key` (insert or replace), stamping `updated_at`."""
     await pool.execute(_UPSERT, key, value)
+
+
+async def setting_exists(pool: Any, key: str) -> bool:
+    """Whether a row exists under `key`, whatever it holds.
+
+    :func:`get_setting` cannot answer this: `value` is `jsonb`, so a row
+    holding the JSON scalar `null` decodes to None and reads back exactly like
+    no row at all. A form that says "you have saved a value here" must not call
+    those two the same thing.
+    """
+    return await pool.fetchval("SELECT true FROM settings WHERE key = $1", key) is True

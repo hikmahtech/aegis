@@ -30,19 +30,11 @@ type Props<T> = {
   emptyText?: ReactNode;
   rowKey?: (row: T, index: number) => Key;
   tr?: (row: T, index: number) => HTMLAttributes<HTMLTableRowElement>;
-  className?: string;
 };
 
-export default function DataTable<T>({
-  columns,
-  rows,
-  emptyText,
-  rowKey,
-  tr,
-  className = 'data-table',
-}: Props<T>) {
+export default function DataTable<T>({ columns, rows, emptyText, rowKey, tr }: Props<T>) {
   return (
-    <table className={className}>
+    <table className="data-table">
       <thead>
         <tr>
           {columns.map((c, i) => (

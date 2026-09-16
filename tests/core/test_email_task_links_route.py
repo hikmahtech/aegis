@@ -89,6 +89,23 @@ async def test_put_400s_on_what_the_read_path_would_drop_silently(app_client, ba
     assert r.status_code == 400 and message in r.json()["detail"]
 
 
+@pytest.mark.parametrize("body", [{}, {"links": None}, {"link": [RULE]}])
+async def test_a_body_without_links_is_refused_not_read_as_empty(app_client, body):
+    """A PUT is a REPLACEMENT, so `body.get("links") or []` would answer 200 to a
+    typo'd key and wipe every rule. The rules are only removable on purpose."""
+    await app_client.put(URL, auth=AUTH, json={"links": [RULE]})
+
+    r = await app_client.put(URL, auth=AUTH, json=body)
+    assert r.status_code == 400 and "links is required" in r.json()["detail"]
+    assert (await app_client.get(URL, auth=AUTH)).json()["links"] == [RULE], "the rules were wiped"
+
+
+async def test_an_explicit_empty_list_still_removes_every_rule(app_client):
+    await app_client.put(URL, auth=AUTH, json={"links": [RULE]})
+    r = await app_client.put(URL, auth=AUTH, json={"links": []})
+    assert r.status_code == 200 and r.json()["links"] == []
+
+
 async def test_duplicate_keys_are_refused(app_client):
     r = await app_client.put(URL, auth=AUTH, json={"links": [RULE, {**RULE, "action": "comment"}]})
     assert r.status_code == 400 and "duplicate rule key" in r.json()["detail"]

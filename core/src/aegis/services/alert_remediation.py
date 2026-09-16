@@ -29,6 +29,7 @@ from __future__ import annotations
 from typing import Any
 
 from aegis.services.config_rows import SettingsRow
+from aegis.services.settings_store import setting_exists
 
 SETTINGS_KEY = "alert_remediation"
 DEFAULT_REPEAT_WINDOW_MINUTES = 60
@@ -84,15 +85,17 @@ async def get_alert_remediation(pool: Any) -> dict[str, Any]:
     """What the admin page shows: the effective window, the default under it,
     the cap, and whether a row is stored at all.
 
-    Read through :meth:`SettingsRow.raw` rather than ``get``: ``stored`` is a
-    fact about the row, and the merged value cannot carry it — a row holding
-    exactly the default reads the same as no row at all."""
-    stored = await ROW.raw(pool)
+    Read through :meth:`SettingsRow.raw` rather than ``get``, and asked twice:
+    ``stored`` is a fact about the ROW, which no merged value can carry — a row
+    holding exactly the default reads the same as no row. Neither call
+    swallows, so a database that is down answers 500 here rather than 200 with
+    the defaults and ``stored: false``, which would read as "nothing is
+    configured"."""
     return {
-        **merge(stored),
+        **merge(await ROW.raw(pool)),
         "defaults": dict(DEFAULTS),
         "max_minutes": MAX_MINUTES,
-        "stored": stored is not None,
+        "stored": await setting_exists(pool, SETTINGS_KEY),
     }
 
 
