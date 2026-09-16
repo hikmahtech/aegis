@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from aegis_worker.activities.delivery import DeliveryActivities, safe_send_message
 
+from tests.delivery_stub import FakeDelivery
+
 
 async def test_interaction_card_web_returns_web_ref():
     d = DeliveryActivities(channel="web", comms_url="http://comms:8081")
@@ -19,24 +21,13 @@ async def test_interaction_card_web_when_no_comms_url():
     assert r["delivery_ref"]["adapter"] == "web"
 
 
-class _FakeDelivery:
-    def __init__(self, channel: str):
-        self.channel = channel
-        self.db_pool = None
-        self.sent: list[str] = []
-
-    async def send_message(self, *, agent_id, message, chat_id):
-        self.sent.append(message)
-        return {"ok": True}
-
-
 async def test_safe_send_skips_for_web():
-    d = _FakeDelivery("web")
+    d = FakeDelivery("web")
     await safe_send_message(d, agent_id="sebas", message="hi", log_event="e")
     assert d.sent == []  # no external push on the web channel
 
 
 async def test_safe_send_sends_for_slack():
-    d = _FakeDelivery("slack")
+    d = FakeDelivery("slack")
     await safe_send_message(d, agent_id="sebas", message="hi", log_event="e")
     assert d.sent == ["hi"]

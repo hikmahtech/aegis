@@ -32,6 +32,8 @@ from aegis_worker.activities.delivery import DeliveryActivities
 from temporalio.testing import ActivityEnvironment
 
 from tests.books_chart_data import CHART
+from tests.delivery_stub import FakeDelivery
+from tests.llm_stub import RecordingFakeLLM
 
 HAS_HLEDGER = shutil.which("hledger") is not None and shutil.which("git") is not None
 pytestmark = pytest.mark.skipif(not HAS_HLEDGER, reason="hledger/git not installed")
@@ -115,26 +117,6 @@ def _rules_text(cfg: books.BooksConfig) -> str:
 
 def _journal(cfg: books.BooksConfig) -> str:
     return (cfg.path / "personal" / "2026.journal").read_text()
-
-
-class FakeLLM:
-    """Records what it was asked; returns canned text or raises."""
-
-    def __init__(self, response: str | None = None, exc: Exception | None = None):
-        self.response = response
-        self.exc = exc
-        self.calls: list[dict] = []
-
-    async def think(self, **kwargs):
-        self.calls.append(kwargs)
-        if self.exc:
-            raise self.exc
-        return {
-            "response": self.response,
-            "model": "fake-model",
-            "prompt_tokens": 3,
-            "completion_tokens": 2,
-        }
 
 
 @pytest_asyncio.fixture(loop_scope="function")
@@ -232,28 +214,11 @@ def _meta(**over) -> dict:
     return meta
 
 
-class FakeDelivery:
-    """Stand-in for DeliveryActivities as `safe_send_message` uses it.
-
-    `test_fake_delivery_matches_the_real_class` pins this against the real
-    class so the fake cannot drift into testing nothing.
-    """
-
-    channel = "slack"
-    db_pool = None  # skips the notification-budget path in safe_send_message
-
-    def __init__(self):
-        self.sent: list[str] = []
-
-    async def send_message(self, *, agent_id: str, message: str, chat_id: int = 0) -> dict:
-        self.sent.append(message)
-        return {"ok": True}
-
-
 def test_fake_delivery_matches_the_real_class():
-    """The fake must expose what safe_send_message actually reads off the real
-    DeliveryActivities: a `channel` attribute, a `db_pool` attribute and a
-    keyword-only send_message(agent_id, message, chat_id)."""
+    """The shared `tests/delivery_stub.py` fake must expose what
+    safe_send_message actually reads off the real DeliveryActivities: a
+    `channel` attribute, a `db_pool` attribute and send_message(agent_id,
+    message, chat_id)."""
     real = inspect.signature(DeliveryActivities.send_message).parameters
     fake = inspect.signature(FakeDelivery.send_message).parameters
     for name in ("agent_id", "message", "chat_id"):
@@ -294,7 +259,7 @@ async def test_confident_answer_writes_a_rule_and_reclassifies_the_backlog(clean
     cfg = _repo(tmp_path)
     msgid = await _post(clean_db, cfg)
     assert "expenses:unknown" in _journal(cfg), "the fixture did not post an unknown posting"
-    llm = FakeLLM('{"account": "expenses:groceries", "confidence": 0.9}')
+    llm = RecordingFakeLLM('{"account": "expenses:groceries", "confidence": 0.9}')
 
     out = await _apply(clean_db, cfg, llm)
 
@@ -348,7 +313,7 @@ async def test_a_business_account_never_rewrites_the_personal_books(clean_db, tm
     cfg = _repo(tmp_path)
     _declare(cfg, "expenses:hikmah:infra")
     msgid = await _post(clean_db, cfg)  # entity=personal
-    llm = FakeLLM('{"account": "expenses:hikmah:infra", "confidence": 0.95}')
+    llm = RecordingFakeLLM('{"account": "expenses:hikmah:infra", "confidence": 0.95}')
 
     out = await _apply(clean_db, cfg, llm)
 
@@ -370,7 +335,7 @@ async def test_the_sweep_stays_inside_the_account_s_own_books(clean_db, tmp_path
     cfg = _repo(tmp_path)
     mine = await _post(clean_db, cfg)
     theirs = await _post_hikmah(clean_db, cfg)
-    llm = FakeLLM('{"account": "expenses:groceries", "confidence": 0.9}')
+    llm = RecordingFakeLLM('{"account": "expenses:groceries", "confidence": 0.9}')
 
     out = await _apply(clean_db, cfg, llm)
 
@@ -388,7 +353,7 @@ async def test_an_entity_neutral_account_sweeps_both_books(clean_db, tmp_path):
     cfg = _repo(tmp_path)
     mine = await _post(clean_db, cfg)
     theirs = await _post_hikmah(clean_db, cfg)
-    llm = FakeLLM('{"account": "assets:unknown", "confidence": 0.9}')
+    llm = RecordingFakeLLM('{"account": "assets:unknown", "confidence": 0.9}')
 
     out = await _apply(clean_db, cfg, llm)
 
@@ -406,7 +371,7 @@ async def test_the_prompt_carries_the_declared_chart_and_is_billed(clean_db, tmp
     """
     cfg = _repo(tmp_path)
     await _post(clean_db, cfg)
-    llm = FakeLLM('{"account": "expenses:groceries", "confidence": 0.95}')
+    llm = RecordingFakeLLM('{"account": "expenses:groceries", "confidence": 0.95}')
 
     await _apply(clean_db, cfg, llm)
 
@@ -429,7 +394,7 @@ async def test_the_whole_backlog_is_one_commit(clean_db, tmp_path):
     cfg = _repo(tmp_path)
     msgids = [await _post(clean_db, cfg, day=d) for d in (2, 3, 4)]
     before = _commits(cfg)
-    llm = FakeLLM('{"account": "expenses:groceries", "confidence": 0.9}')
+    llm = RecordingFakeLLM('{"account": "expenses:groceries", "confidence": 0.9}')
 
     out = await _apply(clean_db, cfg, llm)
 
@@ -448,7 +413,7 @@ async def test_payee_key_is_derived_when_the_card_predates_the_metadata(clean_db
     msgid = await _post(clean_db, cfg)
     meta = _meta()
     meta.pop("payee_key")
-    llm = FakeLLM('{"account": "expenses:groceries", "confidence": 0.9}')
+    llm = RecordingFakeLLM('{"account": "expenses:groceries", "confidence": 0.9}')
 
     out = await _apply(clean_db, cfg, llm, meta=meta)
 
@@ -464,7 +429,7 @@ async def test_a_low_confidence_answer_writes_no_rule(clean_db, tmp_path):
     cfg = _repo(tmp_path)
     msgid = await _post(clean_db, cfg)
     before = _commits(cfg)
-    llm = FakeLLM('{"account": "expenses:groceries", "confidence": 0.5}')
+    llm = RecordingFakeLLM('{"account": "expenses:groceries", "confidence": 0.5}')
 
     out = await _apply(clean_db, cfg, llm)
 
@@ -486,14 +451,14 @@ async def test_the_threshold_is_inclusive_at_the_boundary(clean_db, tmp_path):
     cfg = _repo(tmp_path)
     await _post(clean_db, cfg)
     at = await _apply(
-        clean_db, cfg, FakeLLM('{"account": "expenses:groceries", "confidence": 0.8}')
+        clean_db, cfg, RecordingFakeLLM('{"account": "expenses:groceries", "confidence": 0.8}')
     )
     assert at["rule"] == "expenses:groceries"
 
     cfg2 = _repo(tmp_path / "second")
     await _post(clean_db, cfg2)
     below = await _apply(
-        clean_db, cfg2, FakeLLM('{"account": "expenses:groceries", "confidence": 0.79}')
+        clean_db, cfg2, RecordingFakeLLM('{"account": "expenses:groceries", "confidence": 0.79}')
     )
     assert below["reason"] == "low_confidence"
     assert below["rule"] is None
@@ -505,7 +470,7 @@ async def test_an_undeclared_account_is_refused_however_confident(clean_db, tmp_
     naming it would mis-file every future payment from this payee."""
     cfg = _repo(tmp_path)
     msgid = await _post(clean_db, cfg)
-    llm = FakeLLM('{"account": "expenses:snacks", "confidence": 1.0}')
+    llm = RecordingFakeLLM('{"account": "expenses:snacks", "confidence": 1.0}')
 
     out = await _apply(clean_db, cfg, llm)
 
@@ -528,7 +493,7 @@ async def test_a_declared_account_from_the_same_chart_is_accepted(clean_db, tmp_
         check=True,
     )
     msgid = await _post(clean_db, cfg)
-    llm = FakeLLM('{"account": "expenses:snacks", "confidence": 1.0}')
+    llm = RecordingFakeLLM('{"account": "expenses:snacks", "confidence": 1.0}')
 
     out = await _apply(clean_db, cfg, llm)
 
@@ -540,7 +505,7 @@ async def test_an_explicit_none_answer_writes_no_rule(clean_db, tmp_path):
     """"NONE" is the model's way of saying it could not tell — it is not an
     account, and `NONE` must never reach the chart membership check as a hit."""
     cfg = _repo(tmp_path)
-    llm = FakeLLM('{"account": "NONE", "confidence": 0.99}')
+    llm = RecordingFakeLLM('{"account": "NONE", "confidence": 0.99}')
     await _post(clean_db, cfg)
 
     out = await _apply(clean_db, cfg, llm)
@@ -552,7 +517,7 @@ async def test_an_explicit_none_answer_writes_no_rule(clean_db, tmp_path):
 
 async def test_unparseable_model_output_writes_no_rule(clean_db, tmp_path):
     cfg = _repo(tmp_path)
-    llm = FakeLLM("I think this is groceries, honestly")
+    llm = RecordingFakeLLM("I think this is groceries, honestly")
     await _post(clean_db, cfg)
 
     out = await _apply(clean_db, cfg, llm)
@@ -567,7 +532,7 @@ async def test_a_failing_llm_still_banks_the_memory(clean_db, tmp_path):
     that throws in there is logged and the memory write stands."""
     cfg = _repo(tmp_path)
     msgid = await _post(clean_db, cfg)
-    llm = FakeLLM(exc=RuntimeError("proxy down"))
+    llm = RecordingFakeLLM(raises=RuntimeError("proxy down"))
 
     out = await _apply(clean_db, cfg, llm)
 
@@ -582,7 +547,7 @@ async def test_a_failing_llm_still_banks_the_memory(clean_db, tmp_path):
 async def test_a_broken_checkout_still_banks_the_memory(clean_db, tmp_path):
     """`declared_accounts` raises when hledger cannot read the chart."""
     cfg = books.BooksConfig(path=tmp_path / "nowhere")
-    llm = FakeLLM('{"account": "expenses:groceries", "confidence": 0.9}')
+    llm = RecordingFakeLLM('{"account": "expenses:groceries", "confidence": 0.9}')
 
     out = await _apply(clean_db, cfg, llm)
 
@@ -611,7 +576,7 @@ async def test_a_failure_after_the_rule_is_written_does_not_claim_otherwise(
     """
     cfg = _repo(tmp_path)
     msgid = await _post(clean_db, cfg)
-    llm = FakeLLM('{"account": "expenses:groceries", "confidence": 0.9}')
+    llm = RecordingFakeLLM('{"account": "expenses:groceries", "confidence": 0.9}')
     delivery = FakeDelivery()
 
     async def boom(*_a, **_k):
@@ -657,7 +622,7 @@ async def test_a_backlog_failure_with_no_rule_still_says_nothing_was_written(
     """
     cfg = _repo(tmp_path)
     msgid = await _post(clean_db, cfg, payee=LONG_PAYEE)
-    llm = FakeLLM('{"account": "expenses:groceries", "confidence": 0.9}')
+    llm = RecordingFakeLLM('{"account": "expenses:groceries", "confidence": 0.9}')
     delivery = FakeDelivery()
 
     async def boom(*_a, **_k):
@@ -689,7 +654,7 @@ async def test_a_backlog_failure_with_no_rule_still_says_nothing_was_written(
 async def test_another_gap_type_never_touches_the_books(clean_db, tmp_path):
     cfg = _repo(tmp_path)
     await _post(clean_db, cfg)
-    llm = FakeLLM('{"account": "expenses:groceries", "confidence": 0.9}')
+    llm = RecordingFakeLLM('{"account": "expenses:groceries", "confidence": 0.9}')
 
     out = await _apply(clean_db, cfg, llm, meta=_meta(gap_type="calendar_attendee"))
 
@@ -704,7 +669,7 @@ async def test_no_books_config_skips_the_lane_without_losing_the_answer(clean_db
     await _post(clean_db, cfg)
     acts = CuriosityActivities(
         db_pool=clean_db,
-        llm_client=FakeLLM('{"account": "expenses:groceries", "confidence": 0.9}'),
+        llm_client=RecordingFakeLLM('{"account": "expenses:groceries", "confidence": 0.9}'),
         model="m",
     )
     iid = await _card(clean_db)
@@ -736,7 +701,7 @@ async def test_a_row_already_classified_is_not_rewritten(clean_db, tmp_path):
         "SELECT count(DISTINCT payee_key) FROM finance.journal_index WHERE message_id = ANY($1)",
         [unknown, settled],
     ) == 1, "the two rows must share a payee_key or this proves nothing"
-    llm = FakeLLM('{"account": "expenses:groceries", "confidence": 0.9}')
+    llm = RecordingFakeLLM('{"account": "expenses:groceries", "confidence": 0.9}')
 
     out = await _apply(clean_db, cfg, llm)
 
@@ -753,7 +718,7 @@ async def test_another_payee_is_left_alone(clean_db, tmp_path):
     cfg = _repo(tmp_path)
     mine = await _post(clean_db, cfg)
     other = await _post(clean_db, cfg, payee="Someone zzt5else", day=6)
-    llm = FakeLLM('{"account": "expenses:groceries", "confidence": 0.9}')
+    llm = RecordingFakeLLM('{"account": "expenses:groceries", "confidence": 0.9}')
 
     out = await _apply(clean_db, cfg, llm)
 
@@ -774,7 +739,7 @@ async def test_a_refused_rule_still_applies_the_backlog(clean_db, tmp_path):
     """
     cfg = _repo(tmp_path)
     msgids = [await _post(clean_db, cfg, payee=LONG_PAYEE, day=d) for d in (2, 3)]
-    llm = FakeLLM('{"account": "expenses:groceries", "confidence": 0.9}')
+    llm = RecordingFakeLLM('{"account": "expenses:groceries", "confidence": 0.9}')
 
     out = await _apply(
         clean_db,
@@ -815,7 +780,7 @@ async def test_a_payee_with_no_usable_key_touches_nothing(clean_db, tmp_path):
         blank,
         MAILBOX,
     )
-    llm = FakeLLM('{"account": "expenses:groceries", "confidence": 0.9}')
+    llm = RecordingFakeLLM('{"account": "expenses:groceries", "confidence": 0.9}')
 
     out = await _apply(clean_db, cfg, llm, meta=_meta(subject="!!!", payee_key=""))
 
@@ -839,7 +804,7 @@ async def test_a_credit_from_the_same_payee_is_left_alone(clean_db, tmp_path):
         "WHERE message_id = $1",
         refund,
     )
-    llm = FakeLLM('{"account": "expenses:groceries", "confidence": 0.9}')
+    llm = RecordingFakeLLM('{"account": "expenses:groceries", "confidence": 0.9}')
 
     out = await _apply(clean_db, cfg, llm)
 
@@ -866,7 +831,7 @@ async def test_an_inbound_answer_files_the_credit_and_leaves_the_debit(clean_db,
         "WHERE message_id = $1",
         received,
     )
-    llm = FakeLLM('{"account": "income:people", "confidence": 0.9}')
+    llm = RecordingFakeLLM('{"account": "income:people", "confidence": 0.9}')
 
     out = await _apply(clean_db, cfg, llm, meta=_meta(direction="in"))
 
@@ -907,7 +872,7 @@ async def test_a_card_with_no_direction_is_treated_as_money_going_out(clean_db, 
         cfg = _repo(tmp_path / f"d{i}")
         payee = f"Zzt5dir{i} Shop"
         msgid = await _post(clean_db, cfg, payee=payee)
-        llm = FakeLLM('{"account": "expenses:groceries", "confidence": 0.9}')
+        llm = RecordingFakeLLM('{"account": "expenses:groceries", "confidence": 0.9}')
         meta = _meta(subject=payee, payee_key=payee_key(payee))
         if value is not None:
             meta["direction"] = value
@@ -927,7 +892,7 @@ async def test_a_rule_from_an_answer_never_fires_on_the_sender(clean_db, tmp_pat
     persists has to be pinned to the payee half of that haystack."""
     cfg = _repo(tmp_path)
     await _post(clean_db, cfg)
-    llm = FakeLLM('{"account": "expenses:groceries", "confidence": 0.9}')
+    llm = RecordingFakeLLM('{"account": "expenses:groceries", "confidence": 0.9}')
 
     await _apply(clean_db, cfg, llm)
 
@@ -946,7 +911,7 @@ async def test_a_payee_spelling_variant_matches_the_rule(clean_db, tmp_path):
     never asked about again."""
     cfg = _repo(tmp_path)
     await _post(clean_db, cfg)
-    llm = FakeLLM('{"account": "expenses:groceries", "confidence": 0.9}')
+    llm = RecordingFakeLLM('{"account": "expenses:groceries", "confidence": 0.9}')
 
     await _apply(clean_db, cfg, llm)
 
@@ -974,7 +939,7 @@ async def test_a_cross_entity_answer_says_what_it_left_behind(clean_db, tmp_path
     _declare(cfg, "expenses:hikmah:infra")
     await _post(clean_db, cfg)  # entity=personal
     delivery = FakeDelivery()
-    llm = FakeLLM('{"account": "expenses:hikmah:infra", "confidence": 0.95}')
+    llm = RecordingFakeLLM('{"account": "expenses:hikmah:infra", "confidence": 0.95}')
 
     out = await _apply(clean_db, cfg, llm, delivery=delivery)
 
@@ -1000,7 +965,7 @@ async def test_an_answer_that_lands_completely_says_nothing(clean_db, tmp_path):
     cfg = _repo(tmp_path)
     await _post(clean_db, cfg)
     delivery = FakeDelivery()
-    llm = FakeLLM('{"account": "expenses:groceries", "confidence": 0.9}')
+    llm = RecordingFakeLLM('{"account": "expenses:groceries", "confidence": 0.9}')
 
     out = await _apply(clean_db, cfg, llm, delivery=delivery)
 
@@ -1024,7 +989,7 @@ async def test_an_answer_the_model_could_not_file_is_reported(clean_db, tmp_path
         await _post(clean_db, cfg)
         delivery = FakeDelivery()
 
-        out = await _apply(clean_db, cfg, FakeLLM(response), delivery=delivery)
+        out = await _apply(clean_db, cfg, RecordingFakeLLM(response), delivery=delivery)
 
         assert out["rule"] is None, response
         assert len(delivery.sent) == 1, (response, delivery.sent)
@@ -1040,7 +1005,7 @@ async def test_a_refused_rule_that_moved_the_backlog_says_both_halves(clean_db, 
     cfg = _repo(tmp_path)
     await _post(clean_db, cfg, payee=LONG_PAYEE)
     delivery = FakeDelivery()
-    llm = FakeLLM('{"account": "expenses:groceries", "confidence": 0.9}')
+    llm = RecordingFakeLLM('{"account": "expenses:groceries", "confidence": 0.9}')
 
     out = await _apply(
         clean_db, cfg, llm,
@@ -1065,7 +1030,7 @@ async def test_a_dead_delivery_never_costs_the_answer(clean_db, tmp_path):
     cfg = _repo(tmp_path)
     _declare(cfg, "expenses:hikmah:infra")
     msgid = await _post(clean_db, cfg)
-    llm = FakeLLM('{"account": "expenses:hikmah:infra", "confidence": 0.95}')
+    llm = RecordingFakeLLM('{"account": "expenses:hikmah:infra", "confidence": 0.95}')
 
     out = await _apply(clean_db, cfg, llm, delivery=Exploding())
 
@@ -1080,7 +1045,7 @@ async def test_no_delivery_wired_still_answers_and_never_raises(clean_db, tmp_pa
     cfg = _repo(tmp_path)
     _declare(cfg, "expenses:hikmah:infra")
     await _post(clean_db, cfg)
-    llm = FakeLLM('{"account": "expenses:hikmah:infra", "confidence": 0.95}')
+    llm = RecordingFakeLLM('{"account": "expenses:hikmah:infra", "confidence": 0.95}')
 
     out = await _apply(clean_db, cfg, llm, delivery=None)
 

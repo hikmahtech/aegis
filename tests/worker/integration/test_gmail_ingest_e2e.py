@@ -18,6 +18,9 @@ from temporalio import activity, workflow
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
+from tests.gmail_stub import FakeGmailService
+from tests.llm_stub import RecordingFakeLLM
+
 with workflow.unsafe.imports_passed_through():
     from aegis_worker.activities.channels import ChannelActivities
     from aegis_worker.activities.gmail import GmailActivities
@@ -32,78 +35,22 @@ with workflow.unsafe.imports_passed_through():
     from aegis_worker.flows.interaction import InteractionFlow
 
 
-class _FakeGmailRequest:
-    def __init__(self, payload):
-        self._payload = payload
-
-    def execute(self):
-        return self._payload
-
-
-class _FakeGmailService:
-    """Minimal stub for googleapiclient Gmail service."""
-
-    def __init__(self, messages_by_label):
-        self._msgs = messages_by_label  # label -> list of message dicts
-        self._current_label = None
-
-    def configure(self, label: str):
-        self._current_label = label
-
-    def users(self):
-        return self
-
-    def messages(self):
-        return self
-
-    def threads(self):
-        return self
-
-    def list(self, userId="me", q="", maxResults=50, **kwargs):  # noqa: N803
-        msgs = self._msgs.get(self._current_label, [])
-        return _FakeGmailRequest({"messages": [{"id": m["id"]} for m in msgs]})
-
-    def get(self, userId="me", id="", format="full", **kwargs):  # noqa: N803
-        msgs = self._msgs.get(self._current_label, [])
-        match = next((m for m in msgs if m["id"] == id), None)
-        if match is None:
-            return _FakeGmailRequest({"messages": []})
-        # Dual-purpose: single message fetch returns the msg, thread fetch
-        # wraps it in a {"messages": [...]} shape.
-        return _FakeGmailRequest({**match, "messages": [match]})
-
-    def modify(self, userId="me", id="", body=None, **kwargs):  # noqa: N803
-        return _FakeGmailRequest({"id": id})
+def _heuristic_verdict(kwargs: dict) -> str:
+    """Mimics the old heuristic classifier so e2e can assert categories."""
+    low = str(kwargs.get("prompt") or "").lower()
+    if "noreply" in low or "no-reply" in low or "donotreply" in low:
+        cat, conf = "useless", 0.9
+    elif "urgent" in low or "action required" in low:
+        cat, conf = "important_action", 0.85
+    elif "receipt" in low or "invoice" in low or "payment" in low:
+        cat, conf = "important_read", 0.8
+    else:
+        cat, conf = "informational", 0.6
+    return json.dumps({"category": cat, "confidence": conf, "reason": "test"})
 
 
-class _FakeLLM:
-    """Stub LLM that mimics the old heuristic classifier so e2e can assert categories."""
-
-    async def think(
-        self,
-        prompt: str,
-        model: str = "",
-        system_prompt: str = "",
-        max_tokens: int = 0,
-        **kwargs,
-    ) -> dict:
-        import json as _json
-
-        low = prompt.lower()
-        if "noreply" in low or "no-reply" in low or "donotreply" in low:
-            cat, conf = "useless", 0.9
-        elif "urgent" in low or "action required" in low:
-            cat, conf = "important_action", 0.85
-        elif "receipt" in low or "invoice" in low or "payment" in low:
-            cat, conf = "important_read", 0.8
-        else:
-            cat, conf = "informational", 0.6
-        return {
-            "response": _json.dumps({"category": cat, "confidence": conf, "reason": "test"}),
-            "model": model,
-            "prompt_tokens": 10,
-            "completion_tokens": 10,
-        }
+def _heuristic_llm() -> RecordingFakeLLM:
+    return RecordingFakeLLM(responder=_heuristic_verdict)
 
 
 @pytest_asyncio.fixture(loop_scope="function")
@@ -299,7 +246,7 @@ async def test_gmail_ingest_e2e(e2e_channels, token_dir, db_pool, monkeypatch):
             },
         ],
     }
-    fake_svc = _FakeGmailService(emails_by_label)
+    fake_svc = FakeGmailService(emails_by_label)
 
     def _build(creds_file, token_path):
         label = Path(token_path).stem
@@ -313,7 +260,7 @@ async def test_gmail_ingest_e2e(e2e_channels, token_dir, db_pool, monkeypatch):
         gmail_credentials_file=str(creds),
         gmail_token_dir=str(tokens),
         aegis_ui_url="https://aegis.example.com",
-        llm_client=_FakeLLM(),
+        llm_client=_heuristic_llm(),
     )
     channel_act = ChannelActivities(db_pool=db_pool)
 
@@ -422,7 +369,7 @@ async def test_gmail_ingest_e2e_idempotent_rerun(e2e_channels, token_dir, db_poo
         ],
         "t2": [],
     }
-    fake_svc = _FakeGmailService(emails_by_label)
+    fake_svc = FakeGmailService(emails_by_label)
 
     def _build(creds_file, token_path):
         label = Path(token_path).stem
@@ -435,7 +382,7 @@ async def test_gmail_ingest_e2e_idempotent_rerun(e2e_channels, token_dir, db_poo
         gmail_credentials_file=str(creds),
         gmail_token_dir=str(tokens),
         aegis_ui_url="https://aegis.example.com",
-        llm_client=_FakeLLM(),
+        llm_client=_heuristic_llm(),
     )
     channel_act = ChannelActivities(db_pool=db_pool)
 

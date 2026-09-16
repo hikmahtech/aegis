@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 from aegis.services.chat import CHAT_TOOLS, _validate_tool_args
+
+from tests.llm_stub import StubbedLLMClient
 
 
 def _schema_for(name: str) -> dict:
@@ -172,22 +175,22 @@ async def test_retry_via_llm_reads_flat_tool_call_shape():
     """
     from aegis.services.chat import _retry_via_llm
 
-    class _FakeLLM:
-        async def chat(self, messages, model, tools):
-            return {
-                "response": "",
-                "tool_calls": [
-                    {
-                        "id": "call_retry",
-                        "name": "search_knowledge",
-                        "arguments": json.dumps({"query": "corrected"}),
-                    }
-                ],
-                "model": model,
-            }
+    # The real client, so the flat shape under test is the one `chat()` builds
+    # from an OpenAI reply — not one the test wrote out itself.
+    llm = StubbedLLMClient(
+        tool_calls=[
+            SimpleNamespace(
+                id="call_retry",
+                function=SimpleNamespace(
+                    name="search_knowledge",
+                    arguments=json.dumps({"query": "corrected"}),
+                ),
+            )
+        ]
+    )
 
     args = await _retry_via_llm(
-        _FakeLLM(),
+        llm,
         messages=[],
         model="balanced",
         tools=None,

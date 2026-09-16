@@ -22,6 +22,8 @@ from aegis_worker.activities.social import (
 from httpx import Response
 from temporalio.testing import ActivityEnvironment
 
+from tests.delivery_stub import FakeDelivery
+
 _TEST_REQUIRED_SETTINGS: dict = {
     "database_url": "postgresql://test:test@localhost:5432/test",
     "litellm_url": "https://litellm.example.com/v1",
@@ -1332,33 +1334,15 @@ async def test_drain_social_outbox_posts_via_postiz_end_to_end(social_env):
 # ============================================================================
 
 
-class _FakeDelivery:
-    """Stand-in for DeliveryActivities as `safe_send_message` uses it.
-
-    `test_stuck_fake_delivery_matches_the_real_class` pins this against the
-    real class so the fake cannot drift into testing nothing.
-    """
-
-    channel = "slack"
-    db_pool = None  # skips the notification-budget path in safe_send_message
-
-    def __init__(self):
-        self.sent: list[str] = []
-
-    async def send_message(self, *, agent_id: str, message: str, chat_id: int = 0) -> dict:
-        self.sent.append(message)
-        return {"ok": True}
-
-
 def test_stuck_fake_delivery_matches_the_real_class():
     real = inspect.signature(DeliveryActivities.send_message).parameters
-    fake = inspect.signature(_FakeDelivery.send_message).parameters
+    fake = inspect.signature(FakeDelivery.send_message).parameters
     for name in ("agent_id", "message", "chat_id"):
         assert name in real, f"DeliveryActivities.send_message lost {name}"
-        assert name in fake, f"_FakeDelivery.send_message lost {name}"
+        assert name in fake, f"FakeDelivery.send_message lost {name}"
     fields = set(DeliveryActivities.__dataclass_fields__)
     assert {"channel", "db_pool"} <= fields
-    assert hasattr(_FakeDelivery, "channel") and hasattr(_FakeDelivery, "db_pool")
+    assert hasattr(FakeDelivery, "channel") and hasattr(FakeDelivery, "db_pool")
 
 
 @pytest_asyncio.fixture(loop_scope="function")
@@ -1920,7 +1904,7 @@ async def test_find_stuck_posts_without_pool_returns_empty():
 async def test_stuck_alert_fires_once_not_on_every_sweep(stuck_env):
     """THE dedup property, as a count. Twenty sweeps of the same stuck post
     must produce exactly one card and exactly one open problem."""
-    delivery = _FakeDelivery()
+    delivery = FakeDelivery()
     act = SocialActivities(db_pool=stuck_env, delivery=delivery)
     env = ActivityEnvironment()
     results = [
@@ -1939,7 +1923,7 @@ async def test_stuck_alert_fires_once_not_on_every_sweep(stuck_env):
 
 
 async def test_stuck_alert_card_names_the_post_and_its_state(stuck_env):
-    delivery = _FakeDelivery()
+    delivery = FakeDelivery()
     act = SocialActivities(db_pool=stuck_env, delivery=delivery)
     await ActivityEnvironment().run(
         act.report_stuck_posts, [_finding("zzsa-pz-card", state="unknown")], "sebas"
@@ -1955,7 +1939,7 @@ async def test_stuck_card_shows_postiz_publish_date_beside_what_aegis_asked_for(
     """A reschedule-shaped card must let a human recognise the move at a glance
     instead of trusting a number derived from AEGIS's stale copy — so when
     Postiz has its own `publishDate`, both times appear."""
-    delivery = _FakeDelivery()
+    delivery = FakeDelivery()
     act = SocialActivities(db_pool=stuck_env, delivery=delivery)
     await ActivityEnvironment().run(
         act.report_stuck_posts,
@@ -1978,7 +1962,7 @@ async def test_stuck_card_says_so_when_postiz_returned_no_publish_date(stuck_env
     """The fallback shape (`state='unknown'`, no `publishDate`) reads
     differently on purpose: the due time is AEGIS's own, and the card must not
     imply Postiz confirmed it."""
-    delivery = _FakeDelivery()
+    delivery = FakeDelivery()
     act = SocialActivities(db_pool=stuck_env, delivery=delivery)
     await ActivityEnvironment().run(
         act.report_stuck_posts,
@@ -1994,7 +1978,7 @@ async def test_stuck_recovery_notifies_and_re_arms_dedup(stuck_env):
     """A post that finally publishes drops out of findings: that sends the
     recovery card and resolves the problem, which is what lets the SAME post
     alert again if it gets stuck a second time."""
-    delivery = _FakeDelivery()
+    delivery = FakeDelivery()
     act = SocialActivities(db_pool=stuck_env, delivery=delivery)
     env = ActivityEnvironment()
     first = await env.run(act.report_stuck_posts, [_finding()], "sebas")
@@ -2018,7 +2002,7 @@ async def test_stuck_recovery_notifies_and_re_arms_dedup(stuck_env):
 
 
 async def test_stuck_recovery_is_silent_when_nothing_was_ever_alerted(stuck_env):
-    act = SocialActivities(db_pool=stuck_env, delivery=_FakeDelivery())
+    act = SocialActivities(db_pool=stuck_env, delivery=FakeDelivery())
     assert await ActivityEnvironment().run(act.report_stuck_posts, [], "sebas") == {
         "alerted": 0,
         "deduped": 0,
@@ -2030,7 +2014,7 @@ async def test_stuck_recovery_is_silent_when_nothing_was_ever_alerted(stuck_env)
 async def test_a_muted_problem_suppresses_the_stuck_alert(stuck_env):
     """Muting is a property of the problem: a muted post that publishes and
     gets stuck again inside the mute is counted, never carded."""
-    delivery = _FakeDelivery()
+    delivery = FakeDelivery()
     act = SocialActivities(db_pool=stuck_env, delivery=delivery)
     env = ActivityEnvironment()
     assert (await env.run(act.report_stuck_posts, [_finding()], "sebas"))["alerted"] == 1
@@ -2045,13 +2029,13 @@ async def test_a_muted_problem_suppresses_the_stuck_alert(stuck_env):
 
 
 async def test_stuck_report_without_pool_is_a_no_op():
-    act = SocialActivities(db_pool=None, delivery=_FakeDelivery())
+    act = SocialActivities(db_pool=None, delivery=FakeDelivery())
     r = await ActivityEnvironment().run(act.report_stuck_posts, [_finding()], "sebas")
     assert r == {"alerted": 0, "deduped": 0, "muted": 0, "recovered": 0}
 
 
 async def test_two_stuck_posts_are_one_card_but_two_problems(stuck_env):
-    delivery = _FakeDelivery()
+    delivery = FakeDelivery()
     act = SocialActivities(db_pool=stuck_env, delivery=delivery)
     r = await ActivityEnvironment().run(
         act.report_stuck_posts,
