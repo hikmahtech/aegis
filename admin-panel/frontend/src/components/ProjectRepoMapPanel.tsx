@@ -1,7 +1,7 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { api } from '../api/client';
+import { useConfigRow } from '../lib/useConfigRow';
 import ErrorBanner from './ErrorBanner';
-import { toast } from './Toast';
 
 // Todoist project name → GitHub repo (`project_repo_map`, #345/#558): the
 // coding lane's first guess at which checkout a `@code` task is about. It
@@ -12,26 +12,17 @@ type Row = [string, string];
 
 export default function ProjectRepoMapPanel({ projectNames = [] }: { projectNames?: string[] }) {
   const [rows, setRows] = useState<Row[]>([]);
-  const [error, setError] = useState<Error | null>(null);
-  const [saving, setSaving] = useState(false);
+  const { error, setError, saving, save } = useConfigRow(async () => {
+    setRows(Object.entries((await api.getProjectRepoMap()).project_repo_map || {}));
+  });
 
-  useEffect(() => {
-    api.getProjectRepoMap()
-      .then(r => setRows(Object.entries(r.project_repo_map || {})))
-      .catch((e: any) => setError(e));
-  }, []);
-
-  async function save() {
-    setSaving(true); setError(null);
-    try {
-      const map: Record<string, string> = {};
-      // A half-filled row is sent as-is so the server's 400 names it.
-      for (const [name, repo] of rows) if (name.trim() || repo.trim()) map[name.trim()] = repo.trim();
-      const r = await api.saveProjectRepoMap(map);
-      setRows(Object.entries(r.project_repo_map || {}));
-      toast.ok('Project → repo map saved. The next coding task reads it.');
-    } catch (e: any) { setError(e); } finally { setSaving(false); }
-  }
+  const onSave = () => save(async () => {
+    const map: Record<string, string> = {};
+    // A half-filled row is sent as-is so the server's 400 names it.
+    for (const [name, repo] of rows) if (name.trim() || repo.trim()) map[name.trim()] = repo.trim();
+    const r = await api.saveProjectRepoMap(map);
+    setRows(Object.entries(r.project_repo_map || {}));
+  }, 'Project → repo map saved. The next coding task reads it.');
 
   return (
     <div className="card" style={{ marginTop: 16 }}>
@@ -73,7 +64,7 @@ export default function ProjectRepoMapPanel({ projectNames = [] }: { projectName
       <button className="btn" style={{ marginTop: 8 }} onClick={() => setRows(rs => [...rs, ['', '']])}>
         + Add project
       </button>
-      <button className="btn btn-primary" style={{ marginTop: 8, marginLeft: 8 }} disabled={saving} onClick={save}>
+      <button className="btn btn-primary" style={{ marginTop: 8, marginLeft: 8 }} disabled={saving} onClick={onSave}>
         {saving ? 'Saving…' : 'Save project map'}
       </button>
     </div>

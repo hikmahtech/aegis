@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { api } from '../api/client';
+import { useConfigRow } from '../lib/useConfigRow';
 import ErrorBanner from '../components/ErrorBanner';
 import { toast } from '../components/Toast';
 import {
@@ -50,22 +51,14 @@ export default function Vault() {
   const [date, setDate] = useState(today());
   const [timezone, setTimezone] = useState('');
   const [effectiveTz, setEffectiveTz] = useState('UTC');
-  const [error, setError] = useState<Error | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
   const [showWording, setShowWording] = useState(false);
 
-  async function load() {
-    setError(null); setLoading(true);
-    try {
-      const r = await api.getVaultLayout();
-      setLayout(r.layout); setDefaults(r.defaults); setOptions(r.options || {});
-      const tz = await api.getTimezone();
-      setTimezone(tz.timezone || ''); setEffectiveTz(tz.effective || 'UTC');
-    } catch (e: any) { setError(e); }
-    finally { setLoading(false); }
-  }
-  useEffect(() => { void load(); }, []);
+  const { error, setError, loading, saving, save: saveRow } = useConfigRow(async () => {
+    const r = await api.getVaultLayout();
+    setLayout(r.layout); setDefaults(r.defaults); setOptions(r.options || {});
+    const tz = await api.getTimezone();
+    setTimezone(tz.timezone || ''); setEffectiveTz(tz.effective || 'UTC');
+  });
 
   // Live preview of the layout AS EDITED, debounced; a layout that does not
   // validate shows the server's reason instead of a stale preview.
@@ -82,16 +75,11 @@ export default function Vault() {
     return () => clearTimeout(handle);
   }, [layout, date]);
 
-  async function save() {
-    if (!layout) return;
-    setError(null); setSaving(true);
-    try {
-      const r = await api.saveVaultLayout(toSaveBody(layout));
-      setLayout(r.layout);
-      toast.ok('Vault layout saved — applies within ~30s. Existing notes stay where they are.');
-    } catch (e: any) { setError(e); }
-    finally { setSaving(false); }
-  }
+  // The guard stays outside `saveRow`: with no layout loaded there is nothing
+  // to write, and nothing to say was saved.
+  const save = () => layout && saveRow(async () => {
+    setLayout((await api.saveVaultLayout(toSaveBody(layout))).layout);
+  }, 'Vault layout saved — applies within ~30s. Existing notes stay where they are.');
 
   async function saveTz() {
     setError(null);

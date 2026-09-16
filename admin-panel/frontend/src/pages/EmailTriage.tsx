@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo, useState } from 'react';
 import { api } from '../api/client';
+import { useConfigRow } from '../lib/useConfigRow';
 import ErrorBanner from '../components/ErrorBanner';
 import MeetingNamesPanel from '../components/MeetingNamesPanel';
 
@@ -39,45 +40,34 @@ export default function EmailTriage() {
   const [overrides, setOverrides] = useState<Rule[]>([]);
   const [markers, setMarkers] = useState<string[]>([]);
   const [senders, setSenders] = useState<Sender[]>([]);
-  const [error, setError] = useState<Error | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
 
-  async function load() {
-    setError(null); setLoading(true);
-    try {
-      const r = await api.getEmailTriageRules();
-      setCategories(r.categories || []);
-      setOverrides(toRules(r.sender_overrides));
-      setMarkers(r.extra_notification_markers || []);
-      setSenders(r.known_senders || []);
-    } catch (e: any) { setError(e); }
-    finally { setLoading(false); }
-  }
-  useEffect(() => { void load(); }, []);
+  const { error, setError, loading, saving, save: saveRow } = useConfigRow(async () => {
+    const r = await api.getEmailTriageRules();
+    setCategories(r.categories || []);
+    setOverrides(toRules(r.sender_overrides));
+    setMarkers(r.extra_notification_markers || []);
+    setSenders(r.known_senders || []);
+  });
 
-  async function save() {
-    setError(null); setSaving(true); setSaved(false);
-    try {
-      const sender_overrides: Record<string, { category: string; tags: string[] }> = {};
-      for (const [addr, cat, tags] of overrides) {
-        if (addr.trim()) sender_overrides[addr.trim().toLowerCase()] = {
-          category: cat,
-          tags: tags.split(',').map(t => t.trim().toLowerCase()).filter(Boolean),
-        };
-      }
-      const r = await api.saveEmailTriageRules({
-        sender_overrides,
-        extra_notification_markers: markers.map(m => m.trim()).filter(Boolean),
-      });
-      setOverrides(toRules(r.sender_overrides));
-      setMarkers(r.extra_notification_markers || []);
-      setSenders(r.known_senders || []);
-      setSaved(true);
-    } catch (e: any) { setError(e); }
-    finally { setSaving(false); }
-  }
+  const save = () => saveRow(async () => {
+    setSaved(false);
+    const sender_overrides: Record<string, { category: string; tags: string[] }> = {};
+    for (const [addr, cat, tags] of overrides) {
+      if (addr.trim()) sender_overrides[addr.trim().toLowerCase()] = {
+        category: cat,
+        tags: tags.split(',').map(t => t.trim().toLowerCase()).filter(Boolean),
+      };
+    }
+    const r = await api.saveEmailTriageRules({
+      sender_overrides,
+      extra_notification_markers: markers.map(m => m.trim()).filter(Boolean),
+    });
+    setOverrides(toRules(r.sender_overrides));
+    setMarkers(r.extra_notification_markers || []);
+    setSenders(r.known_senders || []);
+    setSaved(true);
+  });
 
   const ruled = useMemo(
     () => new Set(overrides.map(([a]) => a.trim().toLowerCase())),

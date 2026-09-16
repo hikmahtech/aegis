@@ -1,7 +1,7 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { api } from '../api/client';
+import { useConfigRow } from '../lib/useConfigRow';
 import ErrorBanner from './ErrorBanner';
-import { toast } from './Toast';
 
 // The automatic restart's repeat window (`alert_remediation`, #501/#558).
 // It gates `docker service update --force`, so the server validates strictly:
@@ -11,26 +11,20 @@ import { toast } from './Toast';
 export default function RestartWindowPanel() {
   const [cfg, setCfg] = useState<Awaited<ReturnType<typeof api.getAlertRemediation>> | null>(null);
   const [minutes, setMinutes] = useState('');
-  const [error, setError] = useState<Error | null>(null);
-  const [saving, setSaving] = useState(false);
 
   function apply(r: NonNullable<typeof cfg>) {
     setCfg(r);
     setMinutes(String(r.repeat_window_minutes));
   }
 
-  useEffect(() => {
-    api.getAlertRemediation().then(apply).catch((e: any) => setError(e));
-  }, []);
+  const { error, setError, saving, save } = useConfigRow(async () => {
+    apply(await api.getAlertRemediation());
+  });
 
-  async function save() {
-    setSaving(true); setError(null);
-    try {
-      const text = minutes.trim();
-      apply(await api.saveAlertRemediation(text === '' ? null : Number(text)));
-      toast.ok('Restart window saved. The next restart reads it.');
-    } catch (e: any) { setError(e); } finally { setSaving(false); }
-  }
+  const onSave = () => save(async () => {
+    const text = minutes.trim();
+    apply(await api.saveAlertRemediation(text === '' ? null : Number(text)));
+  }, 'Restart window saved. The next restart reads it.');
 
   return (
     <div>
@@ -48,7 +42,7 @@ export default function RestartWindowPanel() {
           style={{ width: 110 }} onChange={e => setMinutes(e.target.value)} />
         <span className="meta">minutes</span>
         <button type="button" className="btn btn-primary" style={{ fontSize: 11 }}
-          disabled={saving || !cfg} onClick={save}>
+          disabled={saving || !cfg} onClick={onSave}>
           {saving ? 'Saving…' : 'Save restart window'}
         </button>
       </div>

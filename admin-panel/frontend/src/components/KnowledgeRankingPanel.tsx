@@ -1,7 +1,7 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { api } from '../api/client';
+import { useConfigRow } from '../lib/useConfigRow';
 import ErrorBanner from './ErrorBanner';
-import { toast } from './Toast';
 
 // How a chat turn ranks what the knowledge store finds (`knowledge_ranking`,
 // #579). A document's score is (similarity + domain boost) × decay × weight,
@@ -31,8 +31,6 @@ export default function KnowledgeRankingPanel() {
   const [boost, setBoost] = useState('');
   const [rows, setRows] = useState<Row[]>([]);
   const [newType, setNewType] = useState('');
-  const [error, setError] = useState<Error | null>(null);
-  const [saving, setSaving] = useState(false);
 
   function load(r: Ranking) {
     setData(r);
@@ -40,9 +38,9 @@ export default function KnowledgeRankingPanel() {
     setRows(rowsFrom(r.registry, r.source_types));
   }
 
-  useEffect(() => {
-    api.getKnowledgeRanking().then(load).catch((e: any) => setError(e));
-  }, []);
+  const { error, setError, saving, save } = useConfigRow(async () => {
+    load(await api.getKnowledgeRanking());
+  });
 
   function setRow(i: number, patch: Partial<Row>) {
     setRows(x => x.map((r, j) => (j === i ? { ...r, ...patch } : r)));
@@ -60,39 +58,36 @@ export default function KnowledgeRankingPanel() {
     setNewType('');
   }
 
-  async function save() {
-    if (!data) return;
-    setSaving(true); setError(null);
-    try {
-      const source_types: Record<string, Entry> = {};
-      for (const r of rows) {
-        const e: Entry = {};
-        const rank = r.rank.trim();
-        if (rank !== '') {
-          const n = Number(rank);
-          if (!Number.isFinite(n)) throw new Error(`${r.type}: the weight must be a number`);
-          e.rank_boost = n;
-        }
-        const decay = r.decay.trim().toLowerCase();
-        if (decay === 'default') e.decay_days = null;
-        else if (decay !== '') {
-          const n = Number(decay);
-          if (!Number.isInteger(n)) {
-            throw new Error(`${r.type}: decay must be a whole number of days, or "default"`);
-          }
-          e.decay_days = n;
-        }
-        if (Object.keys(e).length) source_types[r.type] = e;
+  // The guard stays outside `save`: with no row there is nothing to write, and
+  // nothing to say was saved.
+  const onSave = () => data && save(async () => {
+    const source_types: Record<string, Entry> = {};
+    for (const r of rows) {
+      const e: Entry = {};
+      const rank = r.rank.trim();
+      if (rank !== '') {
+        const n = Number(rank);
+        if (!Number.isFinite(n)) throw new Error(`${r.type}: the weight must be a number`);
+        e.rank_boost = n;
       }
-      let domain_boost = data.defaults.domain_boost;
-      if (boost.trim() !== '') {
-        domain_boost = Number(boost);
-        if (!Number.isFinite(domain_boost)) throw new Error('The domain boost must be a number');
+      const decay = r.decay.trim().toLowerCase();
+      if (decay === 'default') e.decay_days = null;
+      else if (decay !== '') {
+        const n = Number(decay);
+        if (!Number.isInteger(n)) {
+          throw new Error(`${r.type}: decay must be a whole number of days, or "default"`);
+        }
+        e.decay_days = n;
       }
-      load(await api.saveKnowledgeRanking({ domain_boost, source_types }));
-      toast.ok('Ranking saved. The next chat turn uses it.');
-    } catch (e: any) { setError(e); } finally { setSaving(false); }
-  }
+      if (Object.keys(e).length) source_types[r.type] = e;
+    }
+    let domain_boost = data.defaults.domain_boost;
+    if (boost.trim() !== '') {
+      domain_boost = Number(boost);
+      if (!Number.isFinite(domain_boost)) throw new Error('The domain boost must be a number');
+    }
+    load(await api.saveKnowledgeRanking({ domain_boost, source_types }));
+  }, 'Ranking saved. The next chat turn uses it.');
 
   if (!data) {
     return (
@@ -164,7 +159,7 @@ export default function KnowledgeRankingPanel() {
           onChange={e => setNewType(e.target.value)} onKeyDown={e => e.key === 'Enter' && addType()} />
         <button className="btn" disabled={!newType.trim()} onClick={addType}>Add type</button>
       </div>
-      <button className="btn btn-primary" style={{ marginTop: 8 }} disabled={saving} onClick={save}>
+      <button className="btn btn-primary" style={{ marginTop: 8 }} disabled={saving} onClick={onSave}>
         {saving ? 'Saving…' : 'Save ranking'}
       </button>
     </div>
