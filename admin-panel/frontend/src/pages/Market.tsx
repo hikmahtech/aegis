@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { api } from '../api/client';
 import ErrorBanner from '../components/ErrorBanner';
 import JsonViewer from '../components/JsonViewer';
+import DataTable from '../components/DataTable';
 
 export default function Market() {
   const [data, setData] = useState<any>(null);
@@ -35,23 +36,26 @@ export default function Market() {
         <>
           <h2 style={{ marginTop: 24 }}>Indices</h2>
           <div className="table-scroll">
-            <table className="data-table">
-              <thead><tr><th>Symbol</th><th>Price</th><th>Change</th><th>Change %</th><th>Currency</th><th>As of</th></tr></thead>
-              <tbody>
-                {indices.map((q: any, i: number) => (
-                  <tr key={i}>
-                    <td><strong>{q.symbol}</strong></td>
-                    <td>{q.price != null ? q.price.toLocaleString?.() ?? q.price : '—'}</td>
-                    <td style={{ color: q.change != null ? (q.change < 0 ? 'var(--danger)' : 'var(--success)') : undefined }}>
-                      {q.change != null ? q.change.toFixed?.(2) ?? q.change : '—'}
-                    </td>
-                    <td>{q.change_percent != null ? `${q.change_percent > 0 ? '+' : ''}${q.change_percent}%` : '—'}</td>
-                    <td>{q.currency ?? '—'}</td>
-                    <td>{q.as_of ?? '—'}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+            <DataTable
+              rows={indices as any[]}
+              columns={[
+                { header: 'Symbol', cell: q => <strong>{q.symbol}</strong> },
+                { header: 'Price', cell: q => (q.price != null ? q.price.toLocaleString?.() ?? q.price : '—') },
+                {
+                  header: 'Change',
+                  td: q => ({
+                    style: { color: q.change != null ? (q.change < 0 ? 'var(--danger)' : 'var(--success)') : undefined },
+                  }),
+                  cell: q => (q.change != null ? q.change.toFixed?.(2) ?? q.change : '—'),
+                },
+                {
+                  header: 'Change %',
+                  cell: q => (q.change_percent != null ? `${q.change_percent > 0 ? '+' : ''}${q.change_percent}%` : '—'),
+                },
+                { header: 'Currency', cell: q => q.currency ?? '—' },
+                { header: 'As of', cell: q => q.as_of ?? '—' },
+              ]}
+            />
           </div>
 
           <details style={{ marginTop: 24 }}>

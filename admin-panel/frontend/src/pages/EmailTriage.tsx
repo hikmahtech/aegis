@@ -3,6 +3,8 @@ import { api } from '../api/client';
 import { useConfigRow } from '../lib/useConfigRow';
 import ErrorBanner from '../components/ErrorBanner';
 import MeetingNamesPanel from '../components/MeetingNamesPanel';
+import EmailTaskLinksPanel from '../components/EmailTaskLinksPanel';
+import DataTable from '../components/DataTable';
 
 // Email triage rules — the user-owned half of Gmail classification.
 //
@@ -97,29 +99,25 @@ export default function EmailTriage() {
             is the <strong>only</strong> thing that changes them. Click one to add a rule.
           </p>
           <div className="table-scroll">
-            <table className="data-table">
-              <thead>
-                <tr><th>Sender</th><th style={{ width: 150 }}>Cached as</th>
-                  <th style={{ width: 60 }}>n</th><th style={{ width: 80 }}>conf</th>
-                  <th style={{ width: 90 }} /></tr>
-              </thead>
-              <tbody>
-                {stuck.slice(0, 20).map(s => (
-                  <tr key={s.email_addr}>
-                    <td><code>{s.email_addr}</code></td>
-                    <td>{s.state}</td>
-                    <td>{s.n}</td>
-                    <td>{s.confidence}</td>
-                    <td>
-                      <button
-                        className="btn btn-sm"
-                        onClick={() => setOverrides(o => [...o, [s.email_addr, 'informational', '']])}
-                      >+ Rule</button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+            <DataTable
+              rows={stuck.slice(0, 20)}
+              rowKey={s => s.email_addr}
+              columns={[
+                { header: 'Sender', cell: s => <code>{s.email_addr}</code> },
+                { header: 'Cached as', th: { style: { width: 150 } }, cell: s => s.state },
+                { header: 'n', th: { style: { width: 60 } }, cell: s => s.n },
+                { header: 'conf', th: { style: { width: 80 } }, cell: s => s.confidence },
+                {
+                  th: { style: { width: 90 } },
+                  cell: s => (
+                    <button
+                      className="btn btn-sm"
+                      onClick={() => setOverrides(o => [...o, [s.email_addr, 'informational', '']])}
+                    >+ Rule</button>
+                  ),
+                },
+              ]}
+            />
           </div>
         </div>
       )}
@@ -225,6 +223,8 @@ export default function EmailTriage() {
       </div>
 
       <MeetingNamesPanel />
+
+      <EmailTaskLinksPanel />
     </div>
   );
 }

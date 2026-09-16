@@ -7,6 +7,7 @@ import {
   changedKeys, joinList, KINDS, splitList, toSaveBody,
   type Kind, type VaultLayout,
 } from '../lib/vaultLayout';
+import DataTable from '../components/DataTable';
 
 // The vault layout — where the journal notes go, what an entry looks like —
 // and the user's clock. AEGIS ships one vault's conventions as the defaults;
@@ -171,21 +172,24 @@ export default function Vault() {
             {previewError && <ErrorBanner error={previewError} />}
             {preview && !previewError && (
               <div className="table-scroll">
-                <table className="data-table">
-                  <thead>
-                    <tr><th style={{ width: 90 }}>Note</th><th>Filed at</th><th>Live note (appended to when it exists)</th><th>Section</th></tr>
-                  </thead>
-                  <tbody>
-                    {KINDS.map(k => (
-                      <tr key={k} style={{ opacity: preview[k].enabled ? 1 : 0.5 }}>
-                        <td>{k}{!preview[k].enabled && ' (off)'}</td>
-                        <td><code>{preview[k].path}</code></td>
-                        <td><code>{preview[k].live_path || '—'}</code></td>
-                        <td>{preview[k].sections.join(' / ')}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+                <DataTable
+                  rows={[...KINDS]}
+                  rowKey={k => k}
+                  tr={k => ({ style: { opacity: preview[k].enabled ? 1 : 0.5 } })}
+                  columns={[
+                    {
+                      header: 'Note',
+                      th: { style: { width: 90 } },
+                      cell: k => <>{k}{!preview[k].enabled && ' (off)'}</>,
+                    },
+                    { header: 'Filed at', cell: k => <code>{preview[k].path}</code> },
+                    {
+                      header: 'Live note (appended to when it exists)',
+                      cell: k => <code>{preview[k].live_path || '—'}</code>,
+                    },
+                    { header: 'Section', cell: k => preview[k].sections.join(' / ') },
+                  ]}
+                />
                 <pre style={{ marginTop: 8, fontSize: 12 }}>{preview.sample_block}</pre>
               </div>
             )}

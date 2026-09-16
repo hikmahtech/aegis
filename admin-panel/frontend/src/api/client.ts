@@ -87,6 +87,14 @@ export async function apiFetch<T>(path: string, options?: RequestInit): Promise<
   return (text ? JSON.parse(text) : undefined) as T;
 }
 
+/** One email → existing-task rule (`settings.email_task_links`). */
+export type EmailTaskLink = {
+  key: string;
+  subject_re: string;
+  body_re: string | null;
+  action: string;
+};
+
 export const api = {
   // Agents
   listAgents: () => apiFetch<any[]>('/api/agents'),
@@ -487,6 +495,14 @@ export const api = {
     sender_overrides: Record<string, { category: string; tags: string[] }>;
     extra_notification_markers: string[];
   }) => apiFetch<any>('/api/admin/email/triage-rules', { method: 'PUT', body: JSON.stringify(body) }),
+  // Mail that closes or unblocks a task AEGIS already tracks
+  // (`email_task_links`, #337). Both regexes are compiled server-side.
+  getEmailTaskLinks: () =>
+    apiFetch<{ actions: string[]; links: EmailTaskLink[] }>('/api/admin/email/task-links'),
+  saveEmailTaskLinks: (links: EmailTaskLink[]) =>
+    apiFetch<{ actions: string[]; links: EmailTaskLink[] }>('/api/admin/email/task-links', {
+      method: 'PUT', body: JSON.stringify({ links }),
+    }),
   // Who "you" are in a meeting transcript (`meeting_rules`, #558).
   getMeetingRules: () => apiFetch<{ self_names: string[] }>('/api/admin/email/meeting-rules'),
   saveMeetingRules: (body: { self_names: string[] }) =>
@@ -565,11 +581,6 @@ export const api = {
   },
   todoistReclarify: (taskId: string) =>
     apiFetch<any>(`/api/admin/todoist/tasks/${encodeURIComponent(taskId)}/reclarify`, { method: 'POST' }),
-
-  // Money Hygiene (Maou)
-  moneyState: () => apiFetch<any>('/api/admin/money/state'),
-  moneyDigest: () => apiFetch<any>('/api/admin/money/digest'),
-  moneyRunFlow: (flow: string) => apiFetch<any>(`/api/admin/money/${flow}/run`, { method: 'POST' }),
 
   // Overview / System
   overviewBrief: () => apiFetch<any>('/api/overview/brief'),

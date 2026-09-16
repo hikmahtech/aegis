@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { api } from '../api/client';
 import ErrorBanner from '../components/ErrorBanner';
+import DataTable from '../components/DataTable';
 
 // Per-alert runbooks stored in the database (the `runbooks` table, #499).
 // Pandora puts the runbook for an alert in front of every investigation of it:
@@ -120,34 +121,36 @@ export default function Runbooks() {
 
       {loading && <div className="loading">Loading runbooks…</div>}
       <div className="table-scroll">
-        <table className="data-table">
-          <thead>
-            <tr>
-              <th>Alert name</th>
-              <th style={{ width: 110 }}>Characters</th>
-              <th style={{ width: 200 }}>Updated</th>
-              <th style={{ width: 160 }}>By</th>
-              <th style={{ width: 140 }}></th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map(r => (
-              <tr key={r.name_key}>
-                <td className="mono">{r.name}</td>
-                <td>{r.chars}</td>
-                <td className="meta">{r.updated_at ? new Date(r.updated_at).toLocaleString() : '—'}</td>
-                <td className="meta">{r.updated_by || '—'}</td>
-                <td>
+        <DataTable
+          rows={rows}
+          rowKey={r => r.name_key}
+          emptyText={loading ? undefined : 'No stored runbooks. Investigations use the built-in files.'}
+          columns={[
+            { header: 'Alert name', td: { className: 'mono' }, cell: r => r.name },
+            { header: 'Characters', th: { style: { width: 110 } }, cell: r => r.chars },
+            {
+              header: 'Updated',
+              th: { style: { width: 200 } },
+              td: { className: 'meta' },
+              cell: r => (r.updated_at ? new Date(r.updated_at).toLocaleString() : '—'),
+            },
+            {
+              header: 'By',
+              th: { style: { width: 160 } },
+              td: { className: 'meta' },
+              cell: r => r.updated_by || '—',
+            },
+            {
+              th: { style: { width: 140 } },
+              cell: r => (
+                <>
                   <button className="btn btn-sm" onClick={() => void openEdit(r.name)}>Edit</button>{' '}
                   <button className="btn btn-sm" onClick={() => void remove(r.name)}>Delete</button>
-                </td>
-              </tr>
-            ))}
-            {!loading && rows.length === 0 && (
-              <tr><td colSpan={5} className="empty">No stored runbooks. Investigations use the built-in files.</td></tr>
-            )}
-          </tbody>
-        </table>
+                </>
+              ),
+            },
+          ]}
+        />
       </div>
     </div>
   );

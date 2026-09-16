@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api } from '../api/client';
 import ErrorBanner from '../components/ErrorBanner';
+import DataTable from '../components/DataTable';
 
 interface DbStatus {
   status?: string;
@@ -179,26 +180,23 @@ export default function SystemMonitoring() {
                 <p className="meta" style={{ marginBottom: '0.5rem' }}>Source: <span className="mono">{data.services.infra_slug}</span></p>
               )}
               <div className="table-scroll">
-                <table className="data-table">
-                  <thead>
-                    <tr>
-                      <th>Name</th>
-                      <th>Stack</th>
-                      <th>Replicas</th>
-                      <th>Image</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {data.services.services.map((s, i) => (
-                      <tr key={`${s.name}-${i}`}>
-                        <td><strong>{s.name}</strong></td>
-                        <td>{s.stack || '—'}</td>
-                        <td><span className={replicaBadgeClass(s.replicas)}>{s.replicas || '—'}</span></td>
-                        <td className="mono" style={{ fontSize: 12, color: 'var(--text-muted)' }}>{s.image || '—'}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+                <DataTable
+                  rows={data.services.services}
+                  rowKey={(s, i) => `${s.name}-${i}`}
+                  columns={[
+                    { header: 'Name', cell: s => <strong>{s.name}</strong> },
+                    { header: 'Stack', cell: s => s.stack || '—' },
+                    {
+                      header: 'Replicas',
+                      cell: s => <span className={replicaBadgeClass(s.replicas)}>{s.replicas || '—'}</span>,
+                    },
+                    {
+                      header: 'Image',
+                      td: { className: 'mono', style: { fontSize: 12, color: 'var(--text-muted)' } },
+                      cell: s => s.image || '—',
+                    },
+                  ]}
+                />
               </div>
             </>
           ) : (

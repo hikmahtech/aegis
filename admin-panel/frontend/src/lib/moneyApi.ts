@@ -328,7 +328,50 @@ export type BooksChartState = {
 
 // ----------------------------------------------------------------- the fetchers
 
+/** One extracted money event, as the indexer filed it. */
+export type MoneyEvent = {
+  message_id: string;
+  mailbox: string;
+  entity: string;
+  kind: string;
+  direction: string | null;
+  amount: string | null;
+  currency: string | null;
+  payee: string | null;
+  account: string | null;
+  channel: string | null;
+  instrument: string | null;
+  occurred_on: string | null;
+  due_on: string | null;
+  parser: string | null;
+  confidence: number | null;
+  source_class: string | null;
+  journal_file: string | null;
+  linked_message_id: string | null;
+  todoist_ref: string | null;
+};
+
+/** What the money page leads with: the recent events and the four counts. */
+export type MoneyState = {
+  events: MoneyEvent[];
+  unknown_count: number;
+  dues_open: number;
+  unpushed_commits: number;
+  books_configured: boolean;
+  home_currency?: string;
+};
+
+export type MoneyDigest = { path: string; markdown: string };
+/** `digest` is null until a month has been closed. */
+export type MoneyDigestResponse = { digest: MoneyDigest | null };
+
 export const moneyApi = {
+  state: () => apiFetch<MoneyState>('/api/admin/money/state'),
+  digest: () => apiFetch<MoneyDigestResponse>('/api/admin/money/digest'),
+  runFlow: (flow: string) =>
+    apiFetch<{ started: boolean; workflow_id?: string }>(
+      `/api/admin/money/${flow}/run`, { method: 'POST' },
+    ),
   balances: () => apiFetch<MoneyBalances>('/api/admin/money/balances'),
   dues: () => apiFetch<MoneyDues>('/api/admin/money/dues'),
   unknowns: (days?: number) =>
