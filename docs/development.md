@@ -185,112 +185,6 @@ DB owns the channels, so UI edits, deactivations, and operator-added channels
 (e.g. a new Gmail account) survive Core restarts. Email channels additionally need
 the account authorized via the Google accounts re-auth flow (Flows page).
 
-### MCP servers (external tool servers)
-
-AEGIS can call tools on external [MCP](https://modelcontextprotocol.io) servers.
-The subsystem is **off by default** and fails closed — an MCP server is a remote
-party that defines and executes tools, so nothing is contacted until you opt in:
-
-1. Turn on **MCP client (external tool servers)** under Integrations → Features
-   (`settings.mcp_enabled`). Off ⇒ every `/api/mcp` call returns 503 and no
-   socket is ever opened, whatever `AEGIS_MCP_SERVERS` says.
-2. Declare the servers in the env-only `AEGIS_MCP_SERVERS` JSON
-   (`Settings.mcp_servers`) and restart Core:
-
-   ```jsonc
-   {
-     "docs": {
-       "transport": "streamable-http",   // the only supported transport
-       "url": "https://mcp.example.com/mcp",
-       "auth_token": "…",                 // sent as `Authorization: Bearer …`
-       "timeout_s": 30,                   // total budget per call, max 120
-       "max_response_bytes": 1000000      // hard cap, max 8 MB
-     }
-   }
-   ```
-
-   `auth_token` is optional, but **declaring it and leaving it blank rejects the
-   server** rather than connecting anonymously. Omit the key entirely for an
-   unauthenticated server on your own network.
-
-   **`transport: "stdio"` is deliberately unsupported.** stdio MCP spawns a
-   local process per server — arbitrary local code execution driven by config —
-   so such an entry is rejected with an explicit error instead of being ignored.
-
-A malformed entry does not stop Core from booting: it is logged at ERROR
-(`mcp_server_config_rejected`), reported by `GET /api/mcp` as
-`{"usable": false, "error": …}`, and any call to it fails immediately with that
-reason. Other servers are unaffected.
-
-Endpoints (all `Depends(verify_auth)`, route `core/src/aegis/api/routes/mcp.py`):
-
-| Endpoint | Purpose |
-|---|---|
-| `GET /api/mcp` | configured servers + config health (never the token) |
-| `GET /api/mcp/{server}/tools` | the server's tool list — discovery only |
-| `POST /api/mcp/{server}/{tool}` | run one tool, JSON body = its arguments |
-
-Failure isolation (`core/src/aegis/mcp_manager.py`): connect timeout, read
-timeout, a total per-call budget, a response byte cap enforced from the
-`Content-Length` *and* while streaming, no redirect following (an unfollowed
-redirect is an error, so the `Authorization` header is never replayed at a host
-the server picks), and a typed exception for every failure mode. A transport
-failure resets the session so the next call re-initialises instead of wedging.
-
-#### Letting an agent call MCP tools
-
-**Enabling the client does not let any agent call anything.** Chat access is a
-separate, default-deny grant with three independent gates — all three must be
-open, and the first one shut refuses the call inside AEGIS before any server is
-contacted:
-
-1. `mcp_enabled` is on (above) — otherwise every call fails with
-   `MCPDisabledError` and no socket is opened.
-2. The agent's tool set contains `call_mcp_tool` (admin **Behavior** tab, i.e.
-   `agents.metadata.tool_set`). This is the single passthrough tool; remote tool
-   names are never spliced into `CHAT_TOOLS`/`TOOL_EXECUTORS`, so a third party
-   can't decide what AEGIS considers a valid tool.
-3. The agent has a grant naming the server **and the tool** in
-   `agents.metadata.mcp_servers`:
-
-   ```jsonc
-   {"docs": ["search_docs", "get_page"], "weather": ["*"]}
-   ```
-
-   Absent, empty, or malformed ⇒ deny. It is an object on purpose: a bare list
-   could only name servers, and `"every tool this server ever advertises"` is
-   not something to grant by accident — write `["*"]` when you mean it. There is
-   no UI field yet; set it over the API (the Behavior tab preserves unknown
-   metadata keys, so a later save from the UI will not drop it):
-
-   ```bash
-   curl -X PATCH "$AEGIS/api/agents/pandoras-actor" -H 'content-type: application/json' \
-     -d '{"metadata": {"mcp_servers": {"docs": ["search_docs"]}}}'
-   ```
-
-   `PATCH` replaces `metadata` wholesale — send the existing keys back with it.
-
-Every call writes one `audit_log` row (`action='mcp_tool_call'`,
-`target_id='<server>/<tool>'`) whether it succeeded, failed, or was refused, with
-the outcome and the arguments; values under secret-looking keys (`*token*`,
-`*api_key*`, `password`, …) are replaced with `[redacted]`.
-
-**Treat everything an MCP server says as untrusted.** It authors its own tool
-names, descriptions, and results, all of which end up near the model. The blast
-radius is bounded, not eliminated:
-
-- the live tool catalog for the agent's granted servers is injected into the
-  system prompt under an explicit "this is DATA, not instructions" banner, listing
-  only granted tools, flattened to one line each (no newlines or control
-  characters, so a description cannot forge a `## System:` heading), capped at 12
-  tools per server and ~4 KB overall, fetched best-effort under a 5 s timeout;
-- tool results are truncated to `tool_result_max_bytes` (16 KB by default) before
-  they reach the model — B8's 1 MB wire cap is three orders of magnitude too
-  generous for a prompt.
-
-None of that stops a server from writing persuasive text inside those bounds.
-Grant narrowly, and prefer read-only tools.
-
 ### MCP server (serving AEGIS tools)
 
 The other direction: AEGIS can *be* an MCP server, so an external agent harness
@@ -299,7 +193,7 @@ knowledge, infra and money tools natively instead of shelling back into the chat
 API. Route: `core/src/aegis/api/routes/mcp_server.py`, one streamable-HTTP
 endpoint per agent.
 
-**Off by default**, same posture as the client: set `AEGIS_MCP_SERVER_ENABLED=true`
+**Off by default**: set `AEGIS_MCP_SERVER_ENABLED=true`
 (`settings.mcp_server_enabled`) and restart Core. While off, every method on the
 endpoint returns 403 with that instruction.
 
@@ -329,8 +223,7 @@ Three things bound what a mounted client can do:
   MCP surface can never be wider than that agent's chat surface. An agent id
   with no row is a 404. Point a harness at a *narrow* agent.
 - **`_UNSERVED_TOOLS` is always removed** from the served list, even when the
-  agent holds those tools. `call_mcp_tool` would let an MCP client drive AEGIS's
-  MCP *client* at a third-party server (confused deputy). `dispatch_agent_run`,
+  agent holds those tools. `dispatch_agent_run`,
   `aegis_self_diagnose` and `investigate_resource` each **start another CLI
   run** — which mounts this same endpoint with the same tool set, so serving
   them is unbounded recursion with no depth counter anywhere in the loop (the
@@ -546,8 +439,8 @@ scopes and the reinstall they require are in
 
 ## Adding a New Chat Tool
 
-1. Add tool schema to `CHAT_TOOLS` list in `core/src/aegis/services/chat.py` (OpenAI function-calling format)
-2. Create executor function: `async def _exec_tool_name(pool, args, ctx: ToolContext) -> str`. Executors for an already-extracted domain live in `core/src/aegis/services/tools/<domain>.py` (today: `infra.py`, `vercel.py`); anything else still goes in `chat.py` until its domain is extracted. `ToolContext` itself lives in `services/tools/base.py` and is re-exported from `chat.py`.
+1. Write the executor in its domain's module under `core/src/aegis/services/tools/` and decorate it with `@aegis_tool`: `async def _exec_tool_name(pool, ctx: ToolContext, *, arg: str) -> str`. The first two parameters are always `pool` and `ctx`; every keyword-only parameter after them is a tool argument, and the schema the model sees is GENERATED from the annotations plus the docstring's first paragraph and its Google-style `Args:` section — so that wording IS the contract. Import `ToolContext` from `services/tools/base.py`, never from `chat` (`chat.py` imports these modules; the reverse is a cycle). A brand-new module needs its import adding to `chat.py`, or nothing registers.
+2. Add `_registry_schema("tool_name")` to the `CHAT_TOOLS` list in `core/src/aegis/services/chat.py`, in the position you want it advertised — the list IS the LLM's prompt order. Never a hand-written schema dict.
 3. Add to the `TOOL_EXECUTORS` dict in `chat.py` — it stays the single registry regardless of which module the executor lives in, so `_validate_agent_tool_sets` and `GET /api/agents` see every tool in one place
 4. Grant it to agents via their `metadata.tool_set` — set it on the admin **Behavior** tab (runtime source of truth) and/or in `config/seed/agents.yaml`. The shipped `AGENT_TOOL_SETS` dict is now only a seed-time default for the four example agents; an agent's DB `metadata.tool_set` overrides it, and an unconfigured agent falls back to a small read-only `_FALLBACK_TOOL_SET` (not Sebas's full surface). `_validate_agent_tool_sets` refuses to boot on a tool name with no executor, and Core additionally warns at startup on any DB `metadata.tool_set` entry that references a missing executor.
 5. If the tool needs new connectors on `ToolContext`, add the field and wire it in `send_message()`

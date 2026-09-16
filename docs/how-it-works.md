@@ -749,8 +749,10 @@ constructed in `main()`.
 For any human decision inside the flow, spawn `InteractionFlow` — don't build
 custom callback plumbing.
 
-**A new chat tool** — schema into `CHAT_TOOLS`, executor into
-`TOOL_EXECUTORS` (both `core/src/aegis/services/chat.py`), then **grant it
+**A new chat tool** — a `@aegis_tool`-decorated executor in its domain's
+module under `core/src/aegis/services/tools/` (the docstring generates the
+schema), then `_registry_schema("<name>")` into `CHAT_TOOLS` and the executor
+into `TOOL_EXECUTORS` (both `core/src/aegis/services/chat.py`), then **grant it
 via `metadata.tool_set`** — a DB write on the agent's Behavior tab (or seed
 YAML for fresh installs), *not* a code change: the DB tool set overrides the
 Python dict at runtime ([§2](#2-agents-and-capability-tags)). Core refuses to

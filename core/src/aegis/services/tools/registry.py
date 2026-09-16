@@ -43,21 +43,13 @@ all behave exactly as they did for the hand-written executors.
 
 from __future__ import annotations
 
-import asyncio
 import functools
 import inspect
-import json
 import re
 import types
 import typing
 from dataclasses import dataclass
 from typing import Annotated, Any, Literal, get_args, get_origin
-
-import structlog
-from jsonschema import Draft202012Validator
-from jsonschema.exceptions import ValidationError as JSONSchemaValidationError
-
-logger = structlog.get_logger()
 
 
 @dataclass
@@ -239,146 +231,3 @@ def aegis_tool(
     if fn is not None:
         return decorate(fn)
     return decorate
-
-
-def build_chat_tools() -> list[dict]:
-    """The OpenAI-format tool list advertised to the LLM (replaces CHAT_TOOLS)."""
-    return [
-        {
-            "type": "function",
-            "function": {
-                "name": tool.name,
-                "description": tool.description,
-                "parameters": tool.parameters,
-            },
-        }
-        for tool in TOOL_REGISTRY.values()
-    ]
-
-
-def build_tool_executors() -> dict[str, Any]:
-    """The name → executor dispatch table (replaces the hand-written one)."""
-    return {name: tool.executor for name, tool in TOOL_REGISTRY.items()}
-
-
-class ChatToolValidationError(Exception):
-    """Raised when a tool call's args fail JSONSchema validation twice in a row."""
-
-    def __init__(self, tool_name: str, message: str, schema_summary: str):
-        self.tool_name = tool_name
-        self.message = message
-        self.schema_summary = schema_summary
-        super().__init__(f"{tool_name}: {message}")
-
-
-def _validate_tool_args(name: str, args: dict, *, schema: dict | None = None) -> None:
-    """Validate `args` against the tool's JSONSchema. Raises JSONSchemaValidationError.
-
-    Pass `schema` explicitly (cheap fast path) or let the function look it up
-    from TOOL_REGISTRY when invoked in production.
-    """
-    if schema is None:
-        tool = TOOL_REGISTRY.get(name)
-        if tool is None:
-            # No schema known → nothing to validate.
-            return
-        schema = tool.parameters
-    Draft202012Validator(schema).validate(args)
-
-
-def _schema_hint(name: str) -> str:
-    """Compact reminder of a tool's expected arguments (required fields +
-    enum values), appended to a validation-failure message so the model can
-    self-correct on retry instead of giving up to prose.
-
-    gpt-oss (the tool-calling fallback model) frequently omits a required arg
-    or picks an out-of-enum value; the raw jsonschema message ("'context' is a
-    required property") doesn't say what `context` should be. Spelling out the
-    contract gives the retry a real chance to land. Looks the schema up from
-    TOOL_REGISTRY the same way `_validate_tool_args` does; returns "" if unknown.
-    """
-    tool = TOOL_REGISTRY.get(name)
-    schema = tool.parameters if tool else None
-    if not schema:
-        return ""
-    required = set(schema.get("required") or [])
-    props = schema.get("properties") or {}
-    parts: list[str] = []
-    for pname, spec in props.items():
-        spec = spec if isinstance(spec, dict) else {}
-        bits = [str(spec.get("type", "any"))]
-        if "enum" in spec:
-            bits.append("one of " + ", ".join(str(e) for e in spec["enum"]))
-        flag = "required" if pname in required else "optional"
-        parts.append(f"{pname} ({flag}; {'; '.join(bits)})")
-    if not parts:
-        return ""
-    return "Expected arguments — " + "; ".join(parts)
-
-
-async def _dispatch_tool_call_with_retry(
-    pool: Any,
-    name: str,
-    tool_call_id: str,
-    initial_args: dict,
-    messages: list[dict],
-    retry_args_provider: Any,
-    executor: Any,
-    ctx: Any,
-) -> Any:
-    """Validate args; on ValidationError, append a tool error message and retry once.
-
-    `retry_args_provider(error_message)` returns the new args for the retry —
-    in production this is backed by the LLM re-invocation; in tests it's a
-    deterministic callable. On second failure, raise ChatToolValidationError.
-    """
-    args = initial_args
-    attempt = 0
-    while True:
-        try:
-            _validate_tool_args(name, args)
-            return await executor(pool, args, ctx)
-        except JSONSchemaValidationError as exc:
-            if attempt >= 1:
-                raise ChatToolValidationError(
-                    tool_name=name,
-                    message=exc.message,
-                    schema_summary=str(exc.schema)[:200],
-                ) from exc
-            err_msg = f"Validation error on tool `{name}`: {exc.message}."
-            hint = _schema_hint(name)
-            if hint:
-                err_msg += f" {hint}. Call `{name}` again with corrected arguments."
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tool_call_id,
-                    "content": err_msg,
-                }
-            )
-            result_or_coro = retry_args_provider(err_msg)
-            if asyncio.iscoroutine(result_or_coro):
-                args = await result_or_coro
-            else:
-                args = result_or_coro
-            attempt += 1
-
-
-async def _retry_via_llm(
-    llm_client: Any,
-    messages: list[dict],
-    model: str,
-    tools: list[dict] | None,
-    original_tool_name: str,
-    error_msg: str,
-) -> dict:
-    """Re-ask the LLM for new args after a validation failure."""
-    retry_result = await llm_client.chat(messages=messages, model=model, tools=tools)
-    # chat() returns tool calls in the flat shape {id, name, arguments} — not the
-    # nested {function: {...}} of an outbound assistant message.
-    for tc in retry_result.get("tool_calls", []) or []:
-        if tc.get("name") == original_tool_name:
-            return json.loads(tc["arguments"])
-    # LLM didn't produce a tool call this time — return empty to force surface.
-    logger.warning("chat_tool_retry_no_matching_call", tool=original_tool_name)
-    return {}

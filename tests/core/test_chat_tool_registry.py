@@ -6,8 +6,9 @@ incumbent tests, but three failure modes of the *move itself* are not:
 1. a tool name silently disappearing from `TOOL_EXECUTORS` — which fails in
    production, not in a default-config test, because a DB
    `agents.metadata.tool_set` can reference a tool no seed agent declares;
-2. a `functools.partial` rebinding to the wrong `_INFRA_SPECS` key while the
-   registry key stays right, so `list_pods` quietly runs `list_nodes`;
+2. an executor registering under the wrong name, so `list_pods` quietly runs
+   `list_nodes` (the `_INFRA_SPECS` key each infra tool passes is pinned
+   script-by-script in `tests/core/test_chat_infra_tools.py`);
 3. the compat re-export in `chat.py` binding a *copy* rather than the same
    object — `tests/core/test_chat_infra_tools.py` mutates
    `chat._INFRA_CONTEXTS_K8S` IN PLACE and relies on `_exec_infra`'s
@@ -19,7 +20,6 @@ than derived, so a dropped or renamed tool has to be acknowledged here.
 
 from __future__ import annotations
 
-import functools
 import json
 from unittest.mock import AsyncMock, MagicMock
 
@@ -32,7 +32,6 @@ from aegis.services.tools import vercel as tools_vercel
 EXPECTED_TOOL_NAMES = [
     "aegis_self_diagnose",
     "ask_knowledge",
-    "call_mcp_tool",
     "capture_to_inbox",
     "cloud_identity",
     "comment_on_task",
@@ -112,22 +111,24 @@ EXPECTED_TOOL_NAMES = [
 ]
 
 # name -> executor __qualname__, module path deliberately excluded so this
-# survives a later move; `_exec_infra` partials carry their bound tool key.
+# survives a later move. `@aegis_tool` wraps with `functools.wraps`, so the
+# qualname is the decorated function's own — a tool registered under the wrong
+# name shows up here as a mismatched pair.
 EXPECTED_EXECUTOR_IDENTITY = {
     "cloud_identity": "_exec_cloud_identity",
-    "get_pod_logs": "_exec_infra('get_pod_logs')",
-    "get_service_logs": "_exec_infra('get_service_logs')",
-    "inspect_service": "_exec_infra('inspect_service')",
-    "list_argocd_apps": "_exec_infra('list_argocd_apps')",
+    "get_pod_logs": "_exec_get_pod_logs",
+    "get_service_logs": "_exec_get_service_logs",
+    "inspect_service": "_exec_inspect_service",
+    "list_argocd_apps": "_exec_list_argocd_apps",
     "list_cloud_accounts": "_exec_list_cloud_accounts",
-    "list_deployments": "_exec_infra('list_deployments')",
-    "list_nodes": "_exec_infra('list_nodes')",
-    "list_pods": "_exec_infra('list_pods')",
-    "list_services": "_exec_infra('list_services')",
+    "list_deployments": "_exec_list_deployments",
+    "list_nodes": "_exec_list_nodes",
+    "list_pods": "_exec_list_pods",
+    "list_services": "_exec_list_services",
     "restart_deployment": "_exec_restart_deployment",
-    "restart_service": "_exec_infra('restart_service')",
+    "restart_service": "_exec_restart_service",
     "run_infra_script": "_exec_run_infra_script",
-    "sync_argocd_app": "_exec_infra('sync_argocd_app')",
+    "sync_argocd_app": "_exec_sync_argocd_app",
     "vercel_get_build_logs": "_exec_vercel_get_build_logs",
     "vercel_get_deployment": "_exec_vercel_get_deployment",
     "vercel_get_project": "_exec_vercel_get_project",
@@ -136,9 +137,6 @@ EXPECTED_EXECUTOR_IDENTITY = {
 
 
 def _identity(executor) -> str:
-    if isinstance(executor, functools.partial):
-        inner = ", ".join(repr(a) for a in executor.args)
-        return f"{executor.func.__qualname__}({inner})"
     return executor.__qualname__
 
 
@@ -153,7 +151,7 @@ def test_chat_tools_schema_names_match_the_registry():
 
 
 def test_moved_executor_identities_are_unchanged():
-    """Guards a partial silently rebinding to the wrong _INFRA_SPECS key."""
+    """Guards an executor silently registering under another tool's name."""
     actual = {n: _identity(TOOL_EXECUTORS[n]) for n in EXPECTED_EXECUTOR_IDENTITY}
     assert actual == EXPECTED_EXECUTOR_IDENTITY
 

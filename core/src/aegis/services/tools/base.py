@@ -36,7 +36,6 @@ class ToolContext:
     llm_client: Any | None = None
     remote_script_connector: Any | None = None
     vercel_connector: Any | None = None
-    mcp_manager: Any | None = None
     model_light: str = "gemma4:e2b"
 
 

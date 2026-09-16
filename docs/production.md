@@ -151,7 +151,6 @@ the checklist to work through after a deploy.
 | Curiosity's calendar lane | `owner_emails`, same reason | Integrations → Owner |
 | Slack reaction capture | `slack_owner_member_id` (unset ⇒ the lane is a no-op) + the scopes below | Integrations + the Slack app |
 | Voice ingest on comms | `AEGIS_VOICE_INGEST_SECRET` (its own credential, **not** `AEGIS_API_KEY`) **and** `AEGIS_ELEVENLABS_API_KEY` for transcription — either unset ⇒ 503, never an open endpoint | comms env |
-| MCP client | `mcp_enabled`, `AEGIS_MCP_SERVERS`, **and** a per-agent `metadata.mcp_servers` grant — three independent gates, all default-deny. Core restart required | [`development.md`](development.md#mcp-servers-external-tool-servers) |
 | Life chat tools | `query_observations` / `last_contact_with_person` are in `AGENT_TOOL_SETS` but **not** in `config/seed/agents.yaml`, so no agent gets them from a seed — grant them explicitly | Agents → **Behavior** |
 | Memory consolidation (A4) | **two independent keys**: `dry_run: false` on the `memory-reflection-nightly` row *and* `AEGIS_MEMORY_CONSOLIDATION_APPLY_ENABLED=true` in the worker env. Either one alone writes nothing | admin **Flows** + worker env |
 | Persona self-editing (A2/A5) | nothing to enable — but nothing is written to a persona doc until a human approves the `draft_review` card. A resolve whose acknowledged base fingerprint has drifted is refused with **409** and must be resubmitted with a matching `base_ack` | Interactions |

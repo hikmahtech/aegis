@@ -1968,7 +1968,7 @@ class AlertActivities:
                 "output_file": "",
             }
 
-        # Kimi needs a checkout path. Connectors/runbooks/mcp_servers in the
+        # Kimi needs a checkout path. Connectors and runbooks in the
         # resources list have no path — pick the first resource that does.
         primary_idx = next(
             (i for i, r in enumerate(resources) if r.get("resource_path")),
