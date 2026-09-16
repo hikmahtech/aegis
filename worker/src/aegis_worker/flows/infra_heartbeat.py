@@ -65,7 +65,7 @@ from dataclasses import dataclass, field
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
-    from aegis.errors import error_text
+    from aegis.errors import error_text, logged_failure
 
     from aegis_worker.activities.homelab import HomelabActivities
     from aegis_worker.activities.hub import HubActivities
@@ -259,7 +259,9 @@ class InfraHeartbeatFlow:
         # existed.
         ingress_failing = bool(prior.get("ingress_failing"))
         ingress_fails = int(prior.get("ingress_fails") or 0)
-        if workflow.patched("ingress-canary") and config.ingress_url:
+        # deprecate_patch: remove after the next release, see #614
+        workflow.deprecate_patch("ingress-canary")
+        if config.ingress_url:
             try:
                 probe = await workflow.execute_activity_method(
                     HomelabActivities.probe_ingress,
@@ -361,7 +363,7 @@ class InfraHeartbeatFlow:
         # converged. Safety net only — the deploy role posts `ok` itself —
         # so it never fails the tick.
         deploys_cleared = 0
-        try:
+        with logged_failure("heartbeat_clear_deploys_failed", logger=workflow.logger):
             cleared = await workflow.execute_activity_method(
                 HubActivities.clear_converged_deploys,
                 args=[sorted(cur_stuck)],
@@ -369,8 +371,6 @@ class InfraHeartbeatFlow:
                 retry_policy=NO_RETRY,
             )
             deploys_cleared = len(cleared.get("cleared") or [])
-        except Exception as exc:  # noqa: BLE001 — housekeeping, never the tick
-            workflow.logger.warning("heartbeat_clear_deploys_failed err=%s", error_text(exc))
 
         nodes_down, nodes_recovered = [], []
         for name, status in cur_nodes.items():
@@ -409,7 +409,7 @@ class InfraHeartbeatFlow:
         # that used to live in the heartbeat state row are gone.
         stale: list[dict] = []
         if config.restuck_hours > 0 and confirmed_now:
-            try:
+            with logged_failure("heartbeat_stale_lookup_failed", logger=workflow.logger):
                 stale = await workflow.execute_activity_method(
                     HubActivities.stale_stuck_problems,
                     # The classes the heartbeat itself raises for a stuck
@@ -423,8 +423,6 @@ class InfraHeartbeatFlow:
                     start_to_close_timeout=TIMEOUT_FAST,
                     retry_policy=FAST,
                 )
-            except Exception as exc:  # noqa: BLE001
-                workflow.logger.warning("heartbeat_stale_lookup_failed err=%s", error_text(exc))
 
         quiet = set(config.quiet_nodes or [])
         quiet_notified = 0

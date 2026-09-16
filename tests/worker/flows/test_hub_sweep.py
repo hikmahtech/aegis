@@ -4,7 +4,7 @@ and only group on a yes."""
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 import pytest
 from temporalio import activity, workflow
@@ -212,86 +212,6 @@ async def test_sweep_leaves_a_cluster_the_judge_rejects_alone():
     assert out["group_candidates"] == 1
     assert out["grouped"] == 0
     assert "apply" not in _calls
-
-
-# --- the completed-task step (#473) --------------------------------------------
-
-
-@workflow.defn(name="HubSweepFlow")
-class _SweepBeforeCompletedTasks:
-    """HubSweepFlow as it ran before step 2 existed: the same activities in
-    the same order, minus `reconcile_completed_tasks`. Kept so a history it
-    wrote can be replayed against today's flow."""
-
-    @workflow.run
-    async def run(self, config: HubSweepConfig) -> dict:
-        short = timedelta(seconds=30)
-        await workflow.execute_activity(
-            "promote_expired_suppressions", start_to_close_timeout=short
-        )
-        await workflow.execute_activity("project_pending", start_to_close_timeout=short)
-        await workflow.execute_activity(
-            "find_group_candidates", args=[0, 0.0], start_to_close_timeout=short
-        )
-        return {}
-
-
-@pytest.mark.asyncio
-async def test_a_sweep_started_before_the_deploy_replays_on_the_new_worker():
-    """HubSweepFlow runs every five minutes, so a deploy can land mid-run and
-    the new worker replays a history with no `reconcile_completed_tasks` in
-    it. The step is behind `workflow.patched`, which is what keeps that replay
-    deterministic.
-
-    Falsifiable: call the activity without the `patched` guard and this
-    replay raises a nondeterminism error.
-    """
-    _, history = await _run(
-        [_promote, _project, _finder([])],
-        workflows=(_SweepBeforeCompletedTasks,),
-        flow=_SweepBeforeCompletedTasks,
-    )
-    await Replayer(workflows=[HubSweepFlow]).replay_workflow(history)
-
-
-@workflow.defn(name="HubSweepFlow")
-class _SweepBeforeFixVerification:
-    """HubSweepFlow as it ran before #502: the completed-task step behind its
-    patch, and no `verify_fixes`. Kept so a history it wrote can be replayed
-    against today's flow."""
-
-    @workflow.run
-    async def run(self, config: HubSweepConfig) -> dict:
-        short = timedelta(seconds=30)
-        await workflow.execute_activity(
-            "promote_expired_suppressions", start_to_close_timeout=short
-        )
-        if workflow.patched("hub-sweep-completed-tasks"):
-            await workflow.execute_activity(
-                "reconcile_completed_tasks", start_to_close_timeout=short
-            )
-        await workflow.execute_activity("project_pending", start_to_close_timeout=short)
-        await workflow.execute_activity(
-            "find_group_candidates", args=[0, 0.0], start_to_close_timeout=short
-        )
-        return {}
-
-
-@pytest.mark.asyncio
-async def test_a_sweep_started_before_fix_verification_replays_on_the_new_worker():
-    """#502 put `verify_fixes` between the completed-task step and projection.
-    A sweep in flight across the deploy replays a history without it, so the
-    step is behind `workflow.patched`.
-
-    Falsifiable: call the activity without the guard and this replay raises a
-    nondeterminism error.
-    """
-    _, history = await _run(
-        [_promote, _reconcile, _project, _finder([])],
-        workflows=(_SweepBeforeFixVerification,),
-        flow=_SweepBeforeFixVerification,
-    )
-    await Replayer(workflows=[HubSweepFlow]).replay_workflow(history)
 
 
 @pytest.mark.asyncio

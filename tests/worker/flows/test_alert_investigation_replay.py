@@ -1,16 +1,13 @@
-"""Runs in flight across the #500/#501 deploy replay through the new flow.
+"""AlertInvestigationFlow replays its own histories (#500/#501).
 
-An AlertInvestigationFlow run can wait up to 48 hours on its Gate-2 card, so
-some are always in flight when the worker is redeployed. The worker replays
-each one's history through the new code, and a single command the new code
-issues differently from the recorded history wedges the run.
+A run can wait up to 48 hours on its Gate-2 card, so some are always in
+flight when the worker is redeployed, and the worker replays each one's
+history through the code it now runs. A single command issued differently
+from the recorded history wedges the run.
 
-Each history below is recorded by the flow as it was before this change
-(`_alert_investigation_pre500.py`, a frozen copy) and replayed through the
-current flow. Between them they walk every command sequence the two patches
-changed: the card for a verdict with nothing to decide, answered and still
-open; the second automatic restart; and a restart that did not recover.
-Remove either `workflow.patched` guard and these fail.
+The scenarios below walk the command sequences the card paths take: a verdict
+with nothing to decide, with and without proposed commands; a repeat
+automatic restart; and a first restart.
 """
 
 from __future__ import annotations
@@ -25,7 +22,6 @@ from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer, Worker
 
 from tests.worker.flows import _alert_flow_harness as h
-from tests.worker.flows._alert_investigation_pre500 import AlertInvestigationFlowPre500
 
 with workflow.unsafe.imports_passed_through():
     from aegis_worker.flows.interaction import InteractionFlowInput, InteractionResult
@@ -75,74 +71,6 @@ async def _record(flow_cls: type, alert: dict, *, card_cls: type = h.FakeInterac
 async def _replays(history) -> None:
     # Raises on any command the new flow issues differently from the history.
     await Replayer(workflows=[AlertInvestigationFlow]).replay_workflow(history)
-
-
-async def test_an_answered_card_for_a_verdict_with_nothing_to_decide():
-    h.reset()
-    history = await _record(AlertInvestigationFlowPre500, h.app_alert())
-    assert len(h.S.cards) == 1, "the old flow carded it"
-    await _replays(history)
-
-
-async def test_an_open_card_for_a_verdict_with_nothing_to_decide():
-    h.reset()
-    history = await _record(AlertInvestigationFlowPre500, h.app_alert(), card_cls=OpenCard)
-    assert len(h.S.cards) == 1
-    await _replays(history)
-
-
-async def test_an_answered_card_for_commands_on_an_inconclusive_verdict():
-    """#518 made commands on a verdict that is not actionable a no-card case
-    too, under the same `gate2-only-for-decisions` guard. The old flow
-    carded this one with Run fix."""
-    h.reset()
-    h.S.run_investigation = {
-        **h.S.run_investigation,
-        "output": "Unclear.\n\nPROPOSED_COMMANDS:\n- docker service ps shop_web\n",
-    }
-    h.S.verdict = {**h.S.verdict, "status": "inconclusive"}
-    alert = h.app_alert(
-        title="Host out of memory", source="alertmanager", labels={"alertname": "HostOutOfMemory"}
-    )
-    history = await _record(AlertInvestigationFlowPre500, alert)
-    assert len(h.S.cards) == 1 and "run_fix" in h.S.cards[0].options
-    await _replays(history)
-
-
-async def test_a_second_automatic_restart():
-    """The old flow restarts whatever happened before; the new one would
-    look the problem up first. The recorded restart must win."""
-    h.reset(restart_history={"repeat": True, "window_minutes": 60})
-    h.S.remediation = {
-        "attempted": True,
-        "recovered": True,
-        "service": "shop_web",
-        "command": "docker service update --force shop_web",
-        "output": "",
-        "reason": "recovered",
-        "diagnostics": [],
-    }
-    history = await _record(AlertInvestigationFlowPre500, h.service_down_alert())
-    assert len(h.S.restarts) == 1 and h.S.restart_checks == []
-    await _replays(history)
-
-
-async def test_a_restart_that_did_not_recover_then_a_card():
-    """The unrecovered restart the new flow records, and the card the old one
-    posted for a verdict the new one would not card."""
-    h.reset()
-    h.S.remediation = {
-        "attempted": True,
-        "recovered": False,
-        "service": "shop_web",
-        "command": "docker service update --force shop_web",
-        "output": "",
-        "reason": "restart_issued_not_converged",
-        "diagnostics": [],
-    }
-    history = await _record(AlertInvestigationFlowPre500, h.service_down_alert())
-    assert len(h.S.restarts) == 1 and len(h.S.cards) == 1
-    await _replays(history)
 
 
 @pytest.mark.parametrize(

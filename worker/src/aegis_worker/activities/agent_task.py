@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
-from aegis.errors import error_text
+from aegis.errors import error_text, logged_failure
 from aegis.services import hub, work_sessions
 from aegis.services.agent_task_verbs import (
     DEFAULT_VERBS,
@@ -1597,7 +1597,7 @@ class AgentTaskActivities:
         live: list[str] = []
         status = "unavailable"
         if self.remote_script is not None:
-            try:
+            with logged_failure("work_sessions_inventory_failed", logger=activity.logger):
                 inventory = await self.remote_script.list_coding_sessions() or {}
                 status = str(inventory.get("status") or "unavailable")
                 if status == "ok":
@@ -1606,8 +1606,6 @@ class AgentTaskActivities:
                         for s in (inventory.get("sessions") or [])
                         if s.get("session_id")
                     ]
-            except Exception as exc:  # noqa: BLE001
-                activity.logger.warning("work_sessions_inventory_failed err=%s", error_text(exc))
         if status != "ok":
             return {"refreshed": 0, "parked": 0, "inventory": status}
         result = await work_sessions.reconcile_operator_sessions(self.db_pool, live)

@@ -21,6 +21,8 @@ from aegis.llm import parse_llm_json
 from aegis.services.settings_store import get_setting
 from temporalio import activity
 
+from aegis_worker.shared.jsonb import decode_jsonb
+
 # review-copilot thresholds; override live via settings key 'review_config'.
 # ponytail: code default, no migration — tune with PUT /api/settings/review_config.
 _REVIEW_DEFAULTS = {
@@ -1215,19 +1217,13 @@ def format_meeting_week(data: dict) -> str:
 
 
 def _decode_counts(value: Any) -> dict:
-    """review_digest_log.counts is jsonb — a dict when asyncpg's jsonb codec
-    is registered, else a raw string. Accept both; {} on anything odd."""
-    if isinstance(value, dict):
-        return value
-    if isinstance(value, str):
-        import json
-
-        try:
-            parsed = json.loads(value)
-            return parsed if isinstance(parsed, dict) else {}
-        except (ValueError, TypeError):
-            return {}
-    return {}
+    """A jsonb column as a dict, `{}` for anything that is not one — a broken
+    row costs the digest one line, never the whole weekly review."""
+    try:
+        decoded = decode_jsonb(value, {})
+    except (ValueError, TypeError):
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
 
 
 def _waiting_streak(task_id: str, prior_weeklies: list[dict]) -> int:

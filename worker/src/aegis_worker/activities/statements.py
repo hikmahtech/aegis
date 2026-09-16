@@ -161,7 +161,7 @@ class StatementActivities:
             statement_post,
         )
         from aegis.services import journal_index as ji
-        from aegis.services.reconciled import mark_reconciled
+        from aegis.services.journal_index import mark_reconciled
 
         accounts = await _folder_config(self.db_pool)
         if not accounts or self.books_cfg is None:

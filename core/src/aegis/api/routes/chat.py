@@ -221,19 +221,10 @@ async def get_thread_history(
         raise HTTPException(status_code=400, detail="thread_id is required")
 
     pool = request.app.state.db_pool
-    conditions = ["thread_id = $1"]
-    params: list[Any] = [thread_id]
-    idx = 2
-
-    if agent_id:
-        conditions.append(f"agent_id = ${idx}")
-        params.append(agent_id)
-        idx += 1
-
-    where = " AND ".join(conditions)
+    where, params = build_where({"thread_id": thread_id, "agent_id": agent_id})
     params.append(limit)
     rows = await pool.fetch(
-        f"SELECT * FROM chat_history WHERE {where} ORDER BY created_at ASC LIMIT ${idx}",
+        f"SELECT * FROM chat_history{where} ORDER BY created_at ASC LIMIT ${len(params)}",
         *params,
     )
     return [dict(r) for r in rows]

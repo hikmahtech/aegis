@@ -1,10 +1,10 @@
-"""Unit tests for worker/src/aegis_worker/relevance.py.
+"""Unit tests for worker/src/aegis_worker/activities/relevance.py.
 
 All tests are synchronous / pure — no asyncio needed.
 """
 
 
-from aegis_worker.relevance import (
+from aegis_worker.activities.relevance import (
     Candidate,
     RelevanceResult,
     _tokenize,

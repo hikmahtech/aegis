@@ -9,28 +9,15 @@ activities own their DB access.
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from typing import Any
 
 import structlog
 from temporalio import activity
 
+from aegis_worker.shared.jsonb import decode_jsonb
+
 logger = structlog.get_logger()
-
-
-def _decode_capabilities(raw) -> list:
-    """Normalise the jsonb capabilities column to a plain list.
-
-    With the JSONB codec registered (aegis.db.create_pool) asyncpg returns a
-    Python list; without it the raw value is a JSON string — same dual-path
-    handling as channels._decode_config.
-    """
-    if not raw:
-        return []
-    if isinstance(raw, list):
-        return raw
-    return json.loads(raw)
 
 
 @dataclass
@@ -54,7 +41,7 @@ class AgentRegistryActivities:
             )
         resolved: dict[str, str | None] = {}
         for tag in tags:
-            matches = [r["id"] for r in rows if tag in _decode_capabilities(r["capabilities"])]
+            matches = [r["id"] for r in rows if tag in decode_jsonb(r["capabilities"], [])]
             if not matches:
                 logger.warning("agent_tag_unresolved", tag=tag)
                 resolved[tag] = None

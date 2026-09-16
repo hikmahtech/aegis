@@ -22,7 +22,7 @@ from html import escape as _esc
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
-    from aegis.errors import error_text
+    from aegis.errors import error_text, logged_failure
 
     from aegis_worker.activities.calendar import FetchEventsInput, FetchEventsResult
     from aegis_worker.activities.capture import CaptureActivities
@@ -138,7 +138,7 @@ class CalendarIngestFlow:
 
             if content_items:
                 for item in content_items:
-                    try:
+                    with logged_failure("calendar_ingest_content_failed", logger=workflow.logger):
                         ingest_result = await workflow.execute_activity(
                             "ingest_content",
                             item,
@@ -147,10 +147,6 @@ class CalendarIngestFlow:
                         )
                         if ingest_result.get("status") in ("ok", "accepted"):
                             total_ingested += 1
-                    except Exception as exc:
-                        workflow.logger.warning(
-                            "calendar_ingest_content_failed err=%s", error_text(exc)
-                        )
 
             if result.latest_updated_ts:
                 await workflow.execute_activity(

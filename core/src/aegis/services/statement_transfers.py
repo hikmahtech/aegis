@@ -60,7 +60,7 @@ from __future__ import annotations
 
 import re
 from collections import Counter
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 
@@ -429,8 +429,3 @@ def _same_event(a: StatementRow, b: StatementRow) -> bool:
     if a.ref and b.ref and a.ref == b.ref:
         return True
     return normalise_narration(a.narration) == normalise_narration(b.narration)
-
-
-def legs_of(paired: Mapping[str, PairedRow], kind: str) -> tuple[PairedRow, ...]:
-    """Every leg of one kind, in `row_id` order. For reporting and tests."""
-    return tuple(sorted((p for p in paired.values() if p.kind == kind), key=lambda p: p.row_id))

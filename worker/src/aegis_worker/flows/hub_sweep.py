@@ -34,7 +34,7 @@ from dataclasses import dataclass
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
-    from aegis.errors import error_text
+    from aegis.errors import logged_failure
 
     from aegis_worker.activities.hub import HubActivities
     from aegis_worker.shared.retry import (
@@ -50,12 +50,17 @@ with workflow.unsafe.imports_passed_through():
 # and a sweep that runs every five minutes has no reason to spend four model
 # calls at once.
 _MAX_JUDGED_PER_TICK = 2
-# The patch ids for steps 2 and 3. The sweep runs every five minutes, so a
-# worker deployed mid-run replays a history that has no such activity in it.
+
+# Retired `workflow.patched` ids. The old branches are gone; the markers
+# stay one release longer as `workflow.deprecate_patch`, because a run that
+# RECORDED one is wedged by a worker whose code no longer mentions it at all
+# ("[TMPRL1100] Non-deprecated patch marker encountered"). Drop the calls and
+# these ids in the release after next — see #614.
+# The sweep runs every five minutes, so a worker deployed mid-run always has
+# some in flight.
 PATCH_COMPLETED_TASKS = "hub-sweep-completed-tasks"
 PATCH_FIX_VERIFICATION = "hub-sweep-fix-verification"
 PATCH_ALERTMANAGER_RECONCILE = "hub-sweep-alertmanager-reconcile"
-
 
 @dataclass
 class HubSweepConfig:
@@ -90,28 +95,27 @@ class HubSweepFlow:
         # Then read completions back: a task a person ticked off resolves its
         # problem, before projection, so the resolve reaches the task in this
         # tick. FAST retries are safe — nothing is touched twice.
-        completed: dict = {}
-        if workflow.patched(PATCH_COMPLETED_TASKS):
-            completed = await workflow.execute_activity_method(
-                HubActivities.reconcile_completed_tasks,
-                start_to_close_timeout=TIMEOUT_FAST,
-                retry_policy=FAST,
-            )
+        # deprecate_patch: remove after the next release, see #614
+        workflow.deprecate_patch(PATCH_COMPLETED_TASKS)
+        completed = await workflow.execute_activity_method(
+            HubActivities.reconcile_completed_tasks,
+            start_to_close_timeout=TIMEOUT_FAST,
+            retry_policy=FAST,
+        )
         # Then settle merged fixes, also before projection, so the resolve or
         # the "it came back" reaches the task in this tick. A failure here is
         # logged, not raised: projection matters more than a verdict that
         # the next tick can reach just as well.
         verified: dict = {}
-        if workflow.patched(PATCH_FIX_VERIFICATION):
-            try:
-                verified = await workflow.execute_activity_method(
-                    HubActivities.verify_fixes,
-                    args=[config.fix_verify_hours, config.fix_grace_hours],
-                    start_to_close_timeout=TIMEOUT_FAST,
-                    retry_policy=FAST,
-                )
-            except Exception as exc:  # noqa: BLE001
-                workflow.logger.warning("hub_sweep_verify_fixes_failed err=%s", error_text(exc))
+        # deprecate_patch: remove after the next release, see #614
+        workflow.deprecate_patch(PATCH_FIX_VERIFICATION)
+        with logged_failure("hub_sweep_verify_fixes_failed", logger=workflow.logger):
+            verified = await workflow.execute_activity_method(
+                HubActivities.verify_fixes,
+                args=[config.fix_verify_hours, config.fix_grace_hours],
+                start_to_close_timeout=TIMEOUT_FAST,
+                retry_policy=FAST,
+            )
         # Then ask alertmanager what it is still holding, and resolve the live
         # problems it no longer lists (#551). Alertmanager keeps its alerts in
         # memory, so a restart loses every `resolved` webhook it owed — and that
@@ -123,17 +127,15 @@ class HubSweepFlow:
         # on an unreachable or freshly-restarted alertmanager, and projection
         # matters more than a reconciliation the next tick can do just as well.
         reconciled: dict = {}
-        if workflow.patched(PATCH_ALERTMANAGER_RECONCILE) and config.alertmanager_url:
-            try:
+        # deprecate_patch: remove after the next release, see #614
+        workflow.deprecate_patch(PATCH_ALERTMANAGER_RECONCILE)
+        if config.alertmanager_url:
+            with logged_failure("hub_sweep_alertmanager_reconcile_failed", logger=workflow.logger):
                 reconciled = await workflow.execute_activity_method(
                     HubActivities.reconcile_alertmanager,
                     args=[config.alertmanager_url, config.alertmanager_min_uptime_seconds],
                     start_to_close_timeout=TIMEOUT_STANDARD,
                     retry_policy=FAST,
-                )
-            except Exception as exc:  # noqa: BLE001
-                workflow.logger.warning(
-                    "hub_sweep_alertmanager_reconcile_failed err=%s", error_text(exc)
                 )
         # Then project: a problem promoted a moment ago gets its task in the
         # same tick, and any comment a producer's inline projection could not

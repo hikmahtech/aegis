@@ -1,8 +1,12 @@
-"""finance.journal_index — the books' index (spec §5.3).
+"""finance.journal_index — the books' index (spec §5.3), and its watermark.
 
 The hledger journal is the record. This table gives idempotency on the
 Gmail message id, receipt<->bank matching (§5.4), dues dedupe and the
 admin page. Never treat `amount` here as authoritative; run hledger.
+
+`finance.reconciled_through`, at the end of this module, is the other half
+of "what does the index already know about this account": the per-account
+statement watermark a post is checked against (spec §9.3, §15.10 item 2).
 """
 
 from __future__ import annotations
@@ -301,3 +305,65 @@ async def find_open_due(
         around - timedelta(days=_DUE_DAYS), around + timedelta(days=_DUE_DAYS), around,
     )
     return dict(row) if row else None
+
+
+# --------------------------------------------------------------------------
+# finance.reconciled_through — the per-account statement watermark (§9.3)
+# --------------------------------------------------------------------------
+#
+# Once a bank statement has reconciled an account through a date, that
+# statement is the record for everything up to and including it: `post_money_event`
+# reads the watermark before writing a transaction and declines to post one
+# dated inside a reconciled period (see the gate there for the fail-open
+# contract). The statement poster (spec step 5/6) is the only writer.
+
+
+def _canonical_instrument(instrument: str) -> str:
+    """Normalise the way the rest of the lane does (`statement_match._canonical`).
+
+    No chart is available here -- `reconciled_through`/`mark_reconciled` take
+    a bare instrument, not a `books.BooksConfig` to read one from -- so this
+    calls `books.canonical_instrument` with an empty chart, which is a no-op
+    on an already-canonical spelling (`hdfc-1225`, `axis-cc-1313`: the form
+    `finance.statement_rows.instrument` uses, per its own comment) but cannot
+    resolve a bare `card-1313` to its bank the way a chart-aware caller can.
+    A caller holding a chart should canonicalise before calling in, the way
+    `post_money_event` does with the chart it already read for indexing.
+    """
+    return books.canonical_instrument(instrument) or instrument
+
+
+async def reconciled_through(pool: Any, instrument: str) -> date | None:
+    """The date `instrument` is reconciled through, or None if never reconciled."""
+    row = await pool.fetchrow(
+        "SELECT through_date FROM finance.reconciled_through WHERE instrument = $1",
+        _canonical_instrument(instrument),
+    )
+    return row["through_date"] if row else None
+
+
+async def mark_reconciled(pool: Any, instrument: str, through: date, *, statement_id: str) -> None:
+    """Advance the watermark for `instrument` to `through`. Never moves it back.
+
+    A backfill posts statements in whatever order the operator has them in
+    hand, so reconciling June after July must not un-reconcile July. The
+    `WHERE` clause on the `DO UPDATE` is what enforces that: it is evaluated
+    against the row already in the table, so a `through` that is not strictly
+    later leaves the existing row -- including its `statement_id` -- alone.
+    Read-then-compare in Python would race two concurrent callers; this does
+    not, because the check and the write are the same statement.
+    """
+    await pool.execute(
+        """
+        INSERT INTO finance.reconciled_through (instrument, through_date, statement_id, updated_at)
+        VALUES ($1, $2, $3, now())
+        ON CONFLICT (instrument) DO UPDATE
+        SET through_date = EXCLUDED.through_date,
+            statement_id = EXCLUDED.statement_id,
+            updated_at = now()
+        WHERE EXCLUDED.through_date > finance.reconciled_through.through_date
+        """,
+        _canonical_instrument(instrument),
+        through,
+        statement_id,
+    )

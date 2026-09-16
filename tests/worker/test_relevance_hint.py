@@ -1,4 +1,4 @@
-from aegis_worker.relevance import score_resources
+from aegis_worker.activities.relevance import score_resources
 
 _RESOURCES = [
     {"id": "a", "title": "aegis", "metadata": {"path": "aegis", "github_repo": "example/aegis"}},

@@ -1353,45 +1353,25 @@ async def mcp_server_operator_endpoint(
     return await _serve(agent_id, request, settings, gated=False, operator=True)
 
 
+# A client probes every URL it mounts, so all three need the same answer.
+# Without the operator route the probe fell through to the admin SPA's
+# catch-all and got a 404, which the MCP transport reserves for "your session
+# is gone" (#476). That endpoint takes no DELETE, so it says so.
 @router.get("/{agent_id}")
-async def mcp_server_no_stream(agent_id: str) -> Response:
+@router.get("/{agent_id}/gated")
+@router.get("/{agent_id}/operator")
+async def mcp_server_no_stream(request: Request, agent_id: str) -> Response:
     """No server-initiated SSE stream — the spec's way to say so is 405."""
     raise HTTPException(
         status_code=405,
         detail="This MCP endpoint is stateless and POST-only; it opens no server-initiated stream.",
-        headers={"Allow": "POST, DELETE"},
-    )
-
-
-@router.get("/{agent_id}/gated")
-async def mcp_server_gated_no_stream(agent_id: str) -> Response:
-    """Parity with the ungated endpoint — a client probes the URL it mounts."""
-    raise HTTPException(
-        status_code=405,
-        detail="This MCP endpoint is stateless and POST-only; it opens no server-initiated stream.",
-        headers={"Allow": "POST, DELETE"},
-    )
-
-
-@router.get("/{agent_id}/operator")
-async def mcp_server_operator_no_stream(agent_id: str) -> Response:
-    """Parity again. Without this route the probe fell through to the admin
-    SPA's catch-all and got a 404, which the MCP transport reserves for "your
-    session is gone" (#476)."""
-    raise HTTPException(
-        status_code=405,
-        detail="This MCP endpoint is stateless and POST-only; it opens no server-initiated stream.",
-        headers={"Allow": "POST"},
+        headers={"Allow": "POST" if request.url.path.endswith("/operator") else "POST, DELETE"},
     )
 
 
 @router.delete("/{agent_id}", status_code=204)
-async def mcp_server_end_session(agent_id: str) -> Response:
-    """Session termination. No session is ever issued, so this is a no-op."""
-    return Response(status_code=204)
-
-
 @router.delete("/{agent_id}/gated", status_code=204)
-async def mcp_server_gated_end_session(agent_id: str) -> Response:
-    """Session termination on the gated URL — same no-op."""
+async def mcp_server_end_session(agent_id: str) -> Response:
+    """Session termination, on either URL. No session is ever issued, so this
+    is a no-op that exists because the transport calls it."""
     return Response(status_code=204)

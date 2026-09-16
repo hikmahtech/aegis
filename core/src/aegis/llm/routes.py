@@ -85,14 +85,10 @@ def set_routes(routes: dict[str, Any] | None) -> dict[str, Any]:
 
     _ROUTES["categories"] = categories
     _ROUTES["purposes"] = purposes
-    return get_routes()
-
-
-def get_routes() -> dict[str, Any]:
-    """A copy of the installed table — callers must not mutate module state."""
+    # A copy of what was installed — callers must not mutate module state.
     return {
-        "categories": {k: dict(v) for k, v in _ROUTES["categories"].items()},
-        "purposes": dict(_ROUTES["purposes"]),
+        "categories": {name: dict(spec) for name, spec in categories.items()},
+        "purposes": dict(purposes),
     }
 
 

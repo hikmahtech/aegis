@@ -1646,7 +1646,7 @@ async def test_mount_writes_a_scoped_token_and_never_the_shared_key(monkeypatch)
     with a secret makes zero `settings` queries on the mount path.
     """
     from aegis.services.api_key import invalidate_api_key_cache
-    from aegis.services.mcp_tokens import verify_mount_token
+    from aegis.services.mcp_tokens import read_mount_token
 
     secret_key = "unit-test-secret-key"
     pool = _KeyRowPool({"value": {"key_enc": "should-never-be-read"}})
@@ -1687,9 +1687,8 @@ async def test_mount_writes_a_scoped_token_and_never_the_shared_key(monkeypatch)
     cfg = json.loads(payload.decode())
     written = cfg["mcpServers"]["aegis"]["headers"]["X-API-Key"]
     assert written != "SHARED-ADMIN-KEY", "the shared key must never be the mount credential"
-    assert verify_mount_token(written, "sebas", secret_key) is True
-    # Bound: the same token must not authorise another agent.
-    assert verify_mount_token(written, "pandora", secret_key) is False
+    # Bound: the token names sebas, so it cannot authorise another agent.
+    assert read_mount_token(written, secret_key) == ("sebas", False)
     assert pool.queries == [], "minting needs no DB lookup"
     assert "--mcp-config" in all_cmds[-1]
 

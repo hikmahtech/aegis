@@ -26,7 +26,7 @@ from typing import Any
 
 import pytest
 import pytest_asyncio
-from aegis.connectors.homelab import _envelope
+from aegis.connectors._base import envelope
 from aegis.services.hub import get_problem, list_events, slug
 from aegis_worker.activities.homelab import HomelabActivities
 from aegis_worker.activities.hub import HubActivities
@@ -250,8 +250,8 @@ class FakeHomelab:
     async def probe_tls(self, domain: str, port: int = 443) -> dict:
         c = self.certs[domain]
         if "error" in c:
-            return _envelope(False, error=c["error"], retryable=True)
-        return _envelope(
+            return envelope(False, error=c["error"], retryable=True)
+        return envelope(
             True, data={"domain": domain, "not_after": c["not_after"], "serial": c["serial"]}
         )
 

@@ -50,16 +50,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /tmp/docker \
     && rm -rf /var/lib/apt/lists/*
 
-# hledger — the books (spec 2026-09-05-maou-books-design.md §10). Static
-# release binary, pinned by version and checksum.
-ARG HLEDGER_VERSION=1.52.3
-ARG HLEDGER_SHA256=d14a4fc2ac804b556f481b64e8c54efa380db1ac85b3723c9df7b1eeade74b3a
-RUN curl -fsSL -o /tmp/hledger.tgz \
-      "https://github.com/simonmichael/hledger/releases/download/${HLEDGER_VERSION}/hledger-linux-x64.tar.gz" \
-    && echo "${HLEDGER_SHA256}  /tmp/hledger.tgz" | sha256sum -c - \
-    && tar -xzf /tmp/hledger.tgz -C /tmp hledger \
-    && install -m 0755 /tmp/hledger /usr/local/bin/hledger \
-    && rm -f /tmp/hledger.tgz /tmp/hledger
+# hledger — the books. Core and the worker share ONE books checkout, so the
+# version and its checksum live once, in the script both images run.
+COPY docker/install-hledger.sh /tmp/install-hledger.sh
+RUN /tmp/install-hledger.sh && rm -f /tmp/install-hledger.sh
 
 WORKDIR /app
 COPY --from=builder /opt/venv /opt/venv

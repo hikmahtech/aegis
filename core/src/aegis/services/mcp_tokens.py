@@ -114,18 +114,3 @@ def read_mount_token(token: str, secret: str, *, now: int | None = None) -> tupl
     if expires_at <= int(now if now is not None else time.time()):
         return None
     return token_agent, mode == "g"
-
-
-def verify_mount_token(
-    token: str,
-    agent_id: str,
-    secret: str,
-    *,
-    gated: bool = False,
-    now: int | None = None,
-) -> bool:
-    """True when `token` authorises exactly this agent, in this mode, right now."""
-    if not agent_id:
-        return False
-    read = read_mount_token(token, secret, now=now)
-    return read is not None and read == (agent_id.strip(), gated)

@@ -434,9 +434,13 @@ def test_books_write_flow_is_gated_on_money_hygiene():
         # `daylog_local_day`, the run's clock on the user's timezone (the day
         # logged is the last complete local one). Unflagged, so all three
         # rows move.
-        (True, True, 51, 252),
-        (False, False, 40, 217),
-        (True, False, 44, 234),
+        # Then MINUS 2 activities and no flow from #437/#601: `capture_task`
+        # on CaptureActivities and `upsert_resources_batch` on
+        # InventoryActivities, neither of which any flow ever called. Both
+        # classes are unflagged, so all three rows move by -2.
+        (True, True, 51, 250),
+        (False, False, 40, 215),
+        (True, False, 44, 232),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):

@@ -19,7 +19,7 @@ from datetime import timedelta
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
-    from aegis.errors import error_text
+    from aegis.errors import logged_failure
 
     from aegis_worker.shared.retry import FAST, NO_RETRY
 
@@ -38,12 +38,10 @@ class MoneyBriefConfig:
 class MoneyBriefFlow:
     @workflow.run
     async def run(self, config: MoneyBriefConfig) -> dict:
-        try:
+        with logged_failure("money_brief_fx_failed", logger=workflow.logger):
             await workflow.execute_activity(
                 "refresh_fx_prices", start_to_close_timeout=_FAST, retry_policy=NO_RETRY
             )
-        except Exception as exc:  # noqa: BLE001 — prices are a nicety
-            workflow.logger.warning("money_brief_fx_failed err=%s", error_text(exc))
 
         brief = await workflow.execute_activity(
             "build_money_brief", args=[config.days], start_to_close_timeout=_SLOW, retry_policy=FAST

@@ -26,6 +26,7 @@ from aegis.errors import error_text
 from aegis.services.agents import resolve_tag
 from aegis.services.tools.base import ToolContext
 from aegis.services.tools.registry import aegis_tool
+from aegis.slugs import slugify
 
 logger = structlog.get_logger()
 
@@ -41,8 +42,7 @@ _AEGIS_SELF_DIAGNOSE_OUTPUT_CAP = 8 * 1024  # last N chars returned to the LLM
 
 def _slugify_issue(text: str, max_len: int = 32) -> str:
     """Stable slug for `aegis-fix/<slug>` branch names. Lowercase a-z0-9-, capped."""
-    base = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
-    return (base or "issue")[:max_len].strip("-") or "issue"
+    return slugify(text, fallback="issue")[:max_len].strip("-") or "issue"
 
 
 def _build_aegis_self_diagnose_prompt(issue: str, mode: str, fix_branch: str) -> str:

@@ -85,6 +85,25 @@ def _safe_json(body: bytes) -> dict:
         return {}
 
 
+async def claim_idempotency(pool, source_type: str, external_id: str) -> bool:
+    """True when this delivery is new, False when it has been seen before.
+
+    The claim IS the row: `ingest_idempotency` is unique on
+    `(source_type, external_id)`, so an INSERT that returns nothing is a
+    replay of a delivery already accepted. A handler that fails after
+    claiming hands the claim back (see the life endpoint's `_release_claim`)
+    so the sender's retry is genuinely reprocessed.
+    """
+    async with pool.acquire() as conn:
+        claimed = await conn.fetchval(
+            "INSERT INTO ingest_idempotency (source_type, external_id) "
+            "VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING external_id",
+            source_type,
+            external_id,
+        )
+    return claimed is not None
+
+
 # ---------------------------------------------------------------------------
 # Life-data push (B4) — the one internet-facing door into the owner's personal
 # data store. Everything below the signature check is plumbing; the signature
@@ -284,18 +303,7 @@ async def life_webhook(
         life_signing_input(source, raw_ts, body)
     ).hexdigest()
     pool = request.app.state.db_pool
-    async with pool.acquire() as conn:
-        claimed = await conn.fetchval(
-            """
-            INSERT INTO ingest_idempotency (source_type, external_id)
-            VALUES ($1, $2)
-            ON CONFLICT DO NOTHING
-            RETURNING external_id
-            """,
-            f"life:{source}",
-            external_id,
-        )
-    if claimed is None:
+    if not await claim_idempotency(pool, f"life:{source}", external_id):
         logger.info("life_webhook_duplicate_skipped", life_source=source)
         return {"accepted": True, "duplicate": True, "external_id": external_id}
 
@@ -444,17 +452,7 @@ async def github_webhook(
     delivery_id = x_github_delivery or str(_uuid.uuid4())
 
     pool = request.app.state.db_pool
-    async with pool.acquire() as conn:
-        claimed = await conn.fetchval(
-            """
-            INSERT INTO ingest_idempotency (source_type, external_id)
-            VALUES ('github', $1)
-            ON CONFLICT DO NOTHING
-            RETURNING external_id
-            """,
-            delivery_id,
-        )
-    if claimed is None:
+    if not await claim_idempotency(pool, "github", delivery_id):
         logger.info("github_webhook_duplicate_skipped", delivery_id=delivery_id)
         return {"accepted": True, "duplicate": True, "delivery_id": delivery_id}
 
@@ -512,17 +510,7 @@ async def sentry_webhook(
         return {"accepted": True, "skipped": "no_issue_id"}
 
     pool = request.app.state.db_pool
-    async with pool.acquire() as conn:
-        claimed = await conn.fetchval(
-            """
-            INSERT INTO ingest_idempotency (source_type, external_id)
-            VALUES ('sentry', $1)
-            ON CONFLICT DO NOTHING
-            RETURNING external_id
-            """,
-            f"sentry:{issue_id}",
-        )
-    if claimed is None:
+    if not await claim_idempotency(pool, "sentry", f"sentry:{issue_id}"):
         logger.info("sentry_webhook_duplicate_skipped", issue_id=issue_id)
         return {"accepted": True, "duplicate": True, "issue_id": issue_id}
 

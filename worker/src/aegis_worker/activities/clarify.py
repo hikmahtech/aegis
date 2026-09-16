@@ -84,6 +84,8 @@ from aegis.services.hub_project import SOURCE_TAG as HUB_SOURCE_TAG
 from aegis.services.knowledge import _content_id_for
 from aegis.services.settings_store import get_setting
 
+from aegis_worker.shared.jsonb import decode_jsonb
+
 
 class _RuleSet:
     """Source-tag → defaults lookup (assignee / contexts / skip-inbox). Rules are
@@ -179,17 +181,11 @@ _agent_reg_cache: dict = {"reg": None, "ts": 0.0}
 
 
 def _decode_jsonish(value, empty):
-    """asyncpg returns jsonb as a Python object when the codec is registered,
-    else a raw string. Accept both; fall back to `empty` on anything odd."""
-    if value is None:
-        return empty
-    if isinstance(value, (dict, list)):
-        return value
+    """A jsonb column, with `empty` for anything that will not decode: a bad
+    row must cost one agent its registry entry, not the whole clarify run."""
     try:
-        import json
-
-        return json.loads(value)
-    except Exception:  # noqa: BLE001
+        return decode_jsonb(value, empty)
+    except (ValueError, TypeError):
         return empty
 
 

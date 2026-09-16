@@ -54,6 +54,16 @@ def _iso(epoch_ms: Any) -> str | None:
         return None
 
 
+class _Failed(dict):
+    """What `_get` returns when a read did not succeed.
+
+    A `dict`, so a caller hands it straight back to the chat tool as the
+    `{"error": ...}` these methods have always returned; a distinct type, so
+    "did this fail?" never has to guess from the presence of an `error` key
+    in a body Vercel sent with a 200.
+    """
+
+
 class VercelConnector(HTTPConnector):
     """Async HTTP client for Vercel REST. Read-only — no deploy/redeploy actions."""
 
@@ -74,12 +84,44 @@ class VercelConnector(HTTPConnector):
 
     def _build_client(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(
+            base_url=self._base_url,
             headers={"Authorization": f"Bearer {self._token}"},
             timeout=self._timeout,
         )
 
     def _team_params(self) -> dict[str, str]:
         return {"teamId": self._team_id} if self._team_id else {}
+
+    async def _get(
+        self, action: str, path: str, params: dict, *, not_found: dict | None = None
+    ) -> Any:
+        """One GET, through the ladder every read here shares.
+
+        A transport error, the 404 the caller names (when it names one), any
+        other non-2xx, else the decoded body — and a `connector_calls` row
+        either way. Every failure comes back as a `_Failed`, so nothing in
+        this connector raises at a chat tool, and a 200 body that happens to
+        carry its own `error` key is never mistaken for one.
+        """
+        client = await self._ensure_client()
+        start = time.monotonic()
+        try:
+            resp = await client.get(path, params=params)
+        except httpx.HTTPError as exc:
+            await self._record(
+                action, "error", int((time.monotonic() - start) * 1000), error_text(exc, 500)
+            )
+            return _Failed({"error": f"http_error: {exc!s}"})
+        latency_ms = int((time.monotonic() - start) * 1000)
+        if not_found is not None and resp.status_code == 404:
+            await self._record(action, "not_found", latency_ms)
+            return _Failed(not_found)
+        if not resp.is_success:
+            await self._record(action, "error", latency_ms, resp.text[:500])
+            return _Failed({"error": f"http_{resp.status_code}", "body": resp.text[:500]})
+        body = resp.json()
+        await self._record(action, "ok", latency_ms)
+        return body
 
     # ------------------------------------------------------------------
     # Public methods
@@ -91,27 +133,12 @@ class VercelConnector(HTTPConnector):
             return {"error": "vercel_token_not_configured"}
         if not project_id_or_name:
             return {"error": "project_id_or_name is required"}
-        client = await self._ensure_client()
-        start = time.monotonic()
-        try:
-            resp = await client.get(
-                f"{self._base_url}/v9/projects/{project_id_or_name}",
-                params=self._team_params(),
-            )
-        except httpx.HTTPError as exc:
-            await self._record(
-                "get_project", "error", int((time.monotonic() - start) * 1000), error_text(exc, 500)
-            )
-            return {"error": f"http_error: {exc!s}"}
-        latency_ms = int((time.monotonic() - start) * 1000)
-        if resp.status_code == 404:
-            await self._record("get_project", "not_found", latency_ms)
-            return {"error": "project_not_found", "project": project_id_or_name}
-        if not resp.is_success:
-            await self._record("get_project", "error", latency_ms, resp.text[:500])
-            return {"error": f"http_{resp.status_code}", "body": resp.text[:500]}
-        await self._record("get_project", "ok", latency_ms)
-        return resp.json()
+        return await self._get(
+            "get_project",
+            f"/v9/projects/{project_id_or_name}",
+            self._team_params(),
+            not_found={"error": "project_not_found", "project": project_id_or_name},
+        )
 
     async def list_deployments(
         self,
@@ -147,26 +174,9 @@ class VercelConnector(HTTPConnector):
         if state:
             params["state"] = state.upper()
 
-        client = await self._ensure_client()
-        start = time.monotonic()
-        try:
-            resp = await client.get(f"{self._base_url}/v6/deployments", params=params)
-        except httpx.HTTPError as exc:
-            await self._record(
-                "list_deployments",
-                "error",
-                int((time.monotonic() - start) * 1000),
-                error_text(exc, 500),
-            )
-            return {"error": f"http_error: {exc!s}"}
-        latency_ms = int((time.monotonic() - start) * 1000)
-        if not resp.is_success:
-            await self._record(
-                "list_deployments", "error", latency_ms, resp.text[:500]
-            )
-            return {"error": f"http_{resp.status_code}", "body": resp.text[:500]}
-        body = resp.json()
-        await self._record("list_deployments", "ok", latency_ms)
+        body = await self._get("list_deployments", "/v6/deployments", params)
+        if isinstance(body, _Failed):
+            return body
         # Trim to the fields actually useful in chat — full body is noisy.
         # Timestamps go out as ISO-8601 UTC (epoch ms confused gpt-oss).
         trimmed = [
@@ -192,32 +202,14 @@ class VercelConnector(HTTPConnector):
             return {"error": "vercel_token_not_configured"}
         if not deployment_id:
             return {"error": "deployment_id is required"}
-        client = await self._ensure_client()
-        start = time.monotonic()
-        try:
-            resp = await client.get(
-                f"{self._base_url}/v13/deployments/{deployment_id}",
-                params=self._team_params(),
-            )
-        except httpx.HTTPError as exc:
-            await self._record(
-                "get_deployment",
-                "error",
-                int((time.monotonic() - start) * 1000),
-                error_text(exc, 500),
-            )
-            return {"error": f"http_error: {exc!s}"}
-        latency_ms = int((time.monotonic() - start) * 1000)
-        if resp.status_code == 404:
-            await self._record("get_deployment", "not_found", latency_ms)
-            return {"error": "deployment_not_found", "id": deployment_id}
-        if not resp.is_success:
-            await self._record(
-                "get_deployment", "error", latency_ms, resp.text[:500]
-            )
-            return {"error": f"http_{resp.status_code}", "body": resp.text[:500]}
-        body = resp.json()
-        await self._record("get_deployment", "ok", latency_ms)
+        body = await self._get(
+            "get_deployment",
+            f"/v13/deployments/{deployment_id}",
+            self._team_params(),
+            not_found={"error": "deployment_not_found", "id": deployment_id},
+        )
+        if isinstance(body, _Failed):
+            return body
         # Surface just the fields Pandora needs for triage — full body is huge.
         # Timestamps go out as ISO-8601 UTC (see _iso).
         return {
@@ -256,38 +248,21 @@ class VercelConnector(HTTPConnector):
         if not deployment_id:
             return {"error": "deployment_id is required"}
         limit = max(1, min(int(limit), 1000))
-        client = await self._ensure_client()
         params = dict(self._team_params())
         params.update(
             {"builds": "1", "direction": "backward", "limit": limit, "follow": "0"}
         )
-        start = time.monotonic()
-        try:
-            resp = await client.get(
-                f"{self._base_url}/v3/deployments/{deployment_id}/events",
-                params=params,
-            )
-        except httpx.HTTPError as exc:
-            await self._record(
-                "get_build_logs",
-                "error",
-                int((time.monotonic() - start) * 1000),
-                error_text(exc, 500),
-            )
-            return {"error": f"http_error: {exc!s}"}
-        latency_ms = int((time.monotonic() - start) * 1000)
-        if resp.status_code == 404:
-            await self._record("get_build_logs", "not_found", latency_ms)
-            return {"error": "deployment_not_found", "id": deployment_id}
-        if not resp.is_success:
-            await self._record(
-                "get_build_logs", "error", latency_ms, resp.text[:500]
-            )
-            return {"error": f"http_{resp.status_code}", "body": resp.text[:500]}
-        events = resp.json() or []
+        events = await self._get(
+            "get_build_logs",
+            f"/v3/deployments/{deployment_id}/events",
+            params,
+            not_found={"error": "deployment_not_found", "id": deployment_id},
+        )
+        if isinstance(events, _Failed):
+            return events
+        events = events or []
         if errors_only:
             events = [e for e in events if e.get("type") == "stderr"]
-        await self._record("get_build_logs", "ok", latency_ms)
         # Trim each event to text + type + timestamp for token economy.
         # Timestamps go out as ISO-8601 UTC (see _iso).
         trimmed = [

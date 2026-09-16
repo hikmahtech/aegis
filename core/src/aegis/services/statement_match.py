@@ -37,7 +37,6 @@ what that constant should be — not as a second constant.
 from __future__ import annotations
 
 import re
-from collections import Counter
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, timedelta
@@ -530,39 +529,6 @@ def summarise(outcomes: Iterable[RowOutcome]) -> tuple[StatementSummary, ...]:
             )
         )
     return tuple(summaries)
-
-
-def date_delta_report(outcomes: Iterable[RowOutcome]) -> dict[str, Counter[int]]:
-    """§8.2's deliverable: `statement_date - journal_date` per bank.
-
-    **Pass 2 and 2b only.** Pass 1 joins on a reference, which is exact and says
-    nothing about the lag between a bank posting a transaction and the email
-    that announced it — and `journal_index.ref` is filled only by the
-    deterministic parsers, so a report built on pass 1 would describe a handful
-    of rows while reading as evidence about all of them. This distribution is
-    the only thing that may move `journal_index._MATCH_DAYS`.
-    """
-    report: dict[str, Counter[int]] = {}
-    for outcome in outcomes:
-        if outcome.matched_pass not in (PASS_WINDOW, PASS_WINDOW_NO_INSTRUMENT):
-            continue
-        if outcome.delta_days is None:
-            continue
-        report.setdefault(bank_of(outcome.instrument), Counter())[outcome.delta_days] += 1
-    return report
-
-
-def window_coverage(
-    report: Mapping[str, Mapping[int, int]], days: int
-) -> dict[str, tuple[int, int]]:
-    """Per bank, `(matches within ±days, matches in total)` — what a window buys."""
-    return {
-        bank: (
-            sum(n for delta, n in deltas.items() if abs(delta) <= days),
-            sum(deltas.values()),
-        )
-        for bank, deltas in report.items()
-    }
 
 
 async def load_candidates(

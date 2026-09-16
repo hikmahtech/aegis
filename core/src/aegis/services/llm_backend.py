@@ -22,7 +22,8 @@ import yaml
 
 from aegis.crypto import decrypt_secret, encrypt_secret
 from aegis.errors import error_text
-from aegis.llm.routes import merge_routes
+from aegis.llm.routes import merge_routes, set_routes
+from aegis.llm.tier import set_model_tiers
 from aegis.services.settings_store import get_setting, put_setting
 
 logger = structlog.get_logger()
@@ -46,6 +47,37 @@ PROVIDER_PRESETS: dict[str, dict[str, str]] = {
     "ollama": {"label": "Ollama (local)", "base_url": "http://localhost:11434/v1"},
     "custom": {"label": "Custom (OpenAI-compatible)", "base_url": ""},
 }
+
+
+def install_llm_config(backend: dict[str, Any]) -> None:
+    """Install a resolved backend's tier map AND its routing table.
+
+    Three sites resolve a backend — core's boot, the worker's, and the admin
+    save that re-resolves it live — and all three must install both halves:
+    refreshing the tiers while leaving an edited `llm_routes` row behind is a
+    half-applied backend, which is how a route change once stayed invisible
+    to core until a restart.
+
+    A routing table that will not validate is logged and routing is turned
+    off. It never blocks a boot or fails a save.
+    """
+    set_model_tiers(backend["tiers"])
+    logger.info(
+        "model_tiers_loaded",
+        tiers=sorted(backend["tiers"]),
+        source=backend.get("source", ""),
+    )
+    try:
+        routes = set_routes(backend.get("routes"))
+    except Exception as exc:  # noqa: BLE001 — a bad routing table must not block boot
+        set_routes(None)
+        logger.warning("llm_routes_invalid", error=error_text(exc))
+        return
+    logger.info(
+        "llm_routes_loaded",
+        categories=len(routes["categories"]),
+        purposes=len(routes["purposes"]),
+    )
 
 
 def _env_tiers(settings: Any) -> dict[str, str]:

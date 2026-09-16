@@ -440,36 +440,7 @@ def test_a_candidate_with_no_currency_never_matches_a_rupee_row():
     assert only(run([row], [candidate])).matched_pass is None
 
 
-# ------------------------------------------------------------- the date-delta report
-
-
-def test_the_date_delta_report_counts_pass_2_and_2b_never_pass_1():
-    """§8.2's deliverable. `journal_index.ref` is filled only by the
-    deterministic parsers, so a report that counted pass 1 would describe a
-    handful of rows while reading as evidence about all of them."""
-    rows = [
-        make_row(10, "500.00", ref="123456789012"),
-        make_row(11, "600.00"),
-        make_row(12, "700.00", instrument="hdfc-1225"),
-    ]
-    pool = [
-        make_candidate("m/ref", 4, "500.00", ref="123456789012"),
-        make_candidate("m/win", 9, "600.00"),
-        make_candidate("m/null", 12, "700.00", instrument=None, entity="personal"),
-    ]
-    result = run(rows, pool, entity_for_instrument={"hdfc-1225": "personal"})
-    assert sorted(o.matched_pass for o in result.outcomes) == sorted(sm.PASSES)
-    report = sm.date_delta_report(result.outcomes)
-    assert report == {"axis": {2: 1}, "hdfc": {0: 1}}  # the pass-1 delta of 6 is absent
-
-
-def test_the_date_delta_report_splits_by_bank():
-    rows = [make_row(10, "500.00"), make_row(10, "600.00", instrument="hdfc-1225")]
-    pool = [
-        make_candidate("m/1", 9, "500.00"),
-        make_candidate("m/2", 8, "600.00", instrument="hdfc-1225"),
-    ]
-    assert sm.date_delta_report(run(rows, pool).outcomes) == {"axis": {1: 1}, "hdfc": {2: 1}}
+# ----------------------------------------------------------------- the date delta
 
 
 def test_the_delta_is_signed_statement_date_minus_journal_date():
@@ -477,12 +448,6 @@ def test_the_delta_is_signed_statement_date_minus_journal_date():
     late_bank = only(run([make_row(12, "500.00")], [make_candidate("m/1", 10, "500.00")]))
     early_bank = only(run([make_row(10, "500.00")], [make_candidate("m/1", 12, "500.00")]))
     assert late_bank.delta_days == 2 and early_bank.delta_days == -2
-
-
-def test_window_coverage_says_what_a_window_would_buy():
-    report = {"axis": {0: 5, 2: 2, -1: 1, 9: 3}}
-    assert sm.window_coverage(report, 3) == {"axis": (8, 11)}
-    assert sm.window_coverage(report, 0) == {"axis": (5, 11)}
 
 
 def test_bank_of_reads_the_first_segment():
