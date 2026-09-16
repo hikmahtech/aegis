@@ -29,6 +29,7 @@ from .test_trading_desk import (
     FakeAnsaar,
     bar,
     market,
+    open_problems,
     row,
     run,
 )
@@ -193,3 +194,59 @@ async def test_all_of_a_days_runs_are_one_hub_occurrence(pool):
         "WHERE p.subject_kind = 'trading_desk' AND e.kind = 'occurrence'"
     )
     assert occurrences == 1
+
+
+# --- a lost trading day is a problem (#593) -----------------------------------
+
+
+async def test_a_day_the_desk_could_not_plan_is_raised_as_a_problem(pool):
+    """The pre-open run never fired, so the first run to see the day found the
+    market already open and refused to plan. That is a day of trading lost,
+    and before this it was a key in a JSON column nobody reads."""
+    await fill_at_open(pool)
+    finance = market({"TCS.NS": [bar(THU, 2990.0), bar(FRI, 3000.0), bar(MON, 3080.0, open=3010.0)]})
+    finance.bars["^NSEI"] = opened(25555.0, 25200.0)
+    ansaar = FakeAnsaar({FRI: [row("TCS", 0.20)]})
+
+    out = await run(pool, ansaar, finance, MON)
+
+    assert out["skipped_plan"] == "after_open"
+    assert "desk_plan_skipped" in out["findings"]
+    assert await open_problems(pool) == [("desk_plan_skipped", "plan")]
+
+
+async def test_the_afternoon_run_does_not_raise_the_lost_day_twice(pool):
+    """Every later run that day sees the same missing plan. They are one
+    occurrence, not one per fire."""
+    await fill_at_open(pool)
+    finance = market({"TCS.NS": [bar(THU, 2990.0), bar(FRI, 3000.0), bar(MON, 3080.0, open=3010.0)]})
+    finance.bars["^NSEI"] = opened(25555.0, 25200.0)
+    ansaar = FakeAnsaar({FRI: [row("TCS", 0.20)]})
+
+    await run(pool, ansaar, finance, MON)
+    await run(pool, ansaar, finance, MON)
+
+    occurrences = await pool.fetchval(
+        "SELECT count(*) FROM problem_events e JOIN problems p ON p.id = e.problem_id "
+        "WHERE p.class = 'desk_plan_skipped' AND e.kind = 'occurrence'"
+    )
+    assert occurrences == 1
+
+
+async def test_the_next_morning_that_plans_resolves_the_lost_day(pool):
+    """Tomorrow's pre-open run plans as normal. Nothing is left to raise, and
+    the class is one this run checks, so the problem resolves itself rather
+    than waiting for a human to notice it is stale."""
+    await fill_at_open(pool)
+    finance = market({"TCS.NS": [bar(THU, 2990.0), bar(FRI, 3000.0), bar(MON, 3080.0, open=3010.0)]})
+    finance.bars["^NSEI"] = opened(25555.0, 25200.0)
+    ansaar = FakeAnsaar({FRI: [row("TCS", 0.20)], MON: [row("TCS", 0.20, day=MON)]})
+    await run(pool, ansaar, finance, MON)
+    assert await open_problems(pool) == [("desk_plan_skipped", "plan")]
+
+    # Tuesday, before the open: Monday now has a close, Tuesday has no bar yet.
+    out = await run(pool, ansaar, finance, TUE)
+
+    assert out.get("planned") == "orders"
+    assert "desk_plan_skipped" not in out["findings"]
+    assert await open_problems(pool) == []
