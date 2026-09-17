@@ -136,6 +136,11 @@ class SlackAdapter:
         self._default_agent_id = ""
         self._default_agent_ts = 0.0
 
+    def refresh_token(self) -> None:
+        """Rebuild the web client from the settings' current bot token, for a
+        token that arrived after this adapter was built (#583)."""
+        self._client = AsyncWebClient(token=self._settings.slack_bot_token)
+
     def _httpx(self) -> httpx.AsyncClient:
         if self._http is None:
             self._http = httpx.AsyncClient(timeout=10.0)
