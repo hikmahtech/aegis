@@ -38,6 +38,11 @@ logger = structlog.get_logger()
 _SLACK_PROBE_INTERVAL = 60  # seconds between is_connected() polls
 _PROBE_STALE_THRESHOLD = 180  # seconds — older than this → healthy=False
 
+# When core cannot be asked for the Slack config at boot, comms asks again,
+# waiting this long first and doubling up to the cap (#583).
+_CONFIG_RETRY_FIRST_S = 5.0
+_CONFIG_RETRY_MAX_S = 60.0
+
 # Largest raw body POST /api/ingest/voice will read. ElevenLabs Scribe caps at
 # 1 GB but a phone voice note is kilobytes — this is the "don't let a bad
 # client stream us out of memory" bound, not a product limit.
@@ -470,9 +475,11 @@ async def _fetch_resolved_slack_config(settings: CommsSettings) -> dict[str, Any
 
     Comms has no DB access of its own — this is the only way it learns about
     tokens set via the admin UI. Returns None on ANY failure (core down, 404,
-    network, bad body) so the caller falls back to comms' own env-sourced
-    settings. Mirrors the existing agent-fetch httpx pattern in
-    `adapters/slack.py`. Never raises.
+    network, bad body), and when there is no core to ask. None means "core did
+    not answer", never "Slack is not configured": that answer is a dict with
+    `configured: false`, and `run()` treats the two differently (#583).
+    Mirrors the existing agent-fetch httpx pattern in `adapters/slack.py`.
+    Never raises.
     """
     if not settings.core_url:
         return None
@@ -513,6 +520,42 @@ def _merge_slack_config(settings: CommsSettings, db_config: dict[str, Any] | Non
     settings.slack_note_to_self_channel = (
         db_config.get("note_to_self_channel") or settings.slack_note_to_self_channel
     )
+
+
+async def _run_slack(adapter: SlackAdapter, settings: CommsSettings) -> None:
+    """The Socket Mode listener and its liveness probe. Runs until cancelled."""
+    logger.info("slack_starting", core_url=settings.core_url)
+    await asyncio.gather(adapter.start_listener(), _run_slack_socket_probe(adapter))
+
+
+async def _start_slack_when_configured(
+    adapter: SlackAdapter, settings: CommsSettings, *, sleep=asyncio.sleep
+) -> None:
+    """Core could not be asked for the Slack config at boot: ask again, with
+    capped backoff, until it answers (#583).
+
+    Until then Slack counts as down in `/api/health`, so the delivery watchdog
+    raises it. If core answers with tokens, the listener and probe start. If it
+    answers that Slack is not configured, comms stays idle and stops asking.
+    """
+    _slack_socket_state.last_error = "slack_config_unavailable: core did not answer"
+    logger.warning("slack_waiting_for_core", core_url=settings.core_url)
+    delay = _CONFIG_RETRY_FIRST_S
+    while True:
+        await sleep(delay)
+        db_config = await _fetch_resolved_slack_config(settings)
+        if db_config is not None:
+            break
+        delay = min(delay * 2, _CONFIG_RETRY_MAX_S)
+
+    _merge_slack_config(settings, db_config)
+    _slack_socket_state.last_error = None
+    if not (settings.slack_bot_token and settings.slack_app_token):
+        logger.info("slack_disabled", reason=_startup_error(settings))
+        return
+    # The adapter was built before the tokens arrived.
+    adapter.refresh_token()
+    await _run_slack(adapter, settings)
 
 
 async def run() -> None:
@@ -556,21 +599,24 @@ async def run() -> None:
     server = uvicorn.Server(config)
 
     if slack_ready:
-        logger.info("slack_starting", core_url=settings.core_url)
-        try:
-            await asyncio.gather(
-                adapter.start_listener(),
-                server.serve(),
-                _run_slack_socket_probe(adapter),
-            )
-        finally:
-            await adapter.stop()
-            logger.info("slack_stopped")
+        slack = _run_slack(adapter, settings)
+    elif db_config is None and settings.core_url:
+        # Core could not be asked, which is not the same as "not configured":
+        # keep serving and ask again in the background (#583).
+        slack = _start_slack_when_configured(adapter, settings)
     else:
-        # Expected/idle state, not an error — log at info once and just serve
-        # the delivery app (no Socket Mode listener, no liveness probe).
+        # Core answered that Slack is not configured. Expected/idle state, not
+        # an error — log at info once and just serve the delivery app (no
+        # Socket Mode listener, no liveness probe).
         logger.info("slack_disabled", reason=_startup_error(settings))
         await server.serve()
+        return
+
+    try:
+        await asyncio.gather(server.serve(), slack)
+    finally:
+        await adapter.stop()
+        logger.info("slack_stopped")
 
 
 if __name__ == "__main__":

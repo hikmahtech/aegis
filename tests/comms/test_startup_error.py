@@ -112,10 +112,13 @@ class _FakeUvicornServer:
 
 
 async def test_run_boots_delivery_app_when_slack_unconfigured(monkeypatch):
-    """Tokens ABSENT + core unreachable (DB fetch fails) -> run() must still
+    """Tokens ABSENT + core answers "not configured" -> run() must still
     build the delivery app and reach `server.serve()` (never return early),
-    must NOT start the Slack listener, and /api/health must report
-    configured=False."""
+    must NOT start the Slack listener, must not ask core again, and
+    /api/health must report configured=False.
+
+    Core being UNREACHABLE is a different state, covered in
+    test_slack_config_retry.py (#583)."""
     import aegis_comms.__main__ as _main
 
     for key in (
@@ -127,10 +130,13 @@ async def test_run_boots_delivery_app_when_slack_unconfigured(monkeypatch):
     monkeypatch.setenv("AEGIS_API_KEY", "test-key")
     monkeypatch.setenv("OTEL_ENABLED", "false")
 
-    async def _fetch_fails(settings):
-        return None  # core unreachable -> pure env fallback (still empty)
+    fetches = []
 
-    monkeypatch.setattr(_main, "_fetch_resolved_slack_config", _fetch_fails)
+    async def _fetch_not_configured(settings):
+        fetches.append(True)
+        return {"configured": False, "bot_token": "", "app_token": "", "channel": ""}
+
+    monkeypatch.setattr(_main, "_fetch_resolved_slack_config", _fetch_not_configured)
 
     _FakeUvicornServer.captured_apps = []
     monkeypatch.setattr(_main.uvicorn, "Server", _FakeUvicornServer)
@@ -142,6 +148,7 @@ async def test_run_boots_delivery_app_when_slack_unconfigured(monkeypatch):
 
     await _main.run()  # must complete without raising / without exiting early
 
+    assert fetches == [True]  # an answer is final: no retry
     assert len(_FakeUvicornServer.captured_apps) == 1
     app = _FakeUvicornServer.captured_apps[0]
 
