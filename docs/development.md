@@ -22,6 +22,7 @@ pip install -e "core[dev]" -e "worker[dev]" -e "comms[dev]"
 docker compose up -d postgres temporal temporal-ui
 
 # 3. Start Core API (runs migrations + serves admin panel)
+#    AEGIS_RELOAD=true restarts it on code changes; reload is off by default
 python -m aegis
 
 # 4. Start Worker (registers schedules, runs flows)

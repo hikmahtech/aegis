@@ -95,6 +95,9 @@ class Settings(BaseSettings):
     # topology, so the switch is explicit rather than tied to the auth posture.
     # Turn on for local development: AEGIS_EXPOSE_API_DOCS=true.
     expose_api_docs: bool = False
+    # Run uvicorn with its file-watching reloader. Local development only (#620);
+    # the production image runs the same `python -m aegis`. AEGIS_RELOAD=true.
+    reload: bool = False
 
     # Connectors
     vercel_token: str = ""
