@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
 
@@ -194,11 +195,25 @@ async def test_stale_current_place_degrades_to_no_place_line(db_pool, _seeded):
 
 
 @pytest.mark.asyncio
-async def test_absent_current_place_is_no_place_line_not_an_exception(db_pool, _seeded):
-    await _set_place(db_pool, None)
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,  # no row at all
+        {"place": "zzb5b-office"},  # no timestamp
+        {"at": "2026-07-30T00:00:00+00:00"},  # no label
+    ],
+)
+async def test_absent_current_place_is_no_place_line_not_an_exception(
+    db_pool, _seeded, value, caplog
+):
+    """No location set is a normal state, not a failure: no place line, and
+    no `briefing_place_failed` warning on every briefing."""
+    await _set_place(db_pool, value)
     act = BriefingActivities(db_pool=db_pool, knowledge_connector=_kc())
-    out = await act.gather_briefing_changes()
+    with caplog.at_level(logging.WARNING):
+        out = await act.gather_briefing_changes()
     assert out["place"] == {}
+    assert not any("briefing_place_failed" in r.getMessage() for r in caplog.records)
     # the rest of the briefing still gathered normally
     assert any(
         r["workflow_type"] == "RaindropIngestFlow" for r in out["broke"]["failed_runs"]
@@ -209,9 +224,7 @@ async def test_absent_current_place_is_no_place_line_not_an_exception(db_pool, _
 @pytest.mark.parametrize(
     "value",
     [
-        {"place": "zzb5b-office"},  # no timestamp
         {"place": "zzb5b-office", "at": "not-a-date"},
-        {"at": "2026-07-30T00:00:00+00:00"},  # no label
         ["not", "an", "object"],
     ],
 )

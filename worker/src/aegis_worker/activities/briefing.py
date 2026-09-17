@@ -495,13 +495,14 @@ class BriefingActivities:
                 if not isinstance(current, dict):
                     current = {}
                 name = str(current.get("place") or "")
-                seen_at = datetime.fromisoformat(
-                    str(current.get("at")).replace("Z", "+00:00")
-                )
-                if seen_at.tzinfo is None:
-                    seen_at = seen_at.replace(tzinfo=UTC)
-                if name and now - seen_at <= timedelta(hours=_PLACE_STALE_HOURS):
-                    place = {"place": name, "at": seen_at.isoformat()}
+                at = current.get("at")
+                # No location set (no row, or no place/at) is normal, not a failure.
+                if name and at:
+                    seen_at = datetime.fromisoformat(str(at).replace("Z", "+00:00"))
+                    if seen_at.tzinfo is None:
+                        seen_at = seen_at.replace(tzinfo=UTC)
+                    if now - seen_at <= timedelta(hours=_PLACE_STALE_HOURS):
+                        place = {"place": name, "at": seen_at.isoformat()}
 
         # Health (B6) is deliberately NOT gathered here — see `_recent_health`.
         # It is read at render time, inside `frame_briefing`, so that no body
