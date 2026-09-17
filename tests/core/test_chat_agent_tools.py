@@ -65,9 +65,18 @@ def test_maou_has_finance_tools():
 
 def test_get_agent_tools_filters_chat_tools():
     """_get_agent_tools returns only the CHAT_TOOLS matching the agent's set."""
-    tools = _get_agent_tools("maou")
+    tools = _get_agent_tools("maou", {"tool_set": sorted(AGENT_TOOL_SETS["maou"])})
     tool_names = {t["function"]["name"] for t in tools}
     assert tool_names == AGENT_TOOL_SETS["maou"]
+
+
+def test_an_example_id_without_a_tool_set_gets_the_fallback_not_its_example_grant():
+    """`AGENT_TOOL_SETS` is not a runtime grant (#579): an agent with no
+    `metadata.tool_set` gets the small fallback whatever its id, so a fork's
+    agent that happens to share an example id inherits nothing."""
+    for agent_id in ("sebas", "raphael", "maou", "pandoras-actor"):
+        tools = {t["function"]["name"] for t in _get_agent_tools(agent_id, {})}
+        assert tools == set(_FALLBACK_TOOL_SET), agent_id
 
 
 def test_get_agent_tools_unknown_agent_gets_minimal_safe_set():
@@ -76,7 +85,10 @@ def test_get_agent_tools_unknown_agent_gets_minimal_safe_set():
     tools = {t["function"]["name"] for t in _get_agent_tools("unknown-agent")}
     assert tools == set(_FALLBACK_TOOL_SET)
     # It must be a strict, small subset of Sebas's tools, not equal to them.
-    sebas_tools = {t["function"]["name"] for t in _get_agent_tools("sebas")}
+    sebas_tools = {
+        t["function"]["name"]
+        for t in _get_agent_tools("sebas", {"tool_set": sorted(AGENT_TOOL_SETS["sebas"])})
+    }
     assert tools < sebas_tools
 
 

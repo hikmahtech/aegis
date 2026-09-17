@@ -29,10 +29,13 @@ with workflow.unsafe.imports_passed_through():
     from aegis_worker.shared.retry import FAST, NO_RETRY, TIMEOUT_FAST, TIMEOUT_STANDARD
 
 _NOTIFY_ACTIONS = {"opened", "reopened", "ready_for_review"}
-# A run is seconds long, but a deploy can still land mid-run; a closed PR used
-# to be filtered with no command at all.
-_PATCH_FOLLOW_FIX_PR = "follow-fix-pr-on-close"
 
+# Retired `workflow.patched` ids. The old branches are gone; the markers
+# stay one release longer as `workflow.deprecate_patch`, because a run that
+# RECORDED one is wedged by a worker whose code no longer mentions it at all
+# ("[TMPRL1100] Non-deprecated patch marker encountered"). Drop the calls and
+# these ids in the release after next — see #614.
+_PATCH_FOLLOW_FIX_PR = "follow-fix-pr-on-close"
 
 @dataclass
 class GitHubAlertInput:
@@ -63,11 +66,11 @@ class GitHubAlertFlow:
     @workflow.run
     async def run(self, input: GitHubAlertInput) -> dict:
         action = input.payload.get("action")
-        if (
-            input.event == "pull_request"
-            and action == "closed"
-            and workflow.patched(_PATCH_FOLLOW_FIX_PR)
-        ):
+        if input.event == "pull_request" and action == "closed":
+            # Guarded: the marker was the last operand of an `and`, so it was
+            # recorded only on a closed PR.
+            # deprecate_patch: remove after the next release, see #614
+            workflow.deprecate_patch(_PATCH_FOLLOW_FIX_PR)
             # FAST: the hub writes are idempotent on GitHub's timestamp, and
             # the webhook claimed the delivery id, so a retry here is the only
             # second chance a merge gets.

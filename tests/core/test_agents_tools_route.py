@@ -29,13 +29,20 @@ def app(settings):
     app.dependency_overrides[get_settings] = lambda: settings
     pool = AsyncMock()
 
-    # The tools route now resolves the agent from the DB first (to prefer
-    # metadata.tool_set), so stub fetchrow: known agent → a row with empty
-    # metadata (falls back to AGENT_TOOL_SETS); unknown agent → None → 404.
+    # The tools route resolves the agent from the DB: a row with a
+    # metadata.tool_set shows it; a row without shows the small fallback set,
+    # whatever its id (#579); an unknown agent → None → 404.
     async def _fetchrow(_query, *args):
         agent_id = args[0] if args else None
         if agent_id == "sebas":
-            return {"id": "sebas", "name": "Sebastian", "role": "chief", "metadata": {}}
+            return {
+                "id": "sebas",
+                "name": "Sebastian",
+                "role": "chief",
+                "metadata": {"tool_set": ["search_knowledge", "trigger_workflow"]},
+            }
+        if agent_id in ("maou", "blank"):
+            return {"id": agent_id, "name": agent_id, "role": "x", "metadata": {}}
         return None
 
     pool.fetchrow = _fetchrow
@@ -64,6 +71,15 @@ def test_agent_tools_known_agent(client):
     names = {t["name"] for t in tools}
     assert "search_knowledge" in names
     assert "trigger_workflow" in names
+
+
+@pytest.mark.parametrize("agent_id", ["maou", "blank"])
+def test_agent_without_a_tool_set_shows_the_fallback_whatever_its_id(client, agent_id):
+    """An example id is not a grant (#579): the page shows what chat gives it."""
+    from aegis.services.chat import _FALLBACK_TOOL_SET
+
+    names = {t["name"] for t in client.get(f"/api/agents/{agent_id}/tools").json()}
+    assert names == set(_FALLBACK_TOOL_SET)
 
 
 def test_agent_tools_unknown_agent(client):

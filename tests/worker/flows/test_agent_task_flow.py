@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from datetime import timedelta
 
 import pytest
 from aegis_worker.flows.agent_task import (
@@ -16,7 +15,7 @@ from aegis_worker.flows.agent_task import (
 from temporalio import activity, workflow
 from temporalio.client import WorkflowFailureError
 from temporalio.testing import WorkflowEnvironment
-from temporalio.worker import Replayer, Worker
+from temporalio.worker import Worker
 
 # Module is `interaction` (singular) — imported inside imports_passed_through
 # per repo convention (mirror tests/worker/flows/test_agent_task_coding.py:15).
@@ -168,8 +167,7 @@ async def test_sweep_spawns_one_child_per_task_and_does_not_await_them():
 # AEGIS out of a task says so with `report_progress`, which is what the
 # `you_are_in_it` exit below reads. #344 added the two `ask` exits and
 # replaced the infra verb's two "nothing to check" parks with the plan's one
-# report; the pre-#344 parks now run only when replaying an older history,
-# which `test_a_run_started_before_344_replays_on_the_new_worker` covers).
+# report).
 #
 # THREE exits deliberately do not park, and each carries its own terminal proof
 # instead (`case.expect_terminal`):
@@ -529,119 +527,3 @@ async def test_every_exit_path_ends_completed_or_parked(case: _ExitCase):
         )
 
 
-# --- #344 behind `workflow.patched`: a run from before the deploy still replays ------
-
-# What `load_task_context` answered in each pre-#344 run below, by task id. A
-# history carries these results, and today's flow reads them on replay to pick
-# the branch it takes — so they are what decides the replayed path.
-_OLD_CONTEXT = {
-    "rp-chat": {"external_id": "", "gmail_message_id": "", "subject": "", "subject_kind": ""},
-    "rp-flow": {"external_id": "", "gmail_message_id": "", "subject": "gmailingestflow",
-                "subject_kind": "flow"},
-    "rp-noname": {"external_id": "", "gmail_message_id": "", "subject": "", "subject_kind": ""},
-    "rp-svc": {"external_id": "", "gmail_message_id": "", "subject": "redis_redis",
-               "subject_kind": "service"},
-}
-_OLD_TASKS = {
-    "rp-chat": dict(_TASK, source_tag="#chat"),
-    "rp-flow": dict(_TASK, source_tag="#alert", content="Flow GmailIngestFlow keeps failing"),
-    "rp-noname": dict(_TASK, source_tag="#alert", content="Something went wrong today"),
-    "rp-svc": _ALERT_TASK,
-}
-
-
-@workflow.defn(name="AgentTaskFlow")
-class _AgentTaskFlowBefore344:
-    """AgentTaskFlow as it ran before #344, on the paths #344 changed: an
-    unrouted `#chat` task and an `#alert` task naming no swarm service both
-    commented and parked; a healthy service was checked, commented on and
-    completed. The same activities in the same order — kept so a history it
-    wrote can be replayed against today's flow."""
-
-    @workflow.run
-    async def run(self, input: AgentTaskFlowInput) -> dict:
-        short = timedelta(seconds=30)
-        task_id = input.todoist_task_id
-        await workflow.execute_activity(
-            "load_task_context", args=[task_id], start_to_close_timeout=short
-        )
-        if task_id == "rp-svc":
-            await workflow.execute_activity(
-                "service_health", args=["redis_redis"], start_to_close_timeout=short
-            )
-            await workflow.execute_activity(
-                "comment", args=[task_id, input.agent_id, "healthy"], start_to_close_timeout=short
-            )
-            await workflow.execute_activity(
-                "complete_task", args=[task_id], start_to_close_timeout=short
-            )
-            return {}
-        await workflow.execute_activity(
-            "comment", args=[task_id, input.agent_id, "old"], start_to_close_timeout=short
-        )
-        await workflow.execute_activity(
-            "park_task", args=[task_id, "old"], start_to_close_timeout=short
-        )
-        return {}
-
-
-@activity.defn(name="load_task_context")
-async def _old_load_task_context(task_id: str) -> dict:
-    return _OLD_CONTEXT[task_id]
-
-
-@activity.defn(name="service_health")
-async def _old_service_health(service_name: str) -> dict:
-    return {"found": True, "healthy": True, "detail": "1/1", "service": service_name}
-
-
-@activity.defn(name="comment")
-async def _old_comment(task_id: str, agent_id: str, body: str) -> dict:
-    return {"ok": True}
-
-
-@activity.defn(name="park_task")
-async def _old_park_task(task_id: str, reason: str) -> dict:
-    return {"parked": True}
-
-
-@activity.defn(name="complete_task")
-async def _old_complete_task(task_id: str) -> dict:
-    return {"completed": True}
-
-
-@pytest.mark.parametrize("task_id", sorted(_OLD_TASKS))
-async def test_a_run_started_before_344_replays_on_the_new_worker(task_id):
-    """A deploy can land while an AgentTaskFlow is between two activities, and
-    the new worker then replays that run's history. #344 changed which
-    activity comes after `load_task_context` for every path above, so the new
-    branches sit behind `workflow.patched`, and the pre-#344 code stays in the
-    other arm — this replay walks it.
-
-    Falsifiable: drop the `patched` guard (always take the new branch) and
-    this replay raises a nondeterminism error."""
-    async with (
-        await WorkflowEnvironment.start_time_skipping() as env,
-        Worker(
-            env.client,
-            task_queue=f"tq-{uuid.uuid4()}",
-            workflows=[_AgentTaskFlowBefore344],
-            activities=[
-                _old_load_task_context, _old_service_health, _old_comment, _old_park_task,
-                _old_complete_task,
-            ],
-        ) as worker,
-    ):
-        handle = await env.client.start_workflow(
-            _AgentTaskFlowBefore344.run,
-            AgentTaskFlowInput(
-                agent_id="pandoras-actor", todoist_task_id=task_id,
-                task=dict(_OLD_TASKS[task_id], id=task_id),
-            ),
-            id=f"agent-task-{task_id}-{uuid.uuid4()}",
-            task_queue=worker.task_queue,
-        )
-        await handle.result()
-        history = await handle.fetch_history()
-
-    await Replayer(workflows=[AgentTaskFlow]).replay_workflow(history)

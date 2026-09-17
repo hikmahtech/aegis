@@ -14,10 +14,12 @@ start a child workflow.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import asyncpg
+import httpx
+from aegis.errors import error_text, logged_failure
 from aegis.services import hub, hub_fix, hub_group, hub_project, hub_watch
 from temporalio import activity
 
@@ -28,6 +30,31 @@ _DIGEST_LIST_CAP = 12
 # How many members a grouping judge is shown. Enough to see a pattern; a
 # hundred stuck posts do not read differently from twelve.
 _GROUP_PROMPT_CAP = 12
+# Two small reads of alertmanager, on the LAN. Short: the sweep runs every five
+# minutes and a monitoring stack that cannot answer in this long is one the
+# reconciliation must decline to act on anyway.
+_ALERTMANAGER_TIMEOUT_S = 8.0
+
+
+def _uptime_since(raw: str, now: datetime) -> timedelta | None:
+    """How long alertmanager has been up, from its `/api/v2/status` `uptime`.
+
+    That field is a START TIMESTAMP in RFC 3339 (`2026-09-12T21:04:27.879Z`),
+    not a duration — measured against the live instance, not assumed. `None`
+    when it cannot be read, which the caller treats as "do not reconcile":
+    without a trustworthy uptime there is no way to tell a healthy empty alert
+    set from one a restart has just emptied.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return None
+    try:
+        started = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=UTC)
+    return now - started
 
 
 class HubActivities:
@@ -45,6 +72,19 @@ class HubActivities:
         self.llm_client = llm_client
         self.model = model
         self.delivery = delivery
+
+    async def _infra_agent(self) -> str:
+        """The `infra` holder, who judges and announces a group — never an
+        example id (#579). "" when nobody holds the tag or there is no pool."""
+        if self.db_pool is None:
+            return ""
+        from aegis.services.agents import resolve_tag
+
+        try:
+            return await resolve_tag(self.db_pool, "infra") or ""
+        except Exception as exc:  # noqa: BLE001 — an owner lookup never breaks the sweep
+            activity.logger.warning("hub_infra_agent_lookup_failed error=%s", error_text(exc))
+            return ""
 
     @activity.defn
     async def ingest_alert(self, alert: dict, resolved: bool = False) -> dict:
@@ -88,7 +128,7 @@ class HubActivities:
                 activity.logger.warning(
                     "ingest_alert_project_failed problem=%s err=%s",
                     result.problem_id,
-                    str(exc)[:200],
+                    error_text(exc),
                 )
         return {
             **result.to_dict(),
@@ -146,7 +186,7 @@ class HubActivities:
                 activity.logger.warning(
                     "ingest_finding_project_failed problem=%s err=%s",
                     result.problem_id,
-                    str(exc)[:200],
+                    error_text(exc),
                 )
         return result.to_dict()
 
@@ -187,6 +227,27 @@ class HubActivities:
             "occurrences": p["occurrences"],
             "todoist_task_id": p["todoist_task_id"],
             "muted": p["muted_until"] is not None and p["muted_until"] > datetime.now(UTC),
+        }
+
+    @activity.defn
+    async def project_problem(self, problem_id: str) -> dict:
+        """Bring the problem's task up to date and report the task's id.
+
+        How the investigation flow learns a task the settle window deferred
+        (#537): it asks for this once its verification delay is over, which is
+        the same window, so the projection mints the task and hands back the id
+        the flow needs for every comment it is about to post. Idempotent — the
+        projector is re-runnable by design — and quiet about a problem that has
+        nothing to project.
+        """
+        if self.db_pool is None or not problem_id:
+            return {"task_id": "", "skipped": "no_pool"}
+        projected = await hub_project.project(
+            self.db_pool, problem_id, now=datetime.now(UTC)
+        )
+        return {
+            "task_id": str(projected.get("task_id") or ""),
+            "skipped": str(projected.get("skipped") or ""),
         }
 
     @activity.defn
@@ -246,7 +307,7 @@ class HubActivities:
             task_id = str(projected.get("task_id") or "")
         except Exception as exc:  # noqa: BLE001
             activity.logger.warning(
-                "record_investigation_project_failed problem=%s err=%s", problem_id, str(exc)[:200]
+                "record_investigation_project_failed problem=%s err=%s", problem_id, error_text(exc)
             )
         # `task_id` is reported because THIS projection is what mints the task
         # when a settle window held it back (#537): the status this call just
@@ -284,7 +345,7 @@ class HubActivities:
                 activity.logger.warning(
                     "follow_fix_pr_project_failed problem=%s err=%s",
                     row["problem_id"],
-                    str(exc)[:200],
+                    error_text(exc),
                 )
         return {"followed": len(rows), "problems": rows}
 
@@ -353,7 +414,7 @@ class HubActivities:
             await hub_project.project(self.db_pool, problem["id"], now=now)
         except Exception as exc:  # noqa: BLE001 — the turn's own output is what matters
             activity.logger.warning(
-                "record_plan_failed task_id=%s err=%s", task_id, str(exc)[:200]
+                "record_plan_failed task_id=%s err=%s", task_id, error_text(exc)
             )
             return {"recorded": False, "steps": len(steps)}
         return {"recorded": True, "steps": len(steps), "problem_id": problem["id"]}
@@ -585,11 +646,11 @@ class HubActivities:
                 ),
                 db_pool=self.db_pool,
                 purpose="hub_group_judge",
-                agent_id="pandoras-actor",
+                agent_id=await self._infra_agent() or None,
             )
         except Exception as exc:  # noqa: BLE001 — a judge that will not answer says no
-            activity.logger.warning("hub_group_judge_failed error=%s", str(exc)[:200])
-            return {**no, "reason": f"judge failed: {str(exc)[:120]}"}
+            activity.logger.warning("hub_group_judge_failed error=%s", error_text(exc))
+            return {**no, "reason": f"judge failed: {error_text(exc, 120)}"}
 
         from aegis.llm import parse_llm_json
 
@@ -639,8 +700,8 @@ class HubActivities:
                 by="hub-sweep",
             )
         except ValueError as exc:
-            activity.logger.warning("hub_group_upgrade_refused error=%s", str(exc)[:200])
-            return {"grouped": False, "reason": str(exc)[:200]}
+            activity.logger.warning("hub_group_upgrade_refused error=%s", error_text(exc))
+            return {"grouped": False, "reason": error_text(exc)}
 
         # Retire the tasks the folded problems owned: leaving them open is the
         # very thing grouping exists to stop.
@@ -658,12 +719,10 @@ class HubActivities:
                     retired += 1
             except Exception as exc:  # noqa: BLE001 — the group still stands
                 activity.logger.warning(
-                    "hub_group_retire_failed task_id=%s error=%s", task_id, str(exc)[:200]
+                    "hub_group_retire_failed task_id=%s error=%s", task_id, error_text(exc)
                 )
-        try:
+        with logged_failure("hub_group_project_failed", logger=activity.logger, field="error"):
             await hub_project.project(self.db_pool, result["problem_id"])
-        except Exception as exc:  # noqa: BLE001 — the sweep re-projects
-            activity.logger.warning("hub_group_project_failed error=%s", str(exc)[:200])
 
         subjects = [s for s in result["subjects"] if s]
         body = (
@@ -678,7 +737,7 @@ class HubActivities:
         )
         await safe_send_message(
             self.delivery,
-            agent_id="pandoras-actor",
+            agent_id=await self._infra_agent(),
             message=f"[PROBLEM GROUPED] {title}\n\n{body}",
             log_event="hub_group_notify_failed",
         )
@@ -689,4 +748,83 @@ class HubActivities:
             "title": title,
             "folded": len(result["merged"]),
             "tasks_retired": retired,
+        }
+
+    @activity.defn
+    async def reconcile_alertmanager(self, url: str, min_uptime_seconds: int = 900) -> dict:
+        """Resolve live alertmanager problems whose alerts it no longer lists.
+
+        The alertmanager lane was the only producer on the hub with no
+        reconciliation: it resolves a problem solely on the `resolved` webhook,
+        and alertmanager keeps its alerts in memory, so a restart means that
+        webhook is never sent and the problem plus its Todoist task are stranded
+        for good (#551). Every other lane already recovers — the heartbeat
+        re-checks, the watchdogs run `reconcile_findings`.
+
+        **Everything here fails closed**, because the failure mode of getting
+        this wrong is mass-resolving a live estate:
+
+        * no URL configured → do nothing (a fork ships nobody's monitoring host);
+        * the status or alerts read fails, times out, or answers non-200 → do
+          nothing, because an unreachable monitoring stack must never read as
+          "everything recovered";
+        * **alertmanager itself started less than `min_uptime_seconds` ago → do
+          nothing.** This is the guard the bug taught: a freshly restarted
+          alertmanager holds an empty set until Prometheus re-sends, and
+          reconciling against that would resolve every open problem at once.
+          Prometheus re-sends on the order of a minute, so the default leaves a
+          wide margin.
+
+        A `suppressed` alert (silenced or inhibited) counts as ACTIVE: it is
+        still firing, someone has merely asked not to be told.
+        """
+        target = (url or "").strip().rstrip("/")
+        if not target:
+            return {"skipped": "not_configured", "resolved": 0, "checked": 0}
+        if self.db_pool is None:
+            return {"skipped": "no_pool", "resolved": 0, "checked": 0}
+        try:
+            async with httpx.AsyncClient(timeout=_ALERTMANAGER_TIMEOUT_S) as client:
+                status = await client.get(f"{target}/api/v2/status")
+                status.raise_for_status()
+                uptime_raw = str((status.json() or {}).get("uptime") or "")
+                alerts = await client.get(f"{target}/api/v2/alerts")
+                alerts.raise_for_status()
+                payload = alerts.json()
+        except Exception as exc:  # noqa: BLE001 — fail closed, never resolve on doubt
+            activity.logger.warning(
+                "hub_alertmanager_read_failed url=%s err=%s", target, error_text(exc)
+            )
+            return {"skipped": "unreachable", "resolved": 0, "checked": 0}
+
+        now = datetime.now(UTC)
+        uptime = _uptime_since(uptime_raw, now)
+        if uptime is None:
+            return {"skipped": "uptime_unreadable", "resolved": 0, "checked": 0}
+        if uptime < timedelta(seconds=max(0, min_uptime_seconds)):
+            # It has forgotten what it was holding and has not been told again.
+            return {
+                "skipped": "alertmanager_just_started",
+                "uptime_seconds": int(uptime.total_seconds()),
+                "resolved": 0,
+                "checked": 0,
+            }
+
+        if not isinstance(payload, list):
+            return {"skipped": "unexpected_payload", "resolved": 0, "checked": 0}
+        active = {
+            str(a.get("fingerprint") or "")
+            for a in payload
+            if isinstance(a, dict) and str((a.get("status") or {}).get("state") or "") != "unprocessed"
+        }
+        active.discard("")
+
+        out = await hub_watch.reconcile_alertmanager(
+            self.db_pool, active_fingerprints=active, now=now
+        )
+        return {
+            "checked": out["checked"],
+            "resolved": len(out["resolved"]),
+            "problems": [r["problem_id"] for r in out["resolved"]],
+            "active_alerts": len(active),
         }

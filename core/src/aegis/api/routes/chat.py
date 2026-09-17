@@ -78,11 +78,33 @@ async def chat(request: Request, body: dict[str, Any]) -> dict[str, Any]:
 
     Optional `delivery_ref` block stores the channel-neutral handle of the
     user's incoming message on the user chat_history row's metadata.
+
+    With no `agent_id`, the front door picks one the way POST /api/chat/route
+    does (keywords, then the fast model, then the `gtd` holder) and the
+    response's `agent_id` says who answered (#579). A caller that could not
+    route — comms when core's route call failed — sends none rather than
+    guessing an example id. 400 only when nobody can take it.
     """
-    agent_id = body.get("agent_id")
+    agent_id = (body.get("agent_id") or "").strip()
     message = body.get("message")
-    if not agent_id or not message:
-        raise HTTPException(status_code=400, detail="agent_id and message are required")
+    if not message:
+        raise HTTPException(status_code=400, detail="message is required")
+
+    llm = getattr(request.app.state, "llm", None)
+    if not agent_id:
+        routed = await classify_intent(
+            message,
+            llm,
+            getattr(request.app.state, "settings", None),
+            pool=request.app.state.db_pool,
+        )
+        agent_id = routed.get("agent_id") or ""
+        if not agent_id:
+            raise HTTPException(
+                status_code=400,
+                detail="no agent_id given, and no agent could take it: no active agent "
+                "holds the gtd tag",
+            )
 
     delivery_ref = body.get("delivery_ref") or None
     user_metadata: dict | None = None
@@ -92,7 +114,6 @@ async def chat(request: Request, body: dict[str, Any]) -> dict[str, Any]:
             "delivery_ref": delivery_ref,
         }
 
-    llm = getattr(request.app.state, "llm", None)
     result = await send_message(
         request.app.state.db_pool,
         llm,
@@ -106,14 +127,14 @@ async def chat(request: Request, body: dict[str, Any]) -> dict[str, Any]:
         search_connector=getattr(request.app.state, "search_connector", None),
         remote_script_connector=getattr(request.app.state, "remote_script_connector", None),
         vercel_connector=getattr(request.app.state, "vercel_connector", None),
-        mcp_manager=getattr(request.app.state, "mcp_manager", None),
         background_tasks=getattr(request.app.state, "background_tasks", None),
         user_metadata=user_metadata,
         tier_override=(body.get("tier") or None),
     )
     if result.get("error"):
         raise HTTPException(status_code=500, detail=result["error"])
-    return result
+    # Who answered — the routed agent when the caller named none.
+    return {**result, "agent_id": agent_id}
 
 
 @router.post("/route")
@@ -200,19 +221,10 @@ async def get_thread_history(
         raise HTTPException(status_code=400, detail="thread_id is required")
 
     pool = request.app.state.db_pool
-    conditions = ["thread_id = $1"]
-    params: list[Any] = [thread_id]
-    idx = 2
-
-    if agent_id:
-        conditions.append(f"agent_id = ${idx}")
-        params.append(agent_id)
-        idx += 1
-
-    where = " AND ".join(conditions)
+    where, params = build_where({"thread_id": thread_id, "agent_id": agent_id})
     params.append(limit)
     rows = await pool.fetch(
-        f"SELECT * FROM chat_history WHERE {where} ORDER BY created_at ASC LIMIT ${idx}",
+        f"SELECT * FROM chat_history{where} ORDER BY created_at ASC LIMIT ${len(params)}",
         *params,
     )
     return [dict(r) for r in rows]
@@ -267,7 +279,6 @@ async def post_agent_reply(
                 request.app.state, "remote_script_connector", None
             ),
             vercel_connector=getattr(request.app.state, "vercel_connector", None),
-            mcp_manager=getattr(request.app.state, "mcp_manager", None),
         )
     except (httpx.HTTPStatusError, httpx.ConnectError, httpx.TimeoutException) as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc

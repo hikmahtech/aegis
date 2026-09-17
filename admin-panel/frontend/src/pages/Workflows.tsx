@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api } from '../api/client';
 import ErrorBanner from '../components/ErrorBanner';
+import DataTable from '../components/DataTable';
 
 type Tab = 'live' | 'history';
 
@@ -12,6 +13,11 @@ function normalizeStatus(raw: unknown): string {
   if (raw == null) return 'running';
   return String(raw).replace(/^WORKFLOW_EXECUTION_STATUS_/i, '').toLowerCase();
 }
+
+// A Temporal execution carries its ids under two spellings depending on which
+// API answered; both cells and the row key need them.
+const wfIdOf = (e: any): string => e?.execution?.workflowId ?? e?.workflowId ?? '?';
+const runIdOf = (e: any): string => e?.execution?.runId ?? e?.runId ?? '';
 
 const LIVE_POLL_MS = 5_000;
 const HISTORY_PAGE_SIZE = 50;
@@ -78,47 +84,42 @@ function LiveTab() {
         </div>
       )}
       <div className="table-scroll">
-        <table className="data-table">
-          <thead>
-            <tr>
-              <th>Workflow ID</th>
-              <th>Type</th>
-              <th>Status</th>
-              <th>Start</th>
-              <th>Link</th>
-            </tr>
-          </thead>
-          <tbody>
-            {executions.map((e: any) => {
-              const wfId = e?.execution?.workflowId ?? e?.workflowId ?? '?';
-              const runId = e?.execution?.runId ?? e?.runId ?? '';
-              const type = e?.type?.name ?? e?.workflowType?.name ?? '?';
-              const status = normalizeStatus(e?.status);
-              const start = e?.startTime ?? e?.start_time;
-              return (
-                <tr key={`${wfId}-${runId}`}>
-                  <td className="mono" title={wfId} style={{ maxWidth: 260, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    {wfId !== '?'
-                      ? <Link to={`/workflows/${encodeURIComponent(wfId)}?run=${encodeURIComponent(runId)}`}>{wfId}</Link>
-                      : wfId}
-                  </td>
-                  <td>{type}</td>
-                  <td><span className={`badge badge-${status}`}>{status}</span></td>
-                  <td>{start ? new Date(start).toLocaleString() : '—'}</td>
-                  <td>
-                    {uiBase && wfId !== '?' && (
-                      <a href={`${uiBase}/namespaces/default/workflows/${wfId}/${runId}/history`}
-                         target="_blank" rel="noreferrer">Temporal →</a>
-                    )}
-                  </td>
-                </tr>
-              );
-            })}
-            {executions.length === 0 && !loading && (
-              <tr><td colSpan={5} className="empty">No live workflows.</td></tr>
-            )}
-          </tbody>
-        </table>
+        <DataTable
+          rows={executions as any[]}
+          rowKey={e => `${wfIdOf(e)}-${runIdOf(e)}`}
+          emptyText={loading ? undefined : 'No live workflows.'}
+          columns={[
+            {
+              header: 'Workflow ID',
+              td: e => ({ className: 'mono', title: wfIdOf(e), style: { maxWidth: 260, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }),
+              cell: e => (wfIdOf(e) !== '?'
+                ? <Link to={`/workflows/${encodeURIComponent(wfIdOf(e))}?run=${encodeURIComponent(runIdOf(e))}`}>{wfIdOf(e)}</Link>
+                : wfIdOf(e)),
+            },
+            { header: 'Type', cell: e => e?.type?.name ?? e?.workflowType?.name ?? '?' },
+            {
+              header: 'Status',
+              cell: e => {
+                const status = normalizeStatus(e?.status);
+                return <span className={`badge badge-${status}`}>{status}</span>;
+              },
+            },
+            {
+              header: 'Start',
+              cell: e => {
+                const start = e?.startTime ?? e?.start_time;
+                return start ? new Date(start).toLocaleString() : '—';
+              },
+            },
+            {
+              header: 'Link',
+              cell: e => uiBase && wfIdOf(e) !== '?' && (
+                <a href={`${uiBase}/namespaces/default/workflows/${wfIdOf(e)}/${runIdOf(e)}/history`}
+                   target="_blank" rel="noreferrer">Temporal →</a>
+              ),
+            },
+          ]}
+        />
       </div>
     </>
   );
@@ -201,41 +202,33 @@ function HistoryTab() {
       </div>
 
       <div className="table-scroll">
-        <table className="data-table">
-          <thead>
-            <tr>
-              <th>run_id</th>
-              <th>Type</th>
-              <th>Agent</th>
-              <th>Status</th>
-              <th>Started</th>
-              <th>Duration</th>
-              <th>Error</th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map(r => (
-              <tr key={r.run_id}>
-                <td className="mono" title={r.run_id} style={{ maxWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  {r.workflow_id
-                    ? <Link to={`/workflows/${encodeURIComponent(r.workflow_id)}?run=${encodeURIComponent(r.run_id ?? '')}`}>{(r.run_id ?? '').slice(0, 8)}…</Link>
-                    : `${(r.run_id ?? '').slice(0, 8)}…`}
-                </td>
-                <td>{r.workflow_type}</td>
-                <td>{r.agent_id || '—'}</td>
-                <td><span className={`badge badge-${String(r.status).toLowerCase()}`}>{r.status}</span></td>
-                <td>{r.started_at ? new Date(r.started_at).toLocaleString() : '—'}</td>
-                <td>{r.duration_ms != null ? `${r.duration_ms} ms` : '—'}</td>
-                <td title={r.error || ''} style={{ maxWidth: 260, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  {r.error || '—'}
-                </td>
-              </tr>
-            ))}
-            {rows.length === 0 && !loading && (
-              <tr><td colSpan={7} className="empty">No runs match these filters.</td></tr>
-            )}
-          </tbody>
-        </table>
+        <DataTable
+          rows={rows}
+          rowKey={r => r.run_id}
+          emptyText={loading ? undefined : 'No runs match these filters.'}
+          columns={[
+            {
+              header: 'run_id',
+              td: r => ({ className: 'mono', title: r.run_id, style: { maxWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }),
+              cell: r => (r.workflow_id
+                ? <Link to={`/workflows/${encodeURIComponent(r.workflow_id)}?run=${encodeURIComponent(r.run_id ?? '')}`}>{(r.run_id ?? '').slice(0, 8)}…</Link>
+                : `${(r.run_id ?? '').slice(0, 8)}…`),
+            },
+            { header: 'Type', cell: r => r.workflow_type },
+            { header: 'Agent', cell: r => r.agent_id || '—' },
+            {
+              header: 'Status',
+              cell: r => <span className={`badge badge-${String(r.status).toLowerCase()}`}>{r.status}</span>,
+            },
+            { header: 'Started', cell: r => (r.started_at ? new Date(r.started_at).toLocaleString() : '—') },
+            { header: 'Duration', cell: r => (r.duration_ms != null ? `${r.duration_ms} ms` : '—') },
+            {
+              header: 'Error',
+              td: r => ({ title: r.error || '', style: { maxWidth: 260, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }),
+              cell: r => r.error || '—',
+            },
+          ]}
+        />
       </div>
 
       {hasMore && (

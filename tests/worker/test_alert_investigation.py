@@ -11,14 +11,6 @@ from tests.llm_stub import StubbedLLMClient
 
 
 @pytest.fixture
-def mock_db_pool():
-    pool = AsyncMock()
-    pool.fetchrow.return_value = None
-    pool.execute.return_value = "OK"
-    return pool
-
-
-@pytest.fixture
 def mock_llm():
     llm = AsyncMock()
     llm.think.return_value = {
@@ -940,7 +932,7 @@ async def test_record_verdict_to_kg_swallows_errors():
 # ── score_resource_relevance (Gate-0 deny-by-default repo confirmation) ──
 #
 # The activity fetches all repository resources, runs the pure scorer
-# (aegis_worker.relevance.score_resources) against the alert CONTENT, and
+# (aegis_worker.activities.relevance.score_resources) against the alert CONTENT, and
 # returns {confident, resolved_resource_id, candidates}. A mock db_pool's
 # .fetch returns row-like dicts (dict["id"]/["title"]/["metadata"] all work);
 # metadata is passed as a plain dict so the activity's `if isinstance(m, str)`

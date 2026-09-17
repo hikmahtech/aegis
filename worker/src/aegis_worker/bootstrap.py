@@ -9,6 +9,7 @@ import structlog
 from aegis.config import Settings
 from aegis.connectors.search import SearchConnector
 from aegis.db import create_pool, wait_for_migrations
+from aegis.errors import error_text
 from aegis.llm import LLMClient
 
 logger = structlog.get_logger()
@@ -27,9 +28,8 @@ class ConnectorUnavailableError(RuntimeError):
 class _UnavailableConnector:
     """Stand-in for a connector whose constructor raised.
 
-    Mirrors ``MCPManager``'s handling of a bad server entry (B8,
-    ``core/src/aegis/mcp_manager.py``): log at ERROR once, keep booting, record
-    why, and raise a typed error the moment anyone actually reaches for it.
+    Log at ERROR once, keep booting, record why, and raise a typed error the
+    moment anyone actually reaches for it.
 
     Deliberately **truthy**, which is the whole behaviour change. Activities
     guard with ``if not self.remote_script: return``, meaning a falsy stand-in
@@ -161,7 +161,7 @@ async def bootstrap(settings: Settings | None = None) -> WorkerDeps:
     try:
         install_deploy_key(settings)
     except Exception as exc:  # noqa: BLE001 — a bad key must not block boot
-        logger.warning("books_deploy_key_install_failed", error=str(exc)[:200])
+        logger.warning("books_deploy_key_install_failed", error=error_text(exc))
 
     # The vault key (#514), the same way, before the daylog or the notes index
     # first touch the checkout.
@@ -170,27 +170,16 @@ async def bootstrap(settings: Settings | None = None) -> WorkerDeps:
     try:
         notes_service.install_deploy_key(settings)
     except Exception as exc:  # noqa: BLE001 — a bad key must not block boot
-        logger.warning("notes_deploy_key_install_failed", error=str(exc)[:200])
+        logger.warning("notes_deploy_key_install_failed", error=error_text(exc))
 
     # LLM client + tier map from the configurable backend (DB → env fallback).
     # Cap the fast tier at 2 concurrent calls — it typically shares a GPU with
     # everything else aegis hosts, and bursts serialise through ollama
     # compounding tail latency.
-    from aegis.llm import set_model_tiers, set_routes
-    from aegis.services.llm_backend import get_llm_backend
+    from aegis.services.llm_backend import get_llm_backend, install_llm_config
 
     backend = await get_llm_backend(pool, settings)
-    set_model_tiers(backend["tiers"])
-    try:
-        routes = set_routes(backend.get("routes"))
-        logger.info(
-            "llm_routes_loaded",
-            categories=len(routes["categories"]),
-            purposes=len(routes["purposes"]),
-        )
-    except Exception as exc:  # noqa: BLE001 — a bad routing table must not block boot
-        set_routes(None)
-        logger.warning("llm_routes_invalid", error=str(exc)[:200])
+    install_llm_config(backend)
     llm = LLMClient(
         base_url=backend["base_url"],
         api_key=backend["api_key"],

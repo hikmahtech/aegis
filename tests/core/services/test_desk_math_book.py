@@ -119,34 +119,53 @@ def test_book_helpers():
     assert book.avg_cost("NONE") == 0.0
 
 
-def test_financial_year_runs_april_to_march():
-    assert fy(date(2026, 3, 31)) == 2025
-    assert fy(date(2026, 4, 1)) == 2026
+def test_the_financial_year_defaults_to_the_calendar_year():
+    """The code names no country's financial year: a fork that says nothing
+    gets January to December."""
+    assert fy(date(2026, 3, 31)) == 2026
+    assert fy(date(2026, 12, 31)) == 2026
+
+
+def test_a_configured_start_month_moves_the_year_boundary():
+    """4 is India's April-to-March year, which is what the seeded example sets."""
+    assert fy(date(2026, 3, 31), 4) == 2025
+    assert fy(date(2026, 4, 1), 4) == 2026
 
 
 def _r(day, gain, cls="equity", lt=False):
     return Realised(day, "S", cls, gain, lt)
 
 
-def test_tax_nets_short_term_gains_per_class_within_a_year():
+def test_no_tax_model_configured_owes_nothing():
+    """The code ships nobody's tax law, so an unconfigured desk deducts nothing
+    rather than inventing a rate. The page labels that, so the zero is never
+    read as a result."""
+    assert tax_owed([_r(date(2026, 5, 1), 1000.0)], Rules()) == 0.0
+    assert tax_owed([_r(date(2026, 5, 1), 1000.0, lt=True)], Rules()) == 0.0
+
+
+def test_tax_nets_short_term_gains_per_class_within_a_year(seeded_desk_rules):
     rows = [_r(date(2026, 5, 1), 1000.0), _r(date(2026, 6, 1), -400.0), _r(date(2026, 7, 1), 500.0, cls="etf")]
-    assert tax_owed(rows, Rules()) == pytest.approx(0.20 * 600 + 0.30 * 500)
+    assert tax_owed(rows, seeded_desk_rules) == pytest.approx(0.20 * 600 + 0.30 * 500)
 
 
-def test_tax_does_not_net_across_the_31_march_boundary():
+def test_tax_does_not_net_across_the_financial_year_boundary(seeded_desk_rules):
     rows = [_r(date(2026, 3, 31), 1000.0), _r(date(2026, 4, 1), -1000.0)]
-    assert tax_owed(rows, Rules()) == pytest.approx(200.0)
+    assert tax_owed(rows, seeded_desk_rules) == pytest.approx(200.0)
 
 
-def test_long_term_equity_gains_are_taxed_only_above_the_exemption():
-    assert tax_owed([_r(date(2026, 5, 1), 200_000.0, lt=True)], Rules()) == pytest.approx(0.125 * 75_000)
+def test_long_term_equity_gains_are_taxed_only_above_the_exemption(seeded_desk_rules):
+    assert tax_owed([_r(date(2026, 5, 1), 200_000.0, lt=True)], seeded_desk_rules) == pytest.approx(
+        0.125 * 75_000
+    )
 
 
-def test_a_long_term_etf_gain_gets_no_exemption():
+def test_a_long_term_etf_gain_gets_no_exemption(seeded_desk_rules):
     """Section 112A's ₹1.25L covers listed equity and equity-oriented units. A
-    gold or silver ETF is neither."""
+    gold or silver ETF is neither — and which classes qualify is now the
+    operator's `long_term_exemption_classes`, not a literal in the code."""
     rows = [_r(date(2026, 5, 1), 200_000.0, cls="etf", lt=True)]
-    assert tax_owed(rows, Rules()) == pytest.approx(0.125 * 200_000)
+    assert tax_owed(rows, seeded_desk_rules) == pytest.approx(0.125 * 200_000)
 
 
 def test_a_same_day_sell_and_buy_both_land():
@@ -164,5 +183,5 @@ def test_a_loss_year_owes_nothing():
     assert tax_owed([_r(date(2026, 5, 1), -500.0)], Rules()) == 0.0
 
 
-def test_an_unknown_class_pays_the_highest_configured_rate():
-    assert tax_owed([_r(date(2026, 5, 1), 100.0, cls="crypto")], Rules()) == pytest.approx(30.0)
+def test_an_unknown_class_pays_the_highest_configured_rate(seeded_desk_rules):
+    assert tax_owed([_r(date(2026, 5, 1), 100.0, cls="crypto")], seeded_desk_rules) == pytest.approx(30.0)

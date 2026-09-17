@@ -166,7 +166,7 @@ async def test_subscribe_checks_the_feed_then_adds_and_resubscribes(pool):
     url = _PREFIX + "feed.xml"
     respx.get(url).mock(return_value=Response(200, text=_RSS))
     with patch.object(feeds, "public_url_problem", AsyncMock(return_value=None)):
-        first = await feeds.subscribe(pool, url, agent_id="raphael")
+        first = await feeds.subscribe(pool, url)
         again = await feeds.subscribe(pool, url)
         dropped = await feeds.unsubscribe(pool, "example & co")
         back = await feeds.subscribe(pool, url)
@@ -175,7 +175,7 @@ async def test_subscribe_checks_the_feed_then_adds_and_resubscribes(pool):
     assert first["label"] == "Example & Co"
     assert first["entries_in_feed"] == 2
     row = await pool.fetchrow("SELECT config, active FROM channels WHERE identifier = $1", url)
-    assert row["config"]["agent_id"] == "raphael"
+    assert "agent_id" not in row["config"], "no per-feed agent: the research tag owns feeds"
     assert row["config"]["ingest"] == "full"
     assert again["status"] == "already_subscribed"
     assert dropped["status"] == "unsubscribed"

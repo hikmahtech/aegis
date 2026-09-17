@@ -1,4 +1,4 @@
-"""ResearchFlow — Raphael works one question (#509).
+"""ResearchFlow — the research agent works one question (#509).
 
 Started two ways: by the `research_topic` chat tool, under an id derived from
 the question, and as a child of `AgentTaskFlow` for a `#research` task. Four
@@ -27,9 +27,11 @@ from html import escape
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
+    from aegis.errors import error_text
     from aegis.services.research import DEPTHS, render_report
 
-    from aegis_worker.shared.retry import RETRY_ONCE, TIMEOUT_FAST
+    from aegis_worker.activities.agent_registry import AgentRegistryActivities
+    from aegis_worker.shared.retry import NO_RETRY, RETRY_ONCE, TIMEOUT_FAST
 
 _GATHER_TIMEOUT = timedelta(seconds=150)
 # Reads run together; each fetch has its own 30s ceiling inside.
@@ -43,7 +45,10 @@ _REPORT_MARGIN_S = 2.0
 
 @dataclass
 class ResearchInput:
-    agent_id: str = "raphael"
+    # The agent whose channel a late answer is posted to. "" = resolve the
+    # holder of the `research` capability tag at run time; no holder = the
+    # answer is still made, and nobody's channel gets the late copy.
+    agent_id: str = ""
     question: str = ""
     depth: str = "quick"
     domains: list[str] = field(default_factory=list)
@@ -72,6 +77,9 @@ class ResearchFlow:
             }
         depth = inp.depth if inp.depth in DEPTHS else "quick"
         notes: dict = {}
+        agent_id = inp.agent_id or await self._research_agent()
+        if not agent_id:
+            notes["no_research_agent"] = True
 
         try:
             gathered = await workflow.execute_activity(
@@ -88,7 +96,7 @@ class ResearchFlow:
                 retry_policy=RETRY_ONCE,
             )
         except Exception as exc:
-            workflow.logger.warning("research_gather_degraded err=%s", str(exc)[:200])
+            workflow.logger.warning("research_gather_degraded err=%s", error_text(exc))
             gathered = {"kg": [], "web": [], "papers": [], "to_read": [], "errors": []}
             notes["gather_degraded"] = True
         errors = list(gathered.get("errors") or [])
@@ -105,7 +113,7 @@ class ResearchFlow:
                 pages = list(read.get("pages") or [])
                 errors += list(read.get("errors") or [])
             except Exception as exc:
-                workflow.logger.warning("research_read_degraded err=%s", str(exc)[:200])
+                workflow.logger.warning("research_read_degraded err=%s", error_text(exc))
                 notes["read_degraded"] = True
 
         try:
@@ -116,7 +124,7 @@ class ResearchFlow:
                 retry_policy=RETRY_ONCE,
             )
         except Exception as exc:
-            workflow.logger.warning("research_synthesis_degraded err=%s", str(exc)[:200])
+            workflow.logger.warning("research_synthesis_degraded err=%s", error_text(exc))
             synth = {
                 "answer": "I gathered sources but the synthesis step failed.",
                 "synthesized": False,
@@ -137,11 +145,13 @@ class ResearchFlow:
                 )
                 saved = bool(res.get("saved"))
             except Exception as exc:
-                workflow.logger.warning("research_save_failed err=%s", str(exc)[:200])
+                workflow.logger.warning("research_save_failed err=%s", error_text(exc))
                 notes["save_failed"] = True
 
-        report = render_report(answer, sources)
-        notified = await self._report_if_late(inp, question, report)
+        # The activity renders the report under the configured `report_chars`;
+        # a degraded synthesis has none, so it is rendered here at the default.
+        report = str(synth.get("report") or "") or render_report(answer, sources)
+        notified = await self._report_if_late(inp, agent_id, question, report)
         return {
             "status": "ok" if synth.get("synthesized") else "no_answer",
             "question": question,
@@ -162,12 +172,32 @@ class ResearchFlow:
         is exactly the delay that makes a fast run land after the tool gave up."""
         return (workflow.now() - workflow.info().start_time).total_seconds()
 
-    async def _report_if_late(self, inp: ResearchInput, question: str, report: str) -> bool:
+    async def _research_agent(self) -> str:
+        """The agent holding the `research` tag, or "" (logged) — never a
+        literal id, and never a failed run over a routing lookup."""
+        try:
+            resolved = await workflow.execute_activity_method(
+                AgentRegistryActivities.resolve_agents,
+                args=[["research"]],
+                start_to_close_timeout=TIMEOUT_FAST,
+                retry_policy=NO_RETRY,
+            )
+            agent_id = str((resolved or {}).get("research") or "")
+        except Exception as exc:  # noqa: BLE001 — routing is a nicety
+            workflow.logger.warning("research_agent_resolve_failed err=%s", error_text(exc))
+            return ""
+        if not agent_id:
+            workflow.logger.warning("research_agent_unresolved tag=research")
+        return agent_id
+
+    async def _report_if_late(
+        self, inp: ResearchInput, agent_id: str, question: str, report: str
+    ) -> bool:
         """Send the report to the agent's channel when the tool stopped waiting.
 
         Never raises: the answer is already made, and a dead comms server must
         not fail the run that made it."""
-        if inp.reply_after_seconds <= 0:
+        if inp.reply_after_seconds <= 0 or not agent_id:
             return False
         if self._elapsed() + _REPORT_MARGIN_S < inp.reply_after_seconds:
             return False
@@ -175,11 +205,11 @@ class ResearchFlow:
         try:
             res = await workflow.execute_activity(
                 "send_message",
-                args=[inp.agent_id, text],
+                args=[agent_id, text],
                 start_to_close_timeout=TIMEOUT_FAST,
                 retry_policy=RETRY_ONCE,
             )
         except Exception as exc:  # noqa: BLE001 — the answer stands; the message is extra
-            workflow.logger.warning("research_report_failed err=%s", str(exc)[:200])
+            workflow.logger.warning("research_report_failed err=%s", error_text(exc))
             return False
         return bool(isinstance(res, dict) and res.get("ok"))

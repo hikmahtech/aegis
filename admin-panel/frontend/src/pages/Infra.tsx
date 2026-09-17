@@ -4,6 +4,7 @@ import ErrorBanner from '../components/ErrorBanner';
 import ActionMenu from '../components/ActionMenu';
 import JsonViewer from '../components/JsonViewer';
 import { toast } from '../components/Toast';
+import DataTable from '../components/DataTable';
 
 const INFRA_KINDS = ['ssh_host', 'swarm', 'docker', 'k8s', 'cloud'];
 
@@ -426,38 +427,32 @@ function K8sClusterPanel({ infraId, readOnly }: { infraId: string; readOnly: boo
 
       <h4 style={{ margin: '0.6rem 0 0.3rem' }}>Deployments</h4>
       {deployments.length === 0 ? <p className="meta">None in this namespace.</p> : (
-        <table className="data-table">
-          <thead><tr><th>Name</th><th>Ready</th><th>Images</th><th /></tr></thead>
-          <tbody>
-            {deployments.map(d => (
-              <tr key={d.name}>
-                <td className="mono">{d.name}</td>
-                <td>{d.ready}</td>
-                <td className="mono" style={{ fontSize: 12 }}>{(d.images || []).join(', ')}</td>
-                <td>{!readOnly && <button className="btn btn-sm" onClick={() => void restart(d.name)}>Restart</button>}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+        <DataTable
+          rows={deployments}
+          rowKey={d => d.name}
+          columns={[
+            { header: 'Name', td: { className: 'mono' }, cell: d => d.name },
+            { header: 'Ready', cell: d => d.ready },
+            { header: 'Images', td: { className: 'mono', style: { fontSize: 12 } }, cell: d => (d.images || []).join(', ') },
+            { cell: d => !readOnly && <button className="btn btn-sm" onClick={() => void restart(d.name)}>Restart</button> },
+          ]}
+        />
       )}
 
       <h4 style={{ margin: '0.6rem 0 0.3rem' }}>Pods</h4>
       {pods.length === 0 ? <p className="meta">None in this namespace.</p> : (
-        <table className="data-table">
-          <thead><tr><th>Name</th><th>Phase</th><th>Ready</th><th>Restarts</th><th>Node</th><th /></tr></thead>
-          <tbody>
-            {pods.map(p => (
-              <tr key={p.name}>
-                <td className="mono">{p.name}</td>
-                <td>{p.phase}</td>
-                <td>{p.ready}</td>
-                <td>{p.restarts}</td>
-                <td className="mono" style={{ fontSize: 12 }}>{p.node}</td>
-                <td><button className="btn btn-sm" onClick={() => void showLogs(p.name)}>Logs</button></td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+        <DataTable
+          rows={pods}
+          rowKey={p => p.name}
+          columns={[
+            { header: 'Name', td: { className: 'mono' }, cell: p => p.name },
+            { header: 'Phase', cell: p => p.phase },
+            { header: 'Ready', cell: p => p.ready },
+            { header: 'Restarts', cell: p => p.restarts },
+            { header: 'Node', td: { className: 'mono', style: { fontSize: 12 } }, cell: p => p.node },
+            { cell: p => <button className="btn btn-sm" onClick={() => void showLogs(p.name)}>Logs</button> },
+          ]}
+        />
       )}
 
       {logs && (

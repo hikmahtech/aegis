@@ -10,10 +10,35 @@ transport — the only part that genuinely differs between connectors.
 
 from __future__ import annotations
 
+from typing import Any
+
 import httpx
 import structlog
 
+from aegis.errors import error_text
+
 logger = structlog.get_logger()
+
+
+def envelope(
+    ok: bool,
+    data: Any = None,
+    error: str | None = None,
+    retryable: bool = False,
+    external_ref: str | None = None,
+) -> dict:
+    """The result shape every connector method returns.
+
+    `retryable` is the only field a caller MUST read beside `ok`: it is what
+    tells the outbox to queue a write again rather than drop it.
+    """
+    return {
+        "ok": ok,
+        "data": data,
+        "error": error,
+        "retryable": retryable,
+        "external_ref": external_ref,
+    }
 
 
 class HTTPConnector:
@@ -64,5 +89,5 @@ class HTTPConnector:
                 connector=self.connector_name,
                 action=action,
                 status=status,
-                error=str(exc)[:200],
+                error=error_text(exc),
             )

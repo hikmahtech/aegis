@@ -118,12 +118,35 @@ async def test_note_write_refuses_a_path_outside_raphael(tmp_path):
 
 async def test_note_link_dispatches_a_link(tmp_path):
     client = _Client({"message": "wrote to raphael/topics/rag.md"})
-    ctx = ToolContext(settings=_configured(tmp_path), temporal_client=client)
+    ctx = ToolContext(settings=_configured(tmp_path), temporal_client=client, agent_id="raphael")
     await _exec_note_link(
         None, {"path": "raphael/topics/rag", "target": "Designing Data-Intensive Apps"}, ctx
     )
     assert client.started[0]["arg"]["op"] == "link"
     assert client.started[0]["arg"]["payload"]["target"] == "Designing Data-Intensive Apps"
+
+
+async def test_a_write_with_no_calling_agent_and_no_pool_is_refused(tmp_path):
+    """No literal agent id anywhere: without a caller and without a pool to
+    resolve the `research` holder from, the write has no owner and is refused."""
+    client = _Client({"message": "x"})
+    ctx = ToolContext(settings=_configured(tmp_path), temporal_client=client)
+    out = await _exec_note_write(None, {"path": "topics/rag", "text": "t"}, ctx)
+    assert out.startswith("error: no agent owns this write") and "Nothing was written" in out
+    assert client.started == []
+
+
+async def test_a_write_with_no_calling_agent_goes_to_the_research_holder(tmp_path, db_pool):
+    """The owner is resolved by capability, not by name (issue #36)."""
+    client = _Client({"message": "ok"})
+    ctx = ToolContext(settings=_configured(tmp_path), temporal_client=client)
+    holder = await db_pool.fetchval(
+        "SELECT id FROM agents WHERE active AND capabilities @> '[\"research\"]'::jsonb "
+        "ORDER BY id LIMIT 1"
+    )
+    assert holder, "the seed ships a research agent"
+    await _exec_note_write(db_pool, {"path": "topics/rag", "text": "t"}, ctx)
+    assert client.started[0]["arg"]["agent_id"] == holder
 
 
 def test_the_four_tools_are_registered_and_the_writers_are_not_read_only():

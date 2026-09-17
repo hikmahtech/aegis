@@ -4,20 +4,20 @@ Every executor here is built on the same script-host + infra-registry helper
 base (`_INFRA_SPECS` / `_run_infra_script` / `_validate_infra_name` /
 `_registry_k8s_id`), and that shared base is what draws the module boundary.
 Pandora's other two tools — `aegis_self_diagnose` and `investigate_resource` —
-use none of it and stay in `services/chat.py`.
+use none of it and live in `tools/agents.py`.
 """
 
 from __future__ import annotations
 
-import functools
 import json
 import os
 import re
-from typing import Any
+from typing import Any, Literal
 
 import asyncpg
 
 from aegis.services.tools.base import ToolContext
+from aegis.services.tools.registry import aegis_tool
 
 _INFRA_CONTEXTS_SWARM = {"swarm"}
 # k8s "context" names that exist on the remote script host (the host that
@@ -72,8 +72,8 @@ async def _run_infra_script(
 
 # The 10 infra executors are one context-check → arg-validate → run-script
 # pipeline differing only in data. `_INFRA_SPECS` holds that data and `_exec_infra`
-# is the shared driver; the named `_exec_*` callables are `partial`s of it so the
-# `TOOL_EXECUTORS` registry and the test imports keep their exact identities.
+# is the shared driver; the named `_exec_*` tools below are typed shells that
+# pass their own key into it.
 #
 # spec = (script, contexts, ctx_default, ctx_err, timeout, arg_fields)
 #   ctx_err   "for_tool" → "Unsupported context for {tool}: {ctx}", else "Unsupported context: {ctx}"
@@ -237,24 +237,189 @@ async def _exec_infra(tool: str, pool: asyncpg.Pool, args: dict, ctx: ToolContex
     return await _run_infra_script(ctx, script, script_args, timeout=timeout)
 
 
-# Named callables for the registry + test imports. `partial` of a coroutine
-# function is itself awaitable, so `await _exec_list_nodes(pool, args, ctx)` works.
-_exec_list_nodes = functools.partial(_exec_infra, "list_nodes")
-_exec_list_services = functools.partial(_exec_infra, "list_services")
-_exec_inspect_service = functools.partial(_exec_infra, "inspect_service")
-_exec_get_service_logs = functools.partial(_exec_infra, "get_service_logs")
-_exec_restart_service = functools.partial(_exec_infra, "restart_service")
-_exec_list_pods = functools.partial(_exec_infra, "list_pods")
-_exec_list_deployments = functools.partial(_exec_infra, "list_deployments")
-_exec_get_pod_logs = functools.partial(_exec_infra, "get_pod_logs")
-_exec_list_argocd_apps = functools.partial(_exec_infra, "list_argocd_apps")
-_exec_sync_argocd_app = functools.partial(_exec_infra, "sync_argocd_app")
+# Named callables for the registry + test imports. Each is a thin typed shell
+# over `_exec_infra` whose docstring IS the advertised schema — a decorator
+# cannot be applied to a `functools.partial`, and the wording has to live
+# somewhere a human reads. The `_INFRA_SPECS` key each one passes is what
+# `test_chat_infra_tools.py` pins, script name by script name.
 
 
-async def _exec_restart_deployment(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
-    """Registry-only k8s tool (no script-host equivalent): rolling-restart a
-    deployment on a registered kind=k8s entry. Read-only entries refuse it."""
-    context = args.get("context", "")
+@aegis_tool
+async def _exec_list_nodes(
+    pool: asyncpg.Pool, ctx: ToolContext, *, context: Literal["swarm"]
+) -> str:
+    """List infrastructure cluster nodes and their status (up/down/drain). Use for checking Docker Swarm node health.
+
+    Args:
+        context: Infrastructure context. 'swarm' = homelab Docker Swarm.
+    """
+    return await _exec_infra("list_nodes", pool, {"context": context}, ctx)
+
+
+@aegis_tool
+async def _exec_list_services(
+    pool: asyncpg.Pool, ctx: ToolContext, *, context: Literal["swarm"]
+) -> str:
+    """List Docker Swarm services with replica counts, mode, and image versions."""
+    return await _exec_infra("list_services", pool, {"context": context}, ctx)
+
+
+@aegis_tool
+async def _exec_inspect_service(
+    pool: asyncpg.Pool, ctx: ToolContext, *, context: Literal["swarm"], service_name: str
+) -> str:
+    """Inspect a Docker Swarm service: tasks, errors, update state, placement.
+
+    Args:
+        service_name: Swarm service name (e.g. 'aegis_core')
+    """
+    return await _exec_infra(
+        "inspect_service", pool, {"context": context, "service_name": service_name}, ctx
+    )
+
+
+@aegis_tool
+async def _exec_get_service_logs(
+    pool: asyncpg.Pool,
+    ctx: ToolContext,
+    *,
+    context: Literal["swarm"],
+    service_name: str,
+    tail: int = 50,
+) -> str:
+    """Tail recent logs from a Docker Swarm service.
+
+    Args:
+        tail: Number of log lines (1-500)
+    """
+    return await _exec_infra(
+        "get_service_logs",
+        pool,
+        {"context": context, "service_name": service_name, "tail": tail},
+        ctx,
+    )
+
+
+@aegis_tool
+async def _exec_restart_service(
+    pool: asyncpg.Pool, ctx: ToolContext, *, context: Literal["swarm"], service_name: str
+) -> str:
+    """Force-update (rolling restart) a Docker Swarm service. Mutating action — executes immediately; refused when the matching infrastructure entry is marked read-only."""
+    return await _exec_infra(
+        "restart_service", pool, {"context": context, "service_name": service_name}, ctx
+    )
+
+
+@aegis_tool
+async def _exec_list_pods(
+    pool: asyncpg.Pool,
+    ctx: ToolContext,
+    *,
+    context: str,
+    namespace: str | None = None,
+    status: str | None = None,
+) -> str:
+    """List Kubernetes pods. Optionally filter by namespace and status (e.g. 'CrashLoopBackOff', 'Running', 'Pending').
+
+    Args:
+        context: Cluster: a script-host context (AEGIS_SCRIPT_HOST_K8S_CONTEXTS) or the slug of a registered kind=k8s infrastructure entry
+        namespace: Kubernetes namespace (omit for all)
+        status: Filter by phase or waiting reason
+    """
+    return await _exec_infra(
+        "list_pods", pool, {"context": context, "namespace": namespace, "status": status}, ctx
+    )
+
+
+@aegis_tool
+async def _exec_list_deployments(
+    pool: asyncpg.Pool, ctx: ToolContext, *, context: str, namespace: str | None = None
+) -> str:
+    """List Kubernetes deployments with replica status.
+
+    Args:
+        context: Cluster: a script-host context (AEGIS_SCRIPT_HOST_K8S_CONTEXTS) or the slug of a registered kind=k8s infrastructure entry
+        namespace: Kubernetes namespace (omit for all)
+    """
+    return await _exec_infra(
+        "list_deployments", pool, {"context": context, "namespace": namespace}, ctx
+    )
+
+
+@aegis_tool
+async def _exec_get_pod_logs(
+    pool: asyncpg.Pool,
+    ctx: ToolContext,
+    *,
+    context: str,
+    namespace: str,
+    pod_name: str,
+    tail: int = 50,
+    container: str | None = None,
+) -> str:
+    """Tail recent logs from a Kubernetes pod.
+
+    Args:
+        context: Cluster: a script-host context (AEGIS_SCRIPT_HOST_K8S_CONTEXTS) or the slug of a registered kind=k8s infrastructure entry
+        tail: Number of log lines (1-500)
+        container: Optional container name
+    """
+    return await _exec_infra(
+        "get_pod_logs",
+        pool,
+        {
+            "context": context,
+            "namespace": namespace,
+            "pod_name": pod_name,
+            "tail": tail,
+            "container": container,
+        },
+        ctx,
+    )
+
+
+@aegis_tool
+async def _exec_list_argocd_apps(
+    pool: asyncpg.Pool, ctx: ToolContext, *, context: str, filter: str | None = None
+) -> str:
+    """List ArgoCD applications with sync and health status. Optional filter: 'degraded', 'outofsync', 'synced', 'healthy'.
+
+    Args:
+        context: k8s cluster context: a configured script-host context (AEGIS_SCRIPT_HOST_K8S_CONTEXTS) with the argocd CLI
+        filter: Optional status filter
+    """
+    return await _exec_infra(
+        "list_argocd_apps", pool, {"context": context, "filter": filter}, ctx
+    )
+
+
+@aegis_tool
+async def _exec_sync_argocd_app(
+    pool: asyncpg.Pool, ctx: ToolContext, *, context: str, app_name: str
+) -> str:
+    """Trigger ArgoCD sync for an application. Mutating action — executes immediately.
+
+    Args:
+        context: k8s cluster context: a configured script-host context (AEGIS_SCRIPT_HOST_K8S_CONTEXTS) with the argocd CLI
+    """
+    return await _exec_infra(
+        "sync_argocd_app", pool, {"context": context, "app_name": app_name}, ctx
+    )
+
+
+@aegis_tool
+async def _exec_restart_deployment(
+    pool: asyncpg.Pool, ctx: ToolContext, *, context: str, namespace: str, deployment_name: str
+) -> str:
+    """Rolling-restart a Kubernetes deployment (kubectl rollout restart) on a registered k8s infrastructure entry. Mutating action — executes immediately; refused when the entry is marked read-only.
+
+    Args:
+        context: Slug of a registered k8s infrastructure entry
+
+    Returns:
+        Registry-only k8s tool (no script-host equivalent). Read-only entries refuse it.
+    """
+    args = {"context": context, "namespace": namespace, "deployment_name": deployment_name}
     infra_id = await _registry_k8s_id(pool, context)
     if infra_id is None:
         return json.dumps(
@@ -266,8 +431,9 @@ async def _exec_restart_deployment(pool: asyncpg.Pool, args: dict, ctx: ToolCont
     return await _exec_registry_k8s("restart_deployment", pool, args, ctx, infra_id)
 
 
-async def _exec_list_cloud_accounts(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
-    """Read-only listing of registered cloud accounts (kind=cloud entries)."""
+@aegis_tool
+async def _exec_list_cloud_accounts(pool: asyncpg.Pool, ctx: ToolContext) -> str:
+    """List registered cloud provider accounts (AWS accounts, GCP projects) from the infrastructure registry: slug, provider, status, and the account id / project recorded at the last provision. Read-only."""
     from aegis.services import infra as infra_service
 
     if pool is None:
@@ -283,15 +449,25 @@ async def _exec_list_cloud_accounts(pool: asyncpg.Pool, args: dict, ctx: ToolCon
     return json.dumps({"accounts": accounts}, default=str)
 
 
-async def _exec_cloud_identity(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
-    """Live identity check for one registered cloud account. Read-only; all
-    failure modes (unknown slug, missing CLI, bad credentials) come back as a
-    clear error envelope, never an exception."""
+@aegis_tool
+async def _exec_cloud_identity(
+    pool: asyncpg.Pool, ctx: ToolContext, *, slug: str, profile: str | None = None
+) -> str:
+    """Run a live identity check for a registered cloud account (`aws sts get-caller-identity` / GCP access-token check) and report which principal the stored credentials resolve to. Read-only.
+
+    Args:
+        slug: Slug of a registered cloud account (kind=cloud)
+        profile: AWS profile override; omit to use the account's default profile
+
+    Returns:
+        Every failure mode (unknown slug, missing CLI, bad credentials) comes
+        back as a clear error envelope, never an exception.
+    """
     from aegis.services import infra as infra_service
 
     if pool is None:
         return json.dumps({"error": "database not available"})
-    slug = (args.get("slug") or "").strip()
+    slug = (slug or "").strip()
     if err := _validate_infra_name(slug, "slug"):
         return json.dumps({"error": err})
     row = await infra_service.get_infra_by_slug(pool, slug, include_credentials=True)
@@ -300,7 +476,7 @@ async def _exec_cloud_identity(pool: asyncpg.Pool, args: dict, ctx: ToolContext)
             {"error": f"Unknown cloud account: {slug!r} — see list_cloud_accounts"}
         )
     secret_key = getattr(ctx.settings, "secret_key", "") or ""
-    profile = (args.get("profile") or "").strip() or None
+    profile = (profile or "").strip() or None
     result = await infra_service.cloud_identity_check(row, secret_key, profile=profile)
     if not result.get("ok"):
         return json.dumps({"error": result.get("error", "identity check failed")})
@@ -309,20 +485,33 @@ async def _exec_cloud_identity(pool: asyncpg.Pool, args: dict, ctx: ToolContext)
     )
 
 
-async def _exec_run_infra_script(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
+@aegis_tool
+async def _exec_run_infra_script(
+    pool: asyncpg.Pool,
+    ctx: ToolContext,
+    *,
+    context: str,
+    script_name: str,
+    args: list[str] | None = None,
+) -> str:
+    """Run an infrastructure script from the predefined scripts/infra/ directory by name (without the .sh suffix). The context is passed as the script's first argument. Prefer the dedicated infra tools (list_nodes, list_services, ...) when one matches.
+
+    Args:
+        context: 'swarm', or a configured script-host k8s context
+        script_name: Script file name, e.g. 'infra_list_nodes'
+        args: Arguments passed to the script
+    """
     # Runs scripts/infra/<script_name>.sh on the remote host with `context`
     # as the first argument — the same surface the dedicated infra tools use.
     # (The original implementation looked scripts up in the `resources` table
     # via a column that never existed, so this tool errored on every call.)
-    context = args.get("context", "")
     if context not in _INFRA_CONTEXTS_ALL:
         return json.dumps({"error": f"Unsupported context: {context}"})
-    script_name = args.get("script_name", "")
     err = _validate_infra_name(script_name, "script_name")
     if err:
         return json.dumps({"error": err})
 
-    script_args = args.get("args") or []
+    script_args = args or []
     if not isinstance(script_args, list):
         return json.dumps({"error": "args must be an array"})
     script_args = [str(a) for a in script_args]

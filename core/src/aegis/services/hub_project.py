@@ -51,6 +51,7 @@ import asyncpg
 import structlog
 
 from aegis.connectors.todoist import TodoistConnector
+from aegis.errors import error_text
 from aegis.services import work_sessions
 from aegis.services.agents import resolve_tag
 from aegis.services.books import parse_kv
@@ -65,6 +66,7 @@ from aegis.services.hub import (
     set_status,
     verify_seconds_for,
 )
+from aegis.services.settings_store import get_setting
 from aegis.services.todoist_config import resolve_todoist_api_key
 from aegis.services.tools.gtd import _capture_to_inbox_impl
 
@@ -81,18 +83,20 @@ COLLAPSE_WINDOW = timedelta(minutes=30)
 PROJECTED_STATUSES = frozenset(
     {"open", "investigating", "waiting_human", "fixing", "verifying", "resolved"}
 )
-# The four alert producers: something outside AEGIS fired, and the same
-# producer sends a resolution when it recovers, so what they raise may turn out
-# to have been a blip. Only these wait out a settle window before earning a
-# task (#537).
+# The two producers OUTSIDE AEGIS that send their own resolution: a monitoring
+# stack and the swarm heartbeat both re-check on a scale of seconds, so what
+# they raise may turn out to have been a blip, and only these wait out a settle
+# window before earning a task (#537).
 #
-# Every other source projects on sight. Not because none of them can pass on
-# their own — a watchdog finding (`social`, `drift`, `expiry`, `llm_governor`)
-# resolves itself when the next sweep stops finding it — but because those
-# sweeps run on their own cadence and have already decided the thing is worth
-# reporting, and because the money, research and manual sources are judgements
-# that no amount of waiting makes truer.
-_SELF_CLEARING_SOURCES = frozenset({"alertmanager", "heartbeat", "flow_health", "delivery"})
+# Every other source projects on sight, including the watchdogs that also
+# resolve their own findings (`flow_health`, `delivery`, `social`, `drift`,
+# `expiry`, `llm_governor`). They were in this set at first, which was a
+# mistake of kind rather than of degree: those sweeps run every 30 minutes or
+# hourly, so a three-minute window cannot observe a blip they would clear — it
+# can only delay the task. And they have already decided the thing is worth
+# reporting before the hub hears about it at all. The money, research and manual
+# sources are judgements that no amount of waiting makes truer.
+_SELF_CLEARING_SOURCES = frozenset({"alertmanager", "heartbeat"})
 _BLOCK_RE = re.compile(r"<!-- aegis:problem [^>]*-->.*?<!-- /aegis:problem -->", re.S)
 _HISTORY_KINDS = frozenset({"investigation", "plan", "session_note"})
 # A plan of one step is a sentence, not a plan; more than this and the
@@ -100,7 +104,6 @@ _HISTORY_KINDS = frozenset({"investigation", "plan", "session_note"})
 _MIN_PLAN_STEPS = 2
 _MAX_PLAN_STEPS = 12
 _STEP_CAP = 200
-_FALLBACK_LABEL = "@pandora"
 _DESCRIPTION_CAP = 2000
 # What the timeline says when a completed task resolved its problem.
 TASK_COMPLETED_REASON = "its Todoist task was completed by a person, not by the hub"
@@ -116,18 +119,23 @@ _BOOKS_PROJECTS_SETTING = "integration:books_todoist_projects"
 
 @dataclass(frozen=True)
 class _Owner:
-    """Who a problem's task belongs to, and so how it is tagged and filed."""
+    """Who a problem's task belongs to, and so how it is tagged and filed.
+
+    The assignee label is resolved from the agent holding `agent_tag`
+    (`_assignee_label`) — never a literal id, so a fork that renames its
+    agents changes nothing here. No holder means no assignee label; the task
+    still carries `extra_labels` (a GTD state), so it is never invisible (#139).
+    """
 
     source_tag: str
     agent_tag: str
-    fallback_label: str
     # Labels after the assignee's.
     extra_labels: tuple[str, ...] = ()
     # The `books_todoist_projects` entry the task is filed in; "" is the Inbox.
     books_entity: str = ""
 
 
-_INFRA_OWNER = _Owner(SOURCE_TAG, "infra", _FALLBACK_LABEL)
+_INFRA_OWNER = _Owner(SOURCE_TAG, "infra")
 # Problems another agent owns, by the source of their first occurrence. All 13
 # money problems in prod (2026-09-11) were projected as `#alert @pandora` in the
 # Inbox, and the agent sweep then ran Pandora's infra verb on them and parked
@@ -144,8 +152,8 @@ _INFRA_OWNER = _Owner(SOURCE_TAG, "infra", _FALLBACK_LABEL)
 # The research agent's two kinds (#513), both in the Inbox, both `@next`:
 #
 # * `#research`: a tracked topic's round that crossed its threshold, or a
-#   `#research` task's question. Raphael can work these, so the agent sweep
-#   may run the `research` verb on them.
+#   `#research` task's question. The research agent can work these, so the
+#   agent sweep may run the `research` verb on them.
 # * `#feeds`: a feed that stopped fetching or publishing. The user fixes or
 #   drops it; `agent_task.EXCLUDED_LABELS` keeps the sweep off it.
 #
@@ -158,9 +166,9 @@ FEEDS_SOURCE_TAG = "#feeds"
 # carry, so the agent lane needs a verb decision for each
 # (`test_agent_task_verbs` reads them from here).
 _OWNER_BY_SOURCE = {
-    "money": _Owner(MONEY_SOURCE_TAG, "finance", "@maou", ("@next",), "personal"),
-    "research": _Owner(RESEARCH_SOURCE_TAG, "research", "@raphael", ("@next",)),
-    "feeds": _Owner(FEEDS_SOURCE_TAG, "research", "@raphael", ("@next",)),
+    "money": _Owner(MONEY_SOURCE_TAG, "finance", ("@next",), "personal"),
+    "research": _Owner(RESEARCH_SOURCE_TAG, "research", ("@next",)),
+    "feeds": _Owner(FEEDS_SOURCE_TAG, "research", ("@next",)),
 }
 
 
@@ -279,7 +287,7 @@ async def _create_plan_steps(
             return 0
         mapping = ((result or {}).get("data") or {}).get("temp_id_mapping") or {}
     except Exception as exc:  # noqa: BLE001 — a plan is worth a comment even with no subtasks
-        logger.warning("hub_project_steps_failed", task_id=task_id, error=str(exc)[:200])
+        logger.warning("hub_project_steps_failed", task_id=task_id, error=error_text(exc))
         return 0
     made = 0
     for index, cmd in enumerate(cmds, start=1):
@@ -381,7 +389,7 @@ async def ensure_problem_for_task(
             ),
         )
     except ValueError as exc:
-        logger.warning("hub_problem_for_task_refused", task_id=task_id, error=str(exc)[:200])
+        logger.warning("hub_problem_for_task_refused", task_id=task_id, error=error_text(exc))
         return None
     if not result.problem_id:
         return None
@@ -398,21 +406,22 @@ def merge_block(description: str | None, block: str) -> str:
     return (base.rstrip() + "\n\n" + block) if base.strip() else block
 
 
-async def _assignee_label(
-    pool: asyncpg.Pool, tag: str = "infra", fallback: str = _FALLBACK_LABEL
-) -> str:
+async def _assignee_label(pool: asyncpg.Pool, tag: str = "infra") -> str:
     """The label that assigns the task to the agent holding ``tag`` — its first
-    mention alias — falling back to ``fallback``. Never raises."""
+    mention alias — or "" when no active agent holds it (logged: the task is
+    then created with no assignee, and its GTD state label alone). Never
+    raises."""
     try:
         agent_id = await resolve_tag(pool, tag)
         if not agent_id:
-            return fallback
+            logger.warning("hub_project_owner_unresolved", tag=tag)
+            return ""
         meta = await pool.fetchval("SELECT metadata FROM agents WHERE id = $1", agent_id)
         aliases = (meta or {}).get("mention_aliases") or [agent_id]
         return f"@{str(aliases[0]).lstrip('@')}"
     except Exception as exc:  # noqa: BLE001 — a label lookup must never block a task
-        logger.warning("hub_project_label_failed", tag=tag, error=str(exc)[:200])
-        return fallback
+        logger.warning("hub_project_label_failed", tag=tag, error=error_text(exc))
+        return ""
 
 
 async def _first_source(pool: asyncpg.Pool, problem_id: str) -> str:
@@ -439,13 +448,11 @@ async def _books_project(pool: asyncpg.Pool, entity: str) -> str | None:
     row first, then the env, then None — the Inbox. Never raises."""
     raw = ""
     try:
-        stored = await pool.fetchval(
-            "SELECT value FROM settings WHERE key = $1", _BOOKS_PROJECTS_SETTING
-        )
+        stored = await get_setting(pool, _BOOKS_PROJECTS_SETTING)
         if isinstance(stored, dict):
             raw = str(stored.get("val") or "")
     except Exception as exc:  # noqa: BLE001 — a project lookup must never block a task
-        logger.warning("hub_project_books_projects_failed", error=str(exc)[:200])
+        logger.warning("hub_project_books_projects_failed", error=error_text(exc))
     project = parse_kv(raw).get(entity)
     if not project:
         project = parse_kv(str(getattr(_settings(), "books_todoist_projects", "") or "")).get(
@@ -482,7 +489,7 @@ async def _post_note(pool: asyncpg.Pool, settings: Any, task_id: str, text: str)
             logger.warning("hub_project_note_failed", task_id=task_id, status=status)
         return bool(status["ok"])
     except Exception as exc:  # noqa: BLE001
-        logger.warning("hub_project_note_failed", task_id=task_id, error=str(exc)[:200])
+        logger.warning("hub_project_note_failed", task_id=task_id, error=error_text(exc))
         return False
 
 
@@ -626,9 +633,10 @@ def _history_text(kind: str, payload: dict[str, Any]) -> str:
     return f"{head}: {text}" if text else head
 
 
-async def _topic_digest(pool: asyncpg.Pool, problem_id: str, limit: int = 10) -> str:
+async def _topic_digest(pool: asyncpg.Pool, problem_id: str, limit: int | None = None) -> str:
     """What a topic's round collected, newest first, as the task's description
-    (#513): one line per article, linked."""
+    (#513): one line per article, linked. At most `limit`, or the
+    `research_topics_config` row's `digest_items`."""
     from aegis.services.research_topics import round_items
 
     lines = []
@@ -696,7 +704,7 @@ async def project(
 
     if not task_id and p["class"] == TOPIC_CLASS and not meta.get("attention"):
         # A tracked topic's round of news earns a task only once it holds
-        # enough items (`research_topics.ATTENTION_ITEMS`, #513). Until then it
+        # enough items (`Topic.threshold_for`, #513). Until then it
         # lives in the hub and Raphael's briefing. Its events are marked seen,
         # so the sweep does not come back for them; the task, when the round
         # crosses its threshold, lists the round's items itself.
@@ -740,6 +748,13 @@ async def project(
         # `first_seen_at` alone, so a problem that blipped, resolved untasked,
         # and came back is already past its window and projects at once — the
         # second episode is the evidence the first one lacked.
+        #
+        # That holds within `REOPEN_WINDOW` (24h), which is the whole of what it
+        # claims: a return after that is a `rollover`, a fresh problem with a
+        # fresh `first_seen_at`, so it waits out the window like any first
+        # sighting. "A return within a day of the resolve is a pattern" is the
+        # rule. Measuring age from the CURRENT episode instead would make a
+        # service that flaps every three minutes invisible forever.
         #
         # The investigation is untouched — Pandora diagnoses and posts its
         # Slack card immediately. Only the human's chore waits.
@@ -791,16 +806,14 @@ async def project(
         project_id = (
             await _books_project(pool, owner.books_entity) if owner.books_entity else None
         )
+        assignee = await _assignee_label(pool, owner.agent_tag)
         task_id = await _capture_to_inbox_impl(
             pool,
             owner.source_tag,
             f"problem-{problem_id}",
             p["title"][:120],
             description[:_DESCRIPTION_CAP],
-            [
-                await _assignee_label(pool, owner.agent_tag, owner.fallback_label),
-                *owner.extra_labels,
-            ],
+            [label for label in (assignee, *owner.extra_labels) if label],
             project_id=project_id,
         )
         if not task_id:
@@ -1016,11 +1029,39 @@ async def project_pending(
     out = []
     for r in rows:
         try:
-            out.append(await project(pool, r["id"], settings=settings, now=now))
+            result = await project(pool, r["id"], settings=settings, now=now)
+            await _note_projection(pool, r["id"], result, now)
+            out.append(result)
         except Exception as exc:  # noqa: BLE001 — one bad problem must not stop the sweep
-            logger.warning("hub_project_failed", problem_id=r["id"], error=str(exc)[:200])
-            out.append({"problem_id": r["id"], "error": str(exc)[:200]})
+            logger.warning("hub_project_failed", problem_id=r["id"], error=error_text(exc))
+            out.append({"problem_id": r["id"], "error": error_text(exc)})
     return out
+
+
+async def _note_projection(
+    pool: asyncpg.Pool, problem_id: str, result: dict[str, Any], now: datetime
+) -> None:
+    """Leave the sweep's verdict on the problem, so the admin page can say WHY
+    a problem has no task yet (settling, waiting on the outbox, resolved before
+    it earned one) instead of showing a blank. `metadata.projection` is written
+    when the reason changes and dropped once the task exists; `at` is when the
+    current reason was first seen. Nothing reads it back but the page."""
+    skipped = result.get("skipped")
+    if skipped:
+        note = {k: v for k, v in result.items() if k != "problem_id"} | {"at": now.isoformat()}
+        await pool.execute(
+            "UPDATE problems SET metadata = metadata || jsonb_build_object('projection', $2::jsonb) "
+            "WHERE id = $1::uuid AND COALESCE(metadata->'projection'->>'skipped', '') <> $3",
+            problem_id,
+            note,
+            skipped,
+        )
+    elif result.get("task_id"):
+        await pool.execute(
+            "UPDATE problems SET metadata = metadata - 'projection' "
+            "WHERE id = $1::uuid AND metadata ? 'projection'",
+            problem_id,
+        )
 
 
 async def reconcile_completed_tasks(
@@ -1110,7 +1151,7 @@ async def reconcile_completed_tasks(
             ):
                 out.append({**row, "action": "resolved"})
         except Exception as exc:  # noqa: BLE001 — one bad problem must not stop the sweep
-            logger.warning("hub_task_completion_failed", problem_id=r["id"], error=str(exc)[:200])
+            logger.warning("hub_task_completion_failed", problem_id=r["id"], error=error_text(exc))
     if out:
         logger.info(
             "hub_task_completions_reconciled",

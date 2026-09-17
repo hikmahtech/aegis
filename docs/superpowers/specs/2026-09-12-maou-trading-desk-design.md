@@ -57,8 +57,37 @@ nothing on this desk. Every number is computed by code.
 
 ## 3. The daily run
 
-`TradingDeskFlow` runs on weekdays at 08:00 IST (`30 2 * * 1-5`), before the market opens at 09:15.
-One idempotent activity does the steps below in order. Running it twice in a day changes nothing.
+`TradingDeskFlow` runs on weekdays at 08:00, 11:00 and 14:00 market time
+(`CRON_TZ=Asia/Kolkata 0 8,11,14 * * 1-5`). One idempotent activity does the steps below in order.
+Running it more than once in a day changes nothing.
+
+> **Amendment, 2026-09-15 (#591): fills move from the close to the open, and the run fires three
+> times a day.**
+>
+> A signal comes from the previous session's close. Filling at the NEXT close meant the desk sat on
+> it for a whole session — a systematic one-session lag in every figure it reports — and left every
+> order pending overnight. It now fills at the open, which is the earliest price that signal could
+> actually have bought.
+>
+> **08:00 plans, before the market opens. 11:00 fills at that open. 14:00 retries a fill a source
+> outage left undone.** The pre-open plan is not a scheduling preference, it is what makes the open
+> a legitimate fill price: an order planned at 11:00 and filled at that day's 09:15 open would have
+> paid a price struck before the decision existed. `_tick` enforces it rather than trusting the
+> cron — once today's index bar has an open, the plan step is skipped and the run reports
+> `skipped_plan: "after_open"`. That skip also raises a `desk_plan_skipped` finding (#593): a
+> day the pre-open run never fired is a lost trading day, and it should be a problem the hub
+> owns rather than a key in `result_summary`. The next run that plans resolves it.
+>
+> **The trading calendar did not change.** `index_days` is still days with a *close*, because it is
+> what `day` is read off, and a session that has not closed has no decisions yet. Filling uses a
+> second, wider list that may include today. Widening the one calendar would make `day` become
+> today, and the desk would report `held_stale` every trading day.
+>
+> The schedule is written in market time via a `CRON_TZ=` prefix that `schedule_sync` passes to
+> Temporal, because the guard above is about 09:15 *there*. A cron with no prefix is still UTC.
+>
+> `fill_at` (`open` | `close`) is config, defaulting to `close` — so a deployment that has not opted
+> in is unchanged, and the switch is reversible without a deploy.
 
 1. **Find the day.** The last NSE trading day is the latest Yahoo bar date for `^NSEI` strictly
    before today (IST). This needs no holiday calendar. If Yahoo fails here, the run stops after
@@ -73,11 +102,14 @@ One idempotent activity does the steps below in order. Running it twice in a day
    `finance.desk_prices`. A stored close is **never overwritten**, because Yahoo rewrites past
    closes after a split: RELIANCE's 2024 bonus shows as about ₹1,338 for days that traded at about
    ₹2,677. So the first fetch of a day, made the morning after it, is the raw price the desk needs,
-   and a later fetch would be split-adjusted. A bar for today or later is never stored, because it
-   could be an intraday price. Split and dividend events are filled in if a later fetch has them
-   and the stored row doesn't.
-4. **Fill.** Fill each pending paper order at the close of its fill day (§6). If that close is not
-   out yet, leave the order pending.
+   and a later fetch would be split-adjusted. A bar dated after today is never stored. **Today's bar
+   is stored for its `open` alone**: the open is the session's first trade, settled from the moment
+   the market opens, while the `close` on that same bar is the live price and still moving — and a
+   stored close is never overwritten, so keeping it would pin an intraday number as the day's close
+   for ever. A later run fills the real close in. Split and dividend events are filled in if a later
+   fetch has them and the stored row doesn't.
+4. **Fill.** Fill each pending paper order on its fill day (§6), at the open under `fill_at: open`
+   and otherwise at the close. If no price is out yet, leave the order pending.
 5. **Plan.** If no plan exists yet for that date and no order is pending, run the checks (§5). If
    they pass, turn the decisions into orders (§4). Write one `finance.desk_plans` row for the date
    whatever the outcome, in the same transaction as its orders, so a date is acted on once.
@@ -156,12 +188,16 @@ the day out of the `held_back` count, which is for days the desk did nothing on.
 ## 6. Paper fills and valuation
 
 - **Fill day:** the first NSE trading day on or after the day the order was created. An order
-  created at 08:00 on a trading day fills at that day's close, and the next morning's run records
-  it.
+  created at 08:00 on a trading day fills at that day's open, and the 11:00 run records it the same
+  morning. Under `fill_at: close` it fills at that day's close instead, and the next morning's run
+  records it — the behaviour before #591.
 - **Fill order:** sells fill before buys. Prices move between planning and the fill, so a buy
   that would take cash below zero is cut to what fits. If no share fits, it is cancelled with the
   reason `no_cash`.
-- **Fill price:** Yahoo's raw close for the fill day. If Yahoo has no bar, use ansaar's price for
+- **Fill price:** Yahoo's raw **open** for the fill day under `fill_at: open`, else its raw close.
+  An open that never arrives falls back to that day's close rather than cancelling the order, and
+  `desk_orders.price_kind` records which print was actually used — without it a desk quietly filling
+  everything at the close would be indistinguishable from one filling at the open. If Yahoo has no bar, use ansaar's price for
   that date and set `price_source = 'ansaar'`. The ansaar prices endpoints return rows newest
   first and `volume` as a string. If neither source has a price three trading days after the fill
   day, cancel the order with the reason `price_missing` and raise `desk_price_missing` for that
@@ -199,7 +235,10 @@ the day out of the `held_back` count, which is for days the desk did nothing on.
 
 ## 8. The score
 
-- **Start:** the first fill date. Paper capital is `capital` (default ₹1,00,000).
+- **Start:** the first fill date. Paper capital is `capital` (default ₹1,00,000), and it is fixed
+  from the first fill: `replay` starts the book from it on every past day, so an edit afterwards
+  would restate the whole history. `desk_rules.save` refuses one, with a reason. A deposits
+  table, where a change is an event, is the proper answer and is the live spec's job (#526).
 - **Benchmark:** `SHARIABEES.NS` (the Nifty 50 Shariah ETF), the fair comparison for a halal
   investor. It's bought with the same capital at the start close and pays one buy cost. From then
   on it's held the way the desk holds: its splits adjust the units, and its dividends are paid as
@@ -211,6 +250,12 @@ the day out of the `held_back` count, which is for days the desk did nothing on.
   `benchmark_prices` in the rules (§12). An unmapped benchmark gets no fallback, as before. The
   index is never backfilled — its bars are the market calendar, and the desk takes that from one
   source only.
+- **A benchmark that stops being priced is a finding, not a silence.** No close for
+  `PRICE_GRACE_DAYS` market days raises `desk_price_missing` for it, exactly as it does for a
+  holding, same class and same subject shape so the daily run's own reconcile clears it when the
+  price comes back. Without it `benchmark_values` returns an empty series, the weekly gap has
+  nothing to compare, the label reads "too early" for ever and the rendered figure is blank: the
+  score quietly stops meaning anything (#524).
 - **No adjusted closes anywhere.** Yahoo rescales its adjusted close after every later dividend,
   so a value stored in September and one fetched in December are in different scales, and their
   ratio is wrong by the dividend.
@@ -275,6 +320,7 @@ The monthly check reads this one.
 Holding (paper) 9 names, 12% cash: TCS, INFY, HCLTECH, GOLDBEES, ...
 This month: 23 orders, ₹612 in costs.
 Days held back: 2 (1 stale, 1 suspect). Prices from ansaar: 1.
+Idle weekdays: 3 — no new market day to act on (a market holiday, or a day the price source did not serve).
 Risk halt on 22 Nov: the desk sold its whole book. DAILY_LOSS fired on 19 Nov.
 Check: XYZ moved −51% on 3 Nov. Possible missing split.
 ```
@@ -293,7 +339,7 @@ map in `hub_project`). A problem resolves itself on the first run that no longer
 | `desk_decisions_stale` | `decisions` | the daily run |
 | `desk_decisions_suspect` | `decisions` | the daily run |
 | `desk_source_error` | `ansaar` or `yahoo` | the daily run |
-| `desk_price_missing` | the symbol | the daily run |
+| `desk_price_missing` | the symbol, of a holding **or a benchmark** | the daily run |
 | `desk_below_expectation` | `desk` | the monthly close only, so while it holds it comes back once a month, not every day |
 
 ## 11. Data
@@ -385,18 +431,36 @@ Integrations page, with matching `Settings` fields defaulting to empty:
 activity and by the monthly close. It is not passed through the workflow input, because
 `trigger_workflow` ignores activity config.
 
+**The code names no market.** AEGIS is forked and configured for someone else's life, so the
+exchange calendar, the clock, the ticker shape, the currency, the financial year and the tax rates
+are all settings, exactly as `email_triage_rules` and `project_repo_map` ship empty rather than
+carrying one operator's senders and repos. `desk_math.Rules`'s defaults are neutral; what follows
+is the SEEDED EXAMPLE (`config/seed/activities.yaml`), one operator's desk on the NSE.
+
 ```yaml
 mode: paper               # 'live' is refused until the live spec lands
+# the market -- what only the operator can know
+calendar_symbol: ^NSEI    # whose bars ARE the trading calendar; REQUIRED
+market_tz: Asia/Kolkata   # the clock "today" is read from
+symbol_suffix: .NS        # what the price source appends per exchange; US listings need none
+currency: INR             # the ISO code every figure on this desk is in
+fy_start_month: 4         # 1 is the calendar year; 4 is April-to-March
+stale_calendar_days: 6    # days before the trading calendar itself looks wrong
+stale_price_days: 7       # days before a price is too old to size or sell on
+# the money
 capital: 100000
 asset_classes: [equity, etf]
 cost_pct_per_side: 0.002
-sell_charge_inr: 16
+sell_charge: 16           # was sell_charge_inr
 band_abs: 0.02
 band_rel: 0.25
 max_order_pct: 0.25
+# the tax model
 tax_rate: {equity: 0.20, etf: 0.30}
-ltcg_rate: 0.125
-ltcg_exemption_inr: 125000
+long_term_rate: 0.125                   # was ltcg_rate
+long_term_exemption: 125000             # was ltcg_exemption_inr
+long_term_exemption_classes: [equity]   # was `asset_class == "equity"` in the code
+# the score
 benchmark: SHARIABEES.NS
 context_benchmark: ^NSEI
 benchmark_prices:            # where a benchmark's prices can also come from
@@ -404,16 +468,46 @@ benchmark_prices:            # where a benchmark's prices can also come from
 expected_excess_pa: 0.06
 ```
 
+| Code default | Why it is neutral |
+|---|---|
+| `calendar_symbol: ""` | The desk cannot tell a market day from a holiday without it, so it does nothing. |
+| `market_tz: UTC` | An unknown zone name falls back to UTC at read time; the write path 400s on it. |
+| `symbol_suffix: ""` | The symbol is already in the price source's form — which is true for US listings. |
+| `currency: ""` | `fmt_money` prints grouped digits with no symbol. |
+| `fy_start_month: 1` | The calendar year, which is most countries'. |
+| `tax_rate: {}`, `long_term_*: 0` | No tax model stated means no tax deducted, and the page labels that rather than showing a zero that reads like a result. |
+| `capital: 0`, `expected_excess_pa: 0` | No money and no claim about the backtest. |
+| `benchmark: ""`, `context_benchmark: ""` | The desk still says what it is worth; only the comparison goes missing. |
+| `stale_calendar_days: 6`, `stale_price_days: 7` | Not one market's numbers — a long weekend plus a holiday in any Mon-Fri market. A market with longer normal closures raises the first. |
+
 `benchmark_prices` maps a benchmark's Yahoo name to what ansaar wants. It is empty in the code
 defaults, so a fork ships nobody's tickers, and an entry missing either half is dropped rather than
 half-applied. The seed row carries the mapping for the benchmark it names — but `activities.config`
 is DB-owned after the first insert, so **an existing deployment needs the mapping written to its
 row** (§16).
 
+**Three keys were renamed** to drop a currency from their names: `sell_charge_inr` →`sell_charge`,
+`ltcg_rate` → `long_term_rate`, `ltcg_exemption_inr` → `long_term_exemption`. `Rules.from_config`
+reads BOTH names, newest first, because `schedule_sync` re-reads this row every few minutes and no
+ordering of the deploy and the config write would close the gap. `desk_math.legacy_keys` names what
+is still stored under an old key, which the daily run logs once and the admin page shows. Migration
+048 rewrites a live row: it renames the three keys and fills in the market keys with exactly the
+values the code used to hardcode, so the day after the deploy is arithmetically the same as the day
+before.
+
+**Where it is set:** the admin Trading desk page (`/admin/desk`) has a settings panel over
+`GET/PUT /api/admin/money/desk/rules` (`services/desk_rules.py`) covering the market, the money, the
+tax model and the benchmarks. It is a MERGE, not a replacement: the knobs it does not show keep
+their stored values, and the Flows page still edits the whole row as raw JSON. Reading is lenient
+and writing is strict — a bad timezone or a rate outside 0 to 1 is a 400, because the read path's
+forgiveness is exactly what would hide a typo for months.
+
 **Gates:**
 - The seed row ships `active: false`, so a fork never runs it.
 - The FlowSpec uses `feature_flag="money_hygiene_enabled"`.
 - With `ansaar_url` empty, the activity logs `trading_desk_unconfigured` and does nothing.
+- With `calendar_symbol` empty, `run_tick` logs `trading_desk_unconfigured`, returns
+  `skipped: unconfigured` and does nothing — no finding, no Todoist task, and no fallback market.
 
 ## 13. Code layout
 

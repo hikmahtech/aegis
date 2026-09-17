@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import asyncpg
@@ -25,6 +26,9 @@ router = APIRouter(prefix="/api/agents", dependencies=[Depends(verify_auth)])
 
 # Persona editor endpoints (admin UI) — separate prefix, same auth.
 admin_router = APIRouter(prefix="/api/admin/agents", dependencies=[Depends(verify_auth)])
+
+# A Slack emoji shortcode, as `icon_emoji` takes it: `:books:`, `:+1:`.
+_SLACK_ICON_RE = re.compile(r"^:[a-z0-9_+'-]+:$")
 
 
 @admin_router.get("/{agent_id}/personality")
@@ -118,9 +122,11 @@ async def list_agents(request: Request, active: bool = True) -> list[dict[str, A
 
 @router.get("/meta/options")
 async def get_agent_options() -> dict[str, Any]:
-    """Vocabulary for the admin Behavior tab: behavior tags, chat tools, tiers."""
+    """Vocabulary for the admin Behavior tab: behavior tags, chat tools, tiers,
+    and the knowledge source types an agent's `knowledge_domains` can name."""
     from aegis.agent_tags import BEHAVIOR_TAGS
     from aegis.services.chat import CHAT_TOOLS
+    from aegis.services.source_types import SOURCE_TYPES
 
     tools = []
     for spec in CHAT_TOOLS:
@@ -131,6 +137,7 @@ async def get_agent_options() -> dict[str, Any]:
         "tags": [{"id": t, "description": d} for t, d in BEHAVIOR_TAGS.items()],
         "tools": sorted(tools, key=lambda t: t["name"]),
         "model_tiers": ["fast", "balanced", "smart"],
+        "source_types": sorted(SOURCE_TYPES),
     }
 
 
@@ -166,6 +173,24 @@ def _validate_agent_patch(body: dict[str, Any]) -> None:
     async_dispatch = metadata.get("async_dispatch")
     if async_dispatch is not None and not isinstance(async_dispatch, bool):
         raise HTTPException(status_code=400, detail="metadata.async_dispatch must be a boolean")
+
+    domains = metadata.get("knowledge_domains")
+    if domains is not None and (
+        not isinstance(domains, list) or not all(isinstance(d, str) and d.strip() for d in domains)
+    ):
+        raise HTTPException(
+            status_code=400, detail="metadata.knowledge_domains must be a list of source types"
+        )
+
+    # A Slack emoji shortcode such as :books:. Empty means the default robot.
+    icon = metadata.get("slack_icon")
+    if icon is not None and icon != "" and (
+        not isinstance(icon, str) or not _SLACK_ICON_RE.match(icon)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=f"metadata.slack_icon must be an emoji shortcode like :books:, got {icon!r}",
+        )
 
 
 @router.post("", status_code=201)
@@ -295,17 +320,16 @@ async def draft_persona(agent_id: str, request: Request, body: dict[str, Any]) -
 async def get_agent_tools(agent_id: str, request: Request) -> list[dict[str, str]]:
     """Return the tool set this agent has access to, joined with tool descriptions.
 
-    Prefers the agent's DB metadata.tool_set (so UI-created agents work), falling
-    back to the hardcoded AGENT_TOOL_SETS — mirrors chat.py's _get_agent_tools.
+    The agent's `metadata.tool_set`, or the small `_FALLBACK_TOOL_SET` when it
+    has none — exactly what chat.py's `_get_agent_tools` gives it. Never a set
+    keyed on the agent's id (#579).
     """
-    from aegis.services.chat import AGENT_TOOL_SETS, CHAT_TOOLS
+    from aegis.services.chat import _FALLBACK_TOOL_SET, CHAT_TOOLS
 
     agent = await _get_agent(request.app.state.db_pool, agent_id)
     if agent is None:
         raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found")
-    tool_names = (
-        (agent.get("metadata") or {}).get("tool_set") or AGENT_TOOL_SETS.get(agent_id) or []
-    )
+    tool_names = (agent.get("metadata") or {}).get("tool_set") or _FALLBACK_TOOL_SET
 
     descriptions: dict[str, str] = {}
     for spec in CHAT_TOOLS:

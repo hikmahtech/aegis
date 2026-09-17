@@ -10,10 +10,55 @@ from pydantic import BaseModel
 
 from aegis.api.auth import verify_auth
 from aegis.api.deps import get_knowledge_connector as _get_connector
-from aegis.api.deps import get_settings
+from aegis.api.deps import get_pool, get_settings
+from aegis.api.settings_routes import settings_row_routes
 from aegis.config import Settings
+from aegis.observability import log_audit
+from aegis.services import knowledge_ranking
 
 router = APIRouter(prefix="/api/knowledge", dependencies=[Depends(verify_auth)])
+# How a chat turn ranks what the store finds (`knowledge_ranking`, #579).
+admin_router = APIRouter(prefix="/api/admin/knowledge", dependencies=[Depends(verify_auth)])
+
+
+def _ranking_view(cfg: dict[str, Any]) -> dict[str, Any]:
+    """The row as the admin page edits it, beside the shipped values it overrides."""
+    return {
+        **cfg,
+        "defaults": {
+            "domain_boost": knowledge_ranking.DEFAULT_DOMAIN_BOOST,
+            "decay_days": knowledge_ranking.DEFAULT_DECAY_DAYS,
+        },
+        "limits": {
+            "domain_boost": knowledge_ranking.MAX_DOMAIN_BOOST,
+            "rank_boost": knowledge_ranking.MAX_RANK_BOOST,
+            "decay_days": knowledge_ranking.MAX_DECAY_DAYS,
+        },
+        "registry": knowledge_ranking.registry_view(),
+    }
+
+
+settings_row_routes(
+    admin_router,
+    "/ranking",
+    get=knowledge_ranking.get_ranking_config,
+    save=knowledge_ranking.save_ranking_config,
+    view=lambda _pool, cfg: _ranking_view(cfg),
+    audit=lambda request, cfg: log_audit(
+        get_pool(request),
+        actor="admin",
+        action="knowledge_ranking_saved",
+        target_type="settings",
+        target_id=knowledge_ranking.SETTINGS_KEY,
+        details=cfg,
+    ),
+    doc=(
+        "How a chat turn ranks what the knowledge store finds "
+        "(`settings.knowledge_ranking`), beside the shipped registry it overrides. The PUT "
+        "answers 400 — not a silent drop — on a bad type name, a negative or non-finite "
+        "boost, or decay days under one."
+    ),
+)
 
 # Extensions the folder/upload seeders will try to extract.
 _TEXT_EXTS = {".txt", ".md", ".markdown", ".html", ".htm", ".pdf", ".json", ".csv", ".rst"}

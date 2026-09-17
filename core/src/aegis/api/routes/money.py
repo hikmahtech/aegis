@@ -1,9 +1,12 @@
 """Admin endpoints for Maou's money: the books, the bills, the statements and
 the trading desk.
 
-Everything here is READ-ONLY apart from the one pre-existing flow trigger. The
-desk holds real paper positions and the journal is the owner's real accounting,
-so the page can show and cannot act.
+Everything here reads, apart from the flow trigger, the desk's own market
+settings and the books' chart of accounts. The desk holds real paper positions
+and the journal is the owner's real accounting, so the page can show and cannot
+trade or post: the only writes are configuration — which market, which
+currency, which tax law (`desk_rules`), and which sets of books exist and which
+category posts where (`books_chart`) — each checked before it is stored.
 
 Two rules run through the whole module:
 
@@ -35,8 +38,10 @@ from temporalio.client import Client as TemporalClient
 from aegis.api.auth import verify_auth
 from aegis.api.deps import get_settings
 from aegis.api.routes._flow_trigger import require_temporal_client, start_named_workflow
+from aegis.api.settings_routes import settings_row_routes
 from aegis.config import Settings
-from aegis.services import books, desk_math, trading_desk
+from aegis.errors import error_text
+from aegis.services import books, books_chart, desk_math, desk_rules, trading_desk
 from aegis.services.journal_index import OPEN_DUE_SQL, TICKED_OFF_SQL
 from aegis.services.money_format import currency_symbol
 
@@ -71,8 +76,9 @@ _EVENT_COLUMNS = (
 )
 
 
-async def _start_workflow(flow: str, cfg: dict, temporal_client: TemporalClient):
-    return await start_named_workflow(flow, cfg, temporal_client, _FLOW_NAMES)
+async def _start_workflow(flow: str, cfg: dict, temporal_client: TemporalClient, pool=None):
+    # With a pool, the run's agent is the flow's activities-row owner (#579).
+    return await start_named_workflow(flow, cfg, temporal_client, _FLOW_NAMES, pool=pool)
 
 
 def _event(row) -> dict:
@@ -121,7 +127,7 @@ async def money_state(request: Request, settings: Settings = Depends(get_setting
     except Exception as exc:  # noqa: BLE001 — a missing/degraded checkout is a
         # counter of 0, not a 500: everything else on this page comes from
         # Postgres and is still worth rendering.
-        logger.warning("money_unpushed_commits_failed error=%s", str(exc)[:200])
+        logger.warning("money_unpushed_commits_failed error=%s", error_text(exc))
         unpushed = 0
     return {
         "events": [_event(r) for r in events],
@@ -148,7 +154,7 @@ def _latest_close_sync(base: Path) -> dict | None:
         # Everything else — a permissions error, an I/O error, a half-finished
         # clone — renders identically to "no close filed yet". Say so in the
         # log, or the page quietly reports an empty month forever.
-        logger.warning("money_digest_list_failed dir=%s error=%s", base, str(exc)[:200])
+        logger.warning("money_digest_list_failed dir=%s error=%s", base, error_text(exc))
         return None
     if not names:
         return None
@@ -156,7 +162,7 @@ def _latest_close_sync(base: Path) -> dict | None:
     try:
         text = (base / newest).read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
-        logger.warning("money_digest_read_failed file=%s error=%s", newest, str(exc)[:200])
+        logger.warning("money_digest_read_failed file=%s error=%s", newest, error_text(exc))
         return None
     return {"path": f"{_REPORTS_REL}/{newest}", "markdown": text}
 
@@ -190,7 +196,7 @@ async def trigger_flow(
         body = await request.json()
     except Exception:
         body = {}
-    handle = await _start_workflow(flow, body or {}, client)
+    handle = await _start_workflow(flow, body or {}, client, pool=request.app.state.db_pool)
     return {"ok": True, "workflow_id": handle.id}
 
 
@@ -302,8 +308,8 @@ async def money_balances(
         # Not a 500: the books are a git checkout that can be absent,
         # mid-clone or unreadable, and none of that is a reason for the page
         # to lose its bills, statements and desk as well.
-        logger.warning("money_balances_unavailable error=%s", str(exc)[:200])
-        return out | {"books_ok": False, "error": str(exc)[:300]}
+        logger.warning("money_balances_unavailable error=%s", error_text(exc))
+        return out | {"books_ok": False, "error": error_text(exc, 300)}
     return out | {"standing": _balance_report(standing), "month": _balance_report(month)}
 
 
@@ -631,7 +637,7 @@ async def desk_state(request: Request) -> dict:
     """
     pool = request.app.state.db_pool
     rules = await trading_desk.load_rules(pool)
-    today = datetime.now(trading_desk.MARKET_TZ).date()
+    today = datetime.now(rules.tz()).date()
 
     fills = await trading_desk._fills(pool)
     async with pool.acquire() as conn:
@@ -647,12 +653,12 @@ async def desk_state(request: Request) -> dict:
         problems = await _desk_problems(conn)
 
     ever = {f.symbol: f.asset_class for f in fills}
-    symbols = (
-        set(ever)
-        | {r["symbol"] for r in pending}
-        | {rules.benchmark, rules.context_benchmark, trading_desk.INDEX}
-    )
-    bars = await trading_desk._bars(pool, symbols)
+    # An unconfigured desk names no calendar and no benchmarks, and an empty
+    # string is not a symbol anything can be looked up by.
+    symbols = set(ever) | {r["symbol"] for r in pending} | {
+        s for s in (rules.benchmark, rules.context_benchmark, rules.calendar_symbol) if s
+    }
+    bars = await trading_desk._bars(pool, rules, symbols)
     book = desk_math.replay(fills, bars, rules.capital, today)
     total = desk_math.value(book, bars, today)
 
@@ -683,14 +689,21 @@ async def desk_state(request: Request) -> dict:
 
     month_first = today.replace(day=1)
     next_first = (month_first + timedelta(days=32)).replace(day=1)
-    score = await trading_desk.month_summary(pool, month_first, next_first)
+    score = await trading_desk.month_summary(pool, month_first, next_first, today=today)
 
     return {
         "as_of": today.isoformat(),
         "mode": rules.mode,
+        # False when no trading calendar is set: the desk then runs nothing, so
+        # the page says that rather than showing an idle desk that looks live.
+        "configured": rules.configured(),
         "capital": rules.capital,
+        "currency": rules.currency,
         "benchmark": rules.benchmark,
         "context_benchmark": rules.context_benchmark,
+        # True when a tax rate has been stated. Without one the desk deducts
+        # nothing, and a zero must not read as "you owe no tax".
+        "taxed": bool(rules.tax_rate or rules.long_term_rate),
         "value": _round(total),
         "cash": _round(book.cash),
         "cash_pct": _round(book.cash / total, 4) if total else None,
@@ -748,7 +761,7 @@ async def desk_history(
         days = [p["data_date"] for p in plans]
         orders = await conn.fetch(
             "SELECT data_date, seq, created_day, symbol, asset_class, side, qty, ref_price, "
-            "       status, fill_date, fill_price, costs, price_source, reason "
+            "       status, fill_date, fill_price, costs, price_source, price_kind, reason "
             "FROM finance.desk_orders WHERE data_date = ANY($1::date[]) "
             "ORDER BY data_date DESC, seq",
             days,
@@ -768,6 +781,7 @@ async def desk_history(
             "fill_price": _round(float(o["fill_price"]), 4) if o["fill_price"] is not None else None,
             "costs": _round(float(o["costs"])) if o["costs"] is not None else None,
             "price_source": o["price_source"],
+            "price_kind": o["price_kind"],
             "reason": o["reason"],
         })
     return {
@@ -784,3 +798,51 @@ async def desk_history(
             for p in plans
         ],
     }
+
+
+settings_row_routes(
+    router,
+    "/chart",
+    get=books_chart.read,
+    save=books_chart.save_chart,
+    doc=(
+        "The chart of accounts, as the money lane itself reads it — through `books_chart.merge`, "
+        "the same lenient read every post goes through, so the form can never show a second "
+        "opinion of where a transaction will be filed. `stored` is false while a deployment is "
+        "still on the code default. The PUT is a REPLACEMENT, not a merge: an entity or a "
+        "category the form did not send is one the operator removed. 400 on anything that would "
+        "not work, rather than a 200 that stores a typo and then misfiles transactions for "
+        "months; nothing is written when the check fails, and the money lane re-reads the row "
+        "on every post, so a save needs no deploy."
+    ),
+)
+
+
+@router.get("/desk/rules")
+async def desk_rules_state(request: Request) -> dict:
+    """The desk's market and tax settings, as the desk itself reads them.
+
+    The values come from `desk_math.Rules`, the same merge the daily run uses,
+    so the form can never show a second opinion of what the desk believes.
+    """
+    return await desk_rules.read(request.app.state.db_pool)
+
+
+@router.put("/desk/rules")
+async def put_desk_rules(request: Request, body: dict[str, Any]) -> dict:
+    """Save the desk's market and tax settings. 400 on anything that would not
+    work, rather than a 200 that stores a typo and does nothing for months.
+
+    This is a merge over the `trading-desk-daily` config, not a replacement:
+    the knobs this page does not show keep their stored values. `schedule_sync`
+    re-reads that row every few minutes and the desk reads it on every run, so
+    a save takes effect without a deploy.
+    """
+    try:
+        return await desk_rules.save(request.app.state.db_pool, body)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(
+            status_code=404, detail="the trading desk has no activities row to configure"
+        ) from exc

@@ -31,6 +31,7 @@ from aegis.connectors._ssh import build_ssh_args
 from aegis.connectors._subprocess import kill_and_wait
 from aegis.connectors.coding_sessions import parse_agents_json, to_records
 from aegis.crypto import decrypt_secret
+from aegis.errors import error_text
 from aegis.services.mcp_tokens import DEFAULT_TTL_SECONDS as DEFAULT_MOUNT_TTL_SECONDS
 from aegis.services.mcp_tokens import mint_mount_token
 
@@ -527,7 +528,7 @@ class RemoteScriptConnector:
                     else:
                         logger.warning("remote_script_kimi_host_slug_unresolved", slug=slug)
         except Exception as exc:  # noqa: BLE001 — keep last-known-good config
-            logger.warning("remote_script_db_config_lookup_failed", error=str(exc))
+            logger.warning("remote_script_db_config_lookup_failed", error=error_text(exc, 500))
             self._config_expiry = now + _DB_CONFIG_TTL_SECONDS
             return
 
@@ -613,7 +614,7 @@ class RemoteScriptConnector:
             try:
                 parsed = parse_agents_json(result["stdout"])
             except ValueError as exc:
-                errors.append({"account": account, "error": str(exc)[:200]})
+                errors.append({"account": account, "error": error_text(exc)})
                 continue
             sessions.extend(to_records(parsed, account, self._repo_base))
 

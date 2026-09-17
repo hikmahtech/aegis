@@ -30,6 +30,8 @@ from temporalio import workflow
 from temporalio.workflow import ParentClosePolicy
 
 with workflow.unsafe.imports_passed_through():
+    from aegis.errors import error_text
+
     from aegis_worker.activities.gmail import FetchEmailsInput, FetchEmailsResult
     from aegis_worker.flows.interaction import InteractionFlow, InteractionFlowInput
     from aegis_worker.flows.money_process import (
@@ -142,7 +144,7 @@ class ReceiptIngestFlow:
                     workflow.logger.warning(
                         "receipt_safety_fanout_failed msg=%s err=%s",
                         msg.get("id", ""),
-                        str(exc)[:200],
+                        error_text(exc),
                     )
 
             if fetched.latest_internal_date_ms > 0:
@@ -223,7 +225,7 @@ class ReceiptIngestFlow:
                     workflow.logger.warning(
                         "receipt_sweep_body_failed receipt_id=%s err=%s",
                         receipt_id,
-                        str(exc)[:200],
+                        error_text(exc),
                     )
 
                 event = await workflow.execute_activity(
@@ -249,7 +251,7 @@ class ReceiptIngestFlow:
                         workflow.logger.warning(
                             "receipt_sweep_capture_failed receipt_id=%s err=%s",
                             receipt_id,
-                            str(exc)[:200],
+                            error_text(exc),
                         )
 
                 posted = await workflow.execute_activity(
@@ -286,7 +288,7 @@ class ReceiptIngestFlow:
                 workflow.logger.warning(
                     "receipt_sweep_failed receipt_id=%s err=%s",
                     receipt_id,
-                    str(exc)[:200],
+                    error_text(exc),
                 )
         return swept
 

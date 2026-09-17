@@ -16,8 +16,17 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
+from aegis.errors import error_text, logged_failure
 from aegis.services import hub, work_sessions
+from aegis.services.agent_task_verbs import (
+    DEFAULT_VERBS,
+    UNTAGGED,
+    VERBS,  # noqa: F401 — re-export: tests import it here
+)
+from aegis.services.agent_task_verbs import SETTINGS_KEY as VERBS_SETTING
+from aegis.services.agent_task_verbs import merge as merge_verbs
 from aegis.services.project_repo_map import get_project_repo_map, lookup
+from aegis.services.settings_store import get_setting
 from temporalio import activity
 
 # Assignee labels this flow will act on. @me is deliberately absent: a task the
@@ -63,67 +72,11 @@ _COMMENT_RETRY_SECONDS = 2
 # @code label on a real #email task in prod, and treating that as "run a
 # coding agent on this email" would be nonsense.
 #
-# EVERY tag AEGIS captures under has an entry: a verb, or an explicit None
-# meaning "decided: nothing here works these". That is the `_GTD_STATE_FOR`
-# contract from clarify (#139), and test_agent_task_verbs.py derives the tag
-# vocabulary from `gtd_rules.SOURCE_TAGS` and the hub's tags, so a new tag
-# added without a decision fails CI instead of silently parking (#344).
-#
-# These are generic defaults. A deployment changes any of them with the
-# `agent_task_verbs` settings row, merged over this table by `merge_verbs`.
-#
-# `ask` hands the task to the agent it is assigned to, through that agent's
-# own chat path — `AgentChatReplyFlow`, the executor clarify already uses when
-# you comment on an agent's task. A `#chat`, `#research`, `#calendar` or
-# `#manual` task given to an agent is a request to that agent; before #344 all
-# four resolved to no verb, got "No executor for this task type" and parked
-# with nothing done (prod: an outage question given to the infra agent, an
-# article given to the research agent).
-#
-# `research` (#509) runs `ResearchFlow` on a `#research` task — knowledge
-# store, web and papers, a cited answer — and posts the answer on the task.
-# Under `ask` the research agent only chatted about the task; the lane had no
-# way to actually look anything up.
-UNTAGGED = "untagged"  # the settings key for a task with no source tag
-DEFAULT_VERBS: dict[str, str | None] = {
-    "#alert": "infra",
-    "#receipt": "finance",
-    "#email": "email",
-    "#chat": "ask",
-    "#research": "research",
-    "#calendar": "ask",
-    "#manual": "ask",
-    # A hand-written task carrying an agent's label and no `@code`: somebody
-    # gave it to that agent, which is the same request a `#manual` task is.
-    UNTAGGED: "ask",
-    # Maou raises these and the user acts on them. `EXCLUDED_LABELS` keeps the
-    # sweep off them before a verb is ever resolved; this says why.
-    "#money": None,
-    # A feed that stopped fetching or publishing (#513): the user fixes or
-    # drops the feed. Kept off the sweep by `EXCLUDED_LABELS` like `#money`.
-    "#feeds": None,
-}
-# The verbs a tag may be routed to. `coding` is not one: it is chosen by the
-# `@code` label on an untagged task, never by a tag.
-VERBS = frozenset({"infra", "email", "finance", "ask", "research"})
-VERBS_SETTING = "agent_task_verbs"
-
-
-def merge_verbs(value: Any) -> dict[str, str | None]:
-    """`DEFAULT_VERBS` with the `agent_task_verbs` settings row merged over it.
-
-    Lenient on read, like every settings merge in AEGIS: an entry that names a
-    verb this lane does not have is ignored, so a typo in the row cannot turn
-    a tag that works into one that parks. None is honoured — it is how a
-    deployment says "leave these tasks to me".
-    """
-    merged = dict(DEFAULT_VERBS)
-    if not isinstance(value, dict):
-        return merged
-    for tag, verb in value.items():
-        if verb is None or verb in VERBS:
-            merged[str(tag)] = verb
-    return merged
+# The table itself — every tag AEGIS captures under, with a verb or an explicit
+# None — is `DEFAULT_VERBS` in `aegis.services.agent_task_verbs`, with the
+# lenient `merge` this lane reads the `agent_task_verbs` settings row through
+# and the strict `validate` the admin Todoist page writes it through (#558).
+# The names are re-exported here because this lane and its tests use them.
 
 
 async def load_verbs(pool: Any) -> dict[str, str | None]:
@@ -132,9 +85,9 @@ async def load_verbs(pool: Any) -> dict[str, str | None]:
     if pool is None:
         return dict(DEFAULT_VERBS)
     try:
-        value = await pool.fetchval("SELECT value FROM settings WHERE key = $1", VERBS_SETTING)
+        value = await get_setting(pool, VERBS_SETTING)
     except Exception as exc:  # noqa: BLE001 — routing must never break on a config read
-        activity.logger.warning("agent_task_verbs_read_failed err=%s", str(exc)[:200])
+        activity.logger.warning("agent_task_verbs_read_failed err=%s", error_text(exc))
         return dict(DEFAULT_VERBS)
     return merge_verbs(value)
 
@@ -406,7 +359,7 @@ async def _probe(url: str) -> dict:
             response = await client.get(url)
     except Exception as exc:  # noqa: BLE001 — a failed probe IS the finding
         return {"ok": False, "status": 0, "ms": 0,
-                "error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+                "error": error_text(exc)}
     return {
         "ok": response.status_code < 400,
         "status": response.status_code,
@@ -610,7 +563,7 @@ class AgentTaskActivities:
             await work_sessions.set_state(self.db_pool, task_id, status="parked", summary=reason)
         except Exception as exc:  # noqa: BLE001 — the park itself must still land
             activity.logger.warning(
-                "task_park_state_not_recorded task_id=%s err=%s", task_id, str(exc)[:200]
+                "task_park_state_not_recorded task_id=%s err=%s", task_id, error_text(exc)
             )
         if PARK_LABEL in labels:
             return {"parked": True}
@@ -683,7 +636,7 @@ class AgentTaskActivities:
                 result = await self.todoist_connector.commands([cmd])
                 status = TodoistConnector.check_sync_status(result, [cmd["uuid"]])
             except Exception as exc:  # noqa: BLE001 — comments are best-effort
-                last_error = str(exc)[:200]
+                last_error = error_text(exc)
                 activity.logger.warning(
                     "agent_task_comment_failed task_id=%s attempt=%s err=%s",
                     task_id,
@@ -1294,7 +1247,7 @@ class AgentTaskActivities:
         try:
             text = await self.alert_act._read_runbook(alertname)
         except Exception as exc:  # noqa: BLE001
-            activity.logger.warning("agent_task_runbook_read_failed err=%s", str(exc)[:200])
+            activity.logger.warning("agent_task_runbook_read_failed err=%s", error_text(exc))
             return ""
         return f"Runbook ({alertname}):\n{_cut(text, _RUNBOOK_CAP)}" if text else ""
 
@@ -1362,7 +1315,7 @@ class AgentTaskActivities:
         try:
             resolved = await self.alert_act.resolve_alert_resource(synthetic_alert)
         except Exception as exc:  # noqa: BLE001 — tier 2 is best-effort; never guess on error
-            activity.logger.warning("agent_task_repo_tier2_failed err=%s", str(exc)[:200])
+            activity.logger.warning("agent_task_repo_tier2_failed err=%s", error_text(exc))
             return empty
 
         # Candidate shape matches what _build_repo_confirm_prompt expects
@@ -1589,7 +1542,7 @@ class AgentTaskActivities:
                     )
                 except Exception as exc:  # noqa: BLE001 — unknown is "not running"
                     activity.logger.warning(
-                        "task_turn_probe_failed task_id=%s err=%s", task_id, str(exc)[:200]
+                        "task_turn_probe_failed task_id=%s err=%s", task_id, error_text(exc)
                     )
                     alive = False
                 if alive:
@@ -1623,9 +1576,9 @@ class AgentTaskActivities:
             return proceed
         except Exception as exc:  # noqa: BLE001 — see the docstring: fails open
             activity.logger.warning(
-                "task_collision_check_failed task_id=%s err=%s", task_id, str(exc)[:200]
+                "task_collision_check_failed task_id=%s err=%s", task_id, error_text(exc)
             )
-            return {**proceed, "reason": f"check failed: {str(exc)[:200]}"}
+            return {**proceed, "reason": f"check failed: {error_text(exc)}"}
 
     @activity.defn
     async def reconcile_work_sessions(self) -> dict:
@@ -1644,7 +1597,7 @@ class AgentTaskActivities:
         live: list[str] = []
         status = "unavailable"
         if self.remote_script is not None:
-            try:
+            with logged_failure("work_sessions_inventory_failed", logger=activity.logger):
                 inventory = await self.remote_script.list_coding_sessions() or {}
                 status = str(inventory.get("status") or "unavailable")
                 if status == "ok":
@@ -1653,8 +1606,6 @@ class AgentTaskActivities:
                         for s in (inventory.get("sessions") or [])
                         if s.get("session_id")
                     ]
-            except Exception as exc:  # noqa: BLE001
-                activity.logger.warning("work_sessions_inventory_failed err=%s", str(exc)[:200])
         if status != "ok":
             return {"refreshed": 0, "parked": 0, "inventory": status}
         result = await work_sessions.reconcile_operator_sessions(self.db_pool, live)
@@ -1749,7 +1700,7 @@ class AgentTaskActivities:
                 )
             except Exception as exc:  # noqa: BLE001
                 activity.logger.warning(
-                    "task_last_run_not_recorded task_id=%s err=%s", task_id, str(exc)[:200]
+                    "task_last_run_not_recorded task_id=%s err=%s", task_id, error_text(exc)
                 )
         return {
             "status": "running",

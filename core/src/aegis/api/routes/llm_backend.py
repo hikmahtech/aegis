@@ -15,10 +15,12 @@ from fastapi import APIRouter, Depends, Request
 from aegis.api.auth import verify_auth
 from aegis.api.deps import get_settings
 from aegis.config import Settings
-from aegis.llm import LLMClient, set_model_tiers, set_routes
+from aegis.errors import error_text
+from aegis.llm import LLMClient
 from aegis.services.llm_backend import (
     PROVIDER_PRESETS,
     get_llm_backend,
+    install_llm_config,
     save_llm_backend,
 )
 
@@ -57,17 +59,12 @@ async def put_backend(
         tiers=body.get("tiers", {}),
         api_key=api_key,
     )
-    # Live-reload core's client + tier map (the worker picks up on next restart).
+    # Live-reload core's client + tier map (the worker picks up on next
+    # restart). The routes ride along inside `install_llm_config`: this is the
+    # one place core re-resolves the backend, so installing one half would
+    # leave an edited `llm_routes` row invisible to core until a restart.
     backend = await get_llm_backend(pool, settings, use_cache=False)
-    set_model_tiers(backend["tiers"])
-    # Routes ride along: this is the one place core re-resolves the backend, so
-    # skipping them here would leave an edited `llm_routes` row invisible to
-    # core until a restart while the tiers refreshed.
-    try:
-        set_routes(backend.get("routes"))
-    except Exception as exc:  # noqa: BLE001 — a bad routing table must not fail the save
-        set_routes(None)
-        logger.warning("llm_routes_invalid", error=str(exc)[:200])
+    install_llm_config(backend)
     # db_pool=pool keeps the spend-governor kill switch wired through a
     # live backend swap — without it, saving a backend would silently
     # replace app.state.llm with an ungoverned client until the next restart.
@@ -106,6 +103,6 @@ async def test_backend(
         text = result.get("response", "") if isinstance(result, dict) else str(result)
         return {"ok": True, "model": model, "reply": (text or "").strip()[:120]}
     except Exception as exc:  # noqa: BLE001 — surface the failure to the UI
-        return {"ok": False, "error": str(exc)[:300]}
+        return {"ok": False, "error": error_text(exc, 300)}
     finally:
         await client.close()

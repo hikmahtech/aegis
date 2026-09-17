@@ -51,6 +51,8 @@ from datetime import datetime, timedelta
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
+    from aegis.errors import error_text
+
     from aegis_worker.activities.agent_run import SCRATCH_REPO, AgentRunActivities
     from aegis_worker.activities.delivery import DeliveryActivities
     from aegis_worker.shared.retry import (
@@ -69,8 +71,7 @@ _OUTPUT_TAIL = 3000
 
 def _err_str(exc: BaseException) -> str:
     """Unwrap ActivityError cause chain to get the original message."""
-    cause = exc.__cause__ or exc
-    return str(cause)[:200]
+    return error_text(exc.__cause__ or exc)
 
 
 def _elapsed_str(seconds: int) -> str:

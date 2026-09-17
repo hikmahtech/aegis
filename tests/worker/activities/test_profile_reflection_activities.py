@@ -19,7 +19,7 @@ import pytest_asyncio
 from aegis_worker.activities.profile import ProfileActivities
 from temporalio.testing import ActivityEnvironment
 
-from tests.llm_stub import StubbedLLMClient
+from tests.llm_stub import RecordingFakeLLM, StubbedLLMClient
 
 AGENT = "zza2-profile"
 OTHER = "zza2-other"
@@ -85,26 +85,6 @@ async def clean_db(db_pool):
     async with db_pool.acquire() as conn:
         await _wipe(conn)
         await conn.execute("DELETE FROM agents WHERE id = ANY($1)", [AGENT, OTHER])
-
-
-class FakeLLM:
-    """Minimal stand-in for LLMClient — only `think` is ever called."""
-
-    def __init__(self, *, response: str = "", raises: BaseException | None = None):
-        self._response = response
-        self._raises = raises
-        self.calls: list[dict] = []
-
-    async def think(self, **kwargs):
-        self.calls.append(kwargs)
-        if self._raises is not None:
-            raise self._raises
-        return {
-            "response": self._response,
-            "model": "fake-balanced",
-            "prompt_tokens": 11,
-            "completion_tokens": 22,
-        }
 
 
 def _acts(pool, **kwargs) -> ProfileActivities:
@@ -350,7 +330,7 @@ async def test_gather_evidence_omits_a_memory_a4_soft_retired(clean_db):
 
     # ...and it stays out of everything derived from the bundle. The prompt is
     # where a leaked belief actually does its damage.
-    llm = FakeLLM(response=_llm_json())
+    llm = RecordingFakeLLM(response=_llm_json())
     await ActivityEnvironment().run(
         _acts(clean_db, llm_client=llm).propose_profile_patch, AGENT, out, CURRENT_DOC
     )
@@ -440,7 +420,7 @@ async def test_propose_records_a_truncated_call(clean_db):
 
 @pytest.mark.asyncio
 async def test_propose_degrades_to_empty_on_an_llm_error(clean_db):
-    llm = FakeLLM(raises=RuntimeError("connection reset"))
+    llm = RecordingFakeLLM(raises=RuntimeError("connection reset"))
     out = await ActivityEnvironment().run(
         _acts(clean_db, llm_client=llm).propose_profile_patch, AGENT, _EVIDENCE, CURRENT_DOC
     )
@@ -453,7 +433,7 @@ async def test_propose_degrades_to_empty_on_an_llm_error(clean_db):
 
 @pytest.mark.asyncio
 async def test_propose_degrades_to_empty_on_unparseable_json(clean_db):
-    llm = FakeLLM(response="I'm afraid I can't do that, Dave.")
+    llm = RecordingFakeLLM(response="I'm afraid I can't do that, Dave.")
     out = await ActivityEnvironment().run(
         _acts(clean_db, llm_client=llm).propose_profile_patch, AGENT, _EVIDENCE, CURRENT_DOC
     )
@@ -462,7 +442,7 @@ async def test_propose_degrades_to_empty_on_unparseable_json(clean_db):
 
 @pytest.mark.asyncio
 async def test_propose_degrades_to_empty_on_a_blank_document(clean_db):
-    llm = FakeLLM(response=json.dumps({"proposed_doc": "   ", "rationale": "nothing"}))
+    llm = RecordingFakeLLM(response=json.dumps({"proposed_doc": "   ", "rationale": "nothing"}))
     out = await ActivityEnvironment().run(
         _acts(clean_db, llm_client=llm).propose_profile_patch, AGENT, _EVIDENCE, CURRENT_DOC
     )
@@ -471,7 +451,7 @@ async def test_propose_degrades_to_empty_on_a_blank_document(clean_db):
 
 @pytest.mark.asyncio
 async def test_propose_flags_an_unchanged_document(clean_db):
-    llm = FakeLLM(response=_llm_json(doc=CURRENT_DOC, rationale="nothing to add"))
+    llm = RecordingFakeLLM(response=_llm_json(doc=CURRENT_DOC, rationale="nothing to add"))
     out = await ActivityEnvironment().run(
         _acts(clean_db, llm_client=llm).propose_profile_patch, AGENT, _EVIDENCE, CURRENT_DOC
     )
@@ -502,7 +482,7 @@ async def test_propose_without_an_llm_client_is_a_no_op(clean_db, caplog):
 
 @pytest.mark.asyncio
 async def test_propose_with_no_evidence_never_calls_the_llm(clean_db):
-    llm = FakeLLM(response=_llm_json())
+    llm = RecordingFakeLLM(response=_llm_json())
     out = await ActivityEnvironment().run(
         _acts(clean_db, llm_client=llm).propose_profile_patch, AGENT, {"counts": {}}, CURRENT_DOC
     )

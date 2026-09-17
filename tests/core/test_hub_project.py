@@ -558,6 +558,32 @@ async def test_project_pending_picks_missing_behind_and_temp_tasks_only(db_pool,
     assert not any("error" in r for r in results)
 
 
+async def test_the_sweep_notes_why_there_is_no_task_and_forgets_once_there_is(
+    db_pool, inbox, todoist
+):
+    """The admin page reads `metadata.projection` to say why a problem has no
+    task. Falsifiable: drop `_note_projection` and the first assert fails."""
+    s = _subject()
+    r = await ingest_event(db_pool, _occ(s, 1), now=NOW)
+    await db_pool.execute(
+        "UPDATE problems SET todoist_task_id = 'item-temp' WHERE id = $1::uuid", r.problem_id
+    )
+    await project_pending(db_pool, now=NOW)
+    note = (await get_problem(db_pool, r.problem_id))["metadata"]["projection"]
+    assert note["skipped"] == "task_pending_outbox" and note["at"] == NOW.isoformat()
+    # Same reason again: `at` keeps the first sighting.
+    await project_pending(db_pool, now=NOW + timedelta(minutes=5))
+    assert (await get_problem(db_pool, r.problem_id))["metadata"]["projection"]["at"] == NOW.isoformat()
+    await db_pool.execute(
+        "INSERT INTO todoist_capture_idempotency (source_tag, external_id, todoist_task_ref) "
+        "VALUES ('#alert', $1, 'T_REAL')",
+        f"problem-{r.problem_id}",
+    )
+    await project_pending(db_pool, now=NOW + timedelta(minutes=10))
+    p = await get_problem(db_pool, r.problem_id)
+    assert p["todoist_task_id"] == "T_REAL" and "projection" not in p["metadata"]
+
+
 async def test_project_pending_survives_one_bad_problem(db_pool, inbox, todoist, monkeypatch):
     s = _subject()
     r = await ingest_event(db_pool, _occ(s, 1), now=NOW)
@@ -571,7 +597,7 @@ async def test_project_pending_survives_one_bad_problem(db_pool, inbox, todoist,
     monkeypatch.setattr(hub_project, "project", boom)
     results = await project_pending(db_pool, now=NOW)
     mine = [x for x in results if x["problem_id"] == r.problem_id]
-    assert mine and mine[0]["error"].startswith("todoist exploded")
+    assert mine and mine[0]["error"].startswith("RuntimeError: todoist exploded")
 
 
 # --- sessions in the block (PR 5) ----------------------------------------------
@@ -1411,6 +1437,38 @@ async def test_a_recurrence_is_not_held_back(db_pool, inbox, todoist):
     again = await ingest_event(db_pool, _occ(s, 10, occurred_at=back), now=back)
     assert again.action == "reopened"
     assert (await project(db_pool, r.problem_id, now=back))["created"] is True
+
+
+async def test_a_watchdog_finding_does_not_wait(db_pool, inbox, todoist):
+    """`flow_health` resolves its own findings, and was in the settle set for
+    that reason — which was wrong. Its sweep runs every 30 minutes, so a
+    three-minute window cannot observe a blip it would clear; the window could
+    only delay the task. The producers that wait are the two outside AEGIS that
+    re-check on a scale of seconds.
+
+    Falsifiable: put `flow_health` back in `_SELF_CLEARING_SOURCES` and this
+    task arrives three minutes late.
+    """
+    await _settle(db_pool, {})
+    s = _subject()
+    r = await ingest_event(
+        db_pool,
+        Event(
+            source="flow_health",
+            external_id=f"{s}@stale",
+            kind="occurrence",
+            title=f"{s} has not succeeded in 3 hours",
+            klass="flow_stale",
+            subject=s,
+            subject_kind="flow",
+            severity="warning",
+            payload={"description": "The watchdog found no successful run."},
+            occurred_at=NOW,
+        ),
+        now=NOW,
+    )
+
+    assert (await project(db_pool, r.problem_id, now=NOW + timedelta(seconds=1)))["created"] is True
 
 
 async def test_only_a_signal_that_can_clear_itself_waits(db_pool, inbox, todoist):

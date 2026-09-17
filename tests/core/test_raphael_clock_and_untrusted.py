@@ -49,11 +49,11 @@ async def test_note_write_dates_its_heading_on_the_users_clock(user_zone, tmp_pa
     seen: dict = {}
     real = notes_tools.nw.normalise
 
-    def spy(op, payload, now=None):
+    def spy(op, payload, now=None, layout=None):
         seen["now"] = now
-        return real(op, payload, now)
+        return real(op, payload, now, layout)
 
-    async def no_flow(ctx, op, payload):
+    async def no_flow(ctx, op, payload, agent_id):
         seen["payload"] = payload
         return "handed over"
 

@@ -14,6 +14,7 @@
  */
 
 import { useEffect, useState } from 'react';
+import DeskRulesPanel from '../components/DeskRulesPanel';
 import {
   fmtAmount,
   fmtPct,
@@ -23,8 +24,15 @@ import {
   type DeskHistory,
   type DeskState,
 } from '../lib/moneyApi';
+import DataTable from '../components/DataTable';
 
 /** What the desk decided on a day, said the way a person would say it. */
+// Money columns: right-aligned and monospaced, the same pair on every table here.
+const RIGHT_MONO = {
+  th: { style: { textAlign: 'right' as const } },
+  td: { className: 'mono', style: { textAlign: 'right' as const } },
+};
+
 const OUTCOME: Record<string, { label: string; badge: string }> = {
   orders: { label: 'placed orders', badge: 'success' },
   no_change: { label: 'nothing to change', badge: 'neutral' },
@@ -50,6 +58,9 @@ function findingText(f: DeskFinding): string {
  */
 function ScoreCard({ desk }: { desk: DeskState }) {
   const s = desk.score;
+  // Every figure is printed in the desk's own currency, which travels with the
+  // figures rather than being assumed by the page.
+  const money = (v: number | null | undefined) => fmtAmount(v, desk.currency);
   if (!s) {
     return (
       <div className="card">
@@ -66,15 +77,15 @@ function ScoreCard({ desk }: { desk: DeskState }) {
     <>
       <div className="stats-bar">
         <div className="stat-item">
-          <span className="stat-value">{fmtAmount(s.value)}</span>
+          <span className="stat-value">{money(s.value)}</span>
           <span className="stat-label">The desk</span>
         </div>
         <div className="stat-item">
-          <span className="stat-value">{fmtAmount(s.benchmark_value)}</span>
+          <span className="stat-value">{money(s.benchmark_value)}</span>
           <span className="stat-label">{s.benchmark} · same money</span>
         </div>
         <div className="stat-item">
-          <span className="stat-value">{fmtAmount(s.context_value)}</span>
+          <span className="stat-value">{money(s.context_value)}</span>
           <span className="stat-label">{s.context} · same money</span>
         </div>
         <div className="stat-item">
@@ -82,7 +93,7 @@ function ScoreCard({ desk }: { desk: DeskState }) {
             className="stat-value"
             style={{ color: (vsBench ?? 0) >= 0 ? 'var(--success-text)' : 'var(--danger-text)' }}
           >
-            {vsBench === null ? '—' : fmtAmount(vsBench)}
+            {vsBench === null ? '—' : money(vsBench)}
           </span>
           <span className="stat-label">Ahead of {s.benchmark} by</span>
         </div>
@@ -118,7 +129,7 @@ function ScoreCard({ desk }: { desk: DeskState }) {
         <div className="card">
           <h3>This month</h3>
           <div className="meta-row"><span>Orders filled</span><span>{s.filled}</span></div>
-          <div className="meta-row"><span>Costs paid</span><span>{fmtAmount(s.costs)}</span></div>
+          <div className="meta-row"><span>Costs paid</span><span>{money(s.costs)}</span></div>
           <div className="meta-row">
             <span>Days it held back</span>
             <span>{Object.values(s.held_back).reduce((a, b) => a + b, 0) || 0}</span>
@@ -129,7 +140,7 @@ function ScoreCard({ desk }: { desk: DeskState }) {
           </div>
           <div className="meta-row">
             <span>After tax if sold</span>
-            <span>{fmtAmount(s.after_tax)}</span>
+            <span>{desk.taxed ? money(s.after_tax) : 'no tax model set'}</span>
           </div>
           <div className="meta-row"><span>Scoring since</span><span>{s.since}</span></div>
         </div>
@@ -142,20 +153,20 @@ function ScoreCard({ desk }: { desk: DeskState }) {
             price rather than a real move.
           </p>
           <div className="table-scroll">
-            <table className="data-table">
-              <thead>
-                <tr><th>Symbol</th><th>Day</th><th style={{ textAlign: 'right' }}>Move</th></tr>
-              </thead>
-              <tbody>
-                {s.moves.map(m => (
-                  <tr key={`${m.symbol}-${m.day}`}>
-                    <td className="mono">{m.symbol}</td>
-                    <td className="mono">{m.day}</td>
-                    <td className="mono" style={{ textAlign: 'right' }}>{fmtSignedPct(m.move, 1)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+            <DataTable
+              rows={s.moves}
+              rowKey={m => `${m.symbol}-${m.day}`}
+              columns={[
+                { header: 'Symbol', td: { className: 'mono' }, cell: m => m.symbol },
+                { header: 'Day', td: { className: 'mono' }, cell: m => m.day },
+                {
+                  header: 'Move',
+                  th: { style: { textAlign: 'right' } },
+                  td: { className: 'mono', style: { textAlign: 'right' } },
+                  cell: m => fmtSignedPct(m.move, 1),
+                },
+              ]}
+            />
           </div>
         </section>
       )}
@@ -186,17 +197,41 @@ export default function TradingDesk() {
 
   const invested = desk.value !== null && desk.cash !== null ? desk.value - desk.cash : null;
   const gainPct = desk.gain !== null && desk.capital ? desk.gain / desk.capital : null;
+  // The desk's currency comes with its figures. A page that assumed one would
+  // print the right digits under the wrong symbol on any other market.
+  const money = (v: number | null | undefined) => fmtAmount(v, desk.currency);
 
   return (
     <div>
       <h1 className="page-title">Trading desk</h1>
       <p className="page-subtitle">
         Maou trades the trading system&rsquo;s picks on paper against real closing prices, out
-        of {fmtAmount(desk.capital)}, and scores itself against {desk.benchmark}. Everything
-        here is a view: the daily run places the orders, and nothing on this page can trade.
+        of {money(desk.capital)}
+        {desk.benchmark ? <>, and scores itself against {desk.benchmark}</> : ''}. The daily run
+        places the orders: nothing on this page can trade, and the only thing it can change is
+        which market the desk trades.
       </p>
 
       {error && <div className="error">{error}</div>}
+
+      {!desk.configured && (
+        <div
+          style={{
+            background: 'var(--warning-tint)',
+            border: '1px solid var(--warning-text)',
+            color: 'var(--warning-text)',
+            padding: '10px 14px',
+            margin: '0 0 1rem',
+            borderRadius: 'var(--radius-sm)',
+          }}
+        >
+          <strong>No market is set, so the desk is doing nothing.</strong>
+          <p style={{ margin: '0.4rem 0 0', fontSize: '0.9rem' }}>
+            It needs a trading calendar before it can tell a market day from a holiday. Set one
+            under <em>Its market</em> below.
+          </p>
+        </div>
+      )}
 
       {desk.mode !== 'paper' && (
         <div
@@ -219,7 +254,7 @@ export default function TradingDesk() {
 
       <div className="stats-bar">
         <div className="stat-item">
-          <span className="stat-value">{fmtAmount(desk.value)}</span>
+          <span className="stat-value">{money(desk.value)}</span>
           <span className="stat-label">Worth today</span>
         </div>
         <div className="stat-item">
@@ -229,20 +264,20 @@ export default function TradingDesk() {
               color: (desk.gain ?? 0) >= 0 ? 'var(--success-text)' : 'var(--danger-text)',
             }}
           >
-            {fmtAmount(desk.gain)}
+            {money(desk.gain)}
           </span>
           <span className="stat-label">
-            Up or down on {fmtAmount(desk.capital)}
+            Up or down on {money(desk.capital)}
             {gainPct !== null ? ` · ${fmtSignedPct(gainPct, 1)}` : ''}
           </span>
         </div>
         <div className="stat-item">
-          <span className="stat-value">{fmtAmount(invested)}</span>
+          <span className="stat-value">{money(invested)}</span>
           <span className="stat-label">In the market</span>
         </div>
         <div className="stat-item">
           <span className="stat-value">{fmtPct(desk.cash_pct)}</span>
-          <span className="stat-label">Sitting in cash · {fmtAmount(desk.cash)}</span>
+          <span className="stat-label">Sitting in cash · {money(desk.cash)}</span>
         </div>
         <div className="stat-item">
           <span
@@ -278,7 +313,7 @@ export default function TradingDesk() {
               {!desk.positions.length && (
                 <tr>
                   <td colSpan={8} className="empty">
-                    Nothing held yet — every rupee is still in cash.
+                    Nothing held yet — it is all still in cash.
                   </td>
                 </tr>
               )}
@@ -294,15 +329,15 @@ export default function TradingDesk() {
                     )}
                   </td>
                   <td className="mono" style={{ textAlign: 'right' }}>{p.qty}</td>
-                  <td className="mono" style={{ textAlign: 'right' }}>{fmtAmount(p.avg_cost)}</td>
-                  <td className="mono" style={{ textAlign: 'right' }}>{fmtAmount(p.cost)}</td>
+                  <td className="mono" style={{ textAlign: 'right' }}>{money(p.avg_cost)}</td>
+                  <td className="mono" style={{ textAlign: 'right' }}>{money(p.cost)}</td>
                   <td className="mono" style={{ textAlign: 'right' }}>
-                    {fmtAmount(p.last_close)}
+                    {money(p.last_close)}
                     {p.priced_on && p.priced_on !== desk.as_of && (
                       <div className="meta" style={{ fontSize: 11 }}>on {p.priced_on}</div>
                     )}
                   </td>
-                  <td className="mono" style={{ textAlign: 'right' }}>{fmtAmount(p.value)}</td>
+                  <td className="mono" style={{ textAlign: 'right' }}>{money(p.value)}</td>
                   <td
                     className="mono"
                     style={{
@@ -310,7 +345,7 @@ export default function TradingDesk() {
                       color: (p.gain ?? 0) >= 0 ? 'var(--success-text)' : 'var(--danger-text)',
                     }}
                   >
-                    {fmtAmount(p.gain)}
+                    {money(p.gain)}
                   </td>
                   <td className="mono" style={{ textAlign: 'right' }}>{fmtPct(p.weight)}</td>
                 </tr>
@@ -318,7 +353,7 @@ export default function TradingDesk() {
               <tr>
                 <td><strong>Cash</strong></td>
                 <td colSpan={4} />
-                <td className="mono" style={{ textAlign: 'right' }}>{fmtAmount(desk.cash)}</td>
+                <td className="mono" style={{ textAlign: 'right' }}>{money(desk.cash)}</td>
                 <td />
                 <td className="mono" style={{ textAlign: 'right' }}>{fmtPct(desk.cash_pct)}</td>
               </tr>
@@ -331,39 +366,34 @@ export default function TradingDesk() {
         <section className="section">
           <h2 className="section-title">Waiting to fill</h2>
           <p className="meta" style={{ marginBottom: 10 }}>
-            Orders the desk has placed and not yet filled. Each one fills at the next close it
-            can price; the money for a buy is already set aside, so today&rsquo;s sizing cannot
-            spend it twice.
+            Orders the desk has placed and not yet filled. Each one fills on the next session it
+            can price, at whichever print the desk is set to use; the money for a buy is already
+            set aside, so today&rsquo;s sizing cannot spend it twice.
           </p>
           <div className="table-scroll">
-            <table className="data-table">
-              <thead>
-                <tr>
-                  <th>Placed</th>
-                  <th>Symbol</th>
-                  <th>Side</th>
-                  <th style={{ textAlign: 'right' }}>Shares</th>
-                  <th style={{ textAlign: 'right' }}>Priced at</th>
-                  <th style={{ textAlign: 'right' }}>About</th>
-                </tr>
-              </thead>
-              <tbody>
-                {desk.pending.map(o => (
-                  <tr key={o.id}>
-                    <td className="mono" style={{ whiteSpace: 'nowrap' }}>{o.created_day}</td>
-                    <td><strong>{o.symbol}</strong></td>
-                    <td>
-                      <span className={`badge badge-${o.side === 'buy' ? 'info' : 'pending'}`}>
-                        {o.side}
-                      </span>
-                    </td>
-                    <td className="mono" style={{ textAlign: 'right' }}>{o.qty}</td>
-                    <td className="mono" style={{ textAlign: 'right' }}>{fmtAmount(o.ref_price)}</td>
-                    <td className="mono" style={{ textAlign: 'right' }}>{fmtAmount(o.est_value)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+            <DataTable
+              rows={desk.pending}
+              rowKey={o => o.id}
+              columns={[
+                {
+                  header: 'Placed',
+                  td: { className: 'mono', style: { whiteSpace: 'nowrap' } },
+                  cell: o => o.created_day,
+                },
+                { header: 'Symbol', cell: o => <strong>{o.symbol}</strong> },
+                {
+                  header: 'Side',
+                  cell: o => (
+                    <span className={`badge badge-${o.side === 'buy' ? 'info' : 'pending'}`}>
+                      {o.side}
+                    </span>
+                  ),
+                },
+                { header: 'Shares', ...RIGHT_MONO, cell: o => o.qty },
+                { header: 'Priced at', ...RIGHT_MONO, cell: o => money(o.ref_price) },
+                { header: 'About', ...RIGHT_MONO, cell: o => money(o.est_value) },
+              ]}
+            />
           </div>
         </section>
       )}
@@ -372,7 +402,7 @@ export default function TradingDesk() {
         <h2 className="section-title">How it is doing</h2>
         <p className="meta" style={{ marginBottom: 12 }}>
           The same figures the monthly close reports: the desk against {desk.benchmark}, the
-          halal ETF it is meant to beat, and {desk.context_benchmark} for context. Both
+          instrument it is meant to beat, and {desk.context_benchmark} for context. Both
           benchmarks are the same money put in on the desk&rsquo;s first day and held.
         </p>
         <ScoreCard desk={desk} />
@@ -453,7 +483,7 @@ export default function TradingDesk() {
                             <td>{ord.side}</td>
                             <td className="mono" style={{ textAlign: 'right' }}>{ord.qty}</td>
                             <td className="mono" style={{ textAlign: 'right' }}>
-                              {fmtAmount(ord.ref_price)}
+                              {money(ord.ref_price)}
                             </td>
                             <td>
                               <span className={`badge badge-${STATUS_BADGE[ord.status] ?? 'neutral'}`}>
@@ -464,16 +494,17 @@ export default function TradingDesk() {
                               )}
                             </td>
                             <td className="mono" style={{ textAlign: 'right' }}>
-                              {fmtAmount(ord.fill_price)}
+                              {money(ord.fill_price)}
                               {ord.fill_date && (
                                 <div className="meta" style={{ fontSize: 11 }}>
                                   {ord.fill_date}
+                                  {ord.price_kind ? ` · ${ord.price_kind}` : ''}
                                   {ord.price_source === 'ansaar' ? ' · ansaar price' : ''}
                                 </div>
                               )}
                             </td>
                             <td className="mono" style={{ textAlign: 'right' }}>
-                              {fmtAmount(ord.costs)}
+                              {money(ord.costs)}
                             </td>
                           </tr>
                         ))}
@@ -486,6 +517,8 @@ export default function TradingDesk() {
           })}
         </div>
       </section>
+
+      <DeskRulesPanel onSaved={() => void moneyApi.desk().then(setDesk, () => {})} />
     </div>
   );
 }

@@ -15,6 +15,20 @@ def get_settings() -> Settings:
     return _settings
 
 
+def get_pool(request: Request):
+    """The database pool from app state, or 503.
+
+    Four routers had their own copy of this; the two spellings of the check had
+    drifted apart, and `research_admin` had no check at all — a request during
+    a database outage answered 500 there and 503 next door. Usable both as a
+    `Depends(...)` and as a plain call, `get_pool(request)`.
+    """
+    pool = getattr(request.app.state, "db_pool", None)
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    return pool
+
+
 def get_knowledge_connector(request: Request):
     """Return the native pgvector KnowledgeStore from app state, or 503.
 

@@ -15,6 +15,8 @@ here are thin wrappers over them.
 
 from __future__ import annotations
 
+import time
+
 import httpx
 import structlog
 from slack_sdk.errors import SlackApiError
@@ -22,6 +24,7 @@ from slack_sdk.web.async_client import AsyncWebClient
 
 from aegis_comms.adapters.base import CardSpec, DeliveryRef, SendResult
 from aegis_comms.cards import render_slack_blocks
+from aegis_comms.errors import error_text
 from aegis_comms.format import html_to_mrkdwn
 
 _logger = structlog.get_logger()
@@ -30,14 +33,15 @@ _logger = structlog.get_logger()
 # blocks/fallback stay comfortable and edits remain cheap.
 _SLACK_MAX_CHARS = 2800
 
-# Per-agent persona icon for chat:write.customize. Defaults to a robot.
-_AGENT_ICON = {
-    "sebas": ":bust_in_silhouette:",
-    "raphael": ":books:",
-    "maou": ":moneybag:",
-    "pandoras-actor": ":robot_face:",
-}
+# Persona icon for chat:write.customize: the agent's `metadata.slack_icon`
+# (admin Agents → Behavior; the example agents' icons are in
+# config/seed/agents.yaml). An agent without one, or a failed core lookup,
+# gets the robot — never an icon keyed on an agent id (#556).
 _DEFAULT_ICON = ":robot_face:"
+
+# How long the `gtd` holder — who speaks for a message that names no agent —
+# is cached once core has named one.
+_DEFAULT_AGENT_TTL_S = 60.0
 
 
 def _split_message(text: str, limit: int = _SLACK_MAX_CHARS) -> list[str]:
@@ -63,13 +67,6 @@ def _split_message(text: str, limit: int = _SLACK_MAX_CHARS) -> list[str]:
     return chunks
 
 
-def _short_agent(agent_id: str) -> str:
-    """Channel-name stem: `pandoras-actor` -> `pandora`, else the id."""
-    if agent_id == "pandoras-actor":
-        return "pandora"
-    return agent_id
-
-
 async def handle_hint_open(client, body) -> None:
     """Open the hint modal for a Gate-0 card. Interaction stays pending."""
     from aegis_comms.slack_modal import build_hint_modal
@@ -87,7 +84,7 @@ async def handle_hint_open(client, body) -> None:
             view=build_hint_modal(interaction_id, title),
         )
     except Exception as exc:  # noqa: BLE001 — original card stays usable
-        _logger.warning("slack_views_open_failed", error=str(exc))
+        _logger.warning("slack_views_open_failed", error=error_text(exc, 500))
 
 
 async def handle_hint_submit(core, body) -> None:
@@ -131,6 +128,13 @@ class SlackAdapter:
         # resolutions (non-None channel) are cached so a transient failure
         # (core fetch error, name lookup miss) does not poison the cache forever.
         self._cache: dict[str, tuple[str | None, str, str, str]] = {}
+        # agent_id -> channel-name stem (`mention_aliases[0]`), noted from every
+        # agent core describes, so a lookup made while core is down still finds
+        # `#aegis-<alias>` for an agent seen earlier in this process (#579).
+        self._stems: dict[str, str] = {}
+        # The `gtd` holder, who speaks for a message that names no agent.
+        self._default_agent_id = ""
+        self._default_agent_ts = 0.0
 
     def _httpx(self) -> httpx.AsyncClient:
         if self._http is None:
@@ -160,38 +164,102 @@ class SlackAdapter:
             if not cursor:
                 return None
 
+    def _note_stem(self, agent: dict) -> None:
+        """Remember an agent's channel-name stem (`mention_aliases[0]`)."""
+        aliases = (agent.get("metadata") or {}).get("mention_aliases") or []
+        if agent.get("id") and aliases:
+            self._stems[str(agent["id"])] = str(aliases[0])
+
+    async def _fetch_agents(self) -> list[dict] | None:
+        """GET /api/agents (the active agents), noting their stems. None on failure."""
+        headers = {"X-API-Key": self._api_key} if self._api_key else {}
+        try:
+            resp = await self._httpx().get(f"{self._core_url}/api/agents", headers=headers)
+            resp.raise_for_status()
+            agents = resp.json()
+        except Exception as exc:  # noqa: BLE001 — the caller degrades
+            _logger.warning("slack_agents_fetch_failed", error=error_text(exc))
+            return None
+        if not isinstance(agents, list):
+            return None
+        for agent in agents:
+            if isinstance(agent, dict):
+                self._note_stem(agent)
+        return agents
+
+    async def _default_agent(self) -> str:
+        """The `gtd` holder, cached for `_DEFAULT_AGENT_TTL_S` once found. When
+        core cannot be asked: the last holder it named, else ""."""
+        now = time.monotonic()
+        if self._default_agent_id and now - self._default_agent_ts < _DEFAULT_AGENT_TTL_S:
+            return self._default_agent_id
+        agents = await self._fetch_agents()
+        if agents is None:
+            return self._default_agent_id
+        from aegis_comms.slack_inbound import _derive_default_agent
+
+        self._default_agent_id = _derive_default_agent(agents)
+        self._default_agent_ts = now
+        return self._default_agent_id
+
+    async def resolve_agent_id(self, agent_id: str) -> str:
+        """`agent_id`, or — when a caller named none — the agent holding the
+        `gtd` tag, from core (#579). "" when nobody holds it, or core cannot be
+        reached and never named one: the message then goes to the general
+        channel as AEGIS, never as an example agent."""
+        return agent_id or await self._default_agent()
+
+    async def _general_channel(self) -> str | None:
+        """Where system events go: the `system` agent's channel, else #aegis-general."""
+        channel, _username, _icon, _voice_id = await self._resolve("system")
+        if channel:
+            return channel
+        try:
+            return await self._resolve_channel_by_name("aegis-general")
+        except SlackApiError as exc:
+            _logger.warning("slack_general_lookup_failed", error=error_text(exc))
+            return None
+
     async def _resolve(self, agent_id: str) -> tuple[str | None, str, str, str]:
-        """Resolve (channel_id, username, icon_emoji, voice_id) for an agent, cached."""
+        """Resolve (channel_id, username, icon_emoji, voice_id) for an agent, cached.
+
+        An empty `agent_id` is the `gtd` holder (`resolve_agent_id`); with none,
+        the general channel as AEGIS (#579)."""
+        agent_id = await self.resolve_agent_id(agent_id)
+        if not agent_id:
+            return (await self._general_channel(), "AEGIS", ":gear:", "")
         if agent_id in self._cache:
             return self._cache[agent_id]
 
-        icon = _AGENT_ICON.get(agent_id, _DEFAULT_ICON)
+        icon = _DEFAULT_ICON
         username = agent_id
         channel: str | None = None
         voice_id = ""
-        # Channel-name stem + icon are metadata-overridable; fall back to the
-        # shipped constants (so a custom agent isn't stuck with the robot icon
-        # or an id-based channel name).
-        stem = _short_agent(agent_id)
+        # Channel-name stem + icon come from the agent's metadata
+        # (`mention_aliases[0]`, `slack_icon`). Until core answers, the stem is
+        # the alias it last gave for this agent, else the id — never a stem
+        # keyed on an example id (#579).
+        stem = self._stems.get(agent_id, agent_id)
         try:
             cfg = await self._fetch_agent(agent_id)
             username = cfg.get("name") or agent_id
             channel = cfg.get("slack_channel_id") or None
             voice_id = cfg.get("elevenlabs_voice_id") or ""
             meta = cfg.get("metadata") or {}
-            icon = meta.get("slack_icon") or _AGENT_ICON.get(agent_id, _DEFAULT_ICON)
+            icon = meta.get("slack_icon") or _DEFAULT_ICON
             aliases = meta.get("mention_aliases") or []
             if aliases:
                 stem = str(aliases[0])
         except Exception as exc:  # noqa: BLE001 — best-effort; fall back to name lookup
-            _logger.warning("slack_agent_lookup_failed", agent_id=agent_id, error=str(exc))
+            _logger.warning("slack_agent_lookup_failed", agent_id=agent_id, error=error_text(exc, 500))
 
+        self._stems[agent_id] = stem
         if not channel:
             try:
                 channel = await self._resolve_channel_by_name(f"aegis-{stem}")
             except SlackApiError as exc:
                 _logger.warning(
-                    "slack_channel_name_lookup_failed", agent_id=agent_id, error=str(exc)
+                    "slack_channel_name_lookup_failed", agent_id=agent_id, error=error_text(exc, 500)
                 )
 
         result = (channel, username, icon, voice_id)
@@ -253,7 +321,7 @@ class SlackAdapter:
                 if first_ref is None:
                     first_ref = DeliveryRef("slack", {"channel": resp["channel"], "ts": resp["ts"]})
         except SlackApiError as exc:
-            return SendResult(ok=False, used_html=False, error=str(exc))
+            return SendResult(ok=False, used_html=False, error=error_text(exc, 500))
         return SendResult(ok=True, ref=first_ref, used_html=False)
 
     async def send_system_event(self, *, text: str) -> SendResult:
@@ -262,7 +330,7 @@ class SlackAdapter:
             try:
                 channel = await self._resolve_channel_by_name("aegis-general")
             except SlackApiError as exc:
-                _logger.warning("slack_general_lookup_failed", error=str(exc))
+                _logger.warning("slack_general_lookup_failed", error=error_text(exc, 500))
         body = html_to_mrkdwn(text)
         try:
             resp = await self._client.chat_postMessage(
@@ -273,7 +341,7 @@ class SlackAdapter:
                 icon_emoji=":gear:",
             )
         except SlackApiError as exc:
-            return SendResult(ok=False, used_html=False, error=str(exc))
+            return SendResult(ok=False, used_html=False, error=error_text(exc, 500))
         return SendResult(
             ok=True,
             ref=DeliveryRef("slack", {"channel": resp["channel"], "ts": resp["ts"]}),
@@ -307,7 +375,7 @@ class SlackAdapter:
                         data["ts"] = ts
                     first_ref = DeliveryRef("slack", data)
         except SlackApiError as exc:
-            return SendResult(ok=False, used_html=False, error=str(exc))
+            return SendResult(ok=False, used_html=False, error=error_text(exc, 500))
         return SendResult(ok=True, ref=first_ref, used_html=False)
 
     async def send_voice(
@@ -343,10 +411,10 @@ class SlackAdapter:
             resp = await self._client.files_upload_v2(
                 channel=channel,
                 content=mp3,
-                filename=f"{_short_agent(agent_id)}.mp3",
+                filename=f"{self._stems.get(agent_id, agent_id)}.mp3",
             )
         except SlackApiError as exc:
-            return SendResult(ok=False, used_html=False, error=str(exc))
+            return SendResult(ok=False, used_html=False, error=error_text(exc, 500))
         files = resp.get("files") or []
         ts = files[0].get("ts") if files else None
         data: dict[str, str] = {"channel": channel}
@@ -366,7 +434,7 @@ class SlackAdapter:
                 icon_emoji=icon,
             )
         except SlackApiError as exc:
-            return SendResult(ok=False, used_html=False, error=str(exc))
+            return SendResult(ok=False, used_html=False, error=error_text(exc, 500))
         return SendResult(
             ok=True,
             ref=DeliveryRef("slack", {"channel": resp["channel"], "ts": resp["ts"]}),
@@ -403,7 +471,7 @@ class SlackAdapter:
         except SlackApiError as exc:
             if (exc.response or {}).get("error") == "message_not_found":
                 return True
-            _logger.warning("slack_delete_failed", error=str(exc))
+            _logger.warning("slack_delete_failed", error=error_text(exc, 500))
             return False
 
     async def _build_channel_agent_map(self) -> dict[str, str]:
@@ -416,10 +484,11 @@ class SlackAdapter:
             resp.raise_for_status()
             agents = resp.json()
         except Exception as exc:  # noqa: BLE001 — empty map is a safe degrade
-            _logger.warning("slack_channel_map_fetch_failed", error=str(exc))
+            _logger.warning("slack_channel_map_fetch_failed", error=error_text(exc, 500))
             return {}
         out: dict[str, str] = {}
         for agent in agents or []:
+            self._note_stem(agent)
             channel_id = agent.get("slack_channel_id")
             agent_id = agent.get("id")
             if channel_id and agent_id:
@@ -449,7 +518,7 @@ class SlackAdapter:
             auth = await self._client.auth_test()
             bot_user_id = auth.get("user_id")
         except SlackApiError as exc:
-            _logger.warning("slack_auth_test_failed", error=str(exc))
+            _logger.warning("slack_auth_test_failed", error=error_text(exc, 500))
 
         channel_agent_map = await self._build_channel_agent_map()
         core = SlackCoreClient(self._settings)

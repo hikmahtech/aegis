@@ -27,14 +27,15 @@ digest read the same rows.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import asyncpg
 import structlog
 
+from aegis.errors import error_text
 from aegis.services import hub_project
-from aegis.services.hub import Event, ingest_event, slug
+from aegis.services.hub import LIVE_STATUSES, Event, ingest_event, slug
 
 logger = structlog.get_logger()
 
@@ -48,6 +49,7 @@ async def reconcile_findings(
     findings: list[dict[str, Any]],
     now: datetime | None = None,
     project: bool = True,
+    once_per: str = "",
 ) -> dict[str, Any]:
     """Record ``findings`` and resolve what is no longer found.
 
@@ -56,6 +58,16 @@ async def reconcile_findings(
     problem of one of them with no current finding is what "recovered" means.
     ``"record": False`` keeps a finding's problem live without adding an
     occurrence.
+
+    ``once_per`` is a stamp that makes a repeated sweep in the same period ONE
+    occurrence instead of several. The external id normally carries the exact
+    time of the call, so `ingest_event`'s duplicate claim can never fire and
+    every sweep counts again — which is right for a watchdog that runs every
+    half hour and whose occurrence count is a measure of how long a fault has
+    lasted. It is wrong for one that runs a handful of times a day over the same
+    facts: the count stops meaning "how often did this happen", and a problem
+    resolved between two sweeps of the same day is reopened by the next one.
+    Pass something that is constant within the period, such as today's date.
 
     Returns ``fresh`` (the findings that earned a card, each with its
     ``problem_id``), the counts of ``attached`` / ``muted`` / ``suppressed`` /
@@ -81,7 +93,7 @@ async def reconcile_findings(
             pool,
             Event(
                 source=source,
-                external_id=f"{source}:{klass}:{subject}@{now.isoformat()}",
+                external_id=f"{source}:{klass}:{subject}@{once_per or now.isoformat()}",
                 kind="occurrence",
                 title=str(f.get("title") or f"{klass}: {subject}")[:500],
                 subject=subject,
@@ -158,7 +170,7 @@ async def reconcile_findings(
             try:
                 await hub_project.project(pool, pid, now=now)
             except Exception as exc:  # noqa: BLE001 — the sweep retries projection
-                logger.warning("hub_watch_project_failed", problem_id=pid, error=str(exc)[:200])
+                logger.warning("hub_watch_project_failed", problem_id=pid, error=error_text(exc))
 
     logger.info(
         "hub_watch_reconciled",
@@ -191,3 +203,128 @@ def mute_hint(problem_ids: list[str]) -> str:
         "Silence: admin Problems page → open the problem → Mute 24h "
         f"(problem{'s' if len(ids) > 1 else ''} {', '.join(ids)})."
     )
+
+
+# Alertmanager holds its firing alerts in memory only, so a restart makes it
+# forget every one it was holding and their `resolved` webhooks are never sent.
+# Until this existed, that stranded the problem AND its Todoist task for good:
+# the alertmanager lane was the only producer with no reconciliation, so a
+# single lost webhook was permanent. Seen live on 2026-09-13 (#551) — a repaired
+# overlay fault sat `waiting_human` for 15 hours with zero resolution events
+# while alertmanager reported no active alerts at all.
+#
+# The same hole swallows a resolve sent during an ingress outage, which is
+# exactly the outage the ingress canary exists to catch (#492).
+_ALERTMANAGER_SOURCE = "alertmanager"
+
+
+async def reconcile_alertmanager(
+    pool: asyncpg.Pool,
+    *,
+    active_fingerprints: set[str],
+    now: datetime | None = None,
+    grace_minutes: float = 10.0,
+) -> dict[str, Any]:
+    """Resolve every live alertmanager problem whose alert it no longer lists.
+
+    ``active_fingerprints`` is what alertmanager currently holds. The caller
+    reads it and MUST NOT call this at all when that read failed or when
+    alertmanager has only just started — an empty set from a monitoring stack
+    that cannot be reached, or that has forgotten everything, would otherwise
+    read as "the whole estate recovered". The resolve says alertmanager stopped
+    listing the alert, not that the alert cleared, because only the first of
+    those is evidenced here.
+
+    **A problem is judged on EVERY fingerprint it has ever had, and resolved
+    only when alertmanager lists none of them.** An alertmanager fingerprint is
+    a hash of the label set, so the same recurring fault arrives under a new one
+    each time — one prod problem had 26 distinct fingerprints across 27
+    occurrences. Judging it on the first occurrence's fingerprint, as this
+    function first did, compares against a hash that can never be active again:
+    the problem was resolved within a minute of every legitimate reopen, for
+    ever (#561). Judging on the latest alone would be nearly as bad, because a
+    reopen can arrive under an older label set.
+
+    Two carve-outs. A problem whose LAST occurrence is newer than
+    ``grace_minutes`` is left alone — the alert is firing right now, whatever
+    alertmanager has managed to group. (The first version bounded
+    ``first_seen_at`` instead, which let a four-day-old problem with an
+    occurrence thirty seconds ago sail straight through.) A GROUP problem is
+    left alone too: its subject is ``*``, it stands for a whole class rather
+    than one alert, and no single fingerprint speaks for it — the same reason
+    :func:`reconcile_findings` treats groups separately.
+    """
+    now = now or datetime.now(UTC)
+    cutoff = now - timedelta(minutes=max(0.0, grace_minutes))
+    rows = await pool.fetch(
+        # `f.source` is the FIRST occurrence's, which is what makes the problem
+        # alertmanager's; `f.fingerprints` is EVERY fingerprint it has had, which
+        # is what decides whether alertmanager still lists it. `external_id` is
+        # `<fingerprint>@<startsAt>`, and a synthesised fingerprint
+        # (`alertmanager:<alertname>:<instance>`) carries colons but never an @.
+        "SELECT p.id::text AS id, p.class, p.subject, p.subject_kind, p.title, "
+        "       f.source, f.fingerprints "
+        "FROM problems p JOIN LATERAL ("
+        "  SELECT (array_agg(e.source ORDER BY e.id))[1] AS source,"
+        "         array_agg(DISTINCT split_part(e.external_id, '@', 1)) AS fingerprints"
+        "  FROM problem_events e"
+        "  WHERE e.problem_id = p.id AND e.kind = 'occurrence'"
+        ") f ON TRUE "
+        "WHERE p.closed_at IS NULL AND p.status = ANY($1::text[]) "
+        "  AND p.group_key IS NULL "
+        "  AND f.source = $2 "
+        # The LAST occurrence, not the first: a long-lived problem that fired
+        # again seconds ago is firing now.
+        "  AND p.last_seen_at < $3 "
+        "ORDER BY p.last_seen_at",
+        sorted(LIVE_STATUSES),
+        _ALERTMANAGER_SOURCE,
+        cutoff,
+    )
+    resolved: list[dict[str, Any]] = []
+    for row in rows:
+        fingerprints = {str(f) for f in (row["fingerprints"] or []) if str(f).strip()}
+        if not fingerprints or fingerprints & active_fingerprints:
+            continue
+        fingerprint = sorted(fingerprints)[0] if len(fingerprints) == 1 else ""
+        result = await ingest_event(
+            pool,
+            Event(
+                source=_ALERTMANAGER_SOURCE,
+                problem_id=row["id"],
+                external_id=f"alertmanager-reconcile:{row['id']}@{now.isoformat()}",
+                kind="resolved",
+                title=f"{row['class']} is no longer firing: {row['subject']}",
+                subject=row["subject"],
+                subject_kind=row["subject_kind"],
+                klass=row["class"],
+                payload={
+                    "reason": (
+                        "alertmanager no longer lists this alert. Reconciled by the hub "
+                        "sweep because a resolution webhook never arrived — alertmanager "
+                        "keeps its alerts in memory, so a restart loses them (#551)."
+                    ),
+                    "fingerprint": fingerprint,
+                    "fingerprints_checked": len(fingerprints),
+                },
+                occurred_at=now,
+            ),
+            now=now,
+        )
+        if result.action == "resolved":
+            resolved.append(
+                {
+                    "problem_id": row["id"],
+                    "klass": row["class"],
+                    "subject": row["subject"],
+                    "fingerprints_checked": len(fingerprints),
+                }
+            )
+    if resolved:
+        logger.info(
+            "hub_alertmanager_reconciled",
+            resolved=len(resolved),
+            checked=len(rows),
+            problems=[r["problem_id"] for r in resolved],
+        )
+    return {"checked": len(rows), "resolved": resolved}

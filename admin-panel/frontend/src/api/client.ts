@@ -87,6 +87,14 @@ export async function apiFetch<T>(path: string, options?: RequestInit): Promise<
   return (text ? JSON.parse(text) : undefined) as T;
 }
 
+/** One email → existing-task rule (`settings.email_task_links`). */
+export type EmailTaskLink = {
+  key: string;
+  subject_re: string;
+  body_re: string | null;
+  action: string;
+};
+
 export const api = {
   // Agents
   listAgents: () => apiFetch<any[]>('/api/agents'),
@@ -190,6 +198,53 @@ export const api = {
     note?: string;
   }) => apiFetch<any>('/api/admin/service-state', { method: 'PUT', body: JSON.stringify(body) }),
 
+  // The hub's own configuration. Both rows were DB-backed but reachable only by
+  // raw SQL, which is not "configurable" in a system meant to be forked (PR #559).
+  getHubSettleSeconds: () =>
+    apiFetch<{
+      overrides: Record<string, number>;
+      defaults: Record<string, number>;
+      default_seconds: number;
+      max_seconds: number;
+      wildcard: string;
+    }>('/api/admin/hub-settle-seconds'),
+  saveHubSettleSeconds: (overrides: Record<string, number>) =>
+    apiFetch<any>('/api/admin/hub-settle-seconds', {
+      method: 'PUT',
+      body: JSON.stringify({ overrides }),
+    }),
+  getInfraAlertRouting: () =>
+    apiFetch<{
+      alertnames: string[];
+      default_alertnames: string[];
+      extra_alertnames: string[];
+      repo: string;
+      platform_hint: string;
+    }>('/api/admin/infra-alert-routing'),
+  saveInfraAlertRouting: (body: {
+    extra_alertnames: string[];
+    repo: string;
+    platform_hint: string;
+  }) =>
+    apiFetch<any>('/api/admin/infra-alert-routing', {
+      method: 'PUT',
+      body: JSON.stringify(body),
+    }),
+  // The automatic restart's repeat window (`alert_remediation`, #501/#558).
+  getAlertRemediation: () =>
+    apiFetch<{
+      repeat_window_minutes: number;
+      defaults: { repeat_window_minutes: number };
+      max_minutes: number;
+      stored: boolean;
+    }>('/api/admin/alert-remediation'),
+  // `null` for a blank field: the server refuses it rather than reading 0.
+  saveAlertRemediation: (repeat_window_minutes: number | null) =>
+    apiFetch<any>('/api/admin/alert-remediation', {
+      method: 'PUT',
+      body: JSON.stringify({ repeat_window_minutes }),
+    }),
+
   // Expiry radar registry (life.expiring_items — passports, policies, warranties)
   listExpiringItems: (params?: { kind?: string; dueWithin?: number }) => {
     const q = new URLSearchParams();
@@ -232,6 +287,26 @@ export const api = {
   feedItems: (qs: string) =>
     apiFetch<FeedItemsPage>(`/api/admin/channels/feed-items${qs}`),
 
+  // How a chat turn ranks what the knowledge store finds (`knowledge_ranking`, #579).
+  getKnowledgeRanking: () =>
+    apiFetch<{
+      domain_boost: number;
+      source_types: Record<string, { rank_boost?: number; decay_days?: number | null }>;
+      defaults: { domain_boost: number; decay_days: number };
+      limits: { domain_boost: number; rank_boost: number; decay_days: number };
+      registry: Record<string, { rank_boost: number; decay_days: number | null; description: string }>;
+    }>('/api/admin/knowledge/ranking'),
+  saveKnowledgeRanking: (body: {
+    domain_boost: number;
+    source_types: Record<string, { rank_boost?: number; decay_days?: number | null }>;
+  }) =>
+    apiFetch<{
+      domain_boost: number;
+      source_types: Record<string, { rank_boost?: number; decay_days?: number | null }>;
+      defaults: { domain_boost: number; decay_days: number };
+      limits: { domain_boost: number; rank_boost: number; decay_days: number };
+      registry: Record<string, { rank_boost: number; decay_days: number | null; description: string }>;
+    }>('/api/admin/knowledge/ranking', { method: 'PUT', body: JSON.stringify(body) }),
   // Knowledge
   knowledgeAsk: (question: string) =>
     apiFetch<{ answer: string; sources: any[] }>('/api/knowledge/ask', {
@@ -398,11 +473,57 @@ export const api = {
     apiFetch<any>('/api/admin/slack-config', { method: 'PUT', body: JSON.stringify(body) }),
 
   // Email triage rules (user-owned sender verdicts + notification phrases)
+  // Research (the research agent's DB-owned config rows)
+  getResearchTopics: () => apiFetch<any>('/api/admin/research/topics'),
+  saveResearchTopics: (body: { topics: any[] }) =>
+    apiFetch<any>('/api/admin/research/topics', { method: 'PUT', body: JSON.stringify(body) }),
+  getResearchTopicsConfig: () => apiFetch<any>('/api/admin/research/topics-config'),
+  saveResearchTopicsConfig: (body: any) =>
+    apiFetch<any>('/api/admin/research/topics-config', { method: 'PUT', body: JSON.stringify(body) }),
+  getFeedsConfig: () => apiFetch<any>('/api/admin/research/feeds-config'),
+  saveFeedsConfig: (body: any) =>
+    apiFetch<any>('/api/admin/research/feeds-config', { method: 'PUT', body: JSON.stringify(body) }),
+  getResearchConfig: () => apiFetch<any>('/api/admin/research/config'),
+  saveResearchConfig: (body: any) =>
+    apiFetch<any>('/api/admin/research/config', { method: 'PUT', body: JSON.stringify(body) }),
+  getLibraryConfig: () => apiFetch<any>('/api/admin/research/library-config'),
+  saveLibraryConfig: (body: any) =>
+    apiFetch<any>('/api/admin/research/library-config', { method: 'PUT', body: JSON.stringify(body) }),
+
   getEmailTriageRules: () => apiFetch<any>('/api/admin/email/triage-rules'),
   saveEmailTriageRules: (body: {
     sender_overrides: Record<string, { category: string; tags: string[] }>;
     extra_notification_markers: string[];
   }) => apiFetch<any>('/api/admin/email/triage-rules', { method: 'PUT', body: JSON.stringify(body) }),
+  // Mail that closes or unblocks a task AEGIS already tracks
+  // (`email_task_links`, #337). Both regexes are compiled server-side.
+  getEmailTaskLinks: () =>
+    apiFetch<{ actions: string[]; links: EmailTaskLink[] }>('/api/admin/email/task-links'),
+  saveEmailTaskLinks: (links: EmailTaskLink[]) =>
+    apiFetch<{ actions: string[]; links: EmailTaskLink[] }>('/api/admin/email/task-links', {
+      method: 'PUT', body: JSON.stringify({ links }),
+    }),
+  // Who "you" are in a meeting transcript (`meeting_rules`, #558).
+  getMeetingRules: () => apiFetch<{ self_names: string[] }>('/api/admin/email/meeting-rules'),
+  saveMeetingRules: (body: { self_names: string[] }) =>
+    apiFetch<{ self_names: string[] }>('/api/admin/email/meeting-rules', {
+      method: 'PUT', body: JSON.stringify(body),
+    }),
+
+  // The vault layout (where the journal goes, what an entry looks like) and
+  // the user's clock. Previews are rendered on the server by the real code.
+  getVaultLayout: () => apiFetch<any>('/api/admin/notes/layout'),
+  saveVaultLayout: (body: any) =>
+    apiFetch<any>('/api/admin/notes/layout', { method: 'PUT', body: JSON.stringify(body) }),
+  previewVaultLayout: (layout: any, date: string) =>
+    apiFetch<any>('/api/admin/notes/layout/preview', {
+      method: 'POST', body: JSON.stringify({ layout, date }),
+    }),
+  getTimezone: () => apiFetch<{ timezone: string; effective: string }>('/api/admin/preferences/timezone'),
+  saveTimezone: (timezone: string) =>
+    apiFetch<{ timezone: string; effective: string }>('/api/admin/preferences/timezone', {
+      method: 'PUT', body: JSON.stringify({ timezone }),
+    }),
 
   // Todoist sync + outbox (GTD hub)
   todoistState: () => apiFetch<any>('/api/admin/todoist/state'),
@@ -419,6 +540,26 @@ export const api = {
     apiFetch<any>('/api/admin/todoist/content-routes/preview', { method: 'POST', body: JSON.stringify(body) }),
   suggestContentRoute: (body: { examples: string[] }) =>
     apiFetch<any>('/api/admin/todoist/content-routes/suggest', { method: 'POST', body: JSON.stringify(body) }),
+  // Todoist project → repo (the coding lane's first guess) and source tag →
+  // agent-task verb. Both were settings rows with no field anywhere (#558).
+  getProjectRepoMap: () =>
+    apiFetch<{ project_repo_map: Record<string, string> }>('/api/admin/todoist/project-repo-map'),
+  saveProjectRepoMap: (project_repo_map: Record<string, string>) =>
+    apiFetch<{ project_repo_map: Record<string, string> }>('/api/admin/todoist/project-repo-map', {
+      method: 'PUT', body: JSON.stringify({ project_repo_map }),
+    }),
+  getAgentTaskVerbs: () =>
+    apiFetch<{
+      overrides: Record<string, string | null>;
+      effective: Record<string, string | null>;
+      defaults: Record<string, string | null>;
+      verbs: string[];
+      untagged: string;
+    }>('/api/admin/todoist/agent-task-verbs'),
+  saveAgentTaskVerbs: (overrides: Record<string, string | null>) =>
+    apiFetch<any>('/api/admin/todoist/agent-task-verbs', {
+      method: 'PUT', body: JSON.stringify({ overrides }),
+    }),
   // Workbench: tasks, project picker, and clarify-decision visibility
   todoistTasks: (params?: { project_id?: string; status?: string; assignee?: string; limit?: number }) => {
     const q = new URLSearchParams();
@@ -440,11 +581,6 @@ export const api = {
   },
   todoistReclarify: (taskId: string) =>
     apiFetch<any>(`/api/admin/todoist/tasks/${encodeURIComponent(taskId)}/reclarify`, { method: 'POST' }),
-
-  // Money Hygiene (Maou)
-  moneyState: () => apiFetch<any>('/api/admin/money/state'),
-  moneyDigest: () => apiFetch<any>('/api/admin/money/digest'),
-  moneyRunFlow: (flow: string) => apiFetch<any>(`/api/admin/money/${flow}/run`, { method: 'POST' }),
 
   // Overview / System
   overviewBrief: () => apiFetch<any>('/api/overview/brief'),

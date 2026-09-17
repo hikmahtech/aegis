@@ -30,13 +30,13 @@ from temporalio.exceptions import ApplicationError, WorkflowAlreadyStartedError
 
 with workflow.unsafe.imports_passed_through():
     from aegis.connectors.remote_script import _PROMPT_CAP_BYTES
+    from aegis.errors import error_text, logged_failure
     from aegis.services.research import task_workflow_id, urls_in
 
     from aegis_worker.activities.agent_run import AgentRunActivities
     from aegis_worker.activities.agent_task import (
         UNTAGGED,
         VERBS_SETTING,
-        extract_service_name,
         resolve_verb,
     )
     from aegis_worker.activities.delivery import DeliveryActivities
@@ -89,18 +89,14 @@ _TURN_OUTPUT_TAIL = 6000
 # a run that never concluded, not an answer.
 _TURN_TIMEOUT_TAIL = 3000
 
-# #344 changed what a run does after `load_task_context`: the verb now comes
-# back from that activity (a setting can change it), `ask` is a new verb, and
-# the infra verb asks `plan_infra_task` before anything else. A deploy can land
-# while a run is between two activities, and the new worker then replays the
-# old history — so the new commands sit behind this patch and the pre-#344
-# code stays in the other arm. The runs are short (seconds, except a coding
-# turn, whose path this does not touch), so the old arm can go with a
-# `workflow.deprecate_patch` once no run started before the deploy is open.
+# Retired `workflow.patched` ids. The old branches are gone; the markers
+# stay one release longer as `workflow.deprecate_patch`, because a run that
+# RECORDED one is wedged by a worker whose code no longer mentions it at all
+# ("[TMPRL1100] Non-deprecated patch marker encountered"). Drop the calls and
+# these ids in the release after next — see #614.
+# One call covers both of #344's old sites: the SDK records a marker once per
+# id per run, and the first site is on every path that reached the second.
 _PATCH_344 = "agent-task-344-verbs-by-kind"
-# The verb table before #344, for replaying a run it started. Nothing else
-# reads it: a live run takes the verb `load_task_context` returns.
-_LEGACY_VERBS = {"#alert": "infra", "#receipt": "finance", "#email": "email"}
 
 
 def _cut(text: str, cap: int = _FIELD_CAP) -> str:
@@ -371,7 +367,7 @@ class AgentTaskSweepFlow:
                     workflow.logger.warning(
                         "agent_task_spawn_failed task_id=%s err=%s",
                         task["id"],
-                        str(exc)[:200],
+                        error_text(exc),
                     )
 
             # The fallback for a missed Todoist webhook, and the only path that
@@ -399,14 +395,12 @@ class AgentTaskSweepFlow:
         return {"found": len(tasks), "spawned": spawned, "resumed": resumed}
 
     async def _reconcile_sessions(self) -> None:
-        try:
+        with logged_failure("work_sessions_reconcile_failed", logger=workflow.logger):
             await workflow.execute_activity(
                 "reconcile_work_sessions",
                 start_to_close_timeout=TIMEOUT_STANDARD,
                 retry_policy=NO_RETRY,
             )
-        except Exception as exc:  # noqa: BLE001
-            workflow.logger.warning("work_sessions_reconcile_failed err=%s", str(exc)[:200])
 
     async def _due_turns(self, limit: int) -> list:
         """Tasks whose newest user comment is newer than their last turn.
@@ -424,7 +418,7 @@ class AgentTaskSweepFlow:
                 retry_policy=ACT_RETRY,
             )
         except Exception as exc:  # noqa: BLE001
-            workflow.logger.warning("agent_task_sweep_due_fetch_failed err=%s", str(exc)[:200])
+            workflow.logger.warning("agent_task_sweep_due_fetch_failed err=%s", error_text(exc))
             return []
 
     async def _dispatch_turn(self, row: dict, config: AgentTaskSweepConfig) -> int:
@@ -459,7 +453,7 @@ class AgentTaskSweepFlow:
             pass
         except Exception as exc:  # noqa: BLE001
             workflow.logger.warning(
-                "agent_task_turn_start_failed task_id=%s err=%s", task_id, str(exc)[:200]
+                "agent_task_turn_start_failed task_id=%s err=%s", task_id, error_text(exc)
             )
             return 0
         try:
@@ -470,7 +464,7 @@ class AgentTaskSweepFlow:
             # comment is still unconsumed, so the next tick starts a fresh
             # workflow for it — 15 minutes later, not never.
             workflow.logger.warning(
-                "agent_task_turn_signal_failed task_id=%s err=%s", task_id, str(exc)[:200]
+                "agent_task_turn_signal_failed task_id=%s err=%s", task_id, error_text(exc)
             )
             return 0
 
@@ -503,7 +497,6 @@ class AgentTaskFlow:
     async def run(self, input: AgentTaskFlowInput) -> dict:
         task = input.task
         task_id = input.todoist_task_id
-        verb = "unknown"
 
         step = "load_task"
         try:
@@ -524,7 +517,6 @@ class AgentTaskFlow:
                 # The other verbs read input.task directly; keep the two views
                 # of the task identical rather than threading a second one.
                 input.task = task
-            verb = resolve_verb(task, _LEGACY_VERBS)
 
             step = "load_task_context"
             context = await workflow.execute_activity(
@@ -533,11 +525,11 @@ class AgentTaskFlow:
                 start_to_close_timeout=TIMEOUT_FAST,
                 retry_policy=ACT_RETRY,
             )
-            by_kind = workflow.patched(_PATCH_344)
-            if by_kind:
-                # The activity resolved it against the `agent_task_verbs`
-                # setting, which this workflow cannot read.
-                verb = str((context or {}).get("verb") or "unknown")
+            # deprecate_patch: remove after the next release, see #614
+            workflow.deprecate_patch(_PATCH_344)
+            # The activity resolved it against the `agent_task_verbs` setting,
+            # which this workflow cannot read.
+            verb = str((context or {}).get("verb") or "unknown")
 
             if verb == "ask":
                 step = "run_ask"
@@ -549,7 +541,7 @@ class AgentTaskFlow:
 
             if verb == "infra":
                 step = "run_infra"
-                return await self._run_infra(input, task_id, context)
+                return await self._run_infra_by_kind(input, task_id)
 
             if verb == "email":
                 step = "run_email"
@@ -563,39 +555,8 @@ class AgentTaskFlow:
                 step = "run_coding"
                 return await self._run_coding(input, task_id, task)
 
-            if by_kind:
-                step = "park_unrouted"
-                return await self._park_unrouted(input, task_id, task, verb)
-
-            # Pre-#344, reached only when replaying a run it started: any
-            # remaining verb parks the task rather than guessing at it.
-            step = "comment"
-            source_note = (
-                f" (source: {context['external_id']})" if context.get("external_id") else ""
-            )
-            await workflow.execute_activity(
-                "comment",
-                args=[
-                    task_id,
-                    input.agent_id,
-                    f"No executor for this task type ({task.get('source_tag') or 'no source tag'})"
-                    f"{source_note} — leaving it for you.",
-                ],
-                # TIMEOUT_STANDARD (60s), not TIMEOUT_FAST (15s): comment()'s
-                # own connector call is best-effort internally, but the
-                # start-to-close deadline still needs enough room for that
-                # call to finish and hand back a caught {"ok": False} rather
-                # than have Temporal time out the activity out from under it.
-                start_to_close_timeout=TIMEOUT_STANDARD,
-                retry_policy=NO_RETRY,
-            )
-            step = "park_task"
-            await workflow.execute_activity(
-                "park_task",
-                args=[task_id, f"no executor for verb={verb}"],
-                start_to_close_timeout=TIMEOUT_FAST,
-                retry_policy=ACT_RETRY,
-            )
+            step = "park_unrouted"
+            return await self._park_unrouted(input, task_id, task, verb)
         except Exception as exc:  # noqa: BLE001
             # Every child MUST reach a terminal state — completed or parked —
             # or the task sits in the eligible pool forever, re-picked and
@@ -617,8 +578,6 @@ class AgentTaskFlow:
             raise ApplicationError(
                 f"agent_task_failed at step={step}: {exc!r}", non_retryable=True
             ) from exc
-
-        return {"task_id": task_id, "verb": verb, "status": "parked"}
 
     async def _run_ask(self, input: AgentTaskFlowInput, task_id: str) -> dict:
         """Hand the task to the agent it is assigned to (#344).
@@ -701,7 +660,7 @@ class AgentTaskFlow:
             problem = got if isinstance(got, dict) else {}
         except Exception as exc:  # noqa: BLE001 — the timeline is extra
             workflow.logger.warning(
-                "research_task_problem_failed task_id=%s err=%s", task_id, str(exc)[:200]
+                "research_task_problem_failed task_id=%s err=%s", task_id, error_text(exc)
             )
         question, context, seeds = title, _cut(description), urls_in(description, limit=3)
         if problem.get("class") == "topic" and problem.get("topic"):
@@ -720,7 +679,8 @@ class AgentTaskFlow:
             result = await workflow.execute_child_workflow(
                 ResearchFlow.run,
                 ResearchInput(
-                    agent_id=input.agent_id or "raphael",
+                    # "" lets the child resolve the `research` tag holder.
+                    agent_id=input.agent_id or "",
                     question=question,
                     context=context,
                     seed_urls=seeds,
@@ -804,71 +764,6 @@ class AgentTaskFlow:
             retry_policy=ACT_RETRY,
         )
         return {"task_id": task_id, "verb": verb, "status": "parked"}
-
-    async def _run_infra(self, input: AgentTaskFlowInput, task_id: str, context: dict) -> dict:
-        """Check live service state; investigate and gate a restart if broken.
-
-        Since #344 the activity `plan_infra_task` decides from the problem
-        behind the task what can be done: a service the swarm runs is checked
-        here as before, and anything else (a node, a URL, a group, a subject
-        the swarm does not run, an error Sentry reported, AEGIS's own kinds)
-        gets a read-only report and parks once.
-
-        The body below the patch check is the pre-#344 verb, kept only to
-        replay a run it started. There, a task the problem hub projected
-        carried its subject in `context` (`problems.subject`); a hand-written
-        one fell back to parsing the title.
-        """
-        if workflow.patched(_PATCH_344):
-            return await self._run_infra_by_kind(input, task_id)
-        title = str(input.task.get("content") or "")
-        kind = str((context or {}).get("subject_kind") or "")
-        if kind and kind != "service":
-            # A flow, a purpose, the comms probe, a domain, a post: the hub
-            # projected it as a task so the human sees it, but there is no
-            # swarm service to check or restart. Say so and park.
-            await workflow.execute_activity(
-                "comment",
-                args=[
-                    task_id,
-                    input.agent_id,
-                    f"This is a {kind} problem ({(context or {}).get('subject')}); "
-                    "there is no service to check or restart, so I have no automatic "
-                    "action for it.",
-                ],
-                start_to_close_timeout=TIMEOUT_STANDARD,
-                retry_policy=NO_RETRY,
-            )
-            await workflow.execute_activity(
-                "park_task",
-                args=[task_id, f"no automatic action for a {kind} problem"],
-                start_to_close_timeout=TIMEOUT_FAST,
-                retry_policy=ACT_RETRY,
-            )
-            return {"task_id": task_id, "verb": "infra", "status": "parked", "kind": kind}
-        service = str((context or {}).get("subject") or "") or extract_service_name(title)
-        if not service:
-            await workflow.execute_activity(
-                "comment",
-                args=[task_id, input.agent_id, "I couldn't tell which service this is about."],
-                start_to_close_timeout=TIMEOUT_STANDARD,
-                retry_policy=NO_RETRY,
-            )
-            await workflow.execute_activity(
-                "park_task",
-                args=[task_id, "service name not parseable from title"],
-                start_to_close_timeout=TIMEOUT_FAST,
-                retry_policy=ACT_RETRY,
-            )
-            return {"task_id": task_id, "verb": "infra", "status": "parked"}
-
-        health = await workflow.execute_activity(
-            "service_health",
-            args=[service],
-            start_to_close_timeout=TIMEOUT_STANDARD,
-            retry_policy=ACT_RETRY,
-        )
-        return await self._run_service(input, task_id, service, health)
 
     async def _run_infra_by_kind(self, input: AgentTaskFlowInput, task_id: str) -> dict:
         """The #344 infra verb: the plan first, then the check or the report."""
@@ -1191,7 +1086,7 @@ class AgentTaskFlow:
             )
         except Exception as exc:  # noqa: BLE001
             workflow.logger.warning(
-                "task_turn_not_counted task_id=%s err=%s", task_id, str(exc)[:200]
+                "task_turn_not_counted task_id=%s err=%s", task_id, error_text(exc)
             )
 
     async def _deliver(
@@ -1221,7 +1116,7 @@ class AgentTaskFlow:
             )
         except Exception as exc:  # noqa: BLE001
             workflow.logger.warning(
-                "agent_task_delivery_failed agent=%s err=%s", agent_id, str(exc)[:200]
+                "agent_task_delivery_failed agent=%s err=%s", agent_id, error_text(exc)
             )
             return None
 
@@ -1263,7 +1158,7 @@ class AgentTaskFlow:
             )
         except Exception as exc:  # noqa: BLE001
             workflow.logger.warning(
-                "task_slack_ref_not_stored task_id=%s err=%s", task_id, str(exc)[:200]
+                "task_slack_ref_not_stored task_id=%s err=%s", task_id, error_text(exc)
             )
 
     async def _run_coding(self, input: AgentTaskFlowInput, task_id: str, task: dict) -> dict:
@@ -1575,7 +1470,7 @@ class AgentTaskFlow:
             )
         except Exception as exc:  # noqa: BLE001
             workflow.logger.warning(
-                "task_plan_not_recorded task_id=%s err=%s", task_id, str(exc)[:200]
+                "task_plan_not_recorded task_id=%s err=%s", task_id, error_text(exc)
             )
 
     async def _kill_turn(self, output_file: str, host: str) -> None:
@@ -1595,7 +1490,7 @@ class AgentTaskFlow:
             )
         except Exception as exc:  # noqa: BLE001
             workflow.logger.warning(
-                "agent_task_kill_failed output_file=%s err=%s", output_file, str(exc)[:200]
+                "agent_task_kill_failed output_file=%s err=%s", output_file, error_text(exc)
             )
 
     async def _fetch_tail(self, output_file: str, host: str) -> str:
@@ -1618,7 +1513,7 @@ class AgentTaskFlow:
             )
         except Exception as exc:  # noqa: BLE001
             workflow.logger.warning(
-                "agent_task_tail_fetch_failed output_file=%s err=%s", output_file, str(exc)[:200]
+                "agent_task_tail_fetch_failed output_file=%s err=%s", output_file, error_text(exc)
             )
             return ""
         return str(check.get("output") or "")

@@ -51,6 +51,33 @@ def _cleanup_activity(calls: list[dict]):
     return cleanup
 
 
+async def _run_flow(activities: list, *inputs: AgentRunInput, id_prefix: str):
+    """One time-skipping environment and one worker, running each input in
+    order; returns the LAST result.
+
+    The tests that pass more than one input assert on what the stub activities
+    recorded across the runs, not on the intermediate results.
+    """
+
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        task_queue = f"tq-{uuid.uuid4().hex[:8]}"
+        async with Worker(
+            env.client,
+            task_queue=task_queue,
+            workflows=[AgentRunFlow],
+            activities=activities,
+        ):
+            result = None
+            for run_input in inputs:
+                result = await env.client.execute_workflow(
+                    AgentRunFlow.run,
+                    run_input,
+                    id=f"{id_prefix}-{uuid.uuid4().hex[:8]}",
+                    task_queue=task_queue,
+                )
+            return result
+
+
 @pytest.mark.asyncio
 async def test_happy_path_delivers_output_tail():
     """Launch ok → first check finished → transcript tail delivered, status ok."""
@@ -86,24 +113,15 @@ async def test_happy_path_delivers_output_tail():
         delivered.append(message)
         return {"ok": True, "message_id": 42}
 
-    async with await WorkflowEnvironment.start_time_skipping() as env:
-        task_queue = f"tq-{uuid.uuid4().hex[:8]}"
-        async with Worker(
-            env.client,
-            task_queue=task_queue,
-            workflows=[AgentRunFlow],
-            activities=[launch, check, send_message, _cleanup_activity(cleanup_calls)],
-        ):
-            result = await env.client.execute_workflow(
-                AgentRunFlow.run,
-                AgentRunInput(
-                    agent_id="pandoras-actor",
-                    prompt="Audit the retry policy in bcp.",
-                    purpose="retry audit",
-                ),
-                id=f"arf-happy-{uuid.uuid4().hex[:8]}",
-                task_queue=task_queue,
-            )
+    result = await _run_flow(
+        [launch, check, send_message, _cleanup_activity(cleanup_calls)],
+        AgentRunInput(
+            agent_id="pandoras-actor",
+            prompt="Audit the retry policy in bcp.",
+            purpose="retry audit",
+        ),
+        id_prefix="arf-happy",
+    )
 
     assert result["status"] == "ok"
     assert result["run_id"] == "ab12cd34"
@@ -174,20 +192,11 @@ async def test_launch_failure_is_attempted_once_and_delivered():
         delivered.append(message)
         return {"ok": True, "message_id": 1}
 
-    async with await WorkflowEnvironment.start_time_skipping() as env:
-        task_queue = f"tq-{uuid.uuid4().hex[:8]}"
-        async with Worker(
-            env.client,
-            task_queue=task_queue,
-            workflows=[AgentRunFlow],
-            activities=[launch, check, send_message, _cleanup_activity(cleanup_calls)],
-        ):
-            result = await env.client.execute_workflow(
-                AgentRunFlow.run,
-                AgentRunInput(agent_id="sebas", prompt="do a thing", purpose="thing"),
-                id=f"arf-launchfail-{uuid.uuid4().hex[:8]}",
-                task_queue=task_queue,
-            )
+    result = await _run_flow(
+        [launch, check, send_message, _cleanup_activity(cleanup_calls)],
+        AgentRunInput(agent_id="sebas", prompt="do a thing", purpose="thing"),
+        id_prefix="arf-launchfail",
+    )
 
     assert attempts["count"] == 1, "launch must be attempted exactly once (NO_RETRY)"
     assert checked["hit"] is False
@@ -230,20 +239,11 @@ async def test_missing_scratch_checkout_delivers_provision_command():
         delivered.append(message)
         return {"ok": True, "message_id": 1}
 
-    async with await WorkflowEnvironment.start_time_skipping() as env:
-        task_queue = f"tq-{uuid.uuid4().hex[:8]}"
-        async with Worker(
-            env.client,
-            task_queue=task_queue,
-            workflows=[AgentRunFlow],
-            activities=[launch, check, send_message, _cleanup_activity(cleanup_calls)],
-        ):
-            result = await env.client.execute_workflow(
-                AgentRunFlow.run,
-                AgentRunInput(agent_id="sebas", prompt="analyse this"),
-                id=f"arf-noscratch-{uuid.uuid4().hex[:8]}",
-                task_queue=task_queue,
-            )
+    result = await _run_flow(
+        [launch, check, send_message, _cleanup_activity(cleanup_calls)],
+        AgentRunInput(agent_id="sebas", prompt="analyse this"),
+        id_prefix="arf-noscratch",
+    )
 
     assert result["status"] == "failed"
     assert len(delivered) == 1
@@ -282,25 +282,16 @@ async def test_timeout_fires_at_the_deadline_and_reports_where_the_run_is():
         delivered.append(message)
         return {"ok": True, "message_id": 1}
 
-    async with await WorkflowEnvironment.start_time_skipping() as env:
-        task_queue = f"tq-{uuid.uuid4().hex[:8]}"
-        async with Worker(
-            env.client,
-            task_queue=task_queue,
-            workflows=[AgentRunFlow],
-            activities=[launch, check, send_message, _cleanup_activity(cleanup_calls)],
-        ):
-            result = await env.client.execute_workflow(
-                AgentRunFlow.run,
-                AgentRunInput(
-                    agent_id="sebas",
-                    prompt="long job",
-                    purpose="long job",
-                    timeout_minutes=5,
-                ),
-                id=f"arf-timeout-{uuid.uuid4().hex[:8]}",
-                task_queue=task_queue,
-            )
+    result = await _run_flow(
+        [launch, check, send_message, _cleanup_activity(cleanup_calls)],
+        AgentRunInput(
+            agent_id="sebas",
+            prompt="long job",
+            purpose="long job",
+            timeout_minutes=5,
+        ),
+        id_prefix="arf-timeout",
+    )
 
     assert result["status"] == "timeout"
     assert result["run_id"] == "ab12cd34"
@@ -363,25 +354,16 @@ async def test_the_deadline_holds_when_the_polls_themselves_are_slow():
         delivered.append(message)
         return {"ok": True, "message_id": 1}
 
-    async with await WorkflowEnvironment.start_time_skipping() as env:
-        task_queue = f"tq-{uuid.uuid4().hex[:8]}"
-        async with Worker(
-            env.client,
-            task_queue=task_queue,
-            workflows=[AgentRunFlow],
-            activities=[launch, check, send_message, _cleanup_activity(cleanup_calls)],
-        ):
-            result = await env.client.execute_workflow(
-                AgentRunFlow.run,
-                AgentRunInput(
-                    agent_id="sebas",
-                    prompt="stalling job",
-                    purpose="stalling job",
-                    timeout_minutes=1,
-                ),
-                id=f"arf-stalled-{uuid.uuid4().hex[:8]}",
-                task_queue=task_queue,
-            )
+    result = await _run_flow(
+        [launch, check, send_message, _cleanup_activity(cleanup_calls)],
+        AgentRunInput(
+            agent_id="sebas",
+            prompt="stalling job",
+            purpose="stalling job",
+            timeout_minutes=1,
+        ),
+        id_prefix="arf-stalled",
+    )
 
     assert result["status"] == "timeout"
     assert 60 <= result["elapsed_s"] <= 66, result["elapsed_s"]
@@ -423,20 +405,11 @@ async def test_elapsed_s_is_wall_clock_including_the_time_spent_in_the_last_poll
     async def send_message(agent_id, message, chat_id=0, keyboard=None):
         return {"ok": True, "message_id": 1}
 
-    async with await WorkflowEnvironment.start_time_skipping() as env:
-        task_queue = f"tq-{uuid.uuid4().hex[:8]}"
-        async with Worker(
-            env.client,
-            task_queue=task_queue,
-            workflows=[AgentRunFlow],
-            activities=[launch, check, send_message, _cleanup_activity(cleanup_calls)],
-        ):
-            result = await env.client.execute_workflow(
-                AgentRunFlow.run,
-                AgentRunInput(agent_id="sebas", prompt="slow finish", purpose="slow finish"),
-                id=f"arf-elapsed-{uuid.uuid4().hex[:8]}",
-                task_queue=task_queue,
-            )
+    result = await _run_flow(
+        [launch, check, send_message, _cleanup_activity(cleanup_calls)],
+        AgentRunInput(agent_id="sebas", prompt="slow finish", purpose="slow finish"),
+        id_prefix="arf-elapsed",
+    )
 
     assert result["status"] == "ok"
     # Two 30s poll intervals (skipped) + the 3s the final poll really took.
@@ -760,26 +733,19 @@ async def test_gated_input_reaches_the_launch_activity():
     async def send_message(agent_id, message, chat_id=0, keyboard=None):
         return {"ok": True, "message_id": 1}
 
-    async with await WorkflowEnvironment.start_time_skipping() as env:
-        task_queue = f"tq-{uuid.uuid4().hex[:8]}"
-        async with Worker(
-            env.client,
-            task_queue=task_queue,
-            workflows=[AgentRunFlow],
-            activities=[launch, check, send_message, _cleanup_activity(cleanup_calls)],
-        ):
-            for gated in (True, False):
-                await env.client.execute_workflow(
-                    AgentRunFlow.run,
-                    AgentRunInput(
-                        agent_id="sebas",
-                        prompt="Refactor the retry policy.",
-                        engine="claude",
-                        gated=gated,
-                    ),
-                    id=f"arf-gated-{gated}-{uuid.uuid4().hex[:8]}",
-                    task_queue=task_queue,
-                )
+    await _run_flow(
+        [launch, check, send_message, _cleanup_activity(cleanup_calls)],
+        *(
+            AgentRunInput(
+                agent_id="sebas",
+                prompt="Refactor the retry policy.",
+                engine="claude",
+                gated=gated,
+            )
+            for gated in (True, False)
+        ),
+        id_prefix="arf-gated",
+    )
 
     # Both values cross the boundary — a hardcoded True or False fails.
     assert [call["gated"] for call in launch_calls] == [True, False]

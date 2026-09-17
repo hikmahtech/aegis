@@ -15,7 +15,8 @@ import uuid
 import httpx
 import structlog
 
-from aegis.connectors._base import HTTPConnector
+from aegis.connectors._base import HTTPConnector, envelope
+from aegis.errors import error_text
 
 logger = structlog.get_logger()
 
@@ -50,22 +51,6 @@ class TodoistConnector(HTTPConnector):
             transport=httpx.AsyncHTTPTransport(retries=2),
         )
 
-    def _envelope(
-        self,
-        ok: bool,
-        data: dict | None = None,
-        error: str | None = None,
-        retryable: bool = False,
-        external_ref: str | None = None,
-    ) -> dict:
-        return {
-            "ok": ok,
-            "data": data,
-            "error": error,
-            "retryable": retryable,
-            "external_ref": external_ref,
-        }
-
     async def _handle_http_response(self, resp, op_name: str, elapsed: int) -> dict:
         """Map an httpx response to the standard envelope via the shared
         status ladder, recording the per-status action under ``op_name``.
@@ -76,18 +61,41 @@ class TodoistConnector(HTTPConnector):
         """
         if resp.status_code == 200:
             await self._record(op_name, "ok", elapsed)
-            return self._envelope(ok=True, data=resp.json())
+            return envelope(ok=True, data=resp.json())
         if resp.status_code in (401, 403):
             await self._record(op_name, "unauthorized", elapsed, resp.text[:200])
-            return self._envelope(ok=False, error="unauthorized", retryable=False)
+            return envelope(ok=False, error="unauthorized", retryable=False)
         if resp.status_code >= 500:
             await self._record(op_name, "server_error", elapsed, resp.text[:200])
-            return self._envelope(ok=False, error=f"http_{resp.status_code}", retryable=True)
+            return envelope(ok=False, error=f"http_{resp.status_code}", retryable=True)
         if resp.status_code == 429:
             await self._record(op_name, "rate_limited", elapsed, resp.text[:200])
-            return self._envelope(ok=False, error="rate_limited", retryable=True)
+            return envelope(ok=False, error="rate_limited", retryable=True)
         await self._record(op_name, "client_error", elapsed, resp.text[:200])
-        return self._envelope(ok=False, error=f"http_{resp.status_code}", retryable=False)
+        return envelope(ok=False, error=f"http_{resp.status_code}", retryable=False)
+
+    async def _post(self, op_name: str, path: str, **kwargs) -> dict:
+        """One POST through the transport + status ladder both sync calls and
+        the upload share.
+
+        A timeout and a network error are RETRYABLE and say so: the outbox
+        queues on that answer, so calling them anything else would drop a
+        write Todoist never saw.
+        """
+        client = await self._ensure_client()
+        started = time.perf_counter()
+        try:
+            resp = await client.post(path, **kwargs)
+        except httpx.TimeoutException as exc:
+            elapsed = int((time.perf_counter() - started) * 1000)
+            await self._record(op_name, "timeout", elapsed, error_text(exc))
+            return envelope(ok=False, error="timeout", retryable=True)
+        except httpx.NetworkError as exc:
+            elapsed = int((time.perf_counter() - started) * 1000)
+            await self._record(op_name, "network_error", elapsed, error_text(exc))
+            return envelope(ok=False, error="network", retryable=True)
+        elapsed = int((time.perf_counter() - started) * 1000)
+        return await self._handle_http_response(resp, op_name, elapsed)
 
     # ---------------- Sync read ----------------
 
@@ -98,27 +106,13 @@ class TodoistConnector(HTTPConnector):
         pass the token returned by the previous response for a delta.
         """
         if not self._api_key:
-            return self._envelope(ok=False, error="no_api_key", retryable=False)
+            return envelope(ok=False, error="no_api_key", retryable=False)
 
-        client = await self._ensure_client()
         payload = {
             "sync_token": sync_token,
             "resource_types": resource_types,
         }
-        started = time.perf_counter()
-        try:
-            r = await client.post(_SYNC_PATH, json=payload)
-        except httpx.TimeoutException as exc:
-            elapsed = int((time.perf_counter() - started) * 1000)
-            await self._record("sync", "timeout", elapsed, str(exc)[:200])
-            return self._envelope(ok=False, error="timeout", retryable=True)
-        except httpx.NetworkError as exc:
-            elapsed = int((time.perf_counter() - started) * 1000)
-            await self._record("sync", "network_error", elapsed, str(exc)[:200])
-            return self._envelope(ok=False, error="network", retryable=True)
-
-        elapsed = int((time.perf_counter() - started) * 1000)
-        return await self._handle_http_response(r, "sync", elapsed)
+        return await self._post("sync", _SYNC_PATH, json=payload)
 
     # ---------------- Write (commands batch) ----------------
 
@@ -130,26 +124,11 @@ class TodoistConnector(HTTPConnector):
         connector handles transport and envelope.
         """
         if not self._api_key:
-            return self._envelope(ok=False, error="no_api_key", retryable=False)
+            return envelope(ok=False, error="no_api_key", retryable=False)
         if not commands:
-            return self._envelope(ok=True, data={"sync_status": {}, "temp_id_mapping": {}})
+            return envelope(ok=True, data={"sync_status": {}, "temp_id_mapping": {}})
 
-        client = await self._ensure_client()
-        payload = {"commands": commands}
-        started = time.perf_counter()
-        try:
-            r = await client.post(_SYNC_PATH, json=payload)
-        except httpx.TimeoutException as exc:
-            elapsed = int((time.perf_counter() - started) * 1000)
-            await self._record("commands", "timeout", elapsed, str(exc)[:200])
-            return self._envelope(ok=False, error="timeout", retryable=True)
-        except httpx.NetworkError as exc:
-            elapsed = int((time.perf_counter() - started) * 1000)
-            await self._record("commands", "network_error", elapsed, str(exc)[:200])
-            return self._envelope(ok=False, error="network", retryable=True)
-
-        elapsed = int((time.perf_counter() - started) * 1000)
-        return await self._handle_http_response(r, "commands", elapsed)
+        return await self._post("commands", _SYNC_PATH, json={"commands": commands})
 
     # ---------------- File uploads ----------------
 
@@ -170,29 +149,19 @@ class TodoistConnector(HTTPConnector):
         Returns the standard envelope with `data` set to the blob above.
         """
         if not self._api_key:
-            return self._envelope(ok=False, error="no_api_key", retryable=False)
+            return envelope(ok=False, error="no_api_key", retryable=False)
         if not filename or not content:
-            return self._envelope(ok=False, error="missing_file", retryable=False)
+            return envelope(ok=False, error="missing_file", retryable=False)
 
-        client = await self._ensure_client()
-        files = {"file": (filename, content, content_type)}
-        started = time.perf_counter()
-        try:
-            # Override the client's default timeout for this call —
-            # multipart uploads of compressed transcripts (~100KB) can
-            # legitimately take 20-40s over a constrained link.
-            r = await client.post(_UPLOAD_PATH, files=files, timeout=_UPLOAD_TIMEOUT)
-        except httpx.TimeoutException as exc:
-            elapsed = int((time.perf_counter() - started) * 1000)
-            await self._record("upload", "timeout", elapsed, str(exc)[:200])
-            return self._envelope(ok=False, error="timeout", retryable=True)
-        except httpx.NetworkError as exc:
-            elapsed = int((time.perf_counter() - started) * 1000)
-            await self._record("upload", "network_error", elapsed, str(exc)[:200])
-            return self._envelope(ok=False, error="network", retryable=True)
-
-        elapsed = int((time.perf_counter() - started) * 1000)
-        return await self._handle_http_response(r, "upload", elapsed)
+        # The timeout overrides the client's default for this call —
+        # multipart uploads of compressed transcripts (~100KB) can
+        # legitimately take 20-40s over a constrained link.
+        return await self._post(
+            "upload",
+            _UPLOAD_PATH,
+            files={"file": (filename, content, content_type)},
+            timeout=_UPLOAD_TIMEOUT,
+        )
 
     # ---------------- Envelope inspection ----------------
 

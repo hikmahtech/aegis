@@ -141,12 +141,13 @@ SOURCE_TYPES: dict[str, SourceTypeInfo] = {
         "text — kept in step with the library by CalibreSyncFlow (#510)",
         decay_days=3650,
     ),
-    # The user's Obsidian vault and Raphael's own notes (#514): the record of
-    # what was concluded, so it barely decays and ranks above raw documents.
+    # The user's Obsidian vault and the research agent's own notes (#514): the
+    # record of what was concluded, so it barely decays and ranks above raw
+    # documents.
     "note": SourceTypeInfo(
-        "A note from the user's Obsidian vault (journal, knowledge, literature, "
-        "reference, and Raphael's own under raphael/), indexed by NotesSyncFlow "
-        "with encrypted blocks stripped. The vault is the record; this is its index.",
+        "A note from the user's Obsidian vault (the journal, their own notes and "
+        "the research agent's, in its folder), indexed by NotesSyncFlow with "
+        "encrypted blocks stripped. The vault is the record; this is its index.",
         decay_days=3650,
         rank_boost=1.25,
     ),

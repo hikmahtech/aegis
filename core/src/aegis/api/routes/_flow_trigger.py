@@ -14,9 +14,12 @@ them against the worker's registered classes at dispatch time.
 from __future__ import annotations
 
 import uuid
+from typing import Any
 
 from fastapi import HTTPException, Request
 from temporalio.client import Client as TemporalClient
+
+from aegis.services.workflows import with_owner, workflow_owner
 
 
 def require_temporal_client(request: Request) -> TemporalClient:
@@ -32,18 +35,21 @@ async def start_named_workflow(
     cfg: dict,
     temporal_client: TemporalClient,
     flow_names: dict[str, str],
+    pool: Any = None,
 ):
     """Start the Temporal workflow mapped to ``flow``.
 
     Raises 400 for an unknown flow slug. The workflow id is
-    ``manual-{flow}-{8 hex}`` and the task queue is ``aegis-main``.
+    ``manual-{flow}-{8 hex}`` and the task queue is ``aegis-main``. A ``cfg``
+    naming no ``agent_id`` runs as the owner of the flow's ``activities`` row,
+    not as the dataclass default's example agent (#579).
     """
     workflow_name = flow_names.get(flow)
     if workflow_name is None:
         raise HTTPException(status_code=400, detail=f"unknown flow: {flow}")
     return await temporal_client.start_workflow(
         workflow_name,
-        cfg or {},
+        with_owner(cfg, await workflow_owner(pool, workflow_name)),
         id=f"manual-{flow}-{uuid.uuid4().hex[:8]}",
         task_queue="aegis-main",
     )

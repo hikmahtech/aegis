@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import structlog
+from aegis.errors import error_text
 from aegis.llm import parse_llm_json
 from aegis.services.email_rules import get_email_rules, match_sender_override
 from aegis.services.email_rules import merge as merge_email_rules
@@ -448,10 +449,10 @@ class GmailActivities:
     llm_client: Any = None
     model_balanced: str = "qwen3:14b"
     db_pool: Any = None
-    # Owning agent for triage — matches GmailIngestFlow's config default.
-    # Threaded into llm_calls rows so gmail_classification stops recording
-    # NULL agent_id (see MoneyActivities.agent_id for the same pattern).
-    agent_id: str = "sebas"
+    # Owning agent for triage — the `gtd` holder, resolved at boot in
+    # `__main__` (#579). Threaded into llm_calls rows so gmail_classification
+    # is attributable; "" (nobody holds the tag) records no agent.
+    agent_id: str = ""
     # Wired post-construction in worker/__main__ so important emails
     # land in the knowledge graph and become searchable later via
     # Raphael's `search_knowledge` / `ask_knowledge` tools.
@@ -572,7 +573,7 @@ class GmailActivities:
         try:
             return await asyncio.to_thread(_sync)
         except Exception as exc:
-            activity.logger.warning("fetch_thread_failed thread=%s: %s", thread_id, str(exc)[:200])
+            activity.logger.warning("fetch_thread_failed thread=%s: %s", thread_id, error_text(exc))
             return ""
 
     @activity.defn
@@ -602,7 +603,7 @@ class GmailActivities:
                 "fetch_message_body_failed account=%s msg=%s err=%s",
                 account_label,
                 message_id,
-                str(exc)[:200],
+                error_text(exc),
             )
             return ""
 
@@ -637,7 +638,7 @@ class GmailActivities:
             activity.logger.warning(
                 "is_message_unread_failed msg_id=%s err=%s — assuming unread",
                 message_id,
-                str(exc)[:200],
+                error_text(exc),
             )
             return True
 
@@ -776,7 +777,7 @@ class GmailActivities:
                 max_tokens=2048,
                 db_pool=self.db_pool,
                 purpose="gmail_classification",
-                agent_id=self.agent_id,
+                agent_id=self.agent_id or None,
             )
             # think() returns {"response": str, "model": str, ...}
             text = (raw.get("response") or "").strip()
@@ -810,7 +811,7 @@ class GmailActivities:
                 "source": "llm",
             }
         except Exception as exc:
-            activity.logger.warning("classify_email_llm_failed: %s", str(exc)[:200])
+            activity.logger.warning("classify_email_llm_failed: %s", error_text(exc))
             return {
                 "category": _FALLBACK_CATEGORY,
                 "confidence": 0.5,
@@ -874,7 +875,7 @@ class GmailActivities:
                 return {"recorded": True, "outcome": "corrected", "actual": correction}
         except Exception as exc:
             activity.logger.warning(
-                "record_triage_outcome_failed email_id=%s err=%s", email_id, str(exc)[:200]
+                "record_triage_outcome_failed email_id=%s err=%s", email_id, error_text(exc)
             )
             return {"recorded": False, "outcome": "error"}
 
@@ -1074,7 +1075,7 @@ class GmailActivities:
             }
         except Exception as exc:  # noqa: BLE001 — feedback must never block ingest
             activity.logger.warning(
-                "recheck_triage_outcomes_failed account=%s err=%s", account_label, str(exc)[:200]
+                "recheck_triage_outcomes_failed account=%s err=%s", account_label, error_text(exc)
             )
             return empty
 
@@ -1249,9 +1250,9 @@ class GmailActivities:
             activity.logger.warning(
                 "ingest_email_to_kg_failed msg_id=%s err=%s",
                 msg_id,
-                str(exc)[:200],
+                error_text(exc),
             )
-            return {"ingested": False, "reason": str(exc)[:200]}
+            return {"ingested": False, "reason": error_text(exc)}
 
     @activity.defn
     async def gather_email_context(
@@ -1273,7 +1274,7 @@ class GmailActivities:
         try:
             hits = await self.knowledge_connector.search(query, limit=6)
         except Exception as exc:
-            activity.logger.warning("gather_email_context_failed err=%s", str(exc)[:200])
+            activity.logger.warning("gather_email_context_failed err=%s", error_text(exc))
             return ""
         lines: list[str] = []
         seen: set[str] = set()
@@ -1305,7 +1306,7 @@ class GmailActivities:
         try:
             return await get_email_rules(self.db_pool)
         except Exception as exc:
-            activity.logger.warning("email_rules_load_failed err=%s", str(exc)[:120])
+            activity.logger.warning("email_rules_load_failed err=%s", error_text(exc, 120))
             return merge_email_rules(None)
 
     async def _triage_lookup(self, sender: str) -> dict | None:
@@ -1334,7 +1335,7 @@ class GmailActivities:
                 "tags": _parse_tags(raw_tags) if isinstance(raw_tags, list) else None,
             }
         except Exception as exc:
-            activity.logger.warning("triage_lookup_failed sender=%s err=%s", sender, str(exc)[:120])
+            activity.logger.warning("triage_lookup_failed sender=%s err=%s", sender, error_text(exc, 120))
             return None
 
     async def _triage_upsert(
@@ -1413,7 +1414,7 @@ class GmailActivities:
                     meta,
                 )
         except Exception as exc:
-            activity.logger.warning("triage_upsert_failed sender=%s err=%s", sender, str(exc)[:120])
+            activity.logger.warning("triage_upsert_failed sender=%s err=%s", sender, error_text(exc, 120))
 
     @activity.defn
     async def apply_label(self, account_label: str, message_id: str, label: str) -> dict:
@@ -1449,5 +1450,5 @@ class GmailActivities:
             result = await asyncio.to_thread(_sync)
             return {"ok": True, "id": result.get("id")}
         except Exception as exc:
-            activity.logger.warning("gmail_label_failed: %s", str(exc)[:200])
-            return {"ok": False, "error": str(exc)[:200]}
+            activity.logger.warning("gmail_label_failed: %s", error_text(exc))
+            return {"ok": False, "error": error_text(exc)}

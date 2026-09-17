@@ -6,14 +6,18 @@ searches title, author, tags and the rest, and each entry carries an
 acquisition link per format (`/opds/download/<id>/<format>/`). Everything sits
 behind HTTP Basic auth for a calibre-web user.
 
-Two rules this module enforces rather than trusts:
+Three rules this module enforces rather than trusts:
 
-* **Never the public host.** `calibre.hikmahtech.in` is behind Cloudflare
-  Access, which answers every path — `/opds` included — with a 302 to its
-  login page. That is how the Miniflux integration broke silently (#70). The
-  constructor refuses that host, and any redirect is an error rather than
-  something to follow, so a misconfigured URL fails loudly instead of parsing
-  a login page as "no books".
+* **Never a host behind an SSO login page.** A calibre-web fronted by an
+  identity proxy (Cloudflare Access, Authelia, oauth2-proxy) answers every
+  path — `/opds` included — with a 302 to its login page. That is how the
+  Miniflux integration broke silently (#70). So no redirect is ever followed:
+  any 3xx is an error, and a misconfigured URL fails loudly instead of parsing
+  a login page as "no books". Point `calibre_url` at the internal address the
+  stack reaches directly.
+* **Same host only.** The client carries the library's credentials, so a
+  `next` page link or a download link that names another host is refused
+  rather than followed with the password.
 * **Read-only.** Nothing here writes to calibre-web; a download is a GET.
 """
 
@@ -30,23 +34,24 @@ import httpx
 import structlog
 
 from aegis.connectors._base import HTTPConnector
+from aegis.errors import error_text
 
 logger = structlog.get_logger()
 
-# The internal swarm address: calibre-web and aegis-core share the
-# `traefik_public` overlay, so this bypasses Cloudflare Access entirely.
-DEFAULT_URL = "http://calibre-web_calibre-web:8083"
-# Hosts that must never be called (see the module docstring).
-PUBLIC_HOSTS = frozenset({"calibre.hikmahtech.in"})
-# A book file larger than this is not read. The library's PDFs are textbooks;
-# 80 MB covers them without letting one scanned tome exhaust the process.
+# No default address: a fork's calibre-web lives wherever it lives, and a
+# blank URL means "not configured" (`library.connector_or_reason`).
+DEFAULT_URL = ""
+# A book file larger than this is not read: the default behind the
+# `calibre_max_book_mb` Integrations key (80 MB covers a textbook PDF without
+# letting one scanned tome exhaust the process).
 MAX_DOWNLOAD_BYTES = 80 * 1024 * 1024
 # How long a fetched catalogue is reused. A tool call that needs one book's
 # metadata should not page through the whole library every time.
 CATALOG_TTL_S = 300.0
-# Runaway guard on `?offset=` paging: at calibre-web's default of 60 books a
-# page this is 3,000 books.
-_MAX_PAGES = 50
+# Runaway guard on `?offset=` paging: the default behind `calibre_max_books`
+# (3,000 books at calibre-web's default of 60 a page).
+MAX_BOOKS = 3000
+_BOOKS_PER_PAGE = 60
 
 _ATOM = "{http://www.w3.org/2005/Atom}"
 _DCTERMS = "{http://purl.org/dc/terms/}"
@@ -61,19 +66,6 @@ _REDIRECTS = (301, 302, 303, 307, 308)
 
 class CalibreError(Exception):
     """calibre-web could not be read (unreachable, refused, redirected, not OPDS)."""
-
-
-def refuse_public_host(url: str) -> None:
-    """Raise ValueError when `url` points at a host AEGIS must never call."""
-    # `hostname` is already lower-case; the trailing dot of a fully qualified
-    # name ("calibre.hikmahtech.in.") would otherwise slip past the match.
-    host = (urlparse(url).hostname or "").lower().rstrip(".")
-    if host in PUBLIC_HOSTS:
-        raise ValueError(
-            f"{host} is behind Cloudflare Access and answers every path with a login "
-            "redirect; use the internal address "
-            f"{DEFAULT_URL} instead"
-        )
 
 
 def _text(el: ET.Element | None) -> str:
@@ -182,19 +174,25 @@ class CalibreConnector(HTTPConnector):
 
     def __init__(
         self,
-        base_url: str = DEFAULT_URL,
+        base_url: str,
         user: str = "",
         password: str = "",
         *,
         timeout: float = 30.0,
         db_pool: Any = None,
+        max_download_bytes: int = MAX_DOWNLOAD_BYTES,
+        max_books: int = MAX_BOOKS,
     ) -> None:
         super().__init__(timeout=timeout, db_pool=db_pool)
-        self._base_url = (base_url or DEFAULT_URL).rstrip("/")
-        refuse_public_host(self._base_url)
+        self._base_url = (base_url or "").strip().rstrip("/")
+        parsed = urlparse(self._base_url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise ValueError("the calibre-web URL must be an http(s) address")
         self._user = user or ""
         self._password = password or ""
         self._catalog: tuple[float, list[dict]] | None = None
+        self.max_download_bytes = max(1, int(max_download_bytes or MAX_DOWNLOAD_BYTES))
+        self.max_pages = max(1, -(-max(1, int(max_books or MAX_BOOKS)) // _BOOKS_PER_PAGE))
 
     @property
     def configured(self) -> bool:
@@ -209,8 +207,9 @@ class CalibreConnector(HTTPConnector):
             base_url=self._base_url,
             auth=httpx.BasicAuth(self._user, self._password),
             timeout=httpx.Timeout(self._timeout, connect=5.0),
-            # A redirect here means a login page (Cloudflare Access, or
-            # calibre-web's own when auth failed): report it, never follow it.
+            # A redirect here means a login page (an SSO proxy in front of
+            # calibre-web, or its own when auth failed): report it, never
+            # follow it.
             follow_redirects=False,
         )
 
@@ -222,14 +221,15 @@ class CalibreConnector(HTTPConnector):
         try:
             resp = await client.get(path, params=params)
         except httpx.HTTPError as exc:
-            await self._record("get", "error", int((time.monotonic() - started) * 1000), str(exc))
+            await self._record("get", "error", int((time.monotonic() - started) * 1000), error_text(exc, 500))
             raise CalibreError(f"calibre-web is unreachable at {self._base_url}: {exc}") from exc
         latency = int((time.monotonic() - started) * 1000)
         if resp.status_code in _REDIRECTS:
             await self._record("get", "error", latency, f"redirect {resp.status_code}")
             raise CalibreError(
                 f"calibre-web redirected {path} (HTTP {resp.status_code}) — a login page, not "
-                "the library. Check the URL is the internal address and the user's password."
+                "the library. The URL must reach calibre-web directly, never a host behind an "
+                "SSO login page; check it and the user's password."
             )
         if resp.status_code == 401:
             await self._record("get", "error", latency, "401")
@@ -272,7 +272,7 @@ class CalibreConnector(HTTPConnector):
             return list(self._catalog[1])
         books: dict[int, dict] = {}
         path: str | None = "/opds/new"
-        for _ in range(_MAX_PAGES):
+        for _ in range(self.max_pages):
             if not path:
                 break
             page, next_href = await self._feed(path)
@@ -282,7 +282,7 @@ class CalibreConnector(HTTPConnector):
             # A next link that yields nothing new would loop forever.
             path = self._next_path(next_href) if new and next_href else None
         else:
-            logger.warning("calibre_catalog_page_cap", pages=_MAX_PAGES)
+            logger.warning("calibre_catalog_page_cap", pages=self.max_pages)
         result = list(books.values())
         self._catalog = (time.monotonic(), result)
         return list(result)
@@ -301,18 +301,19 @@ class CalibreConnector(HTTPConnector):
 
     async def download(self, book: dict, fmt: str) -> bytes:
         """The book file in `fmt` (e.g. "EPUB"). Raises CalibreError when the book
-        has no such format or the file is over MAX_DOWNLOAD_BYTES."""
+        has no such format or the file is over `max_download_bytes`."""
+        limit = self.max_download_bytes
         link = next((f for f in book.get("formats") or [] if f["format"] == fmt.upper()), None)
         if link is None:
             raise CalibreError(f"{book.get('title')!r} has no {fmt.upper()} file")
-        if link.get("size") and link["size"] > MAX_DOWNLOAD_BYTES:
+        if link.get("size") and link["size"] > limit:
             raise CalibreError(
                 f"{book.get('title')!r} ({fmt.upper()}) is {link['size'] // (1024 * 1024)} MB, "
-                f"over the {MAX_DOWNLOAD_BYTES // (1024 * 1024)} MB read limit"
+                f"over the {limit // (1024 * 1024)} MB read limit"
             )
-        href = link["href"]
-        refuse_public_host(href)
-        path = urlparse(href).path or href
+        # The same-host rule `_next_path` keeps: a download link naming another
+        # host is never fetched with the library's credentials.
+        path = self._next_path(link["href"])
         if not self.configured:
             raise CalibreError("calibre-web is not configured (no user or password)")
         client = await self._ensure_client()
@@ -326,10 +327,10 @@ class CalibreConnector(HTTPConnector):
                     )
                 async for chunk in resp.aiter_bytes():
                     total += len(chunk)
-                    if total > MAX_DOWNLOAD_BYTES:
+                    if total > limit:
                         raise CalibreError(
                             f"{book.get('title')!r} is over the "
-                            f"{MAX_DOWNLOAD_BYTES // (1024 * 1024)} MB read limit"
+                            f"{limit // (1024 * 1024)} MB read limit"
                         )
                     chunks.append(chunk)
         except httpx.HTTPError as exc:

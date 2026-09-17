@@ -86,7 +86,12 @@ async def test_last_contact_refuses_empty_name():
 
 def test_tool_is_granted_to_sebas_but_not_to_ungranted_agents():
     """Narrow, opt-in capability: it must NOT leak in via the fallback set."""
-    names = {t["function"]["name"] for t in _get_agent_tools("sebas")}
+    from aegis.services.chat import AGENT_TOOL_SETS
+
+    # Sebas's example grant, passed as its metadata.tool_set: the id alone
+    # grants nothing (#579).
+    grant = {"tool_set": sorted(AGENT_TOOL_SETS["sebas"])}
+    names = {t["function"]["name"] for t in _get_agent_tools("sebas", grant)}
     assert "last_contact_with_person" in names
 
     for agent_id in ("raphael", "some-unconfigured-agent"):

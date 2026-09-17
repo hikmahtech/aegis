@@ -12,6 +12,7 @@ import time
 import asyncpg
 import structlog
 
+from aegis.errors import error_text
 from aegis.services.tools.base import ToolContext, _json_default
 from aegis.services.tools.registry import aegis_tool
 
@@ -43,7 +44,7 @@ async def _exec_search_knowledge(
     try:
         results = await ctx.knowledge_connector.search(query, limit=limit)
     except Exception as exc:
-        logger.warning("search_knowledge_unreachable", error=str(exc))
+        logger.warning("search_knowledge_unreachable", error=error_text(exc, 500))
         return _knowledge_unavailable(f"search failed: {exc}")
     return json.dumps(results, default=_json_default)
 
@@ -60,7 +61,7 @@ async def _exec_ask_knowledge(pool: asyncpg.Pool, ctx: ToolContext, *, question:
     try:
         result = await ctx.knowledge_connector.ask(question)
     except Exception as exc:
-        logger.warning("ask_knowledge_unreachable", error=str(exc))
+        logger.warning("ask_knowledge_unreachable", error=error_text(exc, 500))
         return _knowledge_unavailable(f"ask failed: {exc}")
     return json.dumps(result, default=_json_default)
 
@@ -92,5 +93,5 @@ async def _exec_remember_this(
         )
         return json.dumps({"stored": True, **result}, default=str)
     except Exception as exc:
-        logger.warning("remember_this_failed", error=str(exc))
-        return json.dumps({"stored": False, "error": str(exc)})
+        logger.warning("remember_this_failed", error=error_text(exc, 500))
+        return json.dumps({"stored": False, "error": error_text(exc, 500)})

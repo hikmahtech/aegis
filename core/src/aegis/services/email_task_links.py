@@ -48,16 +48,21 @@ Actions:
     Leave a note and nothing else.
 
 Reads are lenient: a malformed rule is dropped with a warning rather than
-raising, because a typo here must never stop mail being triaged. There is no
-dedicated PUT endpoint yet — edit the settings row directly.
+raising, because a typo here must never stop mail being triaged. The write is
+strict (``validate``, behind ``GET/PUT /api/admin/email/task-links`` on the
+admin Email triage page), for the reason every settings row in AEGIS splits the
+two: that same leniency at the save boundary would let a typo'd action or an
+unclosed regex save with a 200 and then do nothing forever (#337).
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from typing import Any
 
+from aegis.services.config_rows import SettingsRow
 from aegis.services.content_routes import compile_pattern
 
 logger = logging.getLogger(__name__)
@@ -98,6 +103,16 @@ def merge(raw: Any) -> list[dict]:
     ``key``/``subject_re``/``body_re``/``action`` and a compilable
     ``subject_re``.
     """
+    if isinstance(raw, str):
+        # A pool with no jsonb codec, or a row hand-written as a JSON string.
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            logger.warning("email_task_links: stored value is not JSON — no rules applied")
+            return []
+    if isinstance(raw, dict):
+        # The generic `/api/settings` editor wraps what you type in {"value": …}.
+        raw = raw.get("value")
     if not isinstance(raw, list):
         if raw:
             logger.warning("email_task_links: expected a list, got %s — ignoring", type(raw))
@@ -171,24 +186,55 @@ def task_key_pattern(task_key: str) -> str:
     return r"\m" + compile_pattern("contains", task_key) + r"\M"
 
 
+def validate(raw: Any) -> list[dict]:
+    """Strict counterpart to :func:`merge`, for the WRITE path only.
+
+    Every rule is named, its action is one this lane actually has, and both
+    regexes compile — server-side, because a regex you cannot try is a regex you
+    will get wrong. Raises ValueError; the route turns it into a 400.
+    """
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError("email_task_links must be a list of rules")
+    out: list[dict] = []
+    seen: set[str] = set()
+    for i, r in enumerate(raw):
+        if not isinstance(r, dict):
+            raise ValueError(f"rule {i} must be an object")
+        key = str(r.get("key") or "").strip()
+        if not key:
+            raise ValueError(f"rule {i}: key required")
+        if key in seen:
+            raise ValueError(f"duplicate rule key: {key!r}")
+        seen.add(key)
+        action = str(r.get("action") or "").strip()
+        if action not in ACTIONS:
+            raise ValueError(
+                f"rule {key!r}: {action!r} is not an action — use one of {', '.join(ACTIONS)}"
+            )
+        subject_re = str(r.get("subject_re") or "")
+        if not subject_re:
+            raise ValueError(f"rule {key!r}: subject_re required")
+        if not _compiles(subject_re):
+            raise ValueError(f"rule {key!r}: subject_re is not a valid regular expression")
+        body_re = str(r.get("body_re") or "")
+        if body_re and not _compiles(body_re):
+            raise ValueError(f"rule {key!r}: body_re is not a valid regular expression")
+        out.append(
+            {"key": key, "subject_re": subject_re, "body_re": body_re or None, "action": action}
+        )
+    return out
+
+
+ROW = SettingsRow(SETTINGS_KEY, merge, validate)
+
+
 async def get_email_task_links(pool: Any) -> list[dict]:
     """Effective rules. Empty list when unset or on any read error."""
-    try:
-        row = await pool.fetchrow("SELECT value FROM settings WHERE key = $1", SETTINGS_KEY)
-    except Exception as exc:
-        logger.warning("email_task_links: read failed (%s) — no rules applied", str(exc)[:200])
-        return []
-    if not row or not row["value"]:
-        return []
-    value = row["value"]
-    if isinstance(value, str):
-        import json
+    return await ROW.get(pool)
 
-        try:
-            value = json.loads(value)
-        except ValueError:
-            logger.warning("email_task_links: stored value is not JSON — no rules applied")
-            return []
-    if isinstance(value, dict):
-        value = value.get("value")
-    return merge(value)
+
+async def save_email_task_links(pool: Any, raw: Any) -> list[dict]:
+    """Replace the rules (validated); returns the effective list."""
+    return await ROW.save(pool, raw)

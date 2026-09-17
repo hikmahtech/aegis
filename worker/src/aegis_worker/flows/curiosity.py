@@ -37,8 +37,10 @@ from temporalio import workflow
 from temporalio.exceptions import ApplicationError, WorkflowAlreadyStartedError
 
 with workflow.unsafe.imports_passed_through():
+    from aegis.errors import error_text, logged_failure
+
     from aegis_worker.activities.agent_registry import AgentRegistryActivities
-    from aegis_worker.activities.curiosity import CuriosityActivities
+    from aegis_worker.activities.curiosity import TRACK_CHOICES, CuriosityActivities
     from aegis_worker.flows.interaction import InteractionFlow, InteractionFlowInput
     from aegis_worker.shared.retry import NO_RETRY, TIMEOUT_FAST, TIMEOUT_LLM
 
@@ -52,6 +54,8 @@ _GAP_TAG = {
     # "Track this?" (#513) — the research-tagged agent owns tracked topics.
     "untracked_topic": "research",
 }
+# Who asks when the run names nobody: the GTD agent.
+_OWNER_TAG = "gtd"
 
 # Gap types whose subject cannot be shown to be someone other than the owner
 # while `owner_emails` is unconfigured.
@@ -74,7 +78,10 @@ _ANSWER_TIMEOUT_S = 240
 
 @dataclass
 class CuriosityConfig:
-    agent_id: str = "sebas"
+    # Whose question it is. Empty = the holder of the `gtd` behavior tag,
+    # resolved at run time; no holder = the run skips (#556). The scheduled
+    # row passes its own `agent_id`.
+    agent_id: str = ""
     max_per_day: int = 1
     limit: int = 5
     # Two days: long enough that a card sent on a busy Friday survives the
@@ -85,17 +92,50 @@ class CuriosityConfig:
     # "Open in admin" deep link (cards.py renders no button for `input`
     # without it). Empty = section-only card, still resolvable in the admin.
     aegis_ui_url: str = ""
+    # The detectors' thresholds, from the row's `activities.config` (the
+    # registry builder); the defaults are `CuriosityActivities`' own.
+    min_attendee_events: int = 3
+    min_project_tasks: int = 5
+    empty_search_days: int = 14
+    min_empty_searches: int = 2
+    search_miss_below: float = 0.60
+
+    def thresholds(self) -> dict:
+        return {
+            "min_attendee_events": self.min_attendee_events,
+            "min_project_tasks": self.min_project_tasks,
+            "empty_search_days": self.empty_search_days,
+            "min_empty_searches": self.min_empty_searches,
+            "search_miss_below": self.search_miss_below,
+        }
 
 
 @workflow.defn(name="CuriosityCardFlow")
 class CuriosityCardFlow:
     @workflow.run
     async def run(self, config: CuriosityConfig) -> dict:
-        step = "check_curiosity_budget"
+        step = "resolve_owner"
         try:
+            owner = config.agent_id
+            if not owner:
+                # No agent named: the question is the GTD agent's (#556).
+                # Only a run with no agent_id takes this step, so a run
+                # started with one replays unchanged.
+                resolved = await workflow.execute_activity_method(
+                    AgentRegistryActivities.resolve_agents,
+                    args=[[_OWNER_TAG]],
+                    start_to_close_timeout=TIMEOUT_FAST,
+                    retry_policy=NO_RETRY,
+                )
+                owner = (resolved or {}).get(_OWNER_TAG) or ""
+                if not owner:
+                    workflow.logger.warning("curiosity_skipped reason=no_gtd_agent")
+                    return {"status": "skipped", "carded": 0, "reason": "no_gtd_agent"}
+
+            step = "check_curiosity_budget"
             gate = await workflow.execute_activity_method(
                 CuriosityActivities.check_curiosity_budget,
-                args=[config.agent_id, config.max_per_day],
+                args=[owner, config.max_per_day],
                 start_to_close_timeout=TIMEOUT_FAST,
                 retry_policy=NO_RETRY,
             )
@@ -111,13 +151,13 @@ class CuriosityCardFlow:
             try:
                 candidates = await workflow.execute_activity_method(
                     CuriosityActivities.find_curiosity_gaps,
-                    args=[config.agent_id, config.limit],
+                    args=[owner, config.limit, config.thresholds()],
                     # The detector's optional phrasing pass is an LLM call.
                     start_to_close_timeout=TIMEOUT_LLM,
                     retry_policy=NO_RETRY,
                 )
             except Exception as exc:  # noqa: BLE001 — a silent day beats a failed run
-                workflow.logger.warning("curiosity_gaps_failed err=%s", str(exc)[:200])
+                workflow.logger.warning("curiosity_gaps_failed err=%s", error_text(exc))
                 return {"status": "skipped", "carded": 0, "reason": "gap_detection_failed"}
 
             step = "owner_guard"
@@ -137,22 +177,29 @@ class CuriosityCardFlow:
 
             step = "resolve_agents"
             tag = _GAP_TAG.get(str(top.get("gap_type") or ""), "gtd")
-            target = config.agent_id
-            try:
+            target = owner
+            with logged_failure("curiosity_agent_resolve_failed", logger=workflow.logger):
                 resolved = await workflow.execute_activity_method(
                     AgentRegistryActivities.resolve_agents,
                     args=[[tag]],
                     start_to_close_timeout=TIMEOUT_FAST,
                     retry_policy=NO_RETRY,
                 )
-                target = (resolved or {}).get(tag) or config.agent_id
-            except Exception as exc:  # noqa: BLE001 — routing is a nicety
-                workflow.logger.warning("curiosity_agent_resolve_failed err=%s", str(exc)[:200])
+                target = (resolved or {}).get(tag) or owner
 
             step = "spawn_card"
             novelty_key = str(top.get("novelty_key") or "")
             child_id = f"curiosity-{_ID_SAFE.sub('_', novelty_key)[:180]}"
-            options = {"aegis_ui_url": config.aegis_ui_url} if config.aegis_ui_url else None
+            # Most gaps ask an open question (`input`: a deep link in Slack, a
+            # textarea in the admin), because we do not know the answer's
+            # shape. "Track this?" (#513) has exactly two answers, so it is a
+            # `choice` with two buttons, and the hook reads the button value
+            # rather than parsing English.
+            if top.get("gap_type") == "untracked_topic":
+                kind, options = "choice", dict(TRACK_CHOICES)
+            else:
+                kind = "input"
+                options = {"aegis_ui_url": config.aegis_ui_url} if config.aegis_ui_url else None
             metadata = {
                 "novelty_key": novelty_key,
                 "gap_type": top.get("gap_type"),
@@ -182,10 +229,7 @@ class CuriosityCardFlow:
                     InteractionFlow.run,
                     InteractionFlowInput(
                         agent_id=target,
-                        # `input` = free-text answer: a deep link in Slack, a
-                        # textarea in the admin. Not `choice` — the whole point
-                        # is that we do not know the answer's shape.
-                        kind="input",
+                        kind=kind,
                         origin="curiosity",
                         prompt=str(top.get("question") or ""),
                         options=options,

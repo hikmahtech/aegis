@@ -16,11 +16,7 @@ from __future__ import annotations
 
 import pytest_asyncio
 from aegis.services import infra_alert_routing as iar
-from aegis_worker.activities.alerts import (
-    _PRE_498_INFRA_ALERTNAMES,
-    AlertActivities,
-    is_infra_alert,
-)
+from aegis_worker.activities.alerts import AlertActivities, is_infra_alert
 from temporalio.testing import ActivityEnvironment
 
 # A real "Dagster Pipeline Failure" as AlertInvestigationFlow received it in
@@ -93,7 +89,7 @@ async def _set_routing(db_pool, value: dict | None) -> None:
             iar.SETTINGS_KEY,
             value,
         )
-    iar._cache.update(value=None, ts=0.0)
+    iar.ROW.clear_cache()
 
 
 @pytest_asyncio.fixture(loop_scope="function")
@@ -136,35 +132,13 @@ def test_the_configured_list_decides_what_is_infra():
     assert is_infra_alert(alert, "", sorted(iar.DEFAULT_INFRA_ALERTNAMES)) is False
 
 
-def test_moving_names_to_the_db_loses_none_of_them():
-    """The old built-in list = the generic defaults + what a deployment writes
-    to its row. Writing back exactly the names that left the code restores
-    the old classification, so a deploy that does it first changes nothing."""
-    # Alert classes AEGIS itself raises that did not exist at #498. They are
-    # not in the historical list by definition, so they are not evidence that
-    # anything was lost — which is all this test is about.
-    added_since = {"ingressunreachable"}  # #492
-    moved = _PRE_498_INFRA_ALERTNAMES - iar.DEFAULT_INFRA_ALERTNAMES
-    assert iar.DEFAULT_INFRA_ALERTNAMES - added_since <= _PRE_498_INFRA_ALERTNAMES
-    assert set(iar.merge({"extra_alertnames": sorted(moved)})["alertnames"]) == (
-        _PRE_498_INFRA_ALERTNAMES | added_since
-    )
-    assert moved == {
-        "dagster pipeline failure",
-        "clickhousedown",
-        "criticalendpointdown",
-        "gpucriticaltemperature",
-        "tempordown",
-    }
-
-
-def test_a_history_recorded_before_the_list_moved_replays_the_same_way():
-    """No list = an AlertInvestigationFlow history from before #498, whose
-    routing config carried no names. It must classify exactly as it did then,
-    or replay schedules a different activity and the workflow wedges."""
-    assert is_infra_alert(_dagster_alert()) is True
-    assert is_infra_alert({"labels": {"alertname": "ClickHouseDown"}}) is True
-    assert is_infra_alert({"labels": {"alertname": "HighMemoryUsage"}}) is False
+def test_no_list_matches_no_name():
+    """The frozen pre-#498 copy of the built-in list is gone (#504), so the
+    settings row is the only source of infra names. With none, only the
+    `cluster` label can classify an alert as infra."""
+    assert is_infra_alert(_dagster_alert()) is False
+    assert is_infra_alert({"labels": {"alertname": "NodeDown"}}) is False
+    assert is_infra_alert({"labels": {"alertname": "NodeDown", "cluster": "swarm"}}, "swarm") is True
 
 
 async def test_routing_config_serves_the_effective_list_from_the_db(db_pool):

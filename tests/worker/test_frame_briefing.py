@@ -104,7 +104,8 @@ async def test_frame_briefing_records_the_llm_call(db_pool):
     """
     await db_pool.execute("DELETE FROM llm_calls WHERE purpose = 'briefing_frame'")
     llm = StubbedLLMClient(db_pool=db_pool, content="Two things need you this morning.")
-    act = BriefingActivities(db_pool=db_pool, llm_client=llm)
+    # The owner `__main__` resolves from the `gtd` tag and passes in (#579).
+    act = BriefingActivities(db_pool=db_pool, llm_client=llm, agent_id="sebas")
     try:
         out = await act.frame_briefing(BUNDLE)
         assert out.startswith("Two things need you this morning.")
@@ -127,7 +128,8 @@ async def test_frame_briefing_records_a_failed_llm_call(db_pool):
     proxy has to leave a row, or an outage reads as no traffic."""
     await db_pool.execute("DELETE FROM llm_calls WHERE purpose = 'briefing_frame'")
     llm = StubbedLLMClient(db_pool=db_pool, raises=RuntimeError("proxy down"))
-    act = BriefingActivities(db_pool=db_pool, llm_client=llm)
+    # The owner `__main__` resolves from the `gtd` tag and passes in (#579).
+    act = BriefingActivities(db_pool=db_pool, llm_client=llm, agent_id="sebas")
     try:
         out = await act.frame_briefing(BUNDLE)
         assert "GPT-6 ships" in out  # deterministic fallback still ships

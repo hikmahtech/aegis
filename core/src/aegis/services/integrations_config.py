@@ -18,6 +18,8 @@ from typing import Any
 import structlog
 
 from aegis.crypto import decrypt_secret, encrypt_secret
+from aegis.errors import error_text
+from aegis.services.settings_store import get_setting, put_setting
 
 logger = structlog.get_logger()
 
@@ -59,12 +61,31 @@ CONFIG_REGISTRY: list[ConfigKey] = [
     ConfigKey("vercel_token", "API token", "Vercel", True),
     ConfigKey("vercel_team_id", "Team id", "Vercel", False),
     ConfigKey("elevenlabs_api_key", "API key", "Voice (ElevenLabs)", True),
+    ConfigKey(
+        "elevenlabs_stt_model", "Speech-to-text model", "Voice (ElevenLabs)", False,
+        help="The ElevenLabs Scribe model media transcription uses (default scribe_v1). "
+        "Worker restart required.",
+    ),
     ConfigKey("raindrop_api_token", "API token", "Raindrop", True),
     ConfigKey(
-        "calibre_url", "calibre-web URL (internal)", "Calibre (library)", False,
-        help="Default http://calibre-web_calibre-web:8083, the internal swarm address. "
-        "Never the public calibre host: Cloudflare Access answers every path there with "
-        "a login redirect, and AEGIS refuses it. Core applies a change on save; "
+        "semantic_scholar_api_key", "Semantic Scholar API key", "Research", True,
+        help="Sent as x-api-key on paper_search and paper_read. Blank = the public, "
+        "rate-limited tier. Core applies a change on save; the worker (ResearchFlow) "
+        "on restart.",
+    ),
+    ConfigKey(
+        "bot_contact_url", "Bot contact URL (User-Agent)", "Research", False,
+        help="Named in the User-Agent AEGIS sends when it fetches pages and feeds "
+        "(AegisBot/2.0 (+<url>)), so a site can see who is reading it. Blank = the "
+        "admin UI URL, else no contact. Core applies a change on save; the worker on "
+        "restart.",
+    ),
+    ConfigKey(
+        "calibre_url", "calibre-web URL", "Calibre (library)", False,
+        help="The address the stack reaches calibre-web at directly, e.g. "
+        "http://calibre-web:8083 on the same Docker network. Never a host behind an "
+        "SSO login page: it answers every path with a redirect, which AEGIS treats as "
+        "an error. Blank = not configured. Core applies a change on save; "
         "CalibreSyncFlow (the worker) on restart.",
     ),
     ConfigKey(
@@ -74,6 +95,14 @@ CONFIG_REGISTRY: list[ConfigKey] = [
         "CalibreSyncFlow reports not_configured.",
     ),
     ConfigKey("calibre_password", "calibre-web password", "Calibre (library)", True),
+    ConfigKey(
+        "calibre_max_book_mb", "Largest book file read (MB)", "Calibre (library)", False,
+        help="A book file over this size is not downloaded (default 80).",
+    ),
+    ConfigKey(
+        "calibre_max_books", "Most books in the catalogue", "Calibre (library)", False,
+        help="The paging cap when the catalogue is read (default 3000).",
+    ),
     ConfigKey(
         "jira_base_url", "Site URL (https://yours.atlassian.net)", "Jira", False,
         help="JiraSyncFlow closes a Todoist task once its issue has a resolution. "
@@ -192,16 +221,6 @@ CONFIG_REGISTRY: list[ConfigKey] = [
         "Restart the worker after enabling.",
     ),
     ConfigKey(
-        "mcp_enabled", "MCP client (external tool servers)", "Features", False,
-        boolean=True,
-        help="Lets AEGIS call tools on EXTERNAL MCP servers listed in AEGIS_MCP_SERVERS "
-        "(env-only JSON: name -> {url, auth_token, timeout_s}). Only the streamable-http "
-        "transport is supported; stdio entries are rejected because they would spawn "
-        "local processes. Off = no MCP server is contacted at all. Turning it on does "
-        "NOT let any agent call these tools — that is granted separately. Core restart "
-        "required.",
-    ),
-    ConfigKey(
         "books_repo_url", "Repo URL (git@github.com:org/books.git)", "Books", False,
         help="The hledger books repo Maou writes to. Empty = books disabled (money mail is "
         "indexed, never posted). SSH form; the deploy key below must have write access. "
@@ -214,10 +233,10 @@ CONFIG_REGISTRY: list[ConfigKey] = [
     ),
     ConfigKey(
         "notes_repo_url", "Vault repo URL (git@github.com:you/vault.git)", "Notes (vault)", False,
-        help="The Obsidian vault Raphael reads, indexes and keeps the journal in (#514). "
-        "Append-only: Raphael never changes a line you wrote. Needs the deploy key below "
+        help="The Obsidian vault your research agent reads, indexes and keeps the journal in "
+        "(#514). Append-only: it never changes a line you wrote. Needs the deploy key below "
         "with WRITE access. Empty = not configured (the daylog keeps filing knowledge rows). "
-        "Core + worker restart required.",
+        "Where the notes go is the Vault page. Core + worker restart required.",
     ),
     ConfigKey(
         "notes_deploy_key", "Vault deploy key (private, ed25519)", "Notes (vault)", True,
@@ -225,19 +244,26 @@ CONFIG_REGISTRY: list[ConfigKey] = [
         "mode 0600 at boot; never logged.",
     ),
     ConfigKey(
+        "home_currency", "Home currency (ISO code)", "Books", False,
+        help="The currency the books report in — INR, USD, GBP, EUR, … It is what hledger "
+        "converts to for every balance and check, and what a posting that names no "
+        "currency is written in. Core + worker restart required.",
+    ),
+    ConfigKey(
         "books_ignored_mailboxes", "Ignored mailboxes (comma-separated labels)", "Books", False,
         help="Money mail in these mailboxes is not yours (e.g. an employer's account).",
     ),
     ConfigKey(
         "books_mailbox_entities",
-        "Mailbox → entity (label=personal|hikmah, comma-separated)", "Books", False,
-        help="Which set of books a mailbox's money belongs to. Unlisted = personal.",
+        "Mailbox → entity (label=<entity>, comma-separated)", "Books", False,
+        help="Which set of books a mailbox's money belongs to, naming an entity from the "
+        "chart of accounts (Money → Its entities). Unlisted = the default entity.",
     ),
     ConfigKey(
-        "books_todoist_projects", "Todoist projects for dues (personal=<id>,hikmah=<id>)",
+        "books_todoist_projects", "Todoist projects for dues (<entity>=<id>, comma-separated)",
         "Books", False,
         help="Bills and failed payments become dated tasks here, and Maou's money problem "
-        "tasks (#money) go to the personal project. Unset = the Inbox.",
+        "tasks (#money) go to the default entity's project. Unset = the Inbox.",
     ),
     ConfigKey(
         "ansaar_url", "ansaar-data URL", "Trading desk", False,
@@ -264,9 +290,9 @@ async def read_integration(pool: Any, settings: Any, key: str) -> str:
     without a restart, since the worker applies the overlay only at boot. Never raises."""
     spec = _BY_KEY[key]
     try:
-        stored = await pool.fetchval("SELECT value FROM settings WHERE key = $1", _skey(key))
+        stored = await get_setting(pool, _skey(key))
     except Exception as exc:  # noqa: BLE001 — a config read must never break a run
-        logger.warning("integration_read_failed", key=key, error=str(exc)[:200])
+        logger.warning("integration_read_failed", key=key, error=error_text(exc))
         stored = None
     if isinstance(stored, dict):
         val = _resolve(spec, stored, getattr(settings, "secret_key", ""))
@@ -289,7 +315,7 @@ async def apply_config_overrides(settings: Any, pool: Any) -> Any:
             "SELECT key, value FROM settings WHERE key LIKE $1", _PREFIX + "%"
         )
     except Exception as exc:  # noqa: BLE001 — config overlay must never break boot
-        logger.warning("config_overrides_read_failed", error=str(exc)[:200])
+        logger.warning("config_overrides_read_failed", error=error_text(exc))
         return settings
     for r in rows:
         field = r["key"][len(_PREFIX):]
@@ -351,9 +377,4 @@ async def save_integration(pool: Any, settings: Any, key: str, value: str) -> No
         stored = {"enc": encrypt_secret(value, settings.secret_key)}
     else:
         stored = {"val": value}
-    await pool.execute(
-        "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW()) "
-        "ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()",
-        _skey(key),
-        stored,
-    )
+    await put_setting(pool, _skey(key), stored)

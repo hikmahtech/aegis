@@ -31,16 +31,30 @@ async def _capture_settings(db_pool):
         "INSERT INTO settings (key, value) VALUES ('todoist_capture_enabled', 'true'::jsonb) "
         "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"
     )
+    # The user's clock, which `capture_due` reads through services/user_time.py.
+    await db_pool.execute(
+        "INSERT INTO settings (key, value) VALUES ('user_timezone', $1) "
+        "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        _USER_TZ,
+    )
+    yield
+    await db_pool.execute("DELETE FROM settings WHERE key = 'user_timezone'")
+
+
+# Pinned rather than left unset, so "today" below and the activity's agree even
+# if a sibling file left a different zone behind.
+_USER_TZ = "Asia/Kolkata"
 
 
 def _today(acts: CaptureActivities):
-    """"Today" as `capture_due` computes it — in the activity's own `home_tz`.
+    """"Today" as `capture_due` computes it — on the user's clock.
 
     `date.today()` is the RUNNER's timezone, so this test passed locally (IST)
     and failed in CI (UTC) for the ~5.5 hours a day the two disagree on the
-    date. The floor being asserted is the activity's, so read its clock.
+    date. The floor being asserted is the activity's, so read its clock: the
+    `user_timezone` row this file's fixture pins.
     """
-    return datetime.now(ZoneInfo(acts.home_tz)).date()
+    return datetime.now(ZoneInfo(_USER_TZ)).date()
 
 
 def _acts(db_pool, projects=None):

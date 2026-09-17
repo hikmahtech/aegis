@@ -43,26 +43,13 @@ async def _seed(pool) -> None:
     )
 
 
-async def test_trend_returns_that_metric_only_oldest_first(pool):
-    """Insertion order is deliberately not chronological — the series must
-    come back sorted by observed_at, and must not include the decoy metric
-    recorded against the same source."""
+async def test_summarize_reads_that_metric_only(pool):
+    """The decoy is recorded against the same source, so "3 rows" must not be
+    "all the rows"."""
     await _seed(pool)
 
-    series = await svc.query_trend(pool, METRIC)
-
-    assert [r["value"] for r in series] == [73.5, 72.0, 71.0]
-    assert {r["metric"] for r in series} == {METRIC}
-    # The decoy is really there — so "3 rows" isn't just "all the rows".
-    assert len(await svc.query_trend(pool, DECOY)) == 1
-
-
-async def test_trend_window_bounds_are_applied(pool):
-    await _seed(pool)
-    series = await svc.query_trend(
-        pool, METRIC, since=NOW - timedelta(days=4), until=NOW - timedelta(days=2)
-    )
-    assert [r["value"] for r in series] == [72.0]
+    assert (await svc.summarize(pool, METRIC, window_days=30))["count"] == 3
+    assert (await svc.summarize(pool, DECOY, window_days=30))["count"] == 1
 
 
 async def test_summarize_matches_hand_computed_stats(pool):
@@ -127,7 +114,7 @@ async def test_metric_and_source_are_normalised_on_write_and_lookup(pool):
     assert stored["source"] == SOURCE
 
     # Lookup in yet another casing still finds it.
-    assert len(await svc.query_trend(pool, METRIC.title())) == 1
+    assert (await svc.summarize(pool, METRIC.title(), window_days=1))["count"] == 1
     assert (await svc.summarize(pool, METRIC.upper(), window_days=1))["count"] == 1
 
 
@@ -140,9 +127,9 @@ async def test_numeric_value_round_trips_as_a_python_float(pool):
     assert isinstance(stored["value"], float)
     assert stored["value"] == 71.25
 
-    fetched = await svc.query_trend(pool, METRIC)
-    assert isinstance(fetched[0]["value"], float)
-    assert fetched[0]["value"] == 71.25
+    out = await svc.summarize(pool, METRIC, window_days=1)
+    assert isinstance(out["latest"], float)
+    assert out["latest"] == 71.25
 
 
 async def test_null_value_observations_are_stored_and_ignored_by_aggregates(pool):
@@ -168,13 +155,13 @@ async def test_blank_metric_or_source_is_refused_before_the_database(pool):
 
 
 async def test_blank_metric_reads_never_reach_the_database():
-    """Asserting only `== []` / `count == 0` would be vacuous — the SQL
-    returns nothing for an empty metric anyway. Hand the readers a pool that
-    explodes on use, so removing the guard fails the test."""
+    """Asserting only `count == 0` would be vacuous — the SQL returns nothing
+    for an empty metric anyway. Hand the reader a pool that explodes on use,
+    so removing the guard fails the test."""
 
     class ExplodingPool:
         async def fetch(self, *args, **kwargs):
-            raise AssertionError("query_trend queried the database for a blank metric")
+            raise AssertionError("summarize queried the database for a blank metric")
 
         async def fetchrow(self, *args, **kwargs):
             raise AssertionError("summarize queried the database for a blank metric")
@@ -183,7 +170,6 @@ async def test_blank_metric_reads_never_reach_the_database():
             raise AssertionError("summarize queried the database for a blank metric")
 
     for blank in ("", "   ", None):
-        assert await svc.query_trend(ExplodingPool(), blank) == []
         assert (await svc.summarize(ExplodingPool(), blank))["count"] == 0
 
 

@@ -28,7 +28,13 @@ _AMT = r"([\d,]+(?:\.\d{1,2})?)"
 
 
 def amount_from(text: str) -> Decimal:
-    """Indian-grouped or plain digits to a 2-place Decimal ("1,00,308.53")."""
+    """Indian-grouped or plain digits to a 2-place Decimal ("1,00,308.53").
+
+    Raises `InvalidOperation` on anything else. Every statement parser reads
+    its amounts through this; what an unreadable one MEANS is the caller's —
+    a mail parser lets it through to its own handler, a statement parser
+    turns it into that statement's error.
+    """
     return Decimal(text.replace(",", "")).quantize(_CENT)
 
 

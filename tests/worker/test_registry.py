@@ -416,9 +416,31 @@ def test_books_write_flow_is_gated_on_money_hygiene():
         # Then +1 activity and NO new flow from #492: `probe_ingress` on the
         # existing HomelabActivities, the heartbeat's canary on the way in. On
         # the homelab flag, so the two homelab-on rows move.
-        (True, True, 51, 247),
-        (False, False, 40, 212),
-        (True, False, 44, 229),
+        # Then +1 activity and NO new flow from the #537 follow-up:
+        # `project_problem` on the existing HubActivities, how the investigation
+        # learns a task the settle window deferred. Unflagged, so all three
+        # rows move.
+        # Then +1 activity and NO new flow from #551: `reconcile_alertmanager`
+        # on the existing HubActivities, a HubSweepFlow step that resolves a
+        # problem whose alert alertmanager no longer lists. Unflagged, so all
+        # three rows move.
+        # Then +1 activity and NO new flow from the research-lane config work:
+        # `load_feeds_config` on the existing RssActivities (the `feeds_config`
+        # row, read for RssIngestFlow because a workflow cannot hit the DB).
+        # Unflagged, so all three rows move.
+        # Then +2 activities and NO new flow from the vault-layout audit:
+        # `vault_week_rule` on the existing DayLogActivities, the week rule the
+        # weekly rollup reads so its window and the weekly note agree, and
+        # `daylog_local_day`, the run's clock on the user's timezone (the day
+        # logged is the last complete local one). Unflagged, so all three
+        # rows move.
+        # Then MINUS 2 activities and no flow from #437/#601: `capture_task`
+        # on CaptureActivities and `upsert_resources_batch` on
+        # InventoryActivities, neither of which any flow ever called. Both
+        # classes are unflagged, so all three rows move by -2.
+        (True, True, 51, 250),
+        (False, False, 40, 215),
+        (True, False, 44, 232),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):

@@ -20,6 +20,8 @@ from datetime import timedelta
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
+    from aegis.errors import error_text
+
     from aegis_worker.activities.sentry_ingest import (
         FetchNewIssuesInput,
         FetchNewIssuesResult,
@@ -161,7 +163,7 @@ class SentryPollFlow:
                 workflow.logger.warning(
                     "sentry_investigation_spawn_failed fp=%s err=%s",
                     alert["fingerprint"],
-                    str(exc)[:200],
+                    error_text(exc),
                 )
 
         if result.latest_issue_id:

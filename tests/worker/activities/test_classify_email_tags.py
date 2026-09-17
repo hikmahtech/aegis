@@ -8,15 +8,7 @@ import pytest
 from aegis_worker.activities.gmail import GmailActivities
 from temporalio.testing import ActivityEnvironment
 
-
-class _FakeLlm:
-    def __init__(self, response: str):
-        self._response = response
-        self.last_prompt: str | None = None
-
-    async def think(self, **kwargs):
-        self.last_prompt = kwargs.get("prompt", "")
-        return {"response": self._response, "model": "qwen3:14b"}
+from tests.llm_stub import RecordingFakeLLM
 
 
 @pytest.fixture
@@ -26,7 +18,7 @@ def gmail_with_llm():
             gmail_credentials_file="/tmp/unused-creds.json",
             gmail_token_dir="/tmp/unused-tokens",
             aegis_ui_url="https://aegis.example.com",
-            llm_client=_FakeLlm(llm_response),
+            llm_client=RecordingFakeLLM(llm_response),
         )
 
     return _factory
@@ -153,7 +145,7 @@ async def test_lane_surfaced_in_result_and_prompt_when_forwarded(gmail_with_llm)
     forwarded = {**_MSG, "lane": "acme"}
     result = await ActivityEnvironment().run(gmail.classify_email, forwarded, "")
     assert result["lane"] == "acme"
-    assert "Forwarded from: acme" in gmail.llm_client.last_prompt
+    assert "Forwarded from: acme" in gmail.llm_client.calls[-1]["prompt"]
 
 
 @pytest.mark.asyncio
@@ -163,7 +155,7 @@ async def test_own_lane_omits_forwarded_header_from_prompt(gmail_with_llm):
     gmail = gmail_with_llm(json.dumps({"category": "informational", "confidence": 0.6, "tags": []}))
     result = await ActivityEnvironment().run(gmail.classify_email, _MSG, "")
     assert result["lane"] == "own"
-    assert "Forwarded from" not in gmail.llm_client.last_prompt
+    assert "Forwarded from" not in gmail.llm_client.calls[-1]["prompt"]
 
 
 @pytest.mark.asyncio

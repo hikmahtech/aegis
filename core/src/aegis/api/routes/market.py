@@ -8,6 +8,7 @@ import structlog
 from fastapi import APIRouter, Depends, Request
 
 from aegis.api.auth import verify_auth
+from aegis.errors import error_text
 
 logger = structlog.get_logger()
 
@@ -28,7 +29,7 @@ async def market_summary(request: Request) -> dict[str, Any]:
     try:
         quotes = await fin.get_overview()
     except Exception as exc:
-        logger.warning("market_summary_failed", error=str(exc))
+        logger.warning("market_summary_failed", error=error_text(exc, 500))
         return {"available": False}
 
     ok = [q for q in quotes if not q.get("error")]

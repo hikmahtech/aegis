@@ -66,7 +66,7 @@ def _stubs(cap):
 
     @activity.defn(name="update_channel_config_key")
     async def cursor(kind, identifier, key, value) -> None:
-        _seen["cursor"].append(value)
+        _seen["cursor"].append((key, value))
 
     # The feed record and the hub (#511): answered, not part of what this
     # file tests.
@@ -123,7 +123,10 @@ async def test_the_cursor_stops_at_the_last_entry_taken():
     so the next poll still sees them."""
     await _run(CAP, "rss-throttle-2")
 
-    assert _seen["cursor"] == ["2026-04-18T03:00:00"]
+    assert _seen["cursor"] == [
+        ("last_cursor_id", f"{FEED}#3"),
+        ("last_cursor", "2026-04-18T03:00:00"),
+    ]
 
 
 @pytest.mark.asyncio

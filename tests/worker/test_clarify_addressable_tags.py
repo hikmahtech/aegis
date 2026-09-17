@@ -62,11 +62,62 @@ def test_assignee_labels_include_me_and_all_aliases():
 
 
 @pytest.mark.asyncio
-async def test_registry_falls_back_to_defaults_without_pool():
-    # No pool → shipped 4-agent defaults, so routing never breaks.
+async def test_registry_is_empty_without_pool():
+    # No pool → no agents known, so nothing is addressable. Never a list of
+    # example ids, which a fork that renamed its agents would not have (#556).
     reg = await get_agent_registry(None)
-    assert reg["sebas"]["caps"] == {"gtd"}
-    assert reg["pandoras-actor"]["aliases"] == ["@pandora"]
+    assert reg == {}
+    assert _addressable_agents(reg) == []
+    assert _assignee_labels(reg) == ["@me"]
+
+
+class _FailingPool:
+    async def fetch(self, *args, **kwargs):
+        raise RuntimeError("db down")
+
+
+@pytest.mark.asyncio
+async def test_registry_read_failure_keeps_the_last_registry_and_retries(db_pool):
+    """A failed read returns the last registry read and is not cached, so the
+    next call reads the DB again instead of pinning a stale answer."""
+    _reset_reg_cache()
+    try:
+        good = await get_agent_registry(db_pool)
+        assert "sebas" in good
+        clarify_mod._agent_reg_cache["ts"] = 0.0  # expire the cache
+        assert await get_agent_registry(_FailingPool()) == good
+        assert clarify_mod._agent_reg_cache["ts"] == 0.0  # failure not cached
+        _reset_reg_cache()
+        assert await get_agent_registry(_FailingPool()) == {}
+    finally:
+        _reset_reg_cache()
+
+
+@pytest.mark.asyncio
+async def test_renamed_gtd_agent_is_addressable_and_the_old_id_is_not(db_pool):
+    """A fork that renamed its GTD agent: the registry follows the rows, the
+    new agent wins co-occurrence (it holds `gtd`), and `@sebas` is gone."""
+    await db_pool.execute("DELETE FROM agents WHERE id = 'tagtest-jeeves'")
+    await db_pool.execute(
+        """
+        INSERT INTO agents (id, name, role, system_prompt_path, capabilities,
+                            model_tier, metadata, active)
+        VALUES ('tagtest-jeeves', 'Jeeves', 'butler', '', '["gtd"]'::jsonb,
+                'balanced', '{"mention_aliases": ["jeeves"]}'::jsonb, TRUE)
+        """
+    )
+    await db_pool.execute("UPDATE agents SET active = FALSE WHERE id = 'sebas'")
+    _reset_reg_cache()
+    try:
+        reg = await get_agent_registry(db_pool)
+        assert "sebas" not in reg
+        pairs = _addressable_agents(reg)
+        assert pairs[0] == ("@jeeves", "tagtest-jeeves_followup")
+        assert "@sebas" not in _assignee_labels(reg)
+    finally:
+        await db_pool.execute("UPDATE agents SET active = TRUE WHERE id = 'sebas'")
+        await db_pool.execute("DELETE FROM agents WHERE id = 'tagtest-jeeves'")
+        _reset_reg_cache()
 
 
 # ── DB-backed: seed agents preserved, custom agent routed ──

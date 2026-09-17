@@ -19,7 +19,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from aegis.api.auth import alert_token_ok
-from aegis.api.deps import get_settings
+from aegis.api.deps import get_pool, get_settings
 from aegis.config import Settings
 from aegis.services.hub import Event, ingest_event, set_service_state
 
@@ -34,13 +34,6 @@ def _check_token(request: Request, settings: Settings, what: str) -> None:
     ):
         logger.warning(f"hub_{what}_bad_token")
         raise HTTPException(status_code=401, detail="bad_token")
-
-
-def _pool(request: Request):
-    pool = request.app.state.db_pool
-    if pool is None:
-        raise HTTPException(status_code=503, detail="db_unavailable")
-    return pool
 
 
 class ServiceStateBody(BaseModel):
@@ -63,7 +56,7 @@ async def post_service_state(
     _check_token(request, settings, "service_state")
     try:
         return await set_service_state(
-            _pool(request),
+            get_pool(request),
             body.subject,
             body.state,
             subject_kind=body.subject_kind,
@@ -110,7 +103,7 @@ async def post_event(
     billed investigation."""
     _check_token(request, settings, "event")
     try:
-        result = await ingest_event(_pool(request), Event(**body.model_dump(by_alias=False)))
+        result = await ingest_event(get_pool(request), Event(**body.model_dump(by_alias=False)))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return result.to_dict()

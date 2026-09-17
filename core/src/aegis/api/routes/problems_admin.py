@@ -22,10 +22,12 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from aegis.api.auth import verify_auth
-from aegis.api.deps import get_settings
+from aegis.api.deps import get_pool, get_settings
+from aegis.api.settings_routes import settings_row_routes
 from aegis.config import Settings
+from aegis.errors import error_text
 from aegis.observability import log_audit
-from aegis.services import hub_project
+from aegis.services import alert_remediation, hub_project, hub_settle, infra_alert_routing
 from aegis.services.hub import (
     close_problem,
     digest,
@@ -54,13 +56,6 @@ async def _audit(request: Request, action: str, target_id: str, details: dict) -
         target_id=target_id,
         details=details,
     )
-
-
-def _pool(request: Request):
-    pool = request.app.state.db_pool
-    if pool is None:
-        raise HTTPException(status_code=503, detail="db_unavailable")
-    return pool
 
 
 class MuteBody(BaseModel):
@@ -96,7 +91,7 @@ async def get_problems(
     `include_closed`."""
     return {
         "problems": await list_problems(
-            _pool(request),
+            get_pool(request),
             status=status,
             subject=subject,
             include_closed=include_closed,
@@ -110,13 +105,13 @@ async def get_problems(
 async def get_digest(request: Request, hours: float = 24.0) -> dict[str, Any]:
     """What the hub saw in a window — the same query the daily briefing sends.
     Declared before `/problems/{problem_id}` so the literal path wins."""
-    return await digest(_pool(request), hours=hours)
+    return await digest(get_pool(request), hours=hours)
 
 
 @router.get("/problems/{problem_id}")
 async def get_problem_detail(request: Request, problem_id: str, events: int = 50) -> dict[str, Any]:
     """One problem with its timeline, links, sessions and active window."""
-    detail = await problem_detail(_pool(request), problem_id, events=events)
+    detail = await problem_detail(get_pool(request), problem_id, events=events)
     if detail is None:
         raise HTTPException(status_code=404, detail="problem_not_found")
     return detail
@@ -127,7 +122,7 @@ async def post_mute(request: Request, problem_id: str, body: MuteBody) -> dict[s
     """Silence a problem for `hours`. Occurrences are still recorded and still
     counted — muting stops the projection and the investigation, not the
     record."""
-    until = await mute_problem(_pool(request), problem_id, hours=body.hours, by="admin")
+    until = await mute_problem(get_pool(request), problem_id, hours=body.hours, by="admin")
     if until is None:
         raise HTTPException(status_code=404, detail="problem_not_found_or_closed")
     await _audit(request, "problem_muted", problem_id, {"hours": body.hours})
@@ -139,7 +134,7 @@ async def post_resolve(request: Request, problem_id: str, body: CloseBody) -> di
     """Mark a problem resolved by hand. The projector closes its task on the
     next sweep, and the nightly close sweep retires it a week later."""
     moved = await set_status(
-        _pool(request), problem_id, "resolved", reason=body.reason, source="admin"
+        get_pool(request), problem_id, "resolved", reason=body.reason, source="admin"
     )
     if not moved:
         raise HTTPException(status_code=404, detail="problem_not_found_or_already_resolved")
@@ -156,11 +151,11 @@ async def post_close(request: Request, problem_id: str) -> dict[str, Any]:
     projected again, so closing one whose resolution has not reached its task
     yet would leave that task open for ever with no closing comment.
     """
-    pool = _pool(request)
+    pool = get_pool(request)
     try:
         await hub_project.project(pool, problem_id)
     except Exception as exc:  # noqa: BLE001 — Todoist being down must not block the close
-        logger.warning("problem_close_project_failed", problem_id=problem_id, error=str(exc)[:200])
+        logger.warning("problem_close_project_failed", problem_id=problem_id, error=error_text(exc))
     if not await close_problem(pool, problem_id):
         raise HTTPException(status_code=409, detail="problem_not_found_or_not_resolved")
     await _audit(request, "problem_closed", problem_id, {})
@@ -178,7 +173,7 @@ async def post_merge(
     closes with a link back. Its task is completed with a note pointing here,
     the same way the `merge_problems` chat tool does it — a closed problem is
     never projected again, so no sweep would ever close that task."""
-    pool = _pool(request)
+    pool = get_pool(request)
     try:
         result = await merge_problems(pool, problem_id, body.merge_id, by="admin")
     except ValueError as exc:
@@ -192,7 +187,7 @@ async def post_merge(
 @router.get("/service-state")
 async def get_service_state(request: Request) -> dict[str, Any]:
     """Every deploy / maintenance / degraded window in force."""
-    return {"windows": await list_service_states(_pool(request))}
+    return {"windows": await list_service_states(get_pool(request))}
 
 
 @router.put("/service-state")
@@ -200,7 +195,7 @@ async def put_service_state(request: Request, body: ServiceStateBody) -> dict[st
     """Open or clear a window. `state: "ok"` clears it."""
     try:
         row = await set_service_state(
-            _pool(request),
+            get_pool(request),
             body.subject,
             body.state,
             subject_kind=body.subject_kind,
@@ -214,29 +209,56 @@ async def put_service_state(request: Request, body: ServiceStateBody) -> dict[st
     return row
 
 
-@router.get("/infra-alert-routing")
-async def get_infra_alert_routing_route(request: Request) -> dict[str, Any]:
-    """Which alertnames are infra (the built-in list plus yours) and which repo
-    investigates them (`services/infra_alert_routing.py`)."""
-    from aegis.services.infra_alert_routing import (
-        DEFAULT_INFRA_ALERTNAMES,
-        get_infra_alert_routing,
-    )
+settings_row_routes(
+    router,
+    "/infra-alert-routing",
+    get=lambda pool: infra_alert_routing.get_infra_alert_routing(pool, cached=False),
+    save=infra_alert_routing.save_infra_alert_routing,
+    view=lambda _pool, routing: {
+        "default_alertnames": sorted(infra_alert_routing.DEFAULT_INFRA_ALERTNAMES),
+        **routing,
+    },
+    doc=(
+        "Which alertnames are infra — the built-in list plus yours — and which repo "
+        "investigates them (`services/infra_alert_routing.py`). 400 on a bad value."
+    ),
+)
 
-    routing = await get_infra_alert_routing(_pool(request), cached=False)
-    return {"default_alertnames": sorted(DEFAULT_INFRA_ALERTNAMES), **routing}
+settings_row_routes(
+    router,
+    "/hub-settle-seconds",
+    get=hub_settle.get_settle_seconds,
+    save=hub_settle.save_settle_seconds,
+    body=lambda body: body.get("overrides", body),
+    audit=lambda request, out: _audit(
+        request, "hub_settle_seconds_saved", "", {"overrides": out["overrides"]}
+    ),
+    doc=(
+        "How long each class of problem must persist before it earns a task, and before an "
+        "investigation spends effort on it (`services/hub_settle.py`). The GET returns your "
+        "overrides and the code defaults underneath them, so a blank field can be shown as "
+        "what it actually means rather than as zero. `{}` removes every override and returns "
+        "the class to its code default; the key `*` sets a window for every class at once — "
+        "and note it also shortens the matching verification delay, because both read one "
+        "number. 400 on a bad value rather than a quiet no-op."
+    ),
+)
 
-
-@router.put("/infra-alert-routing")
-async def put_infra_alert_routing_route(request: Request, body: dict[str, Any]) -> dict[str, Any]:
-    """Replace your extra infra alertnames and the infra repo. 400 on a bad value."""
-    from aegis.services.infra_alert_routing import (
-        DEFAULT_INFRA_ALERTNAMES,
-        save_infra_alert_routing,
-    )
-
-    try:
-        routing = await save_infra_alert_routing(_pool(request), body)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"default_alertnames": sorted(DEFAULT_INFRA_ALERTNAMES), **routing}
+settings_row_routes(
+    router,
+    "/alert-remediation",
+    get=alert_remediation.get_alert_remediation,
+    save=alert_remediation.save_alert_remediation,
+    audit=lambda request, out: _audit(
+        request,
+        "alert_remediation_saved",
+        "",
+        {"repeat_window_minutes": out["repeat_window_minutes"]},
+    ),
+    doc=(
+        "The automatic restart's repeat window (`services/alert_remediation.py`, #501): the "
+        "effective minutes, the default under them and the cap. 400 on anything but a whole "
+        "number of minutes in range — this row gates `docker service update --force`, so a "
+        "typo must not save. `0` restarts every time."
+    ),
+)

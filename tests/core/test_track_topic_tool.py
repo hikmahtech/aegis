@@ -68,7 +68,11 @@ async def test_track_topic_priority_default_and_explicit(pool, ctx):
     assert [t["priority"] for t in await _registry(pool)] == ["medium", "high"]
 
 
-@pytest.mark.parametrize("args", [{"queries": ["test"]}, {"topic_name": "test", "queries": []}])
+# Blank/empty, not absent: the schema's `required` stops an absent field before
+# the executor, so these are the shapes a model can actually get this far with.
+@pytest.mark.parametrize(
+    "args", [{"topic_name": "  ", "queries": ["test"]}, {"topic_name": "test", "queries": []}]
+)
 async def test_track_topic_refuses_a_topic_without_name_or_queries(pool, ctx, args):
     data = json.loads(await _exec_track_topic(pool, args, ctx))
     assert data == {"error": "topic_name and queries are required"}

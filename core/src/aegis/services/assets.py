@@ -22,12 +22,14 @@ if it ever exists, it can be a child table then.
 
 from __future__ import annotations
 
-import re
 from datetime import date, timedelta
 from typing import Any
 from uuid import UUID
 
 import asyncpg
+
+from aegis.slugs import slugify as _slugify
+from aegis.slugs import unique_slug
 
 _SELECT_COLS = (
     "id, slug, name, kind, purchase_date, warranty_until, service_interval_days, "
@@ -55,27 +57,8 @@ _EDITABLE_FIELDS = (
 # module — see `sync_service_due` / `delete_asset`.
 SERVICE_KIND = "asset_service"
 
-_SLUG_RE = re.compile(r"[^a-z0-9]+")
-
-
 def slugify(name: str) -> str:
-    slug = _SLUG_RE.sub("-", name.strip().lower()).strip("-")
-    return slug or "asset"
-
-
-async def _unique_slug(pool: asyncpg.Pool, base: str) -> str:
-    """Suffix until free. Mirrors services/infra.py.
-
-    The column is UNIQUE, and the create route does not catch
-    asyncpg.UniqueViolationError — so two assets both called "Fridge" would
-    otherwise be an HTTP 500 instead of `fridge` and `fridge-2`.
-    """
-    slug = base
-    n = 2
-    while await pool.fetchval("SELECT 1 FROM life.assets WHERE slug = $1", slug):
-        slug = f"{base}-{n}"
-        n += 1
-    return slug
+    return _slugify(name, fallback="asset")
 
 
 # ---------------------------------------------------------------------------
@@ -182,7 +165,9 @@ async def create_asset(pool: asyncpg.Pool, data: dict[str, Any]) -> dict:
     kind = (data.get("kind") or "").strip().lower()
     if not kind:
         raise ValueError("kind is required")
-    slug = await _unique_slug(pool, slugify(str(data.get("slug") or "").strip() or name))
+    slug = await unique_slug(
+        pool, slugify(str(data.get("slug") or "").strip() or name), table="life.assets"
+    )
 
     row = await pool.fetchrow(
         "INSERT INTO life.assets "

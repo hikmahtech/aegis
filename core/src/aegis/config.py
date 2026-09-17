@@ -257,19 +257,10 @@ class Settings(BaseSettings):
     # owner's personal data store.
     life_webhook_secret: str = ""  # X-Aegis-Signature + X-Aegis-Timestamp
 
-    # MCP — client for EXTERNAL tool servers. Off by default: an MCP server is
-    # a remote party that defines and executes tools, so the subsystem stays
-    # closed until an operator explicitly opens it. Off = no server is ever
-    # contacted, whatever mcp_servers says.
-    mcp_enabled: bool = False
-    # {"<name>": {"transport": "streamable-http", "url": "https://…/mcp",
-    #             "auth_token": "…", "timeout_s": 30, "max_response_bytes": …}}
-    # stdio is deliberately unsupported (it would spawn local processes).
-    mcp_servers: dict = {}
     # MCP — SERVER side (api/routes/mcp_server.py): serve AEGIS's own chat tools
     # to external MCP clients (claude/kimi CLI, Claude Desktop) at
-    # POST /api/mcp-server/{agent_id}. Off by default, same default-deny posture
-    # as the client above — this door lets an outside harness run AEGIS tools.
+    # POST /api/mcp-server/{agent_id}. Off by default, default-deny posture —
+    # this door lets an outside harness run AEGIS tools.
     mcp_server_enabled: bool = False
     # Escape hatch for `mcp_server_enabled` + `auth_disabled` together. That
     # pair serves every agent's tools with NO credential: auth_disabled makes
@@ -300,13 +291,23 @@ class Settings(BaseSettings):
     content_extraction_enabled: bool = True
     raindrop_api_token: str = ""
 
-    # Calibre library (#510). The internal swarm address by default — never the
-    # public host, which is behind Cloudflare Access (a login redirect on every
-    # path). User and password blank = the library tools say "not configured"
-    # and CalibreSyncFlow reports not_configured. DB-first via Integrations.
-    calibre_url: str = "http://calibre-web_calibre-web:8083"
+    # Calibre library (#510). No default address: the URL, user and password
+    # come from the Integrations page (DB-first), and any of them blank = the
+    # library tools say "not configured" and CalibreSyncFlow reports
+    # not_configured. The URL must reach calibre-web directly, never a host
+    # behind an SSO login page (every redirect is an error). The two caps are
+    # numbers the page stores as strings; `library.calibre_limits` coerces.
+    calibre_url: str = ""
     calibre_user: str = ""
     calibre_password: str = ""
+    calibre_max_book_mb: str = ""  # blank = 80
+    calibre_max_books: str = ""  # blank = 3000
+
+    # The research lane (#509). A Semantic Scholar key lifts paper_search off
+    # the public rate limit; the contact URL goes into the bot User-Agent
+    # (`services/user_agent.py`), falling back to aegis_ui_url. Both DB-first.
+    semantic_scholar_api_key: str = ""
+    bot_contact_url: str = ""
 
     # Jira (JiraSyncFlow). Any of the three blank = the flow reports
     # `not_configured` and issues no request. Basic auth: the Atlassian ACCOUNT
@@ -329,8 +330,13 @@ class Settings(BaseSettings):
     # flows that explicitly call send_voice still no-op unless this is true.
     tts_enabled: bool = False
 
-    # AEGIS admin UI base URL (used for reauth links in chat cards)
+    # AEGIS admin UI base URL: where links in chat cards, tasks and mail send a
+    # person. May be a LAN/VPN-only host.
     aegis_ui_url: str = Field(default="", validation_alias="AEGIS_UI_URL")
+    # The host OAuth providers redirect back to (Gmail re-auth, X). Must be the
+    # one registered with the provider, which is usually the public host — so it
+    # is separate from the link host. Blank = aegis_ui_url.
+    aegis_public_url: str = Field(default="", validation_alias="AEGIS_PUBLIC_URL")
 
     # v3 seed directory (YAML files for agents, channels, resources, activities)
     seed_dir: str = "./config/seed"
@@ -357,9 +363,10 @@ class Settings(BaseSettings):
     books_repo_url: str = ""
     books_deploy_key: str = ""  # private ed25519 deploy key, PEM or base64 PEM; never logged
     books_ignored_mailboxes: str = ""  # comma-separated mailbox labels whose money is not ours
-    # "label=entity,..." — mailbox → personal|hikmah; an unlisted mailbox is personal.
+    # "label=entity,..." — mailbox → an entity from `settings.books_chart`; an
+    # unlisted mailbox belongs to the chart's default entity.
     books_mailbox_entities: str = ""
-    books_todoist_projects: str = ""  # "personal=<todoist project id>,hikmah=<id>" for dues
+    books_todoist_projects: str = ""  # "<entity>=<todoist project id>,..." for dues
 
     # Raphael's notes — the user's Obsidian vault (#514, spec
     # 2026-09-12-raphael-notes-design.md). The checkout sits beside the books

@@ -17,7 +17,8 @@ from pydantic import ValidationError
 from aegis.api.deps import get_settings
 from aegis.config import Settings
 from aegis.db import create_pool, run_migrations
-from aegis.llm import LLMClient, set_model_tiers, set_routes
+from aegis.errors import error_text
+from aegis.llm import LLMClient
 from aegis.services.chat import _validate_agent_tool_sets
 
 logger = structlog.get_logger()
@@ -73,7 +74,7 @@ async def lifespan(app: FastAPI):
     try:
         install_deploy_key(settings)
     except Exception as exc:  # noqa: BLE001 — a bad key must not block boot
-        logger.warning("books_deploy_key_install_failed", error=str(exc)[:200])
+        logger.warning("books_deploy_key_install_failed", error=error_text(exc))
 
     # The vault key (#514), the same way.
     from aegis.services import notes as notes_service
@@ -81,7 +82,7 @@ async def lifespan(app: FastAPI):
     try:
         notes_service.install_deploy_key(settings)
     except Exception as exc:  # noqa: BLE001 — a bad key must not block boot
-        logger.warning("notes_deploy_key_install_failed", error=str(exc)[:200])
+        logger.warning("notes_deploy_key_install_failed", error=error_text(exc))
 
     from aegis.seed import load_seeds
 
@@ -96,21 +97,10 @@ async def lifespan(app: FastAPI):
     app.state.db_pool = pool
 
     # LLM client + tier map from the configurable backend (DB → env fallback).
-    from aegis.services.llm_backend import get_llm_backend
+    from aegis.services.llm_backend import get_llm_backend, install_llm_config
 
     backend = await get_llm_backend(pool, settings)
-    set_model_tiers(backend["tiers"])
-    logger.info("model_tiers_loaded", tiers=sorted(backend["tiers"]), source=backend["source"])
-    try:
-        routes = set_routes(backend.get("routes"))
-        logger.info(
-            "llm_routes_loaded",
-            categories=len(routes["categories"]),
-            purposes=len(routes["purposes"]),
-        )
-    except Exception as exc:  # noqa: BLE001 — a bad routing table must not block boot
-        set_routes(None)
-        logger.warning("llm_routes_invalid", error=str(exc)[:200])
+    install_llm_config(backend)
     app.state.llm_backend = backend
     llm = LLMClient(
         base_url=backend["base_url"],
@@ -121,7 +111,6 @@ async def lifespan(app: FastAPI):
     app.state.llm = llm
 
     from aegis.connectors.search import SearchConnector
-    from aegis.mcp_manager import MCPManager
     from aegis.services.knowledge import KnowledgeStore
 
     # Native pgvector knowledge subsystem — always available (it's just our DB).
@@ -186,13 +175,6 @@ async def lifespan(app: FastAPI):
     )
     app.state.remote_script_connector = remote_script_connector
 
-    # MCP client for external tool servers. Constructing it contacts nothing;
-    # a bad server entry is rejected + logged at ERROR here (never a silent
-    # None downstream — issue #205) and connections happen lazily on first use.
-    mcp_manager = MCPManager(
-        server_configs=settings.mcp_servers or {}, enabled=settings.mcp_enabled
-    )
-    app.state.mcp_manager = mcp_manager
     app.state.settings = settings
 
     # Temporal client (best-effort — don't block startup if unreachable)
@@ -203,7 +185,7 @@ async def lifespan(app: FastAPI):
         temporal_client = await TemporalClient.connect(settings.temporal_host)
         logger.info("temporal_client_connected", host=settings.temporal_host)
     except Exception as exc:
-        logger.warning("temporal_client_unavailable", host=settings.temporal_host, error=str(exc))
+        logger.warning("temporal_client_unavailable", host=settings.temporal_host, error=error_text(exc, 500))
     app.state.temporal_client = temporal_client
 
     logger.info("aegis_v2_ready")
@@ -232,7 +214,6 @@ async def lifespan(app: FastAPI):
     sc = getattr(app.state, "search_connector", None)
     if sc:
         await sc.close()
-    await mcp_manager.close()
     await llm.close()
     await pool.close()
     logger.info("aegis_v2_stopped")
@@ -290,14 +271,16 @@ def create_app(run_lifespan: bool = True, settings: Settings | None = None) -> F
         knowledge,
         llm_backend,
         market,
-        mcp,
         mcp_server,
         money,
+        notes_admin,
         observability,
         overview,
         people_admin,
+        preferences,
         problems_admin,
         references,
+        research_admin,
         resources,
         runbooks_admin,
         settings,
@@ -355,9 +338,11 @@ def create_app(run_lifespan: bool = True, settings: Settings | None = None) -> F
     app.include_router(agents.admin_router)
     app.include_router(gmail_reauth.router)
     app.include_router(email_admin.router)
+    app.include_router(research_admin.router)
     app.include_router(social_auth.router)
     app.include_router(chat.router)
     app.include_router(knowledge.router)
+    app.include_router(knowledge.admin_router)
     app.include_router(references.router)
     app.include_router(observability.router)
     app.include_router(audit.router)
@@ -373,7 +358,6 @@ def create_app(run_lifespan: bool = True, settings: Settings | None = None) -> F
     app.include_router(interactions.router)
     app.include_router(webhooks.router)
     app.include_router(capture.router)
-    app.include_router(mcp.router)
     app.include_router(mcp_server.router)
     app.include_router(market.router)
     app.include_router(overview.router)
@@ -391,6 +375,8 @@ def create_app(run_lifespan: bool = True, settings: Settings | None = None) -> F
     app.include_router(runbooks_admin.router)
     app.include_router(todoist.router)
     app.include_router(task_sessions.router)
+    app.include_router(notes_admin.router)
+    app.include_router(preferences.router)
 
     # Serve admin panel SPA (static files from built frontend)
     # Try multiple locations: env override, Docker (/app/admin-panel/...) and local dev.

@@ -30,6 +30,16 @@ _CHANNEL_MAP = {
     "CPANDORA": "pandoras-actor",
 }
 
+# The alias map the seed agents' rows derive (`_derive_mention_map`). Routing
+# has no built-in copy any more (#579), so the pure tests pass it in.
+_MENTIONS = {
+    "sebas": "sebas",
+    "raphael": "raphael",
+    "maou": "maou",
+    "pandora": "pandoras-actor",
+    "pandoras-actor": "pandoras-actor",
+}
+
 
 def _settings():
     """Minimal settings stub for SlackCoreClient (reused across tests)."""
@@ -56,14 +66,18 @@ def test_route_message_plain_in_sebas_channel_is_sync():
 
 
 def test_route_message_pandora_channel_is_async():
-    mode, agent, text = route_message("CPANDORA", "check the swarm", _CHANNEL_MAP)
+    mode, agent, text = route_message(
+        "CPANDORA", "check the swarm", _CHANNEL_MAP, async_agents={"pandoras-actor"}
+    )
     assert mode == "async"
     assert agent == "pandoras-actor"
     assert text == "check the swarm"
 
 
 def test_route_message_explicit_mention_is_async_and_strips_mention():
-    mode, agent, text = route_message("CSEBAS", "@raphael find the ref", _CHANNEL_MAP)
+    mode, agent, text = route_message(
+        "CSEBAS", "@raphael find the ref", _CHANNEL_MAP, mention_map=_MENTIONS
+    )
     assert mode == "async"
     assert agent == "raphael"
     assert "@raphael" not in text
@@ -128,6 +142,9 @@ def test_parse_action_value_may_contain_colon():
 
 def _inbound(channel_map=None, elevenlabs_api_key=""):
     core = AsyncMock()
+    # What core's GET /api/agents answers for the seed agents: routing reads
+    # aliases and async dispatch from these rows, never from a built-in list.
+    core.agents.return_value = list(_AGENTS_PAYLOAD)
     adapter = AsyncMock()
     inbound = SlackInbound(
         adapter=adapter,
@@ -658,12 +675,14 @@ async def test_route_intent_returns_agent_on_200():
 
 
 @pytest.mark.asyncio
-async def test_route_intent_defaults_sebas_on_failure():
+async def test_route_intent_names_no_agent_on_failure():
+    """No example id on failure (#579): "" lets the caller use its own copy of
+    the gtd holder, or send no agent and let core route."""
     client = SlackCoreClient(_settings())
     with respx.mock:
         respx.post("http://core/api/chat/route").mock(return_value=httpx.Response(500))
         result = await client.route_intent(message="anything")
-    assert result["agent_id"] == "sebas"
+    assert result["agent_id"] == ""
     assert result["method"] == "default"
 
 
@@ -717,6 +736,7 @@ async def test_keyword_overrides_sticky():
     core = AsyncMock(spec=SlackCoreClient)
     core.chat = AsyncMock(return_value={"response": "ok", "assistant_message_id": None})
     core.agent_reply_trigger = AsyncMock(return_value={"workflow_id": "x"})
+    core.agents = AsyncMock(return_value=list(_AGENTS_PAYLOAD))
     inbound = SlackInbound(adapter=adapter, core=core, channel_agent_map={}, bot_user_id="U0BOT")
     core.route_intent = AsyncMock(return_value={"agent_id": "maou", "method": "keyword"})
     await inbound.on_message(channel_id="CGEN", text="my bill", user_id="U1")  # sticky=maou
@@ -733,6 +753,7 @@ async def test_mention_seeds_sticky_for_followup():
     core = AsyncMock(spec=SlackCoreClient)
     core.agent_reply_trigger = AsyncMock(return_value={"workflow_id": "x"})
     core.chat = AsyncMock(return_value={"response": "ok", "assistant_message_id": None})
+    core.agents = AsyncMock(return_value=list(_AGENTS_PAYLOAD))
     inbound = SlackInbound(adapter=adapter, core=core, channel_agent_map={}, bot_user_id="U0BOT")
     # turn 1: explicit @maou (route_message → async maou) seeds sticky=maou
     await inbound.on_message(channel_id="CGEN", text="@maou what's owed", user_id="U1")
@@ -823,7 +844,7 @@ _AGENTS_PAYLOAD = [
 
 
 def test_derive_mention_map_matches_shipped_defaults():
-    """Seed agents derive the same mention map as the hardcoded fallback."""
+    """Seed agents derive the aliases their rows declare."""
     m = _derive_mention_map(_AGENTS_PAYLOAD)
     assert m["pandora"] == "pandoras-actor"
     assert m["pandoras-actor"] == "pandoras-actor"
@@ -865,12 +886,13 @@ def test_route_message_custom_mention_via_param():
 
 
 async def test_routing_config_degrades_when_agents_fetch_fails():
-    """A non-list/raising /api/agents fetch falls back to shipped constants."""
+    """A raising /api/agents fetch before any good read is the empty config —
+    no built-in list of example ids to fall back to (#579)."""
+    from aegis_comms.slack_inbound import RoutingConfig
+
     inbound, core, _ = _inbound()
     core.agents.side_effect = RuntimeError("core down")
-    mention_map, async_agents = await inbound._routing_config()
-    assert mention_map["pandora"] == "pandoras-actor"
-    assert async_agents == {"pandoras-actor"}
+    assert await inbound._routing_config() == RoutingConfig()
 
 
 async def test_routing_config_uses_metadata_when_available():
@@ -878,9 +900,9 @@ async def test_routing_config_uses_metadata_when_available():
     core.agents.return_value = _AGENTS_PAYLOAD + [
         {"id": "jeeves", "metadata": {"mention_aliases": ["jeeves"], "async_dispatch": True}}
     ]
-    mention_map, async_agents = await inbound._routing_config()
-    assert mention_map["jeeves"] == "jeeves"
-    assert "jeeves" in async_agents
+    cfg = await inbound._routing_config()
+    assert cfg.mention_map["jeeves"] == "jeeves"
+    assert "jeeves" in cfg.async_agents
 
 
 # --- on_file PDF → extract → attach .txt back + summarize -------------------

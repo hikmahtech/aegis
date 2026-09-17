@@ -14,32 +14,100 @@ import math
 import statistics
 from bisect import bisect_right
 from collections import defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, timedelta
+from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-DEFAULT_TAX_RATE = {"equity": 0.20, "etf": 0.30}
 _EPS = 1e-9
+_UTC = ZoneInfo("UTC")
+
+# Three knobs used to carry a currency in their name. A deployment that has not
+# been re-saved since still holds the old keys, so `from_config` reads either,
+# new name first. Dropping the old ones would have put a live desk on a zero
+# sell charge and a zero exemption the moment the new code deployed, minutes
+# before anyone could rewrite the row.
+RENAMED = {
+    "sell_charge": "sell_charge_inr",
+    "long_term_rate": "ltcg_rate",
+    "long_term_exemption": "ltcg_exemption_inr",
+}
 
 
 @dataclass(frozen=True)
 class Rules:
     """The desk's knobs (spec §12). ``from_config`` merges an activities row's
-    ``config`` over these defaults, so a missing key is never an error."""
+    ``config`` over these defaults, so a missing key is never an error.
+
+    **The defaults name no market, no currency and no tax law.** AEGIS is
+    forked and configured for someone else's life, so one operator's exchange,
+    tickers and tax rates belong in their own ``trading-desk-daily`` row, with
+    an example setup in ``config/seed/activities.yaml``. A desk with no
+    ``calendar_symbol`` cannot tell a market day from a holiday, so it does
+    nothing at all rather than guessing a market.
+    """
 
     mode: str = "paper"
-    capital: float = 100_000.0
+
+    # --- the market ---------------------------------------------------------
+    # The instrument whose bars ARE the trading calendar, in the price source's
+    # own naming (Yahoo: "^NSEI", "^GSPC", "^FTSE"). Empty means unconfigured.
+    calendar_symbol: str = ""
+    # The clock the desk reads "today" from: an IANA zone name.
+    market_tz: str = "UTC"
+    # What the price source appends to a plain instrument symbol to say which
+    # exchange it trades on: ".NS" for the NSE, ".L" for London, ".TO" for
+    # Toronto. US listings need none, which is why empty is the default.
+    symbol_suffix: str = ""
+    # The ISO code every figure on this desk is in. It is the whole desk's
+    # currency, so the charges and the exemption below no longer carry one in
+    # their names.
+    currency: str = ""
+    # The month the financial year starts in, for grouping realised gains: 1 is
+    # the calendar year, 4 an April-to-March year.
+    fy_start_month: int = 1
+    # Calendar days before the trading calendar itself looks wrong. A long
+    # weekend plus a holiday is 4 to 5 days in most markets; a market with a
+    # longer normal closure needs this raised, or it will alarm every year.
+    stale_calendar_days: int = 6
+    # Calendar days before a price is too old to size or sell on.
+    stale_price_days: int = 7
+
+    # --- the money ----------------------------------------------------------
+    capital: float = 0.0
     asset_classes: tuple[str, ...] = ("equity", "etf")
     cost_pct_per_side: float = 0.002
-    sell_charge_inr: float = 16.0
+    # A flat charge on every sell, in `currency`. Was `sell_charge_inr`.
+    sell_charge: float = 0.0
     band_abs: float = 0.02
     band_rel: float = 0.25
     max_order_pct: float = 0.25
-    tax_rate: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_TAX_RATE))
-    ltcg_rate: float = 0.125
-    ltcg_exemption_inr: float = 125_000.0
-    benchmark: str = "SHARIABEES.NS"
-    context_benchmark: str = "^NSEI"
-    expected_excess_pa: float = 0.06
+    # Which print an order fills at: "open" (the session's first trade, the
+    # earliest price a signal from the previous close could actually have
+    # bought) or "close". Defaults to "close" because that is what every desk
+    # did before this knob existed, so a deployment that has not opted in keeps
+    # its arithmetic. Filling at the open only makes sense when the desk plans
+    # BEFORE its market opens — `trading_desk._tick` enforces that, and without
+    # it an order would fill at a price struck before it was decided.
+    fill_at: str = "close"
+
+    # --- the tax model ------------------------------------------------------
+    # Short-term rate per asset class. Empty means no tax model is configured,
+    # and then the desk deducts nothing and says so rather than inventing a
+    # rate. Was `ltcg_rate` and `ltcg_exemption_inr`.
+    tax_rate: dict[str, float] = field(default_factory=dict)
+    long_term_rate: float = 0.0
+    long_term_exemption: float = 0.0
+    # Which asset classes the long-term exemption applies to. India's section
+    # 112A covers listed equity and equity-oriented units and not a gold ETF,
+    # so which classes qualify is the operator's law to state, not ours.
+    long_term_exemption_classes: tuple[str, ...] = ()
+
+    # --- the score ----------------------------------------------------------
+    benchmark: str = ""
+    context_benchmark: str = ""
+    expected_excess_pa: float = 0.0
     # Where a benchmark's prices can also come from, when Yahoo has no close for
     # a market day: benchmark name (Yahoo's form) to the NSE symbol and asset
     # class ansaar wants, e.g. {"SHARIABEES.NS": {"symbol": "SHARIABEES",
@@ -47,14 +115,54 @@ class Rules:
     # gets no fallback, so this repo ships nobody's tickers.
     benchmark_prices: dict[str, dict[str, str]] = field(default_factory=dict)
 
+    def configured(self) -> bool:
+        """Whether the desk knows which market it trades. Without a trading
+        calendar it cannot tell a market day from a holiday, and guessing one
+        would place real paper orders on a day the exchange was shut."""
+        return bool(self.calendar_symbol)
+
+    def tz(self) -> ZoneInfo:
+        """The clock the desk reads "today" from.
+
+        An unknown zone name falls back to UTC rather than stopping the run:
+        reading is forgiving and writing is strict, the same split the email
+        triage rules use. `desk_rules.validate` refuses a bad name with a 400,
+        so a typo is caught where someone is watching."""
+        try:
+            return ZoneInfo(self.market_tz)
+        except (ZoneInfoNotFoundError, ValueError):
+            return _UTC
+
+    def price_symbol(self, symbol: str) -> str:
+        """An instrument's name at the price source (``TCS`` to ``TCS.NS``).
+
+        An index (``^NSEI``) and a symbol that already names its exchange are
+        left alone, so a benchmark can be configured in the source's own form.
+        With no suffix configured, every symbol is already in that form."""
+        if not self.symbol_suffix or symbol.startswith("^") or "." in symbol:
+            return symbol
+        return f"{symbol}{self.symbol_suffix}"
+
     @classmethod
     def from_config(cls, cfg: dict | None) -> Rules:
         cfg = cfg or {}
         base = cls()
 
+        def raw(key: str) -> Any:
+            """The configured value, under the current name or the old one."""
+            value = cfg.get(key)
+            return cfg.get(RENAMED[key]) if value is None and key in RENAMED else value
+
         def num(key: str) -> float:
-            raw = cfg.get(key)
-            return float(raw) if raw is not None else float(getattr(base, key))
+            value = raw(key)
+            return float(value) if value is not None else float(getattr(base, key))
+
+        def whole(key: str) -> int:
+            value = cfg.get(key)
+            return int(value) if value is not None else int(getattr(base, key))
+
+        def text(key: str) -> str:
+            return str(cfg.get(key) or getattr(base, key))
 
         rates = {k: float(v) for k, v in (cfg.get("tax_rate") or {}).items()}
         # A mapping needs both halves to be usable, so one missing either is
@@ -66,22 +174,48 @@ class Rules:
             if isinstance(src, dict) and src.get("symbol") and src.get("asset_class")
         }
         return cls(
-            mode=str(cfg.get("mode") or base.mode),
+            mode=text("mode"),
+            calendar_symbol=text("calendar_symbol"),
+            market_tz=text("market_tz"),
+            symbol_suffix=text("symbol_suffix"),
+            currency=text("currency").upper(),
+            fy_start_month=whole("fy_start_month"),
+            stale_calendar_days=whole("stale_calendar_days"),
+            stale_price_days=whole("stale_price_days"),
             capital=num("capital"),
             asset_classes=tuple(cfg.get("asset_classes") or base.asset_classes),
             cost_pct_per_side=num("cost_pct_per_side"),
-            sell_charge_inr=num("sell_charge_inr"),
+            sell_charge=num("sell_charge"),
             band_abs=num("band_abs"),
             band_rel=num("band_rel"),
             max_order_pct=num("max_order_pct"),
-            tax_rate={**DEFAULT_TAX_RATE, **rates},
-            ltcg_rate=num("ltcg_rate"),
-            ltcg_exemption_inr=num("ltcg_exemption_inr"),
-            benchmark=str(cfg.get("benchmark") or base.benchmark),
-            context_benchmark=str(cfg.get("context_benchmark") or base.context_benchmark),
+            # Read leniently, like every other key here. `fill_price_on` treats
+            # anything that is not "open" as the close, so a typo degrades to
+            # the old behaviour rather than stopping the desk trading. The
+            # strict check lives at the write boundary, in `desk_rules.validate`.
+            fill_at=text("fill_at").lower(),
+            tax_rate=rates,
+            long_term_rate=num("long_term_rate"),
+            long_term_exemption=num("long_term_exemption"),
+            long_term_exemption_classes=tuple(cfg.get("long_term_exemption_classes") or ()),
+            benchmark=text("benchmark"),
+            context_benchmark=text("context_benchmark"),
             expected_excess_pa=num("expected_excess_pa"),
             benchmark_prices=benches,
         )
+
+
+def legacy_keys(cfg: dict | None) -> list[str]:
+    """The old, currency-suffixed key names a config row still supplies a value
+    under, and which nothing newer overrides.
+
+    `from_config` reads them so a deployment keeps working the moment the new
+    code lands — `schedule_sync` re-reads this row every few minutes, so there
+    is no ordering of deploy and config write that avoids the gap. This names
+    them so the gap is visible: the daily run logs it and the admin page says
+    which settings are still stored under a retired name."""
+    cfg = cfg or {}
+    return sorted(old for new, old in RENAMED.items() if cfg.get(new) is None and cfg.get(old) is not None)
 
 
 @dataclass(frozen=True)
@@ -117,6 +251,47 @@ def last_trading_day(index_days: list[date], today: date) -> date | None:
     """The latest market day strictly before ``today``, from the index's bars."""
     before = [d for d in index_days if d < today]
     return max(before) if before else None
+
+
+def trading_week(market_days: Iterable[date]) -> set[int]:
+    """Which days of the week this market trades on, read off its own bars.
+
+    The shape of a week is part of a market, and the desk's market is
+    configuration: most exchanges trade Monday to Friday, a few Sunday to
+    Thursday. The calendar's own bars say which, so nothing here has to assume
+    anyone's weekend."""
+    return {d.weekday() for d in market_days}
+
+
+def last_expected_day(today: date, week: set[int]) -> date | None:
+    """The most recent day strictly before ``today`` that this market would
+    normally have traded on. None when its week is not known yet."""
+    if not week:
+        return None
+    day = today - timedelta(days=1)
+    for _ in range(7):
+        if day.weekday() in week:
+            return day
+        day -= timedelta(days=1)
+    return None
+
+
+def idle_days(market_days: set[date], first: date, last: date) -> list[date]:
+    """Days from ``first`` to ``last`` this market would normally have traded on
+    and has no bar for.
+
+    Two things look exactly like this and the desk cannot tell them apart, so it
+    counts both: a market holiday, and a day the price source simply did not
+    serve. The index's bars ARE the desk's calendar, which is why one of these
+    is normal and a run of them is not (#525)."""
+    week = trading_week(market_days)
+    out: list[date] = []
+    day = first
+    while day <= last:
+        if day.weekday() in week and day not in market_days:
+            out.append(day)
+        day += timedelta(days=1)
+    return out
 
 
 def check_decisions(
@@ -172,13 +347,22 @@ def check_decisions(
 class Bar:
     """One stored day of prices (spec §6). ``close`` is the first close the desk
     saw for the day; ``split_ratio`` is new shares per old share from that day;
-    ``dividend`` is per share on its ex-date; ``source`` is ``yahoo`` or ``ansaar``."""
+    ``dividend`` is per share on its ex-date; ``source`` is ``yahoo`` or ``ansaar``.
+
+    ``open`` is the session's first print, and it sits LAST rather than beside
+    ``close`` where it reads better. Every field here is ``float | None`` or
+    defaulted, and ``trading_desk._bars`` builds this positionally, so a field
+    inserted mid-struct would silently load ``split_ratio`` into ``open`` and
+    ``source`` into ``dividend`` without raising anything. Appending is the only
+    placement the type system cannot catch getting wrong.
+    """
 
     day: date
     close: float | None
     split_ratio: float | None = None
     dividend: float | None = None
     source: str = "yahoo"
+    open: float | None = None
 
 
 @dataclass(frozen=True)
@@ -237,6 +421,18 @@ def bar_on(series: list[Bar], day: date) -> Bar | None:
     """The bar dated exactly ``day``, or None. ``series`` is sorted by day."""
     i = bisect_right(series, day, key=lambda b: b.day)
     return series[i - 1] if i and series[i - 1].day == day else None
+
+
+def open_on(series: list[Bar], day: date) -> float | None:
+    """The open dated EXACTLY ``day``, or None.
+
+    Deliberately not "the last known open on or before", the way `close_on`
+    works. A close carries forward because it is the best mark available for a
+    day the market did not price; an open does not, because it is a statement
+    about one session's first trade. Carrying yesterday's open into today would
+    fill an order at a price from a day that has closed."""
+    bar = bar_on(series, day)
+    return bar.open if bar else None
 
 
 def close_on(series: list[Bar], day: date) -> float | None:
@@ -332,8 +528,14 @@ def _consume(book: Book, f: Fill) -> None:
 
 
 def value(book: Book, bars: dict[str, list[Bar]], day: date) -> float:
-    """Cash plus holdings at the last close on or before ``day``. A holding with
-    no price at all counts at its cost; the daily run raises desk_price_missing."""
+    """Cash plus holdings at the last close on or before ``day``.
+
+    A holding whose price has gone dark keeps its LAST CLOSE, however old: that
+    is what ``close_on`` returns, and the daily run raises `desk_price_missing`
+    for it rather than writing it down. Cost is used only for a holding with no
+    stored close at all on or before ``day``, which a filled order normally
+    rules out. So a delisted position overstates the desk's value at its final
+    traded price until someone sells it (#524)."""
     total = book.cash
     for symbol, qty in book.held().items():
         px = close_on(bars.get(symbol, []), day)
@@ -341,18 +543,24 @@ def value(book: Book, bars: dict[str, list[Bar]], day: date) -> float:
     return total
 
 
-def fy(day: date) -> int:
-    """The Indian financial year (April-March) a day falls in, by its first year."""
-    return day.year if day.month >= 4 else day.year - 1
+def fy(day: date, start_month: int = 1) -> int:
+    """The financial year a day falls in, named by the calendar year it starts
+    in. ``start_month`` 1 is the calendar year; 4 an April-to-March year."""
+    return day.year if day.month >= start_month else day.year - 1
 
 
 def tax_owed(realised: list[Realised], rules: Rules) -> float:
     """Tax on realised gains, per financial year (spec §7). `ponytail:`
-    conservative: no netting across classes and no loss carry-forward."""
-    worst = max(rules.tax_rate.values(), default=0.30)
+    conservative: no netting across classes and no loss carry-forward.
+
+    With no tax model configured every rate is zero, so this returns nothing
+    owed. That is the honest answer to "what are this desk's taxes" when nobody
+    has said what they are, and the page labels it as unconfigured rather than
+    showing a zero that reads like a result."""
+    worst = max(rules.tax_rate.values(), default=0.0)
     years: dict[int, list[Realised]] = defaultdict(list)
     for r in realised:
-        years[fy(r.day)].append(r)
+        years[fy(r.day, rules.fy_start_month)].append(r)
     total = 0.0
     for rows in years.values():
         short: dict[str, float] = defaultdict(float)
@@ -361,10 +569,12 @@ def tax_owed(realised: list[Realised], rules: Rules) -> float:
             (long_gain if r.long_term else short)[r.asset_class] += r.gain
         total += sum(rules.tax_rate.get(c, worst) * max(0.0, g) for c, g in short.items())
         for asset_class, gain in long_gain.items():
-            # The ₹1.25L exemption is section 112A: listed equity and
-            # equity-oriented units. A gold or silver ETF gets none of it.
-            free = rules.ltcg_exemption_inr if asset_class == "equity" else 0.0
-            total += rules.ltcg_rate * max(0.0, gain - free)
+            # Which classes the exemption covers is the operator's tax law, not
+            # ours: India's section 112A covers listed equity and equity-oriented
+            # units, so a gold or silver ETF gets none of it. A fork whose law
+            # says otherwise lists its own classes.
+            free = rules.long_term_exemption if asset_class in rules.long_term_exemption_classes else 0.0
+            total += rules.long_term_rate * max(0.0, gain - free)
     return total
 
 
@@ -401,11 +611,14 @@ class FillResult:
     costs: float = 0.0
     source: str | None = None
     reason: str = ""
+    # Which print the fill got: "open", or "close" when the open was missing and
+    # the desk fell back. Empty on a result that did not fill.
+    kind: str = ""
 
 
 def _costs(side: str, qty: int, price: float, rules: Rules) -> float:
     fee = qty * price * rules.cost_pct_per_side
-    return fee + rules.sell_charge_inr if side == "sell" else fee
+    return fee + rules.sell_charge if side == "sell" else fee
 
 
 def plan_orders(
@@ -498,24 +711,50 @@ def _split_factor(series: list[Bar], after: date, upto: date) -> float:
     return factor
 
 
+def fill_price_on(series: list[Bar], day: date, rules: Rules) -> tuple[float | None, str]:
+    """The price an order fills at on ``day``, and which print it is.
+
+    Under ``fill_at = "open"`` the desk pays the session's first price, which is
+    what a signal taken from the previous close could actually have bought. The
+    close is kept as a fallback rather than a cancel: an order the desk meant to
+    place should not be dropped because one source never published one field,
+    and a fill at the close is exactly what this desk did until now. Anything
+    other than ``"open"`` means the close, so a typo in config degrades to the
+    old behaviour instead of refusing to trade.
+    """
+    bar = bar_on(series, day)
+    if bar is None:
+        return None, ""
+    if rules.fill_at == "open" and bar.open is not None:
+        return bar.open, "open"
+    return (bar.close, "close") if bar.close is not None else (None, "")
+
+
 def fill_orders(
     pending: list[PendingOrder],
     bars: dict[str, list[Bar]],
-    index_days: list[date],
+    tradable_days: list[date],
     book: Book,
     rules: Rules,
     grace_days: int = 3,
 ) -> list[FillResult]:
-    """Fill pending paper orders at the close of their fill day (spec §6).
+    """Fill pending paper orders on their fill day (spec §6).
 
-    The fill day is the first market day on or after the day an order was
-    created. ``book`` is the desk before these fills. Sells fill before buys, and
-    ``seq`` orders each side; a buy that no longer fits the cash is cut, or cancelled
-    as ``no_cash``. Sells of one name share the holding, so each is capped by what
-    the earlier ones left. No price ``grace_days`` market days after the fill day
-    cancels the order as ``price_missing``.
+    The fill day is the first tradable day on or after the day an order was
+    created, and the price is `fill_price_on` — the open under `fill_at="open"`,
+    else the close. ``book`` is the desk before these fills. Sells fill before
+    buys, and ``seq`` orders each side; a buy that no longer fits the cash is
+    cut, or cancelled as ``no_cash``. Sells of one name share the holding, so
+    each is capped by what the earlier ones left. No price ``grace_days``
+    tradable days after the fill day cancels the order as ``price_missing``.
+
+    ``tradable_days`` is NOT the same list as the calendar the rest of the desk
+    runs on. It may include today, once today has an open — that is the whole
+    point of filling at the open. The calendar that decides which day's
+    decisions to act on stays strictly behind today, because a session that has
+    not closed has no decisions yet.
     """
-    days = sorted(index_days)
+    days = sorted(tradable_days)
     cash = book.cash
     sold: dict[str, int] = defaultdict(int)
     results: list[FillResult] = []
@@ -525,14 +764,14 @@ def fill_orders(
             results.append(FillResult(o.id, "pending"))
             continue
         series = bars.get(o.symbol, [])
-        bar = bar_on(series, fill_day)
-        if bar is None or bar.close is None:
+        px, print_used = fill_price_on(series, fill_day, rules)
+        if px is None:
             late = sum(1 for d in days if d > fill_day) >= grace_days
             results.append(
                 FillResult(o.id, "cancelled", reason="price_missing") if late else FillResult(o.id, "pending")
             )
             continue
-        px = bar.close
+        bar = bar_on(series, fill_day)
         qty = math.floor(o.qty * _split_factor(series, o.data_date, fill_day) + _EPS)
         if o.side == "sell":
             qty = min(qty, math.floor(book.qty(o.symbol) + _EPS) - sold[o.symbol])
@@ -550,7 +789,9 @@ def fill_orders(
                 continue
             costs = _costs("buy", qty, px, rules)
             cash -= qty * px + costs
-        results.append(FillResult(o.id, "filled", fill_day, qty, px, costs, bar.source))
+        results.append(
+            FillResult(o.id, "filled", fill_day, qty, px, costs, bar.source if bar else None, kind=print_used)
+        )
     return results
 
 
@@ -595,11 +836,18 @@ def desk_values(
 def benchmark_values(
     series: list[Bar], capital: float, cost_pct: float, days: list[date]
 ) -> list[tuple[date, float]]:
-    """``capital`` put into one instrument at the first day's close, paying one
-    buy cost, then held: splits adjust the units and dividends go to cash (spec §8)."""
+    """``capital`` put into one instrument on the first day, paying one buy cost,
+    then held: splits adjust the units and dividends go to cash (spec §8).
+
+    It buys at that day's OPEN when there is one, because the desk it is scored
+    against does. The whole point of the benchmark is "what the same money would
+    have earned doing nothing clever", and that comparison is only honest if
+    both sides enter on the same print — otherwise the gap carries a fixed
+    slice of one session's move that has nothing to do with the picking. Falls
+    back to the close, which is what every day before this change has."""
     if not days:
         return []
-    start = close_on(series, days[0])
+    start = open_on(series, days[0]) or close_on(series, days[0])
     if not start:
         return []
     units = capital * (1 - cost_pct) / start

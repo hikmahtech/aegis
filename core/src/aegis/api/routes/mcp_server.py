@@ -1,17 +1,16 @@
 """MCP **server** — AEGIS's own chat tools, served over streamable HTTP.
 
-The mirror image of :mod:`aegis.mcp_manager` (the client). One handler behind
-two URLs — ``POST /api/mcp-server/{agent_id}`` and its ``/gated`` variant (last
-paragraph) — speaks JSON-RPC 2.0 so an external agent harness (``claude`` /
-``kimi`` CLI headless runs, Claude Desktop) can mount AEGIS's GTD / knowledge /
-infra / money tools natively instead of shelling back into the chat API.
-``routes/mcp.py`` is the *client* admin surface and is untouched by this module.
+One handler behind two URLs — ``POST /api/mcp-server/{agent_id}`` and its
+``/gated`` variant (last paragraph) — speaks JSON-RPC 2.0 so an external agent
+harness (``claude`` / ``kimi`` CLI headless runs, Claude Desktop) can mount
+AEGIS's GTD / knowledge / infra / money tools natively instead of shelling back
+into the chat API.
 
 Serving tools to a third-party harness is a door into this AEGIS, so it is shut
 by default and narrow when open:
 
 * **Off by default.** ``settings.mcp_server_enabled`` (``AEGIS_MCP_SERVER_ENABLED``)
-  gates every method, matching the client's default-deny posture. Off ⇒ 403.
+  gates every method, default-deny. Off ⇒ 403.
 * **Repo-standard auth, plus a scoped run credential.** Admin access is the same
   ``verify_auth`` as every other route — API key or Basic. A *run* instead
   presents a short-TTL **mount token** (``services/mcp_tokens.py``) signed for
@@ -24,8 +23,8 @@ by default and narrow when open:
 * **Per-agent tool gating.** The URL names an agent and the served *chat* tools
   are exactly that agent's ``metadata.tool_set`` (via ``_get_agent_tools``), so a
   mounted server can never reach past what that agent may already do in chat.
-  ``_UNSERVED_TOOLS`` is removed on top of that — the MCP passthrough and every
-  tool that spawns another agent run (see the constant). The one addition is
+  ``_UNSERVED_TOOLS`` is removed on top of that — every tool that spawns
+  another agent run (see the constant). The one addition is
   ``approve_tool_use`` (below), which grants nothing.
 * **Stateless.** No ``Mcp-Session-Id`` is ever issued and one sent by a client is
   ignored, so there is no server-side session to hijack, expire or leak. ``GET``
@@ -33,9 +32,9 @@ by default and narrow when open:
 
 Responses are always ``application/json``; SSE is spec-legal but never used.
 JSON-RPC *application* errors travel as a 200 with an ``error`` envelope on
-purpose — a non-2xx status is a transport failure to a compliant client
-(``mcp_manager._post`` raises before it ever decodes the body), which would hide
-the message the caller needs.
+purpose — a non-2xx status is a transport failure to a compliant client, which
+raises before it ever decodes the body and would hide the message the caller
+needs.
 
 One tool served here is **not** a chat tool: ``approve_tool_use``. It is the
 target of a gated run's ``--permission-prompt-tool`` flag — the claude CLI calls
@@ -76,13 +75,12 @@ from jsonschema.exceptions import ValidationError as JSONSchemaValidationError
 from aegis.api.auth import security, verify_auth
 from aegis.api.deps import get_settings
 from aegis.config import Settings
+from aegis.errors import error_text
 from aegis.llm.tier import tier_to_model_or
-from aegis.mcp_manager import _PROTOCOL_VERSION as MCP_PROTOCOL_VERSION
 from aegis.observability import record_tool_call
 from aegis.services.agents import get_agent
 from aegis.services.api_key import resolve_api_key
 from aegis.services.chat import (
-    _MCP_TOOL_NAME,
     _TOOL_TIMEOUT_OVERRIDES,
     _execute_tool,
     _get_agent_tools,
@@ -97,6 +95,9 @@ from aegis.services.tools.base import ToolContext
 logger = structlog.get_logger()
 
 _SERVER_NAME = "aegis"
+
+# MCP wire protocol revision this server speaks.
+MCP_PROTOCOL_VERSION = "2025-06-18"
 
 # JSON-RPC 2.0 reserved error codes.
 _PARSE_ERROR = -32700
@@ -116,11 +117,7 @@ _ERROR_CHARS = 300
 
 # Chat tools that are NEVER served here, however the agent's `tool_set` reads.
 #
-# `call_mcp_tool` is the MCP *client* passthrough: serving it would let a
-# mounted client drive AEGIS's own client at a third-party server on its behalf
-# (confused deputy).
-#
-# The other three each START ANOTHER CLI RUN — and a run's mount carries the
+# Each of the first three START ANOTHER CLI RUN — and a run's mount carries the
 # same tool set, so a mounted run calling one of them spawns a run that can
 # spawn a run. There is no depth counter anywhere in that loop: the only brake
 # is the coding host's tmux window cap (10), past which launches fall through
@@ -132,7 +129,6 @@ _ERROR_CHARS = 300
 # missing from that list is unreachable, not merely unadvertised.
 _UNSERVED_TOOLS = frozenset(
     {
-        _MCP_TOOL_NAME,
         "dispatch_agent_run",
         "aegis_self_diagnose",
         "investigate_resource",
@@ -157,13 +153,11 @@ _UNSERVED_TOOLS = frozenset(
     }
 )
 
-# What the OPERATOR mount withholds. The run-spawning tools come back, because
-# the recursion this guards against is run→run and a human terminal is that
-# recursion's base case — and the operator mount cannot be opened with a
-# credential that exists on the coding host. `call_mcp_tool` stays out: it is
-# the MCP client passthrough, and the confused-deputy problem it creates does
-# not depend on who opened the door.
-_OPERATOR_UNSERVED_TOOLS = frozenset({_MCP_TOOL_NAME})
+# What the OPERATOR mount withholds: nothing. The run-spawning tools come back,
+# because the recursion `_UNSERVED_TOOLS` guards against is run→run and a human
+# terminal is that recursion's base case — and the operator mount cannot be
+# opened with a credential that exists on the coding host.
+_OPERATOR_UNSERVED_TOOLS: frozenset[str] = frozenset()
 
 # ── the permission gate (gated agent runs) ─────────────────────────────────
 #
@@ -965,9 +959,7 @@ def _served_tools(agent_id: str, metadata: dict | None, *, operator: bool = Fals
     in that loop. A human at a terminal is the base case of that recursion, and
     the operator mount is unreachable with a run's credential
     (``_require_operator_key``), so nothing on the coding host can take this
-    path. ``call_mcp_tool`` stays withheld regardless — it is the MCP *client*
-    passthrough, and serving it would make AEGIS a confused deputy against a
-    third-party server whichever credential opened the door.
+    path.
     """
     excluded = _OPERATOR_UNSERVED_TOOLS if operator else _UNSERVED_TOOLS
     return [
@@ -996,8 +988,6 @@ def _tool_context(request: Request, agent_id: str, settings: Settings) -> ToolCo
     ``task_id``/``chat_context`` are None: an MCP call has no Todoist anchor and
     no conversation around it. Every executor that reads ``chat_context`` does so
     as ``(ctx.chat_context or {})``, so None is the supported "no chat" value.
-    ``mcp_manager`` is wired for parity with chat, but ``call_mcp_tool`` — its
-    only consumer — is filtered out of the served set above.
     """
     state = request.app.state
     return ToolContext(
@@ -1012,7 +1002,6 @@ def _tool_context(request: Request, agent_id: str, settings: Settings) -> ToolCo
         llm_client=getattr(state, "llm", None),
         remote_script_connector=getattr(state, "remote_script_connector", None),
         vercel_connector=getattr(state, "vercel_connector", None),
-        mcp_manager=getattr(state, "mcp_manager", None),
         model_light=tier_to_model_or("fast", getattr(settings, "model_fast", "gemma4:e2b")),
     )
 
@@ -1156,10 +1145,10 @@ async def _handle_tools_call(
             error=type(exc).__name__,
             arg_keys=arg_keys,
         )
-        await _record("error", {"error": f"{type(exc).__name__}: {str(exc)[:_ERROR_CHARS]}"})
+        await _record("error", {"error": error_text(exc, _ERROR_CHARS)})
         return _tool_result(
             request_id,
-            f"Tool '{name}' failed: {type(exc).__name__}: {str(exc)[:_ERROR_CHARS]}",
+            f"Tool '{name}' failed: {error_text(exc, _ERROR_CHARS)}",
             is_error=True,
         )
 
@@ -1364,45 +1353,25 @@ async def mcp_server_operator_endpoint(
     return await _serve(agent_id, request, settings, gated=False, operator=True)
 
 
+# A client probes every URL it mounts, so all three need the same answer.
+# Without the operator route the probe fell through to the admin SPA's
+# catch-all and got a 404, which the MCP transport reserves for "your session
+# is gone" (#476). That endpoint takes no DELETE, so it says so.
 @router.get("/{agent_id}")
-async def mcp_server_no_stream(agent_id: str) -> Response:
+@router.get("/{agent_id}/gated")
+@router.get("/{agent_id}/operator")
+async def mcp_server_no_stream(request: Request, agent_id: str) -> Response:
     """No server-initiated SSE stream — the spec's way to say so is 405."""
     raise HTTPException(
         status_code=405,
         detail="This MCP endpoint is stateless and POST-only; it opens no server-initiated stream.",
-        headers={"Allow": "POST, DELETE"},
-    )
-
-
-@router.get("/{agent_id}/gated")
-async def mcp_server_gated_no_stream(agent_id: str) -> Response:
-    """Parity with the ungated endpoint — a client probes the URL it mounts."""
-    raise HTTPException(
-        status_code=405,
-        detail="This MCP endpoint is stateless and POST-only; it opens no server-initiated stream.",
-        headers={"Allow": "POST, DELETE"},
-    )
-
-
-@router.get("/{agent_id}/operator")
-async def mcp_server_operator_no_stream(agent_id: str) -> Response:
-    """Parity again. Without this route the probe fell through to the admin
-    SPA's catch-all and got a 404, which the MCP transport reserves for "your
-    session is gone" (#476)."""
-    raise HTTPException(
-        status_code=405,
-        detail="This MCP endpoint is stateless and POST-only; it opens no server-initiated stream.",
-        headers={"Allow": "POST"},
+        headers={"Allow": "POST" if request.url.path.endswith("/operator") else "POST, DELETE"},
     )
 
 
 @router.delete("/{agent_id}", status_code=204)
-async def mcp_server_end_session(agent_id: str) -> Response:
-    """Session termination. No session is ever issued, so this is a no-op."""
-    return Response(status_code=204)
-
-
 @router.delete("/{agent_id}/gated", status_code=204)
-async def mcp_server_gated_end_session(agent_id: str) -> Response:
-    """Session termination on the gated URL — same no-op."""
+async def mcp_server_end_session(agent_id: str) -> Response:
+    """Session termination, on either URL. No session is ever issued, so this
+    is a no-op that exists because the transport calls it."""
     return Response(status_code=204)

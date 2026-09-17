@@ -34,6 +34,8 @@ from temporalio.exceptions import WorkflowAlreadyStartedError
 from temporalio.workflow import ParentClosePolicy
 
 with workflow.unsafe.imports_passed_through():
+    from aegis.errors import error_text
+
     from aegis_worker.activities.gmail import FetchEmailsInput, FetchEmailsResult
     from aegis_worker.flows.meeting_notes import MeetingNotesFlow, MeetingNotesInput
     from aegis_worker.shared.retry import ACT_RETRY, NO_RETRY, TIMEOUT_FAST
@@ -49,7 +51,7 @@ def _err_str(exc: BaseException) -> str:
     ActivityError, so recording `str(exc)` would put the same nine useless
     words in every account's `error` field.
     """
-    return str(exc.__cause__ or exc)[:200]
+    return error_text(exc.__cause__ or exc)
 
 
 @dataclass

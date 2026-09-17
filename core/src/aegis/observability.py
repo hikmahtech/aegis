@@ -2,6 +2,8 @@
 
 import structlog
 
+from aegis.errors import error_text
+
 logger = structlog.get_logger()
 
 
@@ -109,7 +111,7 @@ async def record_tool_call(
             surface,
         )
     except Exception as exc:
-        logger.warning("record_tool_call_failed", tool=tool_name, error=str(exc))
+        logger.warning("record_tool_call_failed", tool=tool_name, error=error_text(exc, 500))
 
 
 async def log_audit(

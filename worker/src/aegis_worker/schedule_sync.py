@@ -6,8 +6,11 @@ Temporal schedules. Idempotent — safe to call on every worker startup.
 
 from __future__ import annotations
 
+from zoneinfo import ZoneInfo
+
 import asyncpg
 import structlog
+from aegis.errors import error_text
 from temporalio.client import (
     Client,
     Schedule,
@@ -20,6 +23,34 @@ from temporalio.client import (
 from aegis_worker.registry import activity_type_map, feature_flagged_types
 
 logger = structlog.get_logger()
+
+
+def split_cron_timezone(cron: str) -> tuple[str, str]:
+    """Split an optional ``CRON_TZ=<zone>`` prefix off a cron string.
+
+    Returns ``(expression, zone)``; the zone is ``""`` when there is no prefix,
+    which Temporal reads as UTC — the behaviour every schedule had before this
+    existed, so a bare cron is untouched.
+
+    A schedule's fire times and the flow's own idea of "today" are not always
+    on the same clock. The trading desk reads its day from ``market_tz`` and
+    has to plan before its exchange opens, so expressing its schedule in UTC
+    put the guard and the trigger in different timezones with nothing saying
+    so. A zone named on the line itself keeps them together and survives a
+    market that observes DST.
+
+    An unknown zone raises: firing in UTC because a name was misspelt is the
+    silent failure this is meant to prevent.
+    """
+    if not cron.startswith("CRON_TZ="):
+        return cron, ""
+    prefix, _, rest = cron.partition(" ")
+    zone = prefix.removeprefix("CRON_TZ=").strip()
+    expression = rest.strip()
+    if not zone or not expression:
+        raise ValueError(f"malformed CRON_TZ prefix in schedule_cron: {cron!r}")
+    ZoneInfo(zone)  # raises ZoneInfoNotFoundError on a name that is not a zone
+    return expression, zone
 
 # Map activity type -> (workflow class, config builder). Derived from the ONE
 # registry in aegis_worker/registry.py — a flow declared there is schedulable
@@ -82,7 +113,23 @@ async def sync_schedules(
         act = dict(row)
         act_name = act["slug"]
         act_type = act["workflow_type"]
-        cron = act["schedule_cron"]
+        # A bad zone must stop this row, not the whole sweep: every other
+        # schedule still reconciles, and the row names itself in the log.
+        try:
+            cron, cron_tz = split_cron_timezone(act["schedule_cron"])
+        except Exception as exc:  # noqa: BLE001 — one bad row must not sink the sweep
+            # Keep the id so the prune pass below leaves the schedule alone: a
+            # misspelt zone is a typo, not a decision to stop running the flow,
+            # and deleting the schedule over one would be a far worse outcome
+            # than carrying on with the times it already has.
+            expected_ids.add(act_name)
+            logger.error(
+                "schedule_bad_timezone",
+                activity=act_name,
+                schedule_cron=act["schedule_cron"],
+                error=error_text(exc),
+            )
+            continue
 
         # Skip flows whose owning feature flag is off — the worker didn't
         # register the workflow type, so a schedule for it would only error.
@@ -164,6 +211,7 @@ async def sync_schedules(
             json.dumps(
                 {
                     "cron": cron,
+                    "tz": cron_tz,
                     "wf": workflow_cls.__name__,
                     "cfg": dataclasses.asdict(flow_config),
                 },
@@ -180,7 +228,7 @@ async def sync_schedules(
                 task_queue=task_queue,
                 id=action_id,
             ),
-            spec=ScheduleSpec(cron_expressions=[cron]),
+            spec=ScheduleSpec(cron_expressions=[cron], time_zone_name=cron_tz),
         )
 
         try:
@@ -202,7 +250,7 @@ async def sync_schedules(
                 await client.create_schedule(schedule_id, schedule)
                 logger.info("schedule_created", schedule_id=schedule_id, cron=cron)
             except Exception as e:
-                logger.warning("schedule_create_failed", schedule_id=schedule_id, error=str(e))
+                logger.warning("schedule_create_failed", schedule_id=schedule_id, error=error_text(e, 500))
                 continue
 
         registered += 1
@@ -219,10 +267,10 @@ async def sync_schedules(
                     logger.warning(
                         "schedule_delete_orphan_failed",
                         schedule_id=sched.id,
-                        error=str(exc),
+                        error=error_text(exc, 500),
                     )
     except Exception as exc:
-        logger.warning("schedule_prune_failed", error=str(exc))
+        logger.warning("schedule_prune_failed", error=error_text(exc, 500))
 
     logger.info("schedule_sync_complete", registered=registered, total_activities=len(rows))
     return registered

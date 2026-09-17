@@ -90,7 +90,8 @@ async def test_render_month_close_activity():
 @pytest.mark.asyncio
 async def test_notify_money_message_sends_the_html_as_maou():
     delivery = _Delivery()
-    act = _act()
+    # The owner `__main__` resolves from the `finance` tag and passes in (#579).
+    act = _act(agent_id="maou")
     act.delivery = delivery
     ok = await ActivityEnvironment().run(
         act.notify_money_message, "<b>Money brief</b>", "money_brief_notify_failed"

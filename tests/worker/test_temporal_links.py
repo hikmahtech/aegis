@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from aegis_worker.shared.temporal_links import (
+from aegis_worker.activities.temporal_links import (
     workflow_history_url,
     workflow_run_footer,
 )

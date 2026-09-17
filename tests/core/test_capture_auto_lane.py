@@ -12,17 +12,17 @@ this file and cannot strip rows another test file seeded. `knowledge_chunks`
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import pytest
 import pytest_asyncio
 from aegis.api.app import create_app
 from aegis.api.auth import verify_auth
 from aegis.api.deps import get_settings
 from aegis.config import Settings
-from aegis.llm import LLMClient, LLMTruncationError
+from aegis.llm import LLMTruncationError
 from aegis.services.knowledge import KnowledgeStore
 from httpx import ASGITransport, AsyncClient
+
+from tests.llm_stub import StubbedLLMClient
 
 _TEST_REQUIRED_SETTINGS = {
     "database_url": "postgresql://test:test@localhost:5432/test",
@@ -75,31 +75,23 @@ class _FakeLLM:
         }
 
 
-class _RecordingLLM(LLMClient):
-    """A REAL `LLMClient` with only the HTTP layer stubbed.
+class _RecordingLLM(StubbedLLMClient):
+    """The shared `StubbedLLMClient` — a REAL `LLMClient` with only the HTTP
+    layer stubbed — plus the deterministic embeddings the pgvector store needs.
 
     The `llm_calls` row is written inside `LLMClient._record_call` (issue #106),
     so a hand-rolled fake with its own `think()` makes every recording assertion
     vacuous — it would pass whether or not the production choke point works.
-    Everything from `think()` down is the shipping code path here; only
-    `chat.completions.create` and `embed` are stubbed.
+    The stub's one constant `embed_vector` cannot be used here: the store is
+    exercised against real SQL, which needs a different vector per text.
     """
 
     def __init__(self, db_pool, *, content: str = "", finish_reason: str = "stop"):
-        super().__init__(base_url="http://litellm.invalid/v1", db_pool=db_pool)
-        self.create_calls: list[dict] = []
+        super().__init__(db_pool=db_pool, content=content, finish_reason=finish_reason)
 
-        async def _create(**kwargs):
-            self.create_calls.append(kwargs)
-            usage = SimpleNamespace(prompt_tokens=11, completion_tokens=22)
-            choice = SimpleNamespace(
-                message=SimpleNamespace(content=content), finish_reason=finish_reason
-            )
-            return SimpleNamespace(choices=[choice], usage=usage)
-
-        self._client = SimpleNamespace(
-            chat=SimpleNamespace(completions=SimpleNamespace(create=_create))
-        )
+    @property
+    def create_calls(self) -> list[dict]:
+        return self.calls
 
     async def embed(self, texts, model="nomic-embed-text"):
         vecs = []

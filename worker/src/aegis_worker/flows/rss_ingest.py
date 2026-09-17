@@ -8,11 +8,15 @@ Since #511/#512 each run also:
   names a topic term, abstract otherwise);
 * records every entry it stored or failed in `feed_entries`, so a feed's worth
   can be measured, and each fetch's outcome in the channel's config;
-* reports a feed that failed `feeds.FAILING_AFTER` fetches in a row (every
-  run) or stored nothing for `stale_after_days` (once a day) to the problem
-  hub as a `feeds` finding. A failing feed's finding resolves after
-  `feeds.RECOVERED_AFTER` good fetches in a row; a stale one when the feed
-  stores an entry again.
+* reports a feed that failed `failing_after` fetches in a row (every run) or
+  stored nothing for `stale_after_days` (once a day) to the problem hub as a
+  `feeds` finding. A failing feed's finding resolves after `recovered_after`
+  good fetches in a row; a stale one when the feed stores an entry again.
+
+The thresholds are the `feeds_config` settings row (`services/feeds_config.py`,
+Admin → Research → Feed health), read through the `load_feeds_config`
+activity at the start of every run; a failed read runs on the code defaults
+and says so.
 """
 
 from __future__ import annotations
@@ -23,7 +27,8 @@ from datetime import UTC, datetime, timedelta
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
-    from aegis.services import feeds
+    from aegis.errors import error_text
+    from aegis.services import feeds, feeds_config
 
     from aegis_worker.activities.rss import (
         FetchFeedInput,
@@ -40,15 +45,36 @@ _HUB_TIMEOUT = timedelta(seconds=120)
 
 # Attaching can raise a topic's task, which is a Todoist round trip.
 _TOPICS_TIMEOUT = timedelta(seconds=120)
-# The UTC hour whose run reconciles the stale findings. Staleness is measured
-# in days, so once a day is enough, and it keeps the hub from recording 24
-# occurrences a day of a feed that is merely quiet.
-_STALE_REVIEW_HOUR = 3
 # Statuses of process_content / store_feed_abstract that settle an entry
 # without storing it: an empty extraction, a URL the store already had, content
 # extraction switched off, a link off the public internet (refused for good).
 # Nothing to retry, nothing new stored.
 _SETTLED_UNSTORED = frozenset({"empty", "duplicate", "disabled", "refused"})
+
+# Retired `workflow.patched` ids. The old branches are gone; the markers
+# stay one release longer as `workflow.deprecate_patch`, because a run that
+# RECORDED one is wedged by a worker whose code no longer mentions it at all
+# ("[TMPRL1100] Non-deprecated patch marker encountered"). Drop the calls and
+# these ids in the release after next — see #614.
+# A capped arXiv run makes 30 content calls of up to 180s each, so a deploy
+# lands mid-run often.
+_CURSOR_TIES_PATCH = "rss-cursor-ties"
+
+
+def _external_id(entry: dict) -> str:
+    """The id an entry is claimed, recorded and placed by."""
+    return entry.get("id") or entry.get("link", "") or ""
+
+
+def _place(entry: dict) -> tuple[str, str]:
+    """Where an entry sits in its feed's order: `(published, external id)`.
+
+    arXiv publishes a day as ONE burst of 270-750 entries that all carry the
+    same timestamp, so a timestamp alone cannot say where a capped run
+    stopped: the cursor landed on the shared timestamp and `fetch_feed`
+    dropped the rest of the burst for good (#584, exactly 30 stored per
+    announcement day). The id breaks the tie."""
+    return (entry.get("published") or "", _external_id(entry))
 
 
 def _parse_stamp(value: str | None) -> datetime | None:
@@ -62,7 +88,12 @@ def _parse_stamp(value: str | None) -> datetime | None:
 
 
 def _stale_finding(
-    now: datetime, identifier: str, config: dict, label: str, run: dict
+    now: datetime,
+    identifier: str,
+    config: dict,
+    label: str,
+    run: dict,
+    default_days: int | None = None,
 ) -> dict | None:
     """A `feed_stale` finding when the last entry the store kept for the feed
     is older than its limit.
@@ -81,7 +112,7 @@ def _stale_finding(
         last = _parse_stamp(run.get("tracking_since"))
     if last is None:
         return None
-    limit = feeds.stale_after_days(config)
+    limit = feeds.stale_after_days(config, default_days)
     if (now - last).days < limit:
         return None
     title = (
@@ -112,29 +143,39 @@ def _held(klass: str, identifier: str, label: str) -> dict:
 
 
 def _after_good_fetch(
-    now: datetime, identifier: str, config: dict, label: str, run: dict | None
+    now: datetime,
+    identifier: str,
+    config: dict,
+    label: str,
+    run: dict | None,
+    cfg: dict | None = None,
 ) -> tuple[list[dict], dict | None]:
     """What a fetch that worked leaves: `(held findings, stale finding)`.
 
-    One good fetch does not end a failure: until `feeds.RECOVERED_AFTER` in a
-    row, the feed's `feed_failing` problem is kept open, so a feed that fails
-    every other hour is one problem rather than one opened and resolved all
-    day. And a record that could not be written says nothing about the feed
-    either way, so both its findings are kept as they are."""
+    One good fetch does not end a failure: until `recovered_after` in a row
+    (`feeds_config`), the feed's `feed_failing` problem is kept open, so a feed
+    that fails every other hour is one problem rather than one opened and
+    resolved all day. And a record that could not be written says nothing
+    about the feed either way, so both its findings are kept as they are."""
+    cfg = cfg or feeds_config.merge(None)
     if run is None:
         return [_held("feed_failing", identifier, label), _held("feed_stale", identifier, label)], None
     held = []
-    if int(run.get("fetch_successes") or 0) < feeds.RECOVERED_AFTER:
+    if int(run.get("fetch_successes") or 0) < int(cfg["recovered_after"]):
         held.append(_held("feed_failing", identifier, label))
-    return held, _stale_finding(now, identifier, config, label, run)
+    return held, _stale_finding(now, identifier, config, label, run, int(cfg["stale_after_days"]))
 
 
 @dataclass
 class RssIngestInput:
-    agent_id: str = "raphael"
+    # The scheduled row's agent; "" (a hand-started run) records no agent.
+    agent_id: str = ""
     # The UTC hour whose run reconciles the stale findings; negative = every
-    # run (tests and a manual trigger). Scheduled runs use the default.
-    stale_review_hour: int = _STALE_REVIEW_HOUR
+    # run (tests and a manual trigger); None = the `feeds_config` row's
+    # `stale_review_hour`. Staleness is measured in days, so once a day is
+    # enough, and it keeps the hub from recording 24 occurrences a day of a
+    # feed that is merely quiet.
+    stale_review_hour: int | None = None
 
 
 @workflow.defn(name="RssIngestFlow")
@@ -148,6 +189,19 @@ class RssIngestFlow:
             retry_policy=ACT_RETRY,
         )
         notes: dict = {}
+        # The deployment's thresholds (`feeds_config`). A failed read runs on
+        # the code defaults, which are what the row's defaults are too.
+        cfg = feeds_config.merge(None)
+        try:
+            loaded = await workflow.execute_activity(
+                "load_feeds_config",
+                start_to_close_timeout=_ACT_TIMEOUT,
+                retry_policy=RETRY_ONCE,
+            )
+            cfg = feeds_config.merge(loaded)
+        except Exception as exc:
+            workflow.logger.warning("rss_feeds_config_degraded err=%s", error_text(exc))
+            notes["feeds_config_degraded"] = True
         pattern = None
         try:
             terms = await workflow.execute_activity(
@@ -159,7 +213,7 @@ class RssIngestFlow:
         except Exception as exc:
             # No terms means the gate lets everything through: a failed
             # config read costs full fetches, never a lost entry.
-            workflow.logger.warning("rss_gate_terms_degraded err=%s", str(exc)[:200])
+            workflow.logger.warning("rss_gate_terms_degraded err=%s", error_text(exc))
             notes["gate_terms_degraded"] = True
 
         total_entries = 0
@@ -179,27 +233,40 @@ class RssIngestFlow:
         # run when it is negative — tests and a manual trigger). Stale feeds
         # are reconciled then, and a feed that is still failing records its
         # daily occurrence then.
-        review = input.stale_review_hour < 0 or now.hour == input.stale_review_hour
-
+        review_hour = (
+            input.stale_review_hour
+            if input.stale_review_hour is not None
+            else int(cfg["stale_review_hour"])
+        )
+        review = review_hour < 0 or now.hour == review_hour
+        failing_after = int(cfg["failing_after"])
+        # Once per run, where the old `ties = workflow.patched(...)` read was.
+        # deprecate_patch: remove after the next release, see #614
+        workflow.deprecate_patch(_CURSOR_TIES_PATCH)
         for ch in channels:
             identifier = ch["identifier"]
             config = ch.get("config") or {}
             since = config.get("last_cursor")
+            # The second half of the cursor. A channel whose cursor predates
+            # it has only `last_cursor`: "" is the lowest id, so the entries AT
+            # that timestamp are offered once more. The ones already stored
+            # resolve as known duplicates and the cursor moves past them.
+            since_id = str(config.get("last_cursor_id") or "")
             label = feeds.feed_label(identifier, config)
-            mode = feeds.ingest_mode(config)
+            mode = feeds.ingest_mode(config, cfg["default_ingest"])
 
             fetch_error = ""
             result: FetchFeedResult | None = None
             try:
                 result = await workflow.execute_activity(
                     "fetch_feed",
-                    FetchFeedInput(url=identifier, since_cursor=since),
+                    FetchFeedInput(url=identifier, since_cursor=since, since_cursor_id=since_id),
                     result_type=FetchFeedResult,
                     start_to_close_timeout=_FETCH_TIMEOUT,
                     retry_policy=NO_RETRY,
                 )
             except Exception as exc:
-                fetch_error = str(exc)[:200] or "fetch failed"
+                fetch_error = error_text(exc)
             else:
                 # An empty parse that says why is a failed fetch too. Before
                 # #511 a dead or moved feed read as a quiet one here.
@@ -220,7 +287,7 @@ class RssIngestFlow:
                     continue
                 failures = int(run.get("fetch_failures") or 0)
                 per_feed[-1]["fetch_failures"] = failures
-                if failures >= feeds.FAILING_AFTER:
+                if failures >= failing_after:
                     failing.append(
                         {
                             "klass": "feed_failing",
@@ -237,15 +304,17 @@ class RssIngestFlow:
                             # keeps the problem open. Hourly occurrences
                             # posted "N more occurrences" on the task 24
                             # times a day for one dead feed.
-                            "record": failures == feeds.FAILING_AFTER or review,
+                            "record": failures == failing_after or review,
                         }
                     )
                 else:
                     # Under the threshold a failure opens nothing, but it never
                     # resolves a failing feed either: that takes good fetches
-                    # (`feeds.RECOVERED_AFTER` in a row).
+                    # (`recovered_after` in a row).
                     held.append(_held("feed_failing", identifier, label))
-                finding = _stale_finding(now, identifier, config, label, run)
+                finding = _stale_finding(
+                    now, identifier, config, label, run, int(cfg["stale_after_days"])
+                )
                 if finding:
                     stale.append(finding)
                 continue
@@ -253,7 +322,7 @@ class RssIngestFlow:
             if not result.entries:
                 per_feed.append({"feed": identifier, "entries": 0})
                 run = await self._record_run(ch, {"ok": True, "backlog": 0})
-                kept, finding = _after_good_fetch(now, identifier, config, label, run)
+                kept, finding = _after_good_fetch(now, identifier, config, label, run, cfg)
                 held += kept
                 if finding:
                     stale.append(finding)
@@ -274,6 +343,10 @@ class RssIngestFlow:
             # prevent. Taking the oldest N leaves the remainder ABOVE the
             # cursor, so the next poll picks them up: a burst drains over
             # several hours instead of being lost or ingested all at once.
+            #
+            # "Oldest" is the `(published, external id)` order, not the
+            # timestamp alone: a burst shares ONE timestamp, and a cursor on
+            # that timestamp left nothing of the burst above it (#584).
             available = len(result.entries)
             cap = config.get("max_entries_per_run") or 0
             entries = result.entries
@@ -286,7 +359,7 @@ class RssIngestFlow:
                 cap = 0
             if cap > 0 and available > cap:
                 # "" (no timestamp) sorts first and so is never starved.
-                entries = sorted(result.entries, key=lambda e: e.get("published") or "")[:cap]
+                entries = sorted(result.entries, key=lambda e: _place(e))[:cap]
                 workflow.logger.info(
                     "rss_throttled feed=%s took=%d of=%d", identifier, len(entries), available
                 )
@@ -307,19 +380,23 @@ class RssIngestFlow:
             # batch is not ordered by outcome. If entry A (10:00) fails and
             # entry B (11:00) resolves, the max is 11:00 and `fetch_feed`'s
             # `published_iso <= since_cursor` filter then excludes A for good.
-            # `earliest_failed_published` is the real ceiling: the cursor may
-            # only move to the newest resolved entry OLDER than the oldest
-            # failure. Measured cost of not doing this: 553 of 3835 arXiv
-            # entries (14%) lost over 14 days, in two large overnight batches.
-            latest_resolved_published: str | None = None
-            earliest_failed_published: str | None = None
+            # `earliest_failed` is the real ceiling: the cursor may only move
+            # to the newest resolved entry OLDER than the oldest failure.
+            # Measured cost of not doing this: 553 of 3835 arXiv entries (14%)
+            # lost over 14 days, in two large overnight batches.
+            #
+            # Both are `_place` pairs, the cursor's own order (#584), so a
+            # failure fences the entries that share its timestamp too: the
+            # cursor stops at the last resolved entry before it in that order.
+            latest_resolved: tuple[str, str] | None = None
+            earliest_failed: tuple[str, str] | None = None
             # A failure we cannot place in time can't be fenced by a timestamp
             # comparison, so the whole feed holds its cursor for this run
             # rather than risk stepping over it. Costs a re-fetch, never a drop.
             saw_untimed_failure = False
-            resolved_published_all: list[str] = []
+            resolved_all: list[tuple[str, str]] = []
             for entry in entries:
-                external_id = entry.get("id") or entry.get("link", "")
+                external_id = _external_id(entry)
                 if not external_id:
                     continue
 
@@ -329,10 +406,10 @@ class RssIngestFlow:
                     start_to_close_timeout=_ACT_TIMEOUT,
                     retry_policy=ACT_RETRY,
                 )
-                resolved_published: str | None = None
+                resolved = False
                 if not new:
                     # Known dup → no retry needed, cursor may advance.
-                    resolved_published = entry.get("published") or None
+                    resolved = True
                 else:
                     use_mode = mode
                     if mode == "gate":
@@ -385,12 +462,12 @@ class RssIngestFlow:
                         workflow.logger.warning(
                             "rss_process_content_failed url=%s err=%s",
                             entry.get("link", ""),
-                            str(exc)[:200],
+                            error_text(exc),
                         )
 
                     entry_ok = status == "ok" or status in _SETTLED_UNSTORED
                     if entry_ok:
-                        resolved_published = entry.get("published") or None
+                        resolved = True
                         if status == "ok":
                             # Only a real store counts. This used to increment
                             # unconditionally, so `ingested` counted failures
@@ -437,30 +514,27 @@ class RssIngestFlow:
                             start_to_close_timeout=_ACT_TIMEOUT,
                             retry_policy=ACT_RETRY,
                         )
-                        failed_published = entry.get("published") or None
-                        if not failed_published:
+                        failed_at = _place(entry)
+                        if not failed_at[0]:
                             saw_untimed_failure = True
-                        elif (
-                            earliest_failed_published is None
-                            or failed_published < earliest_failed_published
-                        ):
-                            earliest_failed_published = failed_published
+                        elif earliest_failed is None or failed_at < earliest_failed:
+                            earliest_failed = failed_at
 
-                if resolved_published:
-                    resolved_published_all.append(resolved_published)
+                # An entry with no timestamp has no place to move the cursor to.
+                resolved_at = _place(entry)
+                if resolved and resolved_at[0]:
+                    resolved_all.append(resolved_at)
 
             # Cursor ceiling: newest resolved entry strictly older than the
             # oldest failure. Computed after the loop because a failure can
             # appear after the resolved entry it has to fence.
             if saw_untimed_failure:
-                latest_resolved_published = None
+                latest_resolved = None
             else:
                 eligible = [
-                    p
-                    for p in resolved_published_all
-                    if earliest_failed_published is None or p < earliest_failed_published
+                    p for p in resolved_all if earliest_failed is None or p < earliest_failed
                 ]
-                latest_resolved_published = max(eligible) if eligible else None
+                latest_resolved = max(eligible) if eligible else None
 
             total_entries += len(entries)
             total_ingested += feed_ingested
@@ -477,20 +551,33 @@ class RssIngestFlow:
                 except Exception as exc:
                     # The stats lose a run; the entries themselves are stored.
                     workflow.logger.warning(
-                        "rss_record_entries_failed feed=%s err=%s", identifier, str(exc)[:200]
+                        "rss_record_entries_failed feed=%s err=%s", identifier, error_text(exc)
                     )
 
             # Cursor advances only past entries with a DEFINITE outcome
             # (stored OR known dup). Failed entries stay inside the next-tick
             # window for retry.
-            if latest_resolved_published:
+            if latest_resolved:
+                cursor_at, cursor_id = latest_resolved
+                # The id BEFORE the timestamp. A run that stops between the
+                # two writes leaves the new id beside the old timestamp, which
+                # only offers entries again (they resolve as duplicates) or
+                # passes over ones this run resolved. The other order could
+                # pair the new timestamp with an old, larger id and pass over
+                # entries nothing ever stored.
+                await workflow.execute_activity(
+                    "update_channel_config_key",
+                    args=["rss", identifier, "last_cursor_id", cursor_id],
+                    start_to_close_timeout=_ACT_TIMEOUT,
+                    retry_policy=ACT_RETRY,
+                )
                 await workflow.execute_activity(
                     "update_channel_config_key",
                     args=[
                         "rss",
                         identifier,
                         "last_cursor",
-                        latest_resolved_published,
+                        cursor_at,
                     ],
                     start_to_close_timeout=_ACT_TIMEOUT,
                     retry_policy=ACT_RETRY,
@@ -516,14 +603,14 @@ class RssIngestFlow:
             # like a quiet feed rather than a batch that lost everything.
             if feed_failed:
                 entry_summary["failed"] = feed_failed
-                entry_summary["cursor_held"] = latest_resolved_published is None
+                entry_summary["cursor_held"] = latest_resolved is None
             per_feed.append(entry_summary)
             total_failed += feed_failed
 
             # After `record_feed_entries`, so this run's stored entries count
             # towards the feed's last stored one.
             run = await self._record_run(ch, {"ok": True, "backlog": available - len(entries)})
-            kept, finding = _after_good_fetch(now, identifier, config, label, run)
+            kept, finding = _after_good_fetch(now, identifier, config, label, run, cfg)
             held += kept
             if finding:
                 stale.append(finding)
@@ -542,7 +629,7 @@ class RssIngestFlow:
                 if isinstance(attached, dict) and attached.get("attached"):
                     notes["topic_items"] = attached["attached"]
             except Exception as exc:  # noqa: BLE001 — the entries are stored either way
-                workflow.logger.warning("rss_topic_attach_degraded err=%s", str(exc)[:200])
+                workflow.logger.warning("rss_topic_attach_degraded err=%s", error_text(exc))
                 notes["topics_degraded"] = True
 
         held_failing = [h for h in held if h["klass"] == "feed_failing"]
@@ -585,7 +672,7 @@ class RssIngestFlow:
             )
         except Exception as exc:
             workflow.logger.warning(
-                "rss_record_run_failed feed=%s err=%s", ch.get("identifier"), str(exc)[:200]
+                "rss_record_run_failed feed=%s err=%s", ch.get("identifier"), error_text(exc)
             )
             return None
         return out if isinstance(out, dict) else {}
@@ -607,6 +694,6 @@ class RssIngestFlow:
                 retry_policy=NO_RETRY,
             )
         except Exception as exc:  # noqa: BLE001 — the feeds were polled either way
-            workflow.logger.warning("rss_hub_reconcile_failed err=%s", str(exc)[:200])
+            workflow.logger.warning("rss_hub_reconcile_failed err=%s", error_text(exc))
             return False
         return True

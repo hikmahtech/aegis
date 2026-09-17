@@ -25,7 +25,9 @@ from temporalio.client import Client
 
 from aegis.api.auth import verify_auth
 from aegis.api.deps import get_settings
+from aegis.api.sql_filters import build_where
 from aegis.config import Settings
+from aegis.errors import error_text
 from aegis.services.personalities import draft_base_conflict
 
 logger = structlog.get_logger()
@@ -142,7 +144,7 @@ async def resolve_interaction(
             "interaction_signal_failed",
             interaction_id=str(interaction_id),
             flow_run_id=row["flow_run_id"],
-            error=str(exc),
+            error=error_text(exc, 500),
         )
 
     return ResolveResponse(
@@ -182,24 +184,16 @@ async def list_interactions(
     limit: int = 50,
 ):
     pool = request.app.state.db_pool
-    clauses: list[str] = []
-    args: list[Any] = []
-    if agent_id:
-        args.append(agent_id)
-        clauses.append(f"agent_id = ${len(args)}")
-    if status:
-        args.append(status)
-        clauses.append(f"status = ${len(args)}")
-    if origin:
-        origins = [o for o in origin.split(",") if o]
-        if origins:
-            args.append(origins)
-            clauses.append(f"origin = ANY(${len(args)}::text[])")
-    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    where, args = build_where({"agent_id": agent_id, "status": status})
+    origins = [o for o in (origin or "").split(",") if o]
+    if origins:
+        # A set membership, not an equality, so it is not `build_where`'s.
+        args.append(origins)
+        where += f"{' AND' if where else ' WHERE'} origin = ANY(${len(args)}::text[])"
     args.append(min(max(limit, 1), 500))
     sql = (
         "SELECT id, agent_id, kind, origin, prompt, options, status, created_at, resolved_at "
-        f"FROM interactions {where} "
+        f"FROM interactions{where} "
         f"ORDER BY created_at DESC LIMIT ${len(args)}"
     )
     async with pool.acquire() as conn:

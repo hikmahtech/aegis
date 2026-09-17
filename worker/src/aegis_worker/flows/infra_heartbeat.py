@@ -65,6 +65,8 @@ from dataclasses import dataclass, field
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
+    from aegis.errors import error_text, logged_failure
+
     from aegis_worker.activities.homelab import HomelabActivities
     from aegis_worker.activities.hub import HubActivities
     from aegis_worker.flows.alert_investigation import AlertInvestigationFlow
@@ -128,8 +130,11 @@ class InfraHeartbeatConfig:
     # alert escalates; at a 2-minute cadence that is a 4-minute fuse.
     ingress_fail_threshold: int = 2
     # The status the probe must get back, when the status alone says who
-    # answered — 405 for a webhook path, which core gives a bare GET and a
-    # proxy that lost the route does not. 0 accepts anything under 500.
+    # answered. Measure it rather than assume: with the admin SPA bundled its
+    # catch-all claims every unmatched `/api/` GET, so a webhook path answers
+    # 404 to a bare GET (405 only without the SPA). Prefer a route that answers
+    # something a proxy never invents — see `/api/webhooks/ping`, 204. 0 accepts
+    # anything under 500.
     ingress_expect_status: int = 0
     # Hours a service must sit `confirmed`-stuck before the flow re-investigates
     # it (#138), and equally the minimum gap between two re-investigations of
@@ -153,7 +158,7 @@ class InfraHeartbeatFlow:
             )
         except Exception as exc:  # noqa: BLE001
             workflow.logger.warning(
-                "heartbeat_hub_ingest_failed fp=%s err=%s", alert.get("fingerprint"), str(exc)[:200]
+                "heartbeat_hub_ingest_failed fp=%s err=%s", alert.get("fingerprint"), error_text(exc)
             )
             return {"problem_id": None, "investigate": False, "action": "error"}
 
@@ -206,7 +211,7 @@ class InfraHeartbeatFlow:
             return True
         except Exception as exc:  # noqa: BLE001 — already-started dedup is benign
             workflow.logger.warning(
-                "heartbeat_spawn_skipped id=%s err=%s", child_id, str(exc)[:200]
+                "heartbeat_spawn_skipped id=%s err=%s", child_id, error_text(exc)
             )
             return False
 
@@ -238,10 +243,15 @@ class InfraHeartbeatFlow:
         # It takes `ingress_fail_threshold` consecutive failures to raise, for
         # the same reason the collect path counts: a rolling update of core
         # drops one request, and this alert escalates and pings Slack the
-        # moment it is raised. A deploy window would not save it either — the
-        # window is keyed on a service name and this problem's subject is the
-        # path, not a service. Two ticks is four minutes, which still finds a
-        # 3.5-hour outage inside the first five minutes.
+        # moment it is raised.
+        #
+        # A deploy window DOES cover an Ansible deploy — this problem's subject
+        # is `ingress`, kind `service`, and the role posts a window for every
+        # name in its deploy-subjects list — but it covers nothing else. A
+        # hand-run `service update --force` of core or of the proxy, which is
+        # the runbook's own remedy, has no window and drops a tick. So the
+        # count stays: two ticks is four minutes, which still finds a 3.5-hour
+        # outage inside the first five minutes.
         #
         # The flag is separate from the count and does two things the count
         # cannot: it stops a second alert while the first is open, and it stops
@@ -249,7 +259,9 @@ class InfraHeartbeatFlow:
         # existed.
         ingress_failing = bool(prior.get("ingress_failing"))
         ingress_fails = int(prior.get("ingress_fails") or 0)
-        if workflow.patched("ingress-canary") and config.ingress_url:
+        # deprecate_patch: remove after the next release, see #614
+        workflow.deprecate_patch("ingress-canary")
+        if config.ingress_url:
             try:
                 probe = await workflow.execute_activity_method(
                     HomelabActivities.probe_ingress,
@@ -262,39 +274,46 @@ class InfraHeartbeatFlow:
                 # state write and the dead-man ping down with it — the tick
                 # matters more than the probe. Its siblings below are wrapped
                 # for the same reason.
-                workflow.logger.warning("heartbeat_ingress_probe_failed err=%s", str(exc)[:200])
-                probe = {"ok": True, "skipped": True}
-            ingress_fails = 0 if probe.get("ok") else ingress_fails + 1
-            if probe.get("skipped"):
-                ingress_fails = int(prior.get("ingress_fails") or 0)
-            if (
-                not probe.get("ok")
-                and not ingress_failing
-                and ingress_fails >= max(1, config.ingress_fail_threshold)
-            ):
-                reached = (
-                    f"answered {probe.get('status')}"
-                    if probe.get("status")
-                    else f"did not answer: {probe.get('error')}"
-                )
-                alert = build_heartbeat_alert(
-                    "IngressUnreachable",
-                    "ingress",
-                    cluster,
-                    "AEGIS cannot be reached from outside",
-                    f"{probe.get('url')} {reached}, {ingress_fails} checks in a row. "
-                    "Every inbound webhook — GitHub, Todoist, Alertmanager — is being "
-                    "dropped for as long as this lasts, and no outside monitor can tell "
-                    "AEGIS about it. Check the proxy in front of core and its route to "
-                    "the core service.",
-                    escalate=True,
-                )
-                if await self._spawn(alert):
-                    spawned += 1
-                ingress_failing = True
-            elif probe.get("ok") and ingress_failing:
-                await self._resolve("IngressUnreachable", "ingress", cluster)
-                ingress_failing = False
+                workflow.logger.warning("heartbeat_ingress_probe_failed err=%s", error_text(exc))
+                # Nothing was learned, so nothing changes: the count and the
+                # flag both stand. In particular this is NOT an answer, so it
+                # must not resolve an open problem — the earlier shim said
+                # `ok=True` here and did exactly that, closing an outage nobody
+                # had proved recovered and then re-raising it as brand new on
+                # the next failing tick.
+                probe = None
+            if probe is not None:
+                ingress_fails = 0 if probe.get("ok") else ingress_fails + 1
+                if (
+                    not probe.get("ok")
+                    and not ingress_failing
+                    and ingress_fails >= max(1, config.ingress_fail_threshold)
+                ):
+                    reached = (
+                        f"answered {probe.get('status')}" if probe.get("status") else "did not answer"
+                    )
+                    if probe.get("error"):
+                        # Keep the reason even when a status came back: a
+                        # redirect off the host answers 200 and is still a fault.
+                        reached += f" — {probe['error']}"
+                    alert = build_heartbeat_alert(
+                        "IngressUnreachable",
+                        "ingress",
+                        cluster,
+                        "AEGIS cannot be reached from outside",
+                        f"{probe.get('url')} {reached}, {ingress_fails} checks in a row. "
+                        "Every inbound webhook — GitHub, Todoist, Alertmanager — is being "
+                        "dropped for as long as this lasts, and no outside monitor can tell "
+                        "AEGIS about it. Check the proxy in front of core and its route to "
+                        "the core service.",
+                        escalate=True,
+                    )
+                    if await self._spawn(alert):
+                        spawned += 1
+                    ingress_failing = True
+                elif probe.get("ok") and ingress_failing:
+                    await self._resolve("IngressUnreachable", "ingress", cluster)
+                    ingress_failing = False
 
         # ── Collect failure path ──
         if not current.get("ok"):
@@ -344,7 +363,7 @@ class InfraHeartbeatFlow:
         # converged. Safety net only — the deploy role posts `ok` itself —
         # so it never fails the tick.
         deploys_cleared = 0
-        try:
+        with logged_failure("heartbeat_clear_deploys_failed", logger=workflow.logger):
             cleared = await workflow.execute_activity_method(
                 HubActivities.clear_converged_deploys,
                 args=[sorted(cur_stuck)],
@@ -352,8 +371,6 @@ class InfraHeartbeatFlow:
                 retry_policy=NO_RETRY,
             )
             deploys_cleared = len(cleared.get("cleared") or [])
-        except Exception as exc:  # noqa: BLE001 — housekeeping, never the tick
-            workflow.logger.warning("heartbeat_clear_deploys_failed err=%s", str(exc)[:200])
 
         nodes_down, nodes_recovered = [], []
         for name, status in cur_nodes.items():
@@ -392,7 +409,7 @@ class InfraHeartbeatFlow:
         # that used to live in the heartbeat state row are gone.
         stale: list[dict] = []
         if config.restuck_hours > 0 and confirmed_now:
-            try:
+            with logged_failure("heartbeat_stale_lookup_failed", logger=workflow.logger):
                 stale = await workflow.execute_activity_method(
                     HubActivities.stale_stuck_problems,
                     # The classes the heartbeat itself raises for a stuck
@@ -406,8 +423,6 @@ class InfraHeartbeatFlow:
                     start_to_close_timeout=TIMEOUT_FAST,
                     retry_policy=FAST,
                 )
-            except Exception as exc:  # noqa: BLE001
-                workflow.logger.warning("heartbeat_stale_lookup_failed err=%s", str(exc)[:200])
 
         quiet = set(config.quiet_nodes or [])
         quiet_notified = 0

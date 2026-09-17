@@ -50,6 +50,7 @@ import asyncpg
 import structlog
 
 from aegis.connectors.todoist import TodoistConnector
+from aegis.errors import error_text
 from aegis.services import hub_project
 from aegis.services.hub import (
     GROUP_SUBJECT,
@@ -59,8 +60,10 @@ from aegis.services.hub import (
     group_key,
     merge_problems,
     normalize_severity,
+    record_state_change,
     slug,
 )
+from aegis.services.settings_store import get_setting
 
 logger = structlog.get_logger()
 
@@ -193,7 +196,7 @@ async def absorb_strays(
             )
         except ValueError as exc:  # a class the hub will not group: leave it
             logger.warning(
-                "hub_group_absorb_refused", group_id=row["group_id"], error=str(exc)[:200]
+                "hub_group_absorb_refused", group_id=row["group_id"], error=error_text(exc)
             )
             continue
         # A stray that shares the group's own task (one task linked to two
@@ -317,7 +320,7 @@ async def recent_verdict(
     are three problems, but the tenth one is evidence of something shared.
     """
     now = now or _utcnow()
-    row = await pool.fetchval("SELECT value FROM settings WHERE key = $1", _VERDICT_KEY)
+    row = await get_setting(pool, _VERDICT_KEY)
     entry = row.get(gkey) if isinstance(row, dict) else None
     if not isinstance(entry, dict):
         return None
@@ -456,14 +459,12 @@ async def upgrade(
 
     # One readable event for the whole upgrade. `merge_problems` writes a row
     # per member, which says how it happened; this says why.
-    await pool.execute(
-        "INSERT INTO problem_events (problem_id, source, external_id, kind, severity, "
-        "payload, occurred_at) VALUES ($1::uuid, 'hub', $2, 'state_change', $3, $4, $5) "
-        "ON CONFLICT (source, external_id) DO NOTHING",
+    await record_state_change(
+        pool,
         keeper_id,
         f"group:{gkey}:{now.isoformat()}",
-        severity,
-        {
+        severity=severity,
+        payload={
             "action": "grouped",
             "group_key": gkey,
             "by": by[:100],
@@ -472,7 +473,7 @@ async def upgrade(
             "member_count": len(folded),
             **({"reason": reason[:300]} if reason else {}),
         },
-        now,
+        occurred_at=now,
     )
     logger.info(
         "hub_problems_grouped",

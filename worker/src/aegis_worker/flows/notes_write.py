@@ -24,6 +24,7 @@ from temporalio import workflow
 from temporalio.exceptions import ApplicationError
 
 with workflow.unsafe.imports_passed_through():
+    from aegis.errors import error_text
     from aegis.services.notes_write import NOTES_WRITE_TIMEOUT_S
 
     from aegis_worker.shared.retry import RETRY_ONCE, TIMEOUT_FAST
@@ -50,12 +51,12 @@ class NotesWriteFlow:
         try:
             result = await workflow.execute_activity(
                 "notes_write",
-                args=[inp.op, inp.payload],
+                args=[inp.op, inp.payload, inp.agent_id],
                 start_to_close_timeout=_WRITE_TIMEOUT,
                 retry_policy=_WRITE_RETRY,
             )
         except Exception as exc:
-            message = f"error: the vault {inp.op} write failed: {str(exc)[:200]}"
+            message = f"error: the vault {inp.op} write failed: {error_text(exc)}"
             await self._report_if_late(inp, message)
             raise ApplicationError(
                 f"notes_write_failed at step=write op={inp.op}: {exc!r}", non_retryable=True
@@ -93,7 +94,7 @@ class NotesWriteFlow:
             )
         except Exception as exc:  # noqa: BLE001 — the write stands; the message is extra
             workflow.logger.warning(
-                "notes_write_report_failed op=%s err=%s", inp.op, str(exc)[:200]
+                "notes_write_report_failed op=%s err=%s", inp.op, error_text(exc)
             )
             return False
         return bool(isinstance(res, dict) and res.get("ok"))

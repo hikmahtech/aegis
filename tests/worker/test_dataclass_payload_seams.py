@@ -17,11 +17,13 @@ from __future__ import annotations
 
 import dataclasses
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from aegis.api.routes.mcp_server import _handle_approve_tool_use
+from aegis.services import books
 from aegis.services.chat import _exec_dispatch_agent_run
 from aegis.services.tools.base import ToolContext
 from aegis.services.tools.ledger import LEDGER_WRITE_WAIT_S, _dispatch_books_write
@@ -147,7 +149,9 @@ async def test_books_write_payload_keys_are_all_books_write_input_fields():
         ],
         "note": "",
     }
-    out = await _dispatch_books_write(_ctx(client), "post", write)
+    out = await _dispatch_books_write(
+        _ctx(client), "post", write, books.BooksConfig(path=Path("/nonexistent"))
+    )
     assert out == "posted manual/abc to personal/2026.journal"
 
     payload = _start_payload(client)

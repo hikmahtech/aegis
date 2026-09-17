@@ -144,9 +144,17 @@ def cron_interval_minutes(cron: str) -> int | None:
     against — `0 9 * * 1-5` fires five times a week but goes 72h quiet over a
     weekend, and a threshold built from the average would page every Monday.
 
+    A `CRON_TZ=<zone>` prefix is dropped first. The zone shifts when a fire
+    lands, never how far apart two fires are, and this function only measures
+    the gap — but a schedule whose cron it cannot parse is silently unwatched,
+    so the prefix has to be understood rather than ignored.
+
     None means "not understood": the caller logs and skips the schedule.
     """
-    parts = (cron or "").split()
+    cron = (cron or "").strip()
+    if cron.startswith("CRON_TZ="):
+        _, _, cron = cron.partition(" ")
+    parts = cron.split()
     if len(parts) != 5:
         return None
     minute, hour, dom, month, dow = parts
@@ -472,7 +480,7 @@ class FlowHealthActivities:
     # -- alerting ----------------------------------------------------------
 
     @activity.defn
-    async def report_flow_health(self, findings: list[dict], agent_id: str = "pandoras-actor") -> dict:
+    async def report_flow_health(self, findings: list[dict], agent_id: str = "") -> dict:
         """Notify about NEW unhealthy flows and about flows that recovered.
 
         The problem hub decides what is new: every finding is an occurrence on

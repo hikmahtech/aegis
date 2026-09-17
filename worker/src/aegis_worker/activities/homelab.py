@@ -15,6 +15,8 @@ from typing import Any
 
 import httpx
 import structlog
+from aegis.errors import error_text
+from aegis.services.settings_store import get_setting, put_setting
 from temporalio import activity
 
 from aegis_worker.activities.delivery import safe_send_message
@@ -41,7 +43,9 @@ class HomelabActivities:
     db_pool: Any
     homelab: Any  # HomelabConnector
     delivery: Any  # DeliveryActivities
-    agent_id: str = "pandoras-actor"
+    # The `infra` holder, resolved at boot in `__main__` (#579). "" sends the
+    # cards to comms' default rather than to an example agent's channel.
+    agent_id: str = ""
     heartbeat_ping_url: str = ""  # healthchecks.io dead-man URL; "" = disabled
     infra_cluster: str = ""       # Prometheus cluster label for synthetic alerts
 
@@ -239,7 +243,7 @@ class HomelabActivities:
                 body = resp.json()
         except Exception as exc:
             activity.logger.warning(
-                "check_comms_inbound_health_request_failed error=%s", str(exc)[:200]
+                "check_comms_inbound_health_request_failed error=%s", error_text(exc)
             )
             return {"status": "unknown"}
 
@@ -285,7 +289,7 @@ class HomelabActivities:
         out, which is this.
 
         **By default any HTTP answer from the right host means the path
-        works**, 401/404/405 included: the question is whether bytes reach
+        works**, 401/404 included: the question is whether bytes reach
         core, not what core makes of them, and the useful probe targets are the
         ones an identity proxy does not challenge. A transport error, a
         timeout, or a 5xx is a fault — a proxy with no healthy backend answers
@@ -301,8 +305,11 @@ class HomelabActivities:
           `/docs` is fine); landing on a different host is not.
         * **`expect_status` asserts which answer**, for the cases where the
           status alone says who replied. A proxy that lost the route to core
-          serves its own 404 with a 200-shaped conscience; pin 405 (what a
-          webhook path gives a bare GET) and that 404 is a fault.
+          serves its own 404 with a 200-shaped conscience, and a bare GET on
+          a webhook path also answers 404 (the admin SPA's catch-all claims
+          every unmatched `/api/` GET before Starlette can say 405). Pin a
+          status only core invents — `/api/webhooks/ping` answers 204 — and
+          that 404 becomes a fault.
         """
         target = (url or "").strip()
         if not target:
@@ -325,7 +332,7 @@ class HomelabActivities:
             ) as client:
                 response = await client.get(target)
         except Exception as exc:  # noqa: BLE001 — a failed probe IS the finding
-            return _result(False, 0, f"{type(exc).__name__}: {str(exc)[:160]}")
+            return _result(False, 0, error_text(exc))
 
         status = response.status_code
         asked = httpx.URL(target).host
@@ -460,7 +467,7 @@ class HomelabActivities:
                 "notify_cert_alert_delivery_failed domain=%s threshold=%s err=%s",
                 alert.get("domain"),
                 alert.get("threshold"),
-                str(exc)[:200],
+                error_text(exc),
             )
             return
         if isinstance(result, dict) and not result.get("ok"):
@@ -516,24 +523,16 @@ class HomelabActivities:
     async def read_heartbeat_state(self) -> dict:
         if not self.db_pool:
             return self._default_heartbeat_state()
-        row = await self.db_pool.fetchrow(
-            "SELECT value FROM settings WHERE key = $1", self._HEARTBEAT_STATE_KEY
-        )
-        if not row or not row["value"]:
+        value = await get_setting(self.db_pool, self._HEARTBEAT_STATE_KEY)
+        if not value:
             return self._default_heartbeat_state()
-        value = row["value"]
         return {**self._default_heartbeat_state(), **value} if isinstance(value, dict) else self._default_heartbeat_state()
 
     @activity.defn
     async def write_heartbeat_state(self, state: dict) -> None:
         if not self.db_pool:
             return
-        await self.db_pool.execute(
-            "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW()) "
-            "ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()",
-            self._HEARTBEAT_STATE_KEY,
-            state,
-        )
+        await put_setting(self.db_pool, self._HEARTBEAT_STATE_KEY, state)
 
     @activity.defn
     async def ping_deadman(self) -> dict:
@@ -546,7 +545,7 @@ class HomelabActivities:
                 await client.get(self.heartbeat_ping_url)
             return {"pinged": True}
         except Exception as exc:  # noqa: BLE001 — dead-man ping is never fatal
-            activity.logger.warning("heartbeat_deadman_ping_failed err=%s", str(exc)[:200])
+            activity.logger.warning("heartbeat_deadman_ping_failed err=%s", error_text(exc))
             return {"pinged": False}
 
     @activity.defn

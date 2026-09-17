@@ -194,21 +194,35 @@ class SocialConnector(HTTPConnector):
         await self._record("refresh_x", "ok", latency_ms)
         return new_access
 
-    async def _post_x(self, access_token: str, payload: dict) -> str:
-        text = _render_text(payload)
+    async def _request(self, action: str, label: str, method: str, url: str, **kwargs):
+        """One publish/read call: time it, record it, decode it.
+
+        Anything but a 200/201 is a `RuntimeError` naming what failed, because
+        a publish that did not publish must reach the stuck-post watchdog as a
+        failure rather than as an empty result. `_refresh_if_needed` does NOT
+        come through here: it raises `SocialAuthError`, takes 200 only, and
+        records its success after the rotated token pair is persisted.
+        """
         client = await self._ensure_client()
         t0 = time.monotonic()
-        resp = await client.post(
-            X_TWEETS_URL,
-            json={"text": text},
-            headers={"Authorization": f"Bearer {access_token}"},
-        )
+        resp = await client.request(method, url, **kwargs)
         latency_ms = int((time.monotonic() - t0) * 1000)
         if resp.status_code not in (200, 201):
-            await self._record("post_x", "error", latency_ms, error=resp.text[:200])
-            raise RuntimeError(f"x post failed: {resp.status_code} {resp.text[:200]}")
-        await self._record("post_x", "ok", latency_ms)
-        return str(resp.json()["data"]["id"])
+            await self._record(action, "error", latency_ms, error=resp.text[:200])
+            raise RuntimeError(f"{label} failed: {resp.status_code} {resp.text[:200]}")
+        await self._record(action, "ok", latency_ms)
+        return resp.json()
+
+    async def _post_x(self, access_token: str, payload: dict) -> str:
+        body = await self._request(
+            "post_x",
+            "x post",
+            "POST",
+            X_TWEETS_URL,
+            json={"text": _render_text(payload)},
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        return str(body["data"]["id"])
 
     async def _postiz_creds(self) -> tuple[str, str]:
         """Postiz base URL + API key, read FRESH from the settings table on
@@ -304,19 +318,15 @@ class SocialConnector(HTTPConnector):
                 }
             ],
         }
-        client = await self._ensure_client()
-        t0 = time.monotonic()
-        resp = await client.post(
+        created = await self._request(
+            "post_postiz",
+            "postiz post",
+            "POST",
             f"{postiz_url.rstrip('/')}/api/public/v1/posts",
             json=body,
             headers={"Authorization": api_key},
         )
-        latency_ms = int((time.monotonic() - t0) * 1000)
-        if resp.status_code not in (200, 201):
-            await self._record("post_postiz", "error", latency_ms, error=resp.text[:200])
-            raise RuntimeError(f"postiz post failed: {resp.status_code} {resp.text[:200]}")
-        await self._record("post_postiz", "ok", latency_ms)
-        return str(resp.json()[0]["postId"])
+        return str(created[0]["postId"])
 
     async def get_post_metrics(self, post_ref: str, days: int = 7) -> dict:
         """Postiz per-post analytics, normalized to {"series": {label: latest total}}.
@@ -333,19 +343,14 @@ class SocialConnector(HTTPConnector):
                 f"postiz not configured — cannot fetch metrics for post {post_ref}: "
                 "set postiz_url/postiz_api_key on the Integrations page"
             )
-        client = await self._ensure_client()
-        t0 = time.monotonic()
-        resp = await client.get(
+        raw = await self._request(
+            "metrics_postiz",
+            "postiz metrics",
+            "GET",
             f"{postiz_url.rstrip('/')}/api/public/v1/analytics/post/{post_ref}",
             params={"date": days},
             headers={"Authorization": api_key},
         )
-        latency_ms = int((time.monotonic() - t0) * 1000)
-        if resp.status_code not in (200, 201):
-            await self._record("metrics_postiz", "error", latency_ms, error=resp.text[:200])
-            raise RuntimeError(f"postiz metrics failed: {resp.status_code} {resp.text[:200]}")
-        await self._record("metrics_postiz", "ok", latency_ms)
-        raw = resp.json()
         if not raw:
             return {"series": {}}
         series: dict[str, float | int] = {}
@@ -377,19 +382,14 @@ class SocialConnector(HTTPConnector):
                 "postiz not configured — cannot list posts: set postiz_url/postiz_api_key "
                 "on the Integrations page"
             )
-        client = await self._ensure_client()
-        t0 = time.monotonic()
-        resp = await client.get(
+        body = await self._request(
+            "list_posts_postiz",
+            "postiz list posts",
+            "GET",
             f"{postiz_url.rstrip('/')}/api/public/v1/posts",
             params={"startDate": start_iso, "endDate": end_iso},
             headers={"Authorization": api_key},
         )
-        latency_ms = int((time.monotonic() - t0) * 1000)
-        if resp.status_code not in (200, 201):
-            await self._record("list_posts_postiz", "error", latency_ms, error=resp.text[:200])
-            raise RuntimeError(f"postiz list posts failed: {resp.status_code} {resp.text[:200]}")
-        await self._record("list_posts_postiz", "ok", latency_ms)
-        body = resp.json()
         if isinstance(body, dict):
             return list(body.get("posts") or [])
         return list(body or [])

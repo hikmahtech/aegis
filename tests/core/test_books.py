@@ -17,6 +17,8 @@ from aegis.api.models.money import MoneyEvent
 from aegis.services import books
 from structlog.testing import capture_logs
 
+from tests.books_chart_data import CHART
+
 HAS_HLEDGER = shutil.which("hledger") is not None and shutil.which("git") is not None
 
 EV_OUT = MoneyEvent(
@@ -533,15 +535,15 @@ def _commits(cfg) -> int:
 @pytest.mark.asyncio
 async def test_post_rewrite_and_query_round_trip(tmp_path):
     cfg = _repo(tmp_path)
-    rel = await books.post_event(EV_OUT, "arshad-personal/1a06cf5a", cfg)
+    rel = await books.post_event(EV_OUT, "arshad-personal/1a06cf5a", cfg, chart=CHART)
     assert rel == "personal/2026.journal"
     assert (cfg.path / rel).read_text() == "; Personal 2026\n\n" + BLOCK_OUT
-    rel2 = await books.post_event(EV_IN, "arshad-personal/1a0659e3", cfg)
+    rel2 = await books.post_event(EV_IN, "arshad-personal/1a0659e3", cfg, chart=CHART)
     assert rel2 == "hikmah/2026.journal"
     assert _commits(cfg) == 3
 
     # idempotent: same msgid → no change, no commit
-    assert await books.post_event(EV_OUT, "arshad-personal/1a06cf5a", cfg) == rel
+    assert await books.post_event(EV_OUT, "arshad-personal/1a06cf5a", cfg, chart=CHART) == rel
     assert _commits(cfg) == 3
 
     out = await books.run_hledger(["print", "tag:msgid=arshad-personal/1a06cf5a"], cfg)
@@ -561,7 +563,7 @@ async def test_post_rewrite_and_query_round_trip(tmp_path):
 @pytest.mark.asyncio
 async def test_undeclared_account_is_reverted(tmp_path):
     cfg = _repo(tmp_path)
-    await books.post_event(EV_OUT, "arshad-personal/1a06cf5a", cfg)
+    await books.post_event(EV_OUT, "arshad-personal/1a06cf5a", cfg, chart=CHART)
     before = (cfg.path / "personal" / "2026.journal").read_text()
     with pytest.raises(books.BooksCheckError):
         await books.rewrite_event("arshad-personal/1a06cf5a", cfg, account="expenses:nope")
@@ -574,7 +576,7 @@ async def test_undeclared_account_is_reverted(tmp_path):
 async def test_post_event_uses_unknown_for_undeclared_rule_account_and_instrument(tmp_path):
     cfg = _repo(tmp_path)
     ev = EV_OUT.model_copy(update={"account": "expenses:not:declared", "instrument": "sbi-1111"})
-    await books.post_event(ev, "m/undeclared", cfg)
+    await books.post_event(ev, "m/undeclared", cfg, chart=CHART)
     text = (cfg.path / "personal" / "2026.journal").read_text()
     assert "    expenses:unknown                        ₹10.00\n    assets:unknown\n" in text
 
@@ -586,7 +588,7 @@ async def test_39_char_account_survives_hledger_check(tmp_path):
     name, so `check --strict` rejects the write and post_event never commits."""
     cfg = _repo(tmp_path)
     ev = EV_OUT.model_copy(update={"account": ACCT39})
-    await books.post_event(ev, "m/pad39", cfg)
+    await books.post_event(ev, "m/pad39", cfg, chart=CHART)
     assert f"    {ACCT39}  ₹10.00\n" in (cfg.path / "personal" / "2026.journal").read_text()
     # An exact-line match: a misparse would name the account "<ACCT39> ₹10.00".
     assert ACCT39 in (await books.run_hledger(["accounts", "--used"], cfg)).splitlines()
@@ -616,7 +618,7 @@ async def test_run_hledger_refuses_bundled_and_abbreviated_file_flags(tmp_path):
 async def test_new_year_file_is_created_and_included(tmp_path):
     cfg = _repo(tmp_path)
     ev = EV_OUT.model_copy(update={"occurred_on": date(2027, 1, 3)})
-    assert await books.post_event(ev, "m/2027", cfg) == "personal/2027.journal"
+    assert await books.post_event(ev, "m/2027", cfg, chart=CHART) == "personal/2027.journal"
     main = (cfg.path / "main.journal").read_text()
     assert main.index("include personal/2027.journal") < main.index("include recurring.journal")
     assert (cfg.path / "personal" / "2027.journal").read_text().startswith("; Personal transactions, 2027.")
@@ -655,7 +657,7 @@ async def test_writes_are_scoped_to_their_own_paths(tmp_path):
     chart = cfg.path / "accounts.journal"                # tracked, modified
     chart.write_text(ACCOUNTS + "account expenses:handedit\n")
 
-    await books.post_event(EV_OUT, "arshad-personal/1a06cf5a", cfg)
+    await books.post_event(EV_OUT, "arshad-personal/1a06cf5a", cfg, chart=CHART)
     assert _committed_files(cfg) == ["personal/2026.journal"]
     assert notes.read_text() == "human notes\n"
     assert "expenses:handedit" in chart.read_text()
@@ -673,10 +675,10 @@ async def test_post_event_is_idempotent_across_year_files(tmp_path):
     """A corrected date re-posts the same msgid into a different journal;
     per-file idempotency would leave the id in the books twice."""
     cfg = _repo(tmp_path)
-    rel = await books.post_event(EV_OUT, "arshad-personal/dup", cfg)
+    rel = await books.post_event(EV_OUT, "arshad-personal/dup", cfg, chart=CHART)
     assert rel == "personal/2026.journal"
     moved = EV_OUT.model_copy(update={"occurred_on": date(2027, 3, 4)})
-    assert await books.post_event(moved, "arshad-personal/dup", cfg) == rel
+    assert await books.post_event(moved, "arshad-personal/dup", cfg, chart=CHART) == rel
     assert not (cfg.path / "personal" / "2027.journal").exists()
     assert _commits(cfg) == 2
     out = await books.run_hledger(["print", "tag:msgid=arshad-personal/dup"], cfg)
@@ -691,7 +693,7 @@ async def test_hostile_instrument_cannot_forge_a_transaction(tmp_path):
     a msgid of its own and PASSED `check --strict`, so nothing reverted it."""
     cfg = _repo(tmp_path)
     ev = EV_OUT.model_copy(update={"instrument": HOSTILE_INSTRUMENT})
-    rel = await books.post_event(ev, "arshad-personal/hostile", cfg)
+    rel = await books.post_event(ev, "arshad-personal/hostile", cfg, chart=CHART)
     text = (cfg.path / rel).read_text()
 
     # One transaction, one msgid, and the forged one resolves nowhere.
@@ -718,7 +720,10 @@ async def test_remove_event_leaves_its_neighbours_byte_intact(tmp_path):
     cfg = _repo(tmp_path)
     for n in (1, 2, 3):
         await books.post_event(
-            EV_OUT.model_copy(update={"payee": f"Payee {n}", "ref": f"ref{n}"}), f"m/{n}", cfg
+            EV_OUT.model_copy(update={"payee": f"Payee {n}", "ref": f"ref{n}"}),
+            f"m/{n}",
+            cfg,
+            chart=CHART,
         )
     path = cfg.path / "personal" / "2026.journal"
     before = path.read_text()
@@ -773,12 +778,12 @@ async def test_hostile_currency_cannot_forge_a_tag(tmp_path):
     `MoneyEvent` at all. The model gate is tested separately.
     """
     cfg = _repo(tmp_path)
-    await books.post_event(EV_OUT, "arshad-personal/clean", cfg)
+    await books.post_event(EV_OUT, "arshad-personal/clean", cfg, chart=CHART)
     hostile = EV_OUT.model_copy(update={"currency": HOSTILE_CURRENCY})
 
     raised = False
     try:
-        await books.post_event(hostile, "arshad-personal/hostilecur", cfg)
+        await books.post_event(hostile, "arshad-personal/hostilecur", cfg, chart=CHART)
     except books.BooksCheckError:
         # Sanitized, the code is three inert letters — an UNDECLARED commodity,
         # so the strict check rejects the write and it reverts. The poisoned
@@ -811,7 +816,7 @@ async def test_a_null_byte_reverts_and_raises_a_books_error(tmp_path):
     account check, which is why that variant proves nothing here.
     """
     cfg = _repo(tmp_path)
-    await books.post_event(EV_OUT, "m/nul", cfg)
+    await books.post_event(EV_OUT, "m/nul", cfg, chart=CHART)
     rules = cfg.path / "rules" / "accounts.yaml"
 
     with pytest.raises(books.BooksError, match="null"):
@@ -840,7 +845,7 @@ async def test_the_first_write_clones_with_the_lock_already_held(tmp_path):
     dest = tmp_path / "checkout"
     cfg = books.BooksConfig(path=dest, repo_url=str(origin))
 
-    rel = await books.post_event(EV_OUT, "m/first", cfg)
+    rel = await books.post_event(EV_OUT, "m/first", cfg, chart=CHART)
 
     assert (dest / ".git").exists(), "the clone never landed"
     assert (dest / ".aegis.lock").exists(), "the lock the write held is gone"
@@ -928,6 +933,7 @@ def test_a_hand_written_block_is_still_cleared():
         [{"account": "expenses:groceries", "amount": "10.00", "currency": "INR"},
          {"account": "assets:bank:hdfc:1225", "amount": "-10.00", "currency": "INR"}],
         "manual-abc",
+        currency="INR",
     )
     assert block.startswith("2026-09-02 * Corner Store")
 
@@ -946,7 +952,7 @@ async def test_promotion_goes_all_the_way_through_the_write_path(tmp_path):
     that matters.
     """
     cfg = _repo(tmp_path)
-    rel = await books.post_event(EV_OUT, "arshad-personal/1a06cf5a", cfg)
+    rel = await books.post_event(EV_OUT, "arshad-personal/1a06cf5a", cfg, chart=CHART)
     assert rel
 
     pending = await books.run_hledger(["print", "--pending", "expenses"], cfg)
@@ -973,8 +979,8 @@ async def test_the_bulk_path_forwards_status_too(tmp_path):
     the journal, so a dropped `status` is a no-op commit that looks like it
     worked."""
     cfg = _repo(tmp_path)
-    await books.post_event(EV_OUT, "arshad-personal/1a06cf5a", cfg)
-    await books.post_event(EV_IN, "arshad-personal/1a0659e3", cfg)
+    await books.post_event(EV_OUT, "arshad-personal/1a06cf5a", cfg, chart=CHART)
+    await books.post_event(EV_IN, "arshad-personal/1a0659e3", cfg, chart=CHART)
 
     rewritten, failed = await books.rewrite_events(
         ["arshad-personal/1a06cf5a", "arshad-personal/1a0659e3"],
@@ -998,7 +1004,7 @@ async def test_a_status_filter_is_reachable_from_the_query_tool(tmp_path):
     by every consumer: the brief, the month close, the admin page and the chat
     tool alike."""
     cfg = _repo(tmp_path)
-    await books.post_event(EV_OUT, "arshad-personal/1a06cf5a", cfg)
+    await books.post_event(EV_OUT, "arshad-personal/1a06cf5a", cfg, chart=CHART)
     for flag in ("-P", "--pending", "-C", "--cleared", "-U", "--unmarked"):
         await books.run_hledger(["bal", flag, "expenses"], cfg)
 

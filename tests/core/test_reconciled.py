@@ -10,7 +10,7 @@ from datetime import date
 
 import pytest
 import pytest_asyncio
-from aegis.services import reconciled
+from aegis.services import journal_index as reconciled
 
 
 @pytest_asyncio.fixture(loop_scope="function", autouse=True)

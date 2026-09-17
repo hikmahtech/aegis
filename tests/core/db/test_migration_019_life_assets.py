@@ -84,7 +84,7 @@ async def test_life_assets_columns(pool: asyncpg.Pool) -> None:
 
 @pytest.mark.asyncio
 async def test_slug_is_unique(pool: asyncpg.Pool) -> None:
-    """The UNIQUE that `services/assets._unique_slug` exists to stay ahead of."""
+    """The UNIQUE that `slugs.unique_slug` exists to stay ahead of."""
     await _make_asset(pool, "dup")
     with pytest.raises(asyncpg.UniqueViolationError):
         await pool.execute(

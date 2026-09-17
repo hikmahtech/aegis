@@ -24,9 +24,11 @@ from typing import Any
 
 import asyncpg
 from aegis.connectors.todoist import TodoistConnector
+from aegis.errors import error_text
 from aegis.observability import log_audit
 from aegis.services import social_channels
 from aegis.services.hub_watch import mute_hint, reconcile_findings
+from aegis.services.settings_store import get_setting
 from temporalio import activity
 
 from aegis_worker.activities.delivery import safe_send_message
@@ -211,7 +213,7 @@ class SocialActivities:
     async def _setting(self, key: str, default):
         if self.db_pool is None:
             return default
-        val = await self.db_pool.fetchval("SELECT value FROM settings WHERE key = $1", key)
+        val = await get_setting(self.db_pool, key)
         return default if val is None else val
 
     async def _connected_platforms(self) -> set[str]:
@@ -477,7 +479,7 @@ class SocialActivities:
                     r["id"],
                     next_attempts,
                     new_status,
-                    str(exc)[:200],
+                    error_text(exc),
                 )
         activity.logger.info("social_drain_outbox posted=%d failed=%d", posted, failed)
         return {"posted": posted, "failed": failed}
@@ -636,7 +638,7 @@ class SocialActivities:
                 self.db_pool, base_url, api_key
             )
         except Exception as exc:  # noqa: BLE001 — degrade, never block publishing
-            activity.logger.warning("social_sync_channels_failed err=%s", str(exc)[:200])
+            activity.logger.warning("social_sync_channels_failed err=%s", error_text(exc))
             return {**idle, "status": "failed"}
         activity.logger.info(
             "social_sync_channels synced=%d skipped_disabled=%d",
@@ -885,7 +887,7 @@ class SocialActivities:
         except Exception as exc:  # noqa: BLE001 — per-post analytics is the core
             # value; a failed list call just means state/release_url stay
             # unknown for this pass, not that we skip the pass entirely.
-            activity.logger.warning("social_list_posts_window_failed err=%s", str(exc)[:200])
+            activity.logger.warning("social_list_posts_window_failed err=%s", error_text(exc))
 
         rows = await self.db_pool.fetch(
             f"""
@@ -936,7 +938,7 @@ class SocialActivities:
                     "social_refresh_post_metrics_failed id=%s posted_ref=%s err=%s",
                     r["id"],
                     post_ref,
-                    str(exc)[:200],
+                    error_text(exc),
                 )
         activity.logger.info(
             "social_refresh_post_metrics refreshed=%d failed=%d", refreshed, failed
@@ -1001,7 +1003,7 @@ class SocialActivities:
         return out
 
     @activity.defn
-    async def report_stuck_posts(self, findings: list[dict], agent_id: str = "sebas") -> dict:
+    async def report_stuck_posts(self, findings: list[dict], agent_id: str = "") -> dict:
         """Notify about NEW stuck posts, and about posts that finally published.
 
         The problem hub decides what is new: each stuck post is an occurrence

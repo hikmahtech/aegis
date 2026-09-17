@@ -34,6 +34,8 @@ from dataclasses import dataclass
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
+    from aegis.errors import error_text
+
     from aegis_worker.activities.chat import ChatActivities
     from aegis_worker.activities.clarify import ClarifyActivities
     from aegis_worker.activities.delivery import DeliveryActivities
@@ -47,8 +49,7 @@ with workflow.unsafe.imports_passed_through():
 
 def _err_str(exc: BaseException) -> str:
     """Unwrap ActivityError cause chain to get the original message."""
-    cause = exc.__cause__ or exc
-    return str(cause)[:200]
+    return error_text(exc.__cause__ or exc)
 
 
 @dataclass

@@ -3,8 +3,7 @@
 A generic life-metrics store: one row per reading (weight, sleep hours, a
 sensor temperature, a location ping), with anything non-numeric in
 `metadata`. Ingest paths call `record_observation`; readers call
-`query_trend` (ordered series) or `summarize` (min/max/avg/latest over a
-window).
+`summarize` (min/max/avg/latest over a window).
 
 Shaped after `services/people.py`: plain dicts in and out over an asyncpg
 pool, no ORM, aggregates in SQL (no pandas).
@@ -42,10 +41,6 @@ logger = structlog.get_logger()
 _SELECT_COLS = (
     "id, source, metric, value::float8 AS value, observed_at, metadata, created_at"
 )
-
-# Upper bound on rows returned by a single trend query — a year of one-minute
-# sensor readings is half a million rows and no caller wants them all.
-_MAX_TREND_ROWS = 5000
 
 
 def normalize_key(value: Any) -> str:
@@ -134,38 +129,6 @@ async def record_external_observation(
         ext,
     )
     return dict(row) if row is not None else None
-
-
-async def query_trend(
-    pool: asyncpg.Pool,
-    metric: str,
-    since: datetime | None = None,
-    until: datetime | None = None,
-    limit: int = _MAX_TREND_ROWS,
-) -> list[dict]:
-    """Readings for `metric` in [since, until), oldest first.
-
-    Both bounds are optional. Returns [] for a blank metric without touching
-    the database.
-    """
-    met = normalize_key(metric)
-    if not met:
-        return []
-    clauses = ["metric = $1"]
-    params: list[Any] = [met]
-    if since is not None:
-        params.append(since)
-        clauses.append(f"observed_at >= ${len(params)}")
-    if until is not None:
-        params.append(until)
-        clauses.append(f"observed_at < ${len(params)}")
-    rows = await pool.fetch(
-        f"SELECT {_SELECT_COLS} FROM life.observations "
-        f"WHERE {' AND '.join(clauses)} "
-        f"ORDER BY observed_at ASC LIMIT {max(1, min(int(limit), _MAX_TREND_ROWS))}",
-        *params,
-    )
-    return [dict(r) for r in rows]
 
 
 async def summarize(

@@ -25,6 +25,8 @@ import pytest
 from aegis.services import statement_transfers as transfers
 from aegis.services.statements import StatementRow, row_id_for
 
+from tests.books_chart_data import CHART
+
 DECLARED = frozenset(
     {
         "assets:bank:hdfc:1225",
@@ -257,7 +259,7 @@ def test_a_failed_payment_and_its_recredit_pair_on_the_reference():
                  ref="612345678906", balance="-500.00")
     credit = _row(3, "500.00", "UPI/P2M/612345678906/SHOP REVERSAL",
                   direction="in", ref="612345678906", balance="0.00")
-    paired = transfers.find_reversals([debit, credit], DECLARED, entity="personal")
+    paired = transfers.find_reversals([debit, credit], DECLARED, entity="personal", chart=CHART)
     assert paired[debit.row_id].peer_row_id == credit.row_id
     assert paired[credit.row_id].peer_row_id == debit.row_id
     assert {p.kind for p in paired.values()} == {transfers.REVERSAL}
@@ -268,7 +270,7 @@ def test_a_failed_payment_and_its_recredit_pair_on_the_reference():
 def test_a_reversal_pairs_on_the_narration_when_there_is_no_reference():
     debit = _row(3, "500.00", "ATM WDL SPECIMEN", balance="-500.00")
     credit = _row(3, "500.00", "ATM WDL SPECIMEN", direction="in", balance="0.00")
-    assert len(transfers.find_reversals([debit, credit], DECLARED, entity="personal")) == 2
+    assert len(transfers.find_reversals([debit, credit], DECLARED, entity="personal", chart=CHART)) == 2
 
 
 def test_two_unrelated_rows_are_not_a_reversal():
@@ -277,7 +279,7 @@ def test_two_unrelated_rows_are_not_a_reversal():
     and both would vanish from the books."""
     debit = _row(3, "500.00", "SPECIMEN SHOP", balance="-500.00")
     credit = _row(3, "500.00", "SALARY", direction="in", balance="0.00")
-    assert transfers.find_reversals([debit, credit], DECLARED, entity="personal") == {}
+    assert transfers.find_reversals([debit, credit], DECLARED, entity="personal", chart=CHART) == {}
 
 
 def test_a_reversal_on_a_different_day_is_not_paired():
@@ -285,7 +287,7 @@ def test_a_reversal_on_a_different_day_is_not_paired():
     matcher already handles."""
     debit = _row(3, "500.00", "ATM WDL SPECIMEN", balance="-500.00")
     credit = _row(6, "500.00", "ATM WDL SPECIMEN", direction="in", balance="0.00")
-    assert transfers.find_reversals([debit, credit], DECLARED, entity="personal") == {}
+    assert transfers.find_reversals([debit, credit], DECLARED, entity="personal", chart=CHART) == {}
 
 
 def test_both_legs_of_a_reversal_take_the_same_account():
@@ -293,7 +295,7 @@ def test_both_legs_of_a_reversal_take_the_same_account():
     is what makes the pair net to zero."""
     debit = _row(3, "500.00", "ATM WDL SPECIMEN", balance="-500.00")
     credit = _row(3, "500.00", "ATM WDL SPECIMEN", direction="in", balance="0.00")
-    paired = transfers.find_reversals([debit, credit], (), entity="personal")
+    paired = transfers.find_reversals([debit, credit], (), entity="personal", chart=CHART)
     assert len({p.account for p in paired.values()}) == 1
 
 
@@ -301,10 +303,10 @@ def test_an_undeclared_clearing_account_falls_back_and_still_nets_to_zero():
     """A fork whose chart has no `equity:transfers` must not have its statement
     reverted by `check --strict`. Both legs move to the unknown account
     together, so the pair still nets to zero and stays visible in the digest."""
-    chart = frozenset({"assets:bank:hdfc:1225", "expenses:unknown", "income:unknown"})
-    assert transfers.reversal_account(chart, "personal") == "expenses:unknown"
-    assert transfers.reversal_account(chart, "hikmah") == "expenses:hikmah:unknown"
-    assert transfers.reversal_account(DECLARED, "personal") == "equity:transfers"
+    undeclared = frozenset({"assets:bank:hdfc:1225", "expenses:unknown", "income:unknown"})
+    assert transfers.reversal_account(undeclared, "personal", CHART) == "expenses:unknown"
+    assert transfers.reversal_account(undeclared, "hikmah", CHART) == "expenses:hikmah:unknown"
+    assert transfers.reversal_account(DECLARED, "personal", CHART) == "equity:transfers"
 
 
 #: The real chart (§"Chart of accounts"), so the table below is judged against

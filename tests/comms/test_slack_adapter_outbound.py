@@ -218,11 +218,20 @@ async def test_build_channel_agent_map_empty_on_fetch_error():
 # --- channel/persona resolution via the core lookup (respx) ---
 
 
+# What core's GET /api/agents/{id} returns for a seeded agent: the persona icon
+# is `metadata.slack_icon` (config/seed/agents.yaml), not a table keyed on ids.
+_SEBAS_META = {"slack_icon": ":bust_in_silhouette:"}
+
+
 @respx.mock
 async def test_resolve_uses_core_slack_channel_id():
     respx.get("http://core.test/api/agents/sebas").mock(
         return_value=httpx.Response(
-            200, json={"id": "sebas", "name": "Sebas", "slack_channel_id": "CSEBAS"}
+            200,
+            json={
+                "id": "sebas", "name": "Sebas", "slack_channel_id": "CSEBAS",
+                "metadata": _SEBAS_META,
+            },
         )
     )
     a = SlackAdapter(_settings())
@@ -255,7 +264,13 @@ async def test_resolve_transient_failure_does_not_poison_cache():
     route = respx.get("http://core.test/api/agents/sebas").mock(
         side_effect=[
             httpx.NetworkError("timeout"),
-            httpx.Response(200, json={"id": "sebas", "name": "Sebas", "slack_channel_id": "CSEBAS"}),
+            httpx.Response(
+                200,
+                json={
+                    "id": "sebas", "name": "Sebas", "slack_channel_id": "CSEBAS",
+                    "metadata": _SEBAS_META,
+                },
+            ),
         ]
     )
     a = SlackAdapter(_settings())
@@ -285,7 +300,11 @@ async def test_resolve_transient_failure_does_not_poison_cache():
 async def test_resolve_falls_back_to_conversations_list_by_name():
     respx.get("http://core.test/api/agents/maou").mock(
         return_value=httpx.Response(
-            200, json={"id": "maou", "name": "Maou", "slack_channel_id": ""}
+            200,
+            json={
+                "id": "maou", "name": "Maou", "slack_channel_id": "",
+                "metadata": {"slack_icon": ":moneybag:"},
+            },
         )
     )
     a = SlackAdapter(_settings())

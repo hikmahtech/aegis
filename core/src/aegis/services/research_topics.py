@@ -5,8 +5,9 @@ Spec: docs/superpowers/specs/2026-09-12-research-hub-design.md.
 
 **The registry is the `intelligence_topics` settings row** —
 ``{"topics": [{"name", "queries", "priority"}]}``, which `track_topic` has
-always written and which the intel scans (#508) and the RSS gate (#512) read
-for their search terms. It stays the registry because a topic's terms must
+always written and which the intel scans (#508) and the RSS gate (#512) read.
+A scan searches each topic once, by its name (#585); the gate, curiosity and
+the rounds match on its terms. It stays the registry because a topic's terms must
 outlive any one problem. Every change to it is a read-modify-write under one
 advisory lock, so `track_topic` from chat and a curiosity "yes" landing
 together cannot lose one of the two.
@@ -16,8 +17,14 @@ slug, kind `topic`, source `research` — so Raphael owns it (`hub_project`).
 Every article that names one of the topic's terms is an occurrence, keyed on
 the article's URL, so the same story reaching us from a scan and a feed
 attaches once. The problem earns a Todoist task only when its current round
-holds enough items (`ATTENTION_ITEMS`); until then it lives in the hub and the
-briefing.
+holds enough items — the topic's own `threshold`, else its priority's number in
+the `research_topics_config` row (`services/topics_config.py`); until then it
+lives in the hub and the briefing.
+
+The registry is also edited whole from Admin → Research → Tracked topics
+(`GET/PUT /api/admin/research/topics`): `parse_topics` is the lenient read,
+`validate_registry` the strict write, and `save_registry` takes the same
+advisory lock as `track` / `untrack`.
 
 **A round ends when the user ticks the task off.** The problem resolves and
 closes at once (`hub_project.reconcile_completed_tasks` → :func:`close_round`),
@@ -37,6 +44,8 @@ from typing import Any
 import asyncpg
 import structlog
 
+from aegis.errors import error_text
+from aegis.services import topics_config
 from aegis.services.hub import (
     TOPIC_CLASS,
     Event,
@@ -45,18 +54,19 @@ from aegis.services.hub import (
     set_status,
     slug,
 )
+from aegis.services.settings_store import get_setting, put_setting
 
 logger = structlog.get_logger()
 
 TOPICS_SETTING = "intelligence_topics"
 SOURCE = "research"
 TOPIC_KIND = "topic"
-PRIORITIES = ("high", "medium", "low")
+PRIORITIES = topics_config.PRIORITIES
 # Items a round must hold before the topic interrupts the user with a task.
 # One new article is news, not a chore; a high-priority topic asks sooner.
-ATTENTION_ITEMS = {"high": 2, "medium": 3, "low": 5}
-# What a round's task lists, newest first.
-_DIGEST_ITEMS = 10
+# These are the code DEFAULTS: the `research_topics_config` row's `attention`
+# sets the live numbers, and a topic's own `threshold` overrides those.
+ATTENTION_ITEMS = topics_config.DEFAULT_ATTENTION
 # The advisory lock every registry read-modify-write takes.
 _REGISTRY_LOCK = "research_topics:registry"
 # The close event's reason for a round that was resolved (by hand, say) and is
@@ -69,6 +79,8 @@ class Topic:
     name: str
     queries: tuple[str, ...]
     priority: str = "medium"
+    # The topic's own item threshold, when the registry entry sets one.
+    threshold_override: int | None = None
 
     @property
     def slug(self) -> str:
@@ -77,12 +89,39 @@ class Topic:
     @property
     def terms(self) -> tuple[str, ...]:
         """What an article must name to belong to the topic: its queries, or
-        its name when it has none — the same rule the scans search by."""
+        its name when it has none — the rule the rounds, the RSS gate and
+        curiosity match by. The intel scans do NOT search these: a scan
+        searches a topic once, by its name (#585)."""
         return self.queries or (self.name,)
 
     @property
     def threshold(self) -> int:
-        return ATTENTION_ITEMS.get(self.priority, ATTENTION_ITEMS["medium"])
+        """The threshold against the code defaults; `threshold_for` takes the
+        merged `research_topics_config` row."""
+        return self.threshold_for(None)
+
+    def threshold_for(self, config: dict | None) -> int:
+        if self.threshold_override:
+            return int(self.threshold_override)
+        attention = (config or {}).get("attention") or ATTENTION_ITEMS
+        return int(attention.get(self.priority, attention.get("medium", ATTENTION_ITEMS["medium"])))
+
+    def as_entry(self) -> dict[str, Any]:
+        """The registry row for this topic."""
+        entry: dict[str, Any] = {
+            "name": self.name,
+            "queries": list(self.queries),
+            "priority": self.priority,
+        }
+        if self.threshold_override:
+            entry["threshold"] = int(self.threshold_override)
+        return entry
+
+
+def _threshold(raw: Any) -> int | None:
+    if isinstance(raw, bool) or not isinstance(raw, int | float) or int(raw) != raw:
+        return None
+    return int(raw) if int(raw) > 0 else None
 
 
 def parse_topics(value: Any) -> list[Topic]:
@@ -108,7 +147,7 @@ def parse_topics(value: Any) -> list[Topic]:
         qs = raw.get("queries")
         queries = tuple(q.strip() for q in qs if isinstance(q, str) and q.strip()) if isinstance(qs, list) else ()
         priority = raw.get("priority") if raw.get("priority") in PRIORITIES else "medium"
-        topic = Topic(name.strip(), queries, priority)
+        topic = Topic(name.strip(), queries, priority, _threshold(raw.get("threshold")))
         if topic.slug in seen:
             continue
         seen.add(topic.slug)
@@ -116,10 +155,44 @@ def parse_topics(value: Any) -> list[Topic]:
     return out
 
 
+def validate_registry(value: Any) -> list[dict[str, Any]]:
+    """Strict counterpart to `parse_topics`, for the admin write path: every
+    entry must have a usable name, a list of string queries, a known priority
+    and, if set, a positive whole-number threshold; names must not collide.
+    Raises ValueError with a message the page can show."""
+    if not isinstance(value, dict) or not isinstance(value.get("topics"), list):
+        raise ValueError("expected an object with a topics list")
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for i, raw in enumerate(value["topics"], start=1):
+        if not isinstance(raw, dict):
+            raise ValueError(f"topic {i} must be an object")
+        name = raw.get("name")
+        if not isinstance(name, str) or not name.strip() or not slug(name):
+            raise ValueError(f"topic {i} needs a name")
+        qs = raw.get("queries", [])
+        if not isinstance(qs, list) or not all(isinstance(q, str) for q in qs):
+            raise ValueError(f"topic {name!r}: queries must be a list of strings")
+        queries = [q.strip() for q in qs if q.strip()]
+        priority = raw.get("priority", "medium")
+        if priority not in PRIORITIES:
+            raise ValueError(f"topic {name!r}: priority must be one of {', '.join(PRIORITIES)}")
+        threshold = raw.get("threshold")
+        if threshold not in (None, "") and _threshold(threshold) is None:
+            raise ValueError(f"topic {name!r}: threshold must be a positive whole number")
+        key = slug(name)
+        if key in seen:
+            raise ValueError(f"topic {name!r} is listed twice")
+        seen.add(key)
+        entry: dict[str, Any] = {"name": name.strip(), "queries": queries, "priority": priority}
+        if threshold not in (None, ""):
+            entry["threshold"] = int(threshold)
+        out.append(entry)
+    return out
+
+
 async def load_topics(pool: asyncpg.Pool) -> list[Topic]:
-    return parse_topics(
-        await pool.fetchval("SELECT value FROM settings WHERE key = $1", TOPICS_SETTING)
-    )
+    return parse_topics(await get_setting(pool, TOPICS_SETTING))
 
 
 def _pattern(topic: Topic) -> re.Pattern[str]:
@@ -181,7 +254,7 @@ async def _close_resolved_round(
         await hub_project.project(pool, problem_id, now=now)
     except Exception as exc:  # noqa: BLE001 — Todoist being down must not keep the round open
         logger.warning(
-            "research_round_close_project_failed", problem_id=problem_id, error=str(exc)[:200]
+            "research_round_close_project_failed", problem_id=problem_id, error=error_text(exc)
         )
     return await close_problem(pool, problem_id, now=now, reason=RESOLVED_ROUND_CLOSED)
 
@@ -225,19 +298,63 @@ async def ensure_round(
 
 
 async def _save_registry(db: Any, topics: list[dict[str, Any]]) -> None:
-    await db.execute(
-        "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW()) "
-        "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
-        TOPICS_SETTING,
-        {"topics": topics},
-    )
+    await put_setting(db, TOPICS_SETTING, {"topics": topics})
 
 
 async def _raw_registry(db: Any) -> list[dict[str, Any]]:
-    value = await db.fetchval("SELECT value FROM settings WHERE key = $1", TOPICS_SETTING)
+    value = await get_setting(db, TOPICS_SETTING)
     if isinstance(value, dict) and isinstance(value.get("topics"), list):
         return [t for t in value["topics"] if isinstance(t, dict)]
     return []
+
+
+async def save_registry(
+    pool: asyncpg.Pool, value: Any, *, now: datetime | None = None
+) -> list[dict[str, Any]]:
+    """Replace the whole registry from the admin page, under the same advisory
+    lock `track` and `untrack` take, so a chat `track_topic` landing at the
+    same moment cannot lose one of the two writes. Validates first (raises
+    ValueError). A topic that was dropped has its live round closed; a topic
+    that is new gets a round opened, as `track` does."""
+    entries = validate_registry(value)
+    now = now or datetime.now(UTC)
+    async with pool.acquire() as conn, conn.transaction():
+        await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", _REGISTRY_LOCK)
+        before = {slug(str(t.get("name") or "")) for t in await _raw_registry(conn)}
+        await _save_registry(conn, entries)
+    after = parse_topics({"topics": entries})
+    for topic in after:
+        if topic.slug not in before:
+            await ensure_round(pool, topic, now=now)
+    for gone in before - {t.slug for t in after}:
+        current = await _open_round(pool, Topic(gone, ()))
+        if current is not None:
+            await close_round(pool, current["id"], reason="the topic is no longer tracked", now=now)
+    logger.info("research_topics_registry_saved", topics=len(entries))
+    return entries
+
+
+async def list_registry(pool: asyncpg.Pool) -> list[dict[str, Any]]:
+    """Every tracked topic with its live round, for the admin page: the
+    registry entry, the threshold in force, and the round's problem id, item
+    count and task (if any)."""
+    cfg = await topics_config.get_topics_config(pool)
+    out: list[dict[str, Any]] = []
+    for topic in await load_topics(pool):
+        entry = topic.as_entry()
+        entry["effective_threshold"] = topic.threshold_for(cfg)
+        entry["slug"] = topic.slug
+        current = await live_problem(pool, topic)
+        if current is not None:
+            entry["round"] = {
+                "problem_id": current["id"],
+                "status": current["status"],
+                "items": await _item_count(pool, current["id"]),
+                "task_id": current.get("todoist_task_id"),
+                "attention": bool((current.get("metadata") or {}).get("attention")),
+            }
+        out.append(entry)
+    return out
 
 
 async def track(
@@ -246,6 +363,7 @@ async def track(
     queries: list[str],
     priority: str = "medium",
     *,
+    threshold: int | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Track a topic: write it to the registry the scans read, and make sure it
@@ -256,7 +374,8 @@ async def track(
     if not name or not queries or not slug(name):
         raise ValueError("topic_name and queries are required")
     priority = priority if priority in PRIORITIES else "medium"
-    entry = {"name": name, "queries": queries, "priority": priority}
+    topic = Topic(name, tuple(queries), priority, _threshold(threshold))
+    entry = topic.as_entry()
 
     async with pool.acquire() as conn, conn.transaction():
         await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", _REGISTRY_LOCK)
@@ -274,7 +393,8 @@ async def track(
             updated.append(entry)
         await _save_registry(conn, updated)
 
-    problem_id = await ensure_round(pool, Topic(name, tuple(queries), priority), now=now)
+    problem_id = await ensure_round(pool, topic, now=now)
+    cfg = await topics_config.get_topics_config(pool)
     logger.info("research_topic_tracked", topic=name, status=status, problem_id=problem_id)
     return {
         "status": status,
@@ -282,7 +402,7 @@ async def track(
         "query_count": len(queries),
         "total_topics": len(updated),
         "problem_id": problem_id,
-        "task_after_items": ATTENTION_ITEMS[priority],
+        "task_after_items": topic.threshold_for(cfg),
     }
 
 
@@ -325,7 +445,7 @@ async def untrack(
                 )
             except Exception as exc:  # noqa: BLE001 — the topic is untracked either way
                 logger.warning(
-                    "research_topic_task_retire_failed", topic=name, error=str(exc)[:200]
+                    "research_topic_task_retire_failed", topic=name, error=error_text(exc)
                 )
                 out["task_retired"] = False
     out["round_closed"] = closed
@@ -366,9 +486,12 @@ def _item_id(url: str, topic: Topic) -> str:
 
 
 async def round_items(
-    pool: asyncpg.Pool, problem_id: str, *, limit: int = _DIGEST_ITEMS
+    pool: asyncpg.Pool, problem_id: str, *, limit: int | None = None
 ) -> list[dict[str, Any]]:
-    """The round's articles, newest first."""
+    """The round's articles, newest first — at most `limit`, or the
+    `research_topics_config` row's `digest_items` when None."""
+    if limit is None:
+        limit = int((await topics_config.get_topics_config(pool))["digest_items"])
     rows = await pool.fetch(
         "SELECT payload, occurred_at FROM problem_events "
         "WHERE problem_id = $1::uuid AND kind = 'occurrence' AND payload->>'item' = 'true' "
@@ -391,12 +514,12 @@ async def _item_count(pool: asyncpg.Pool, problem_id: str) -> int:
 
 
 async def _check_attention(
-    pool: asyncpg.Pool, problem_id: str, topic: Topic, now: datetime
+    pool: asyncpg.Pool, problem_id: str, topic: Topic, now: datetime, config: dict | None = None
 ) -> bool:
-    """Mark the round as worth a task once it holds ``topic.threshold`` items.
-    True only on the call that crosses the threshold."""
+    """Mark the round as worth a task once it holds the topic's threshold of
+    items (`Topic.threshold_for`). True only on the call that crosses it."""
     count = await _item_count(pool, problem_id)
-    if count < topic.threshold:
+    if count < topic.threshold_for(config):
         return False
     tag = await pool.execute(
         "UPDATE problems SET metadata = metadata || $2::jsonb "
@@ -470,8 +593,9 @@ async def attach_items(
             if result.action != "duplicate":
                 attached += 1
     tasks = 0
+    cfg = await topics_config.get_topics_config(pool)
     for topic_slug, pid in rounds.items():
-        if await _check_attention(pool, pid, by_slug[topic_slug], now):
+        if await _check_attention(pool, pid, by_slug[topic_slug], now, cfg):
             tasks += 1
             if project:
                 from aegis.services.hub_project import project as project_problem
@@ -479,7 +603,7 @@ async def attach_items(
                 try:
                     await project_problem(pool, pid, now=now)
                 except Exception as exc:  # noqa: BLE001 — the hub sweep retries projection
-                    logger.warning("research_topic_project_failed", problem_id=pid, error=str(exc)[:200])
+                    logger.warning("research_topic_project_failed", problem_id=pid, error=error_text(exc))
     logger.info(
         "research_topic_items_attached",
         origin=origin,

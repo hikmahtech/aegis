@@ -11,11 +11,16 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from aegis.errors import error_text
 from aegis.llm import parse_llm_json
 from aegis.observability import log_audit
 from aegis.security import SPOTLIGHT_INSTRUCTION, assess_rule_of_two, spotlight
+from aegis.services import alert_remediation as _alert_remediation
 from aegis.services.infra_alert_routing import get_infra_alert_routing
+from aegis.services.settings_store import get_setting
 from temporalio import activity
+
+from aegis_worker.shared.jsonb import decode_jsonb
 
 # Cap on Kimi investigation output kept in the activity return value.
 _INVESTIGATION_OUTPUT_CAP = 8 * 1024
@@ -78,38 +83,6 @@ _RECALL_SNIPPET_CHARS = 600
 # the `infra_alert_routing` settings row merged over a generic default
 # (`aegis.services.infra_alert_routing`, #498). The flow reads the effective
 # list through `get_alert_routing_config` and passes it to `is_infra_alert`.
-#
-# REPLAY ONLY — do not add to this, and do not read it for a new alert. It is
-# the built-in list as it stood before #498, frozen, for AlertInvestigationFlow
-# histories recorded before then: their routing config carried no list, and
-# replaying them against anything else would classify an alert differently,
-# schedule a different activity and wedge the workflow. Delete it once no run
-# started before #498 is open (the Gate-2 card times out after 48h).
-_PRE_498_INFRA_ALERTNAMES: frozenset[str] = frozenset(
-    {
-        "nodedown",
-        "dockerservicedown",
-        "servicedownprolonged",
-        "heartbeatcollectfailed",
-        "lokidown",
-        "criticalendpointdown",
-        "postgresqldown",
-        "clickhousedown",
-        "prometheusdown",
-        "alertmanagerdown",
-        "tempordown",
-        "gpucriticaltemperature",
-        "dagster pipeline failure",
-        "hostoutofmemory",
-        "hostmemorylimitreached",
-        "hostdiskspacefull",
-        "hostdiskreadlatency",
-        "hostdiskwritelatency",
-        "containermemorylimitreached",
-        "containerkilledbysigterm",
-        "containerkilledbysigkill",
-    }
-)
 
 # Infra alert classes safe to auto-remediate with a `service update --force`.
 # A force-restart reschedules a stuck/unplaced task (the DockerServiceDown /
@@ -127,12 +100,12 @@ _DIAGNOSTIC_ERROR_CHARS = 200
 
 # One automatic restart per problem per window (#501). A service that comes
 # back inside the window is not restarted again: the restart did not hold, and
-# the next one will not either. Stored in the `settings` row below as
-# {"repeat_window_minutes": 60}; 0 turns the check off, which restarts every
-# time, as before. Generic on purpose: an hour is what "it broke again right
-# after the restart" means on any cluster.
-ALERT_REMEDIATION_SETTINGS_KEY = "alert_remediation"
-DEFAULT_RESTART_REPEAT_WINDOW_MINUTES = 60
+# the next one will not either. Stored in the `alert_remediation` settings row
+# as {"repeat_window_minutes": 60}; 0 turns the check off, which restarts every
+# time, as before. The row's merge/validate pair is
+# `aegis.services.alert_remediation` (admin Problems page → Hub configuration).
+ALERT_REMEDIATION_SETTINGS_KEY = _alert_remediation.SETTINGS_KEY
+DEFAULT_RESTART_REPEAT_WINDOW_MINUTES = _alert_remediation.DEFAULT_REPEAT_WINDOW_MINUTES
 # How far back through a problem's timeline the lookup reads. A flapping
 # service adds a handful of events an hour, so this covers the window with
 # room to spare.
@@ -163,8 +136,8 @@ def is_infra_alert(
     AEGIS_INFRA_CLUSTER env fallback; blank ⇒ cluster matching is off). Callers
     pass both explicitly — workflows fetch them once via
     AlertActivities.get_alert_routing_config since they can't read the DB.
-    `infra_alertnames=None` means a history recorded before the list moved to
-    the DB, and replays against `_PRE_498_INFRA_ALERTNAMES`.
+    No names (the default, or a history recorded before the list moved to the
+    DB) means nothing matches by name and only the cluster label can classify.
 
     Infra alerts have no application code repo, so they skip the repo match
     and go to the infra repo — unless a repository claims them by label
@@ -176,11 +149,7 @@ def is_infra_alert(
     cluster = (labels.get("cluster") or "").strip()
     if infra_cluster and cluster == infra_cluster:
         return True
-    names = (
-        _PRE_498_INFRA_ALERTNAMES
-        if infra_alertnames is None
-        else {str(n).strip().lower() for n in infra_alertnames}
-    )
+    names = {str(n).strip().lower() for n in infra_alertnames or ()}
     alertname = (labels.get("alertname") or "").strip().lower()
     return alertname in names
 
@@ -207,24 +176,19 @@ def remediation_target(alert: dict) -> str:
 
 
 async def restart_repeat_window_minutes(pool: Any) -> int:
-    """The window from the `alert_remediation` settings row. Read leniently:
-    no pool, no row, a failed read or a value that is not a whole number of
-    minutes all mean the default, because a config mistake must not change
-    what happens to a service that is down. 0 is a real value: off."""
+    """The window from the `alert_remediation` settings row. Read leniently
+    (`alert_remediation.merge`): no pool, no row, a failed read or a value that
+    is not a whole number of minutes all mean the default, because a config
+    mistake must not change what happens to a service that is down. 0 is a real
+    value: off."""
     if pool is None:
         return DEFAULT_RESTART_REPEAT_WINDOW_MINUTES
     try:
-        row = await pool.fetchrow(
-            "SELECT value FROM settings WHERE key = $1", ALERT_REMEDIATION_SETTINGS_KEY
-        )
+        value = await get_setting(pool, ALERT_REMEDIATION_SETTINGS_KEY)
     except Exception as exc:  # noqa: BLE001 — a config read is never fatal
-        activity.logger.warning("alert_remediation_settings_read_failed err=%s", str(exc)[:200])
+        activity.logger.warning("alert_remediation_settings_read_failed err=%s", error_text(exc))
         return DEFAULT_RESTART_REPEAT_WINDOW_MINUTES
-    value = row["value"] if row else None
-    minutes = value.get("repeat_window_minutes") if isinstance(value, dict) else None
-    if isinstance(minutes, bool) or not isinstance(minutes, int) or minutes < 0:
-        return DEFAULT_RESTART_REPEAT_WINDOW_MINUTES
-    return minutes
+    return _alert_remediation.merge(value)["repeat_window_minutes"]
 
 
 def _task_row(t: Any) -> dict | None:
@@ -534,19 +498,12 @@ def _build_jira_scoping_prompt(
 
 
 def _decode_metadata(row: Any) -> dict:
-    """Decode a resource row's `metadata` column to a dict.
-
-    asyncpg's jsonb codec usually returns a dict already, but a string can
-    slip through (legacy double-encoded rows); decode defensively and fall
-    back to {} on anything unparseable.
-    """
-    m = row["metadata"]
-    if isinstance(m, str):
-        try:
-            return json.loads(m)
-        except Exception:
-            return {}
-    return m or {}
+    """A resource row's `metadata` as a dict, `{}` when it will not decode —
+    an unreadable row must not stop the alert being routed."""
+    try:
+        return decode_jsonb(row["metadata"], {})
+    except (ValueError, TypeError):
+        return {}
 
 
 def _coding_match(rid: Any, title: Any, meta: dict, confidence: float) -> dict:
@@ -797,7 +754,7 @@ class AlertActivities:
         try:
             rows = await self.db_pool.fetch(_CLAIM_ROWS_SQL)
         except Exception as exc:  # noqa: BLE001
-            activity.logger.warning("alert_label_claim_db_failed err=%s", str(exc)[:200])
+            activity.logger.warning("alert_label_claim_db_failed err=%s", error_text(exc))
             return None
         claims = _label_claims(alert, rows)
         if len(claims) > 1:
@@ -916,7 +873,7 @@ class AlertActivities:
         from aegis.connectors.todoist import TodoistConnector
 
         if workflow_id:
-            from aegis_worker.shared.temporal_links import workflow_run_footer
+            from aegis_worker.activities.temporal_links import workflow_run_footer
 
             footer = workflow_run_footer(
                 self.temporal_ui_url, workflow_id, run_id or "", self.temporal_namespace
@@ -977,11 +934,11 @@ class AlertActivities:
             activity.logger.warning(
                 "upload_kimi_log_fetch_failed file=%s error=%s",
                 output_file,
-                str(exc)[:200],
+                error_text(exc),
             )
             return {
                 "ok": False,
-                "error": f"fetch_failed: {str(exc)[:200]}",
+                "error": f"fetch_failed: {error_text(exc)}",
                 "file_attachment": None,
                 "file_name": "",
             }
@@ -1134,7 +1091,7 @@ class AlertActivities:
                 # A store that cannot answer costs the investigation its
                 # history, not its run. Logged so a degraded store shows up in
                 # the worker logs rather than as thinner verdicts.
-                activity.logger.warning("gather_alert_knowledge_kg_failed err=%s", str(exc)[:200])
+                activity.logger.warning("gather_alert_knowledge_kg_failed err=%s", error_text(exc))
 
         return "\n\n".join(parts)
 
@@ -1234,7 +1191,7 @@ class AlertActivities:
             )
         except Exception as exc:
             activity.logger.warning(
-                "resolve_infra_resource_db_failed err=%s", str(exc)[:200]
+                "resolve_infra_resource_db_failed err=%s", error_text(exc)
             )
             return null_result
         if not row:
@@ -1345,7 +1302,7 @@ class AlertActivities:
             env = await self.homelab_connector.service_ps(service)
         except Exception as exc:  # noqa: BLE001 — evidence, never a gate
             activity.logger.warning(
-                "alert_service_diagnostics_failed service=%s err=%s", service, str(exc)[:200]
+                "alert_service_diagnostics_failed service=%s err=%s", service, error_text(exc)
             )
             return []
         if not isinstance(env, dict) or not env.get("ok") or not isinstance(env.get("data"), list):
@@ -1512,7 +1469,7 @@ class AlertActivities:
 
     @activity.defn
     async def resolve_alert_resource(self, alert: dict) -> dict:
-        """Map an alert to matching resources using KG cache then LLM, with rule-based expansion.
+        """Map an alert to matching resources using the KG cache, then the LLM.
 
         Returns backward-compatible top-level fields plus a 'resources' list for multi-repo
         investigation. source: "label_claim" | "knowledge" | "sentry_project" |
@@ -1577,7 +1534,7 @@ class AlertActivities:
                 # Tier-1 KG cache miss for resource resolution — fall through
                 # to LLM. Log so KS flakiness is observable.
                 activity.logger.warning(
-                    "resolve_alert_resource_kg_lookup_failed err=%s", str(exc)[:200]
+                    "resolve_alert_resource_kg_lookup_failed err=%s", error_text(exc)
                 )
 
         # Fetch candidate resources for LLM to choose from. When the alert
@@ -1853,7 +1810,7 @@ class AlertActivities:
         ask the user to pick the right repo when not.
 
         Fetches all repository resources, runs the pure scorer
-        (`aegis_worker.relevance.score_resources`), and enriches the returned
+        (`aegis_worker.activities.relevance.score_resources`), and enriches the returned
         candidates with full resource fields so the flow can rebuild its
         resources_list from the user's pick.
 
@@ -1892,7 +1849,7 @@ class AlertActivities:
         Shared by score_resource_relevance (no hint) and reresolve_with_hint
         (hint passed through). Returns (RelevanceResult, candidates).
         """
-        from aegis_worker import relevance
+        from aegis_worker.activities import relevance
 
         rows = await self.db_pool.fetch(
             "SELECT id, title, metadata FROM resources WHERE kind = 'repository'"
@@ -2005,7 +1962,7 @@ class AlertActivities:
                 "output_file": "",
             }
 
-        # Kimi needs a checkout path. Connectors/runbooks/mcp_servers in the
+        # Kimi needs a checkout path. Connectors and runbooks in the
         # resources list have no path — pick the first resource that does.
         primary_idx = next(
             (i for i, r in enumerate(resources) if r.get("resource_path")),
@@ -2218,10 +2175,10 @@ class AlertActivities:
                 "engine": run_result.get("engine", "kimi"),
             }
         except Exception as exc:
-            activity.logger.error("run_investigation_failed error=%s", str(exc))
+            activity.logger.error("run_investigation_failed error=%s", error_text(exc, 500))
             return {
                 "status": "failed",
-                "output": f"Investigation error: {str(exc)[:500]}",
+                "output": f"Investigation error: {error_text(exc, 500)}",
                 "session_id": "",
                 "branch": "",
                 "branches": {},
@@ -2421,6 +2378,6 @@ class AlertActivities:
                 out["outcome"] = outcome
             return out
         except Exception as exc:
-            activity.logger.warning("record_verdict_to_kg_failed: %s", str(exc)[:200])
-            return {"ingested": False, "reason": str(exc)[:200]}
+            activity.logger.warning("record_verdict_to_kg_failed: %s", error_text(exc))
+            return {"ingested": False, "reason": error_text(exc)}
 

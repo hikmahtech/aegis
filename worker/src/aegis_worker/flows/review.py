@@ -14,6 +14,8 @@ from temporalio import workflow
 from temporalio.exceptions import ApplicationError
 
 with workflow.unsafe.imports_passed_through():
+    from aegis.errors import error_text, logged_failure
+
     from aegis_worker.activities.delivery import DeliveryActivities
     from aegis_worker.activities.review import (
         ReviewActivities,
@@ -78,7 +80,7 @@ async def _spawn_review_interaction(
         workflow.logger.warning(
             "review_interaction_spawn_failed kind=%s err=%s",
             kind,
-            str(exc)[:200],
+            error_text(exc),
         )
         return None
 
@@ -97,19 +99,15 @@ class DailyReviewFlow:
             )
             preview = format_daily_preview(digest)
             step = "send_message"
-            try:
+            with logged_failure("daily_review_delivery_failed", logger=workflow.logger):
                 await workflow.execute_activity_method(
                     DeliveryActivities.send_message,
                     args=[config.agent_id, preview],
                     start_to_close_timeout=TIMEOUT_FAST,
                     retry_policy=NO_RETRY,
                 )
-            except Exception as exc:  # noqa: BLE001
-                workflow.logger.warning(
-                    "daily_review_delivery_failed err=%s", str(exc)[:200]
-                )
             step = "today_focus"
-            try:
+            with logged_failure("daily_today_focus_failed", logger=workflow.logger):
                 focus = await workflow.execute_activity_method(
                     ReviewActivities.gather_today_focus,
                     start_to_close_timeout=TIMEOUT_FAST,
@@ -120,10 +118,6 @@ class DailyReviewFlow:
                     args=[config.agent_id, format_today_focus(focus)],
                     start_to_close_timeout=TIMEOUT_FAST,
                     retry_policy=NO_RETRY,
-                )
-            except Exception as exc:  # noqa: BLE001
-                workflow.logger.warning(
-                    "daily_today_focus_failed err=%s", str(exc)[:200]
                 )
             step = "spawn_review_interaction"
             interaction_id = await _spawn_review_interaction(
@@ -175,7 +169,7 @@ async def _spawn_decision_card(
         return True
     except Exception as exc:  # noqa: BLE001
         workflow.logger.warning(
-            "weekly_decision_spawn_failed idx=%s err=%s", idx, str(exc)[:200]
+            "weekly_decision_spawn_failed idx=%s err=%s", idx, error_text(exc)
         )
         return False
 
@@ -217,7 +211,7 @@ class WeeklyReviewFlow:
                 )
             except Exception as exc:  # noqa: BLE001
                 workflow.logger.warning(
-                    "weekly_key_dates_failed err=%s", str(exc)[:200]
+                    "weekly_key_dates_failed err=%s", error_text(exc)
                 )
                 key_dates = []
             # The formatter is guarded too, and separately: the gather and the
@@ -226,7 +220,7 @@ class WeeklyReviewFlow:
                 key_dates_block = format_key_dates(key_dates)
             except Exception as exc:  # noqa: BLE001
                 workflow.logger.warning(
-                    "weekly_key_dates_format_failed err=%s", str(exc)[:200]
+                    "weekly_key_dates_format_failed err=%s", error_text(exc)
                 )
                 key_dates_block = ""
             if key_dates_block:
@@ -242,28 +236,24 @@ class WeeklyReviewFlow:
                     retry_policy=NO_RETRY,
                 )
             except Exception as exc:  # noqa: BLE001
-                workflow.logger.warning("weekly_meeting_week_failed err=%s", str(exc)[:200])
+                workflow.logger.warning("weekly_meeting_week_failed err=%s", error_text(exc))
                 meeting_week = {}
             try:
                 meeting_block = format_meeting_week(meeting_week)
             except Exception as exc:  # noqa: BLE001
                 workflow.logger.warning(
-                    "weekly_meeting_week_format_failed err=%s", str(exc)[:200]
+                    "weekly_meeting_week_format_failed err=%s", error_text(exc)
                 )
                 meeting_block = ""
             if meeting_block:
                 narrative = f"{narrative}\n\n{meeting_block}"
             step = "send_message"
-            try:
+            with logged_failure("weekly_review_delivery_failed", logger=workflow.logger):
                 await workflow.execute_activity_method(
                     DeliveryActivities.send_message,
                     args=[config.agent_id, narrative],
                     start_to_close_timeout=TIMEOUT_FAST,
                     retry_policy=NO_RETRY,
-                )
-            except Exception as exc:  # noqa: BLE001
-                workflow.logger.warning(
-                    "weekly_review_delivery_failed err=%s", str(exc)[:200]
                 )
             step = "spawn_decisions"
             for i, decision in enumerate(decisions):

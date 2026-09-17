@@ -49,6 +49,8 @@ from typing import Any
 import asyncpg
 import structlog
 
+from aegis.errors import error_text
+
 logger = structlog.get_logger()
 
 # An occurrence within this long after a problem resolved reopens it; one
@@ -107,6 +109,12 @@ SOURCES = frozenset(
         # news (`services/research_topics.py`) and a `#research` task's
         # question (`hub_project.ensure_problem_for_task`).
         "research",
+        # An integration that has failed its consecutive-failure threshold
+        # (`services/connector_health.py`, #571). That tracker predates the hub
+        # and its one Slack ping was the only notice a dead connector ever
+        # produced — Calibre was down for two days with `alerted: true` and no
+        # problem behind it.
+        "connector",
     }
 )
 KINDS = frozenset({"occurrence", "resolved", "investigation", "plan", "session_note"})
@@ -424,6 +432,37 @@ async def list_events(
     return [dict(r) for r in rows]
 
 
+async def record_state_change(
+    conn: Any,
+    problem_id: Any,
+    external_id: str,
+    *,
+    severity: str,
+    payload: dict,
+    occurred_at: datetime,
+) -> None:
+    """One `state_change` row on the hub's own timeline.
+
+    Every transition the hub makes writes one of these and nothing else does:
+    the digest and the timeline read them rather than diffing `problems`
+    rows. Idempotent on `(source, external_id)` like every other occurrence,
+    so a retried write is a no-op rather than a second entry.
+
+    `conn` is a connection inside a transaction, or the pool where the write
+    stands alone.
+    """
+    await conn.execute(
+        "INSERT INTO problem_events (problem_id, source, external_id, kind, severity, "
+        "payload, occurred_at) VALUES ($1::uuid, 'hub', $2, 'state_change', $3, $4, $5) "
+        "ON CONFLICT (source, external_id) DO NOTHING",
+        problem_id,
+        external_id,
+        severity,
+        payload,
+        occurred_at,
+    )
+
+
 async def ingest_event(
     pool: asyncpg.Pool, event: Event, *, now: datetime | None = None
 ) -> IngestResult:
@@ -610,17 +649,13 @@ async def ingest_event(
             occurred_at,
         )
         if d.status is not None:
-            # The transition itself is history: the digest and the timeline
-            # read it rather than diffing problem rows.
-            await conn.execute(
-                "INSERT INTO problem_events (problem_id, source, external_id, kind, severity, "
-                "payload, occurred_at) VALUES ($1::uuid, 'hub', $2, 'state_change', $3, $4, $5) "
-                "ON CONFLICT (source, external_id) DO NOTHING",
+            await record_state_change(
+                conn,
                 problem_id,
                 f"{event.source}:{event.external_id}:{d.action}",
-                severity,
-                {"action": d.action, "status": d.status},
-                occurred_at,
+                severity=severity,
+                payload={"action": d.action, "status": d.status},
+                occurred_at=occurred_at,
             )
 
     action = {
@@ -686,7 +721,7 @@ async def _suppression_or_none(
         async with conn.transaction():
             return await _active_suppression(conn, subject, subject_kind, now)
     except Exception as exc:  # noqa: BLE001 — fail open: an alert beats a window
-        logger.warning("hub_service_state_unreadable", subject=subject, error=str(exc)[:200])
+        logger.warning("hub_service_state_unreadable", subject=subject, error=error_text(exc))
         return None
 
 
@@ -840,15 +875,13 @@ async def promote_expired_suppressions(
             await conn.execute(
                 "UPDATE problems SET status = 'open' WHERE id = $1::uuid", row["id"]
             )
-            await conn.execute(
-                "INSERT INTO problem_events (problem_id, source, external_id, kind, severity, "
-                "payload, occurred_at) VALUES ($1::uuid, 'hub', $2, 'state_change', $3, $4, $5) "
-                "ON CONFLICT (source, external_id) DO NOTHING",
+            await record_state_change(
+                conn,
                 row["id"],
                 f"promote:{row['id']}:{now.isoformat()}",
-                row["severity"],
-                {"action": "promote", "status": "open", "reason": "suppression_expired"},
-                now,
+                severity=row["severity"],
+                payload={"action": "promote", "status": "open", "reason": "suppression_expired"},
+                occurred_at=now,
             )
             promoted.append(row["id"])
     if promoted:
@@ -925,14 +958,12 @@ async def set_status(
             now,
             reopening,
         )
-        await conn.execute(
-            "INSERT INTO problem_events (problem_id, source, external_id, kind, severity, "
-            "payload, occurred_at) VALUES ($1::uuid, 'hub', $2, 'state_change', $3, $4, $5) "
-            "ON CONFLICT (source, external_id) DO NOTHING",
+        await record_state_change(
+            conn,
             problem_id,
             f"{source}:{problem_id}:{status}:{now.isoformat()}",
-            row["severity"],
-            {
+            severity=row["severity"],
+            payload={
                 # `resolve` and `reopen` are the two words the PROJECTOR acts
                 # on: it closes a task on one and reopens it on the other.
                 # Writing `set_status` for a move into `resolved` left the
@@ -947,7 +978,7 @@ async def set_status(
                 "status": status,
                 "reason": reason[:300],
             },
-            now,
+            occurred_at=now,
         )
     logger.info("hub_status_set", problem_id=problem_id, status=status, reason=reason[:80])
     return True
@@ -977,15 +1008,18 @@ async def mute_problem(
         )
         if row is None:
             return None
-        await conn.execute(
-            "INSERT INTO problem_events (problem_id, source, external_id, kind, severity, "
-            "payload, occurred_at) VALUES ($1::uuid, 'hub', $2, 'state_change', $3, $4, $5) "
-            "ON CONFLICT (source, external_id) DO NOTHING",
+        await record_state_change(
+            conn,
             problem_id,
             f"mute:{problem_id}:{now.isoformat()}",
-            row["severity"],
-            {"action": "mute", "until": until.isoformat(), "by": by, "reason": reason[:300]},
-            now,
+            severity=row["severity"],
+            payload={
+                "action": "mute",
+                "until": until.isoformat(),
+                "by": by,
+                "reason": reason[:300],
+            },
+            occurred_at=now,
         )
     logger.info("hub_problem_muted", problem_id=problem_id, until=until.isoformat(), by=by)
     return until
@@ -1216,15 +1250,18 @@ async def merge_problems(
                 merge_id,
                 now,
             )
-        await conn.execute(
-            "INSERT INTO problem_events (problem_id, source, external_id, kind, severity, "
-            "payload, occurred_at) VALUES ($1::uuid, 'hub', $2, 'state_change', $3, $4, $5) "
-            "ON CONFLICT (source, external_id) DO NOTHING",
+        await record_state_change(
+            conn,
             keep_id,
             f"merge:{keep_id}:{merge_id}:{now.isoformat()}",
-            keep["severity"],
-            {"action": "merge", "merged": merge_id, "by": by[:100], "status": keep["status"]},
-            now,
+            severity=keep["severity"],
+            payload={
+                "action": "merge",
+                "merged": merge_id,
+                "by": by[:100],
+                "status": keep["status"],
+            },
+            occurred_at=now,
         )
     logger.info("hub_problems_merged", keep_id=keep_id, merge_id=merge_id, by=by)
     parts = str(moved_events).split()
@@ -1335,14 +1372,13 @@ async def close_resolved(
     )
     ids = [r["id"] for r in rows]
     for problem_id in ids:
-        await pool.execute(
-            "INSERT INTO problem_events (problem_id, source, external_id, kind, severity, "
-            "payload, occurred_at) VALUES ($1::uuid, 'hub', $2, 'state_change', 'info', $3, $4) "
-            "ON CONFLICT (source, external_id) DO NOTHING",
+        await record_state_change(
+            pool,
             problem_id,
             f"close:{problem_id}:{now.isoformat()}",
-            {"action": "close", "reason": f"resolved more than {days:g} days ago"},
-            now,
+            severity="info",
+            payload={"action": "close", "reason": f"resolved more than {days:g} days ago"},
+            occurred_at=now,
         )
     if ids:
         logger.info("hub_problems_closed", count=len(ids), days=days)
@@ -1381,14 +1417,13 @@ async def close_problem(
             problem_id,
             now,
         )
-        await conn.execute(
-            "INSERT INTO problem_events (problem_id, source, external_id, kind, severity, "
-            "payload, occurred_at) VALUES ($1::uuid, 'hub', $2, 'state_change', 'info', $3, $4) "
-            "ON CONFLICT (source, external_id) DO NOTHING",
+        await record_state_change(
+            conn,
             problem_id,
             f"close:{problem_id}:{now.isoformat()}",
-            {"action": "close", "reason": reason},
-            now,
+            severity="info",
+            payload={"action": "close", "reason": reason},
+            occurred_at=now,
         )
     logger.info("hub_problem_closed", problem_id=problem_id)
     return True
@@ -1417,7 +1452,8 @@ async def list_problems(
     rows = await pool.fetch(
         "SELECT p.id::text AS id, p.correlation_key, p.class, p.subject, p.subject_kind, "
         "       p.title, p.severity, p.status, p.first_seen_at, p.last_seen_at, p.occurrences, "
-        "       p.muted_until, p.resolved_at, p.closed_at, p.todoist_task_id, p.group_key "
+        "       p.muted_until, p.resolved_at, p.closed_at, p.todoist_task_id, p.group_key, "
+        "       p.metadata->'projection' AS projection "
         f"FROM problems p WHERE {' AND '.join(where)} "
         f"ORDER BY p.last_seen_at DESC LIMIT ${len(args) - 1} OFFSET ${len(args)}",
         *args,

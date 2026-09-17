@@ -19,6 +19,8 @@ on:
       - "core/**"
       - "tests/comms/**"
       - "tests/conftest.py"
+      # tests/conftest.py imports it at load time (#325).
+      - "tests/pg_test_db.py"
       - "config/**"
       - "pyproject.toml"
       - ".github/workflows/comms.yml"
@@ -29,6 +31,8 @@ on:
       - "core/**"
       - "tests/comms/**"
       - "tests/conftest.py"
+      # tests/conftest.py imports it at load time (#325).
+      - "tests/pg_test_db.py"
       - "config/**"
       - "pyproject.toml"
       - ".github/workflows/comms.yml"

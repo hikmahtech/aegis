@@ -20,9 +20,11 @@ def test_tool_set_from_metadata_overrides_defaults():
 
 
 def test_tool_set_falls_back_to_default_when_no_metadata():
-    # No metadata → shipped default for a known agent.
+    # No metadata → the small fallback set, even for an example id (#579).
+    from aegis.services.chat import _FALLBACK_TOOL_SET
+
     raphael = {t["function"]["name"] for t in _get_agent_tools("raphael")}
-    assert "ask_knowledge" in raphael  # raphael's default set
+    assert raphael == set(_FALLBACK_TOOL_SET)
 
 
 def test_keyword_route_uses_provided_map():

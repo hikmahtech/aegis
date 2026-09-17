@@ -37,7 +37,6 @@ what that constant should be — not as a second constant.
 from __future__ import annotations
 
 import re
-from collections import Counter
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, timedelta
@@ -62,14 +61,6 @@ DUPLICATE = "duplicate_row"
 
 #: §8.5's foreign-currency band — the FX markup a card adds on top of the rate.
 FX_BAND = Decimal("0.05")
-
-#: Both banks in scope print rupees, so `statement_rows.amount` IS in this
-#: currency. Anything else on the journal side is the §8.5 candidate class,
-#: matched through `books.latest_prices`. The card parser also stores the
-#: original of a charge made abroad in `fx_currency`/`fx_amount` where the bank
-#: printed it — the exact figure the journal block holds, and a route to §8.5
-#: that needs no rate. Nothing here reads them yet.
-STATEMENT_CURRENCY = "INR"
 
 
 @dataclass(frozen=True)
@@ -307,13 +298,19 @@ def match_statements(
     entity_for_instrument: Mapping[str, str | Collection[str]] | None = None,
     rates: Mapping[str, Decimal] | None = None,
     window_days: int = journal_index._MATCH_DAYS,
-    currency: str = STATEMENT_CURRENCY,
+    currency: str,
 ) -> MatchRun:
     """Run §8.1's passes over `rows` and report; write nothing.
 
     `rows` may span several statements — the journal pool is shared across them,
     which is the point: a transaction claimed by the July statement is not
     offered to the August one.
+
+    `currency` is the books' home currency: the statements in scope print it,
+    so `statement_rows.amount` IS in it. Anything else on the journal side is
+    the §8.5 candidate class, matched through `books.latest_prices`. It has no
+    default because a wrong guess does not fail — it silently stops matching
+    every row.
     """
     rates = rates or {}
     # An empty set needs no filtering out: `_pass_candidates` reads this with
@@ -532,39 +529,6 @@ def summarise(outcomes: Iterable[RowOutcome]) -> tuple[StatementSummary, ...]:
             )
         )
     return tuple(summaries)
-
-
-def date_delta_report(outcomes: Iterable[RowOutcome]) -> dict[str, Counter[int]]:
-    """§8.2's deliverable: `statement_date - journal_date` per bank.
-
-    **Pass 2 and 2b only.** Pass 1 joins on a reference, which is exact and says
-    nothing about the lag between a bank posting a transaction and the email
-    that announced it — and `journal_index.ref` is filled only by the
-    deterministic parsers, so a report built on pass 1 would describe a handful
-    of rows while reading as evidence about all of them. This distribution is
-    the only thing that may move `journal_index._MATCH_DAYS`.
-    """
-    report: dict[str, Counter[int]] = {}
-    for outcome in outcomes:
-        if outcome.matched_pass not in (PASS_WINDOW, PASS_WINDOW_NO_INSTRUMENT):
-            continue
-        if outcome.delta_days is None:
-            continue
-        report.setdefault(bank_of(outcome.instrument), Counter())[outcome.delta_days] += 1
-    return report
-
-
-def window_coverage(
-    report: Mapping[str, Mapping[int, int]], days: int
-) -> dict[str, tuple[int, int]]:
-    """Per bank, `(matches within ±days, matches in total)` — what a window buys."""
-    return {
-        bank: (
-            sum(n for delta, n in deltas.items() if abs(delta) <= days),
-            sum(deltas.values()),
-        )
-        for bank, deltas in report.items()
-    }
 
 
 async def load_candidates(

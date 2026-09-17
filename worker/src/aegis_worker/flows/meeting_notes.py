@@ -22,6 +22,8 @@ from temporalio import workflow
 from temporalio.exceptions import ApplicationError
 
 with workflow.unsafe.imports_passed_through():
+    from aegis.errors import error_text
+
     from aegis_worker.activities.content import ContentActivities
     from aegis_worker.shared.retry import (
         NO_RETRY,
@@ -59,7 +61,7 @@ async def _record_outcome(content_id: str | None, outcome: str) -> None:
         workflow.logger.warning(
             "meeting_outcome_record_failed content_id=%s err=%s",
             content_id,
-            str(exc)[:200],
+            error_text(exc),
         )
 
 
@@ -139,7 +141,7 @@ class MeetingNotesFlow:
                     retry_policy=NO_RETRY,
                 )
             except Exception as exc:  # noqa: BLE001 — notes are filed; review is best-effort
-                workflow.logger.warning("meeting_analyse_failed msg_id=%s err=%s", msg_id, str(exc)[:200])
+                workflow.logger.warning("meeting_analyse_failed msg_id=%s err=%s", msg_id, error_text(exc))
                 analysis = {"skipped": "analysis_failed"}
             if not analysis or analysis.get("skipped"):
                 reason = (analysis or {}).get("skipped") or "no_result"

@@ -4,7 +4,7 @@ Like the A7 curiosity tests, the REAL `ProfileActivities` and the REAL
 `InteractionFlow` run against a real Postgres, so the assertions are about the
 `interactions` and `notification_log` rows production would actually write —
 not a recording stub of the spawn call. Only two things are faked: the LLM
-(`FakeLLM`) and `send_interaction_card`, which is the one step that leaves the
+(`RecordingFakeLLM`) and `send_interaction_card`, which is the one step that leaves the
 process (POST /api/deliver/card).
 
 The card child is spawned ABANDONED, so it is still working when the parent
@@ -33,6 +33,8 @@ from aegis_worker.flows.profile_reflection import ProfileReflectionConfig, Profi
 from temporalio import activity
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
+
+from tests.llm_stub import RecordingFakeLLM
 
 AGENT = "zza2f-profile"
 PURPOSE = "profile_reflection"
@@ -78,39 +80,6 @@ async def clean_db(db_pool):
     async with db_pool.acquire() as conn:
         await _wipe(conn)
         await conn.execute("DELETE FROM agents WHERE id = $1", AGENT)
-
-
-class FakeLLM:
-    def __init__(
-        self,
-        *,
-        response: str = "",
-        raises: BaseException | None = None,
-        by_purpose: dict[str, str] | None = None,
-    ):
-        self._response = response
-        self._raises = raises
-        # A5: the flow now makes TWO calls with different `purpose` values
-        # (profile_generalization, then profile_reflection). Keyed replies let a
-        # test answer each one without stubbing the activity.
-        self._by_purpose = by_purpose or {}
-        self.calls: list[dict] = []
-
-    async def think(self, **kwargs):
-        self.calls.append(kwargs)
-        if self._raises is not None:
-            raise self._raises
-        return {
-            "response": self._by_purpose.get(kwargs.get("purpose", ""), self._response),
-            "model": "fake-balanced",
-            "prompt_tokens": 5,
-            "completion_tokens": 7,
-        }
-
-    def prompt_for(self, purpose: str) -> str:
-        return next(
-            (str(c.get("prompt") or "") for c in self.calls if c.get("purpose") == purpose), ""
-        )
 
 
 def _llm_reply(doc: str = PROPOSED_DOC) -> str:
@@ -278,7 +247,7 @@ async def test_flow_cards_the_draft_and_charges_the_budget(clean_db):
     await _seed_doc(clean_db)
     await _seed_evidence(clean_db)
     cards: list = []
-    llm = FakeLLM(response=_llm_reply())
+    llm = RecordingFakeLLM(response=_llm_reply())
 
     async with await WorkflowEnvironment.start_time_skipping() as env:
         with env.auto_time_skipping_disabled():
@@ -346,7 +315,7 @@ async def test_a_quiet_week_sends_nothing(clean_db):
     """Acceptance: an empty evidence bundle → `skipped`, no card, no charge,
     and the LLM is never asked."""
     await _seed_doc(clean_db)
-    llm = FakeLLM(response=_llm_reply())
+    llm = RecordingFakeLLM(response=_llm_reply())
 
     async with await WorkflowEnvironment.start_time_skipping() as env:
         with env.auto_time_skipping_disabled():
@@ -367,7 +336,7 @@ async def test_a_quiet_week_sends_nothing(clean_db):
 async def test_an_llm_failure_is_a_quiet_week_not_a_failed_run(clean_db):
     await _seed_doc(clean_db)
     await _seed_evidence(clean_db)
-    llm = FakeLLM(raises=RuntimeError("litellm 503"))
+    llm = RecordingFakeLLM(raises=RuntimeError("litellm 503"))
 
     async with await WorkflowEnvironment.start_time_skipping() as env:
         with env.auto_time_skipping_disabled():
@@ -388,7 +357,7 @@ async def test_a_proposal_identical_to_the_current_doc_is_not_carded(clean_db):
     to ignore the card."""
     await _seed_doc(clean_db)
     await _seed_evidence(clean_db)
-    llm = FakeLLM(response=_llm_reply(doc=CURRENT_DOC))
+    llm = RecordingFakeLLM(response=_llm_reply(doc=CURRENT_DOC))
 
     async with await WorkflowEnvironment.start_time_skipping() as env:
         with env.auto_time_skipping_disabled():
@@ -422,7 +391,7 @@ async def test_a_proposal_activity_blow_up_degrades_to_skipped(clean_db):
             async with _flow_worker(
                 env.client,
                 clean_db,
-                llm=FakeLLM(response=_llm_reply()),
+                llm=RecordingFakeLLM(response=_llm_reply()),
                 drop=("propose_profile_patch",),
                 extra=[exploding],
             ) as run:
@@ -450,7 +419,7 @@ async def test_an_evidence_blow_up_degrades_to_skipped(clean_db):
             async with _flow_worker(
                 env.client,
                 clean_db,
-                llm=FakeLLM(response=_llm_reply()),
+                llm=RecordingFakeLLM(response=_llm_reply()),
                 drop=("gather_profile_evidence",),
                 extra=[exploding],
             ) as run:
@@ -471,7 +440,7 @@ async def test_second_run_the_same_day_is_budget_blocked(clean_db):
     await _seed_doc(clean_db)
     await _seed_evidence(clean_db)
     cards: list = []
-    llm = FakeLLM(response=_llm_reply())
+    llm = RecordingFakeLLM(response=_llm_reply())
 
     async with await WorkflowEnvironment.start_time_skipping() as env:
         with env.auto_time_skipping_disabled():
@@ -514,7 +483,7 @@ async def test_generalizations_reach_the_prompt_and_the_card(clean_db):
     await _seed_doc(clean_db)
     ids = await _seed_triple(clean_db)
     cards: list = []
-    llm = FakeLLM(
+    llm = RecordingFakeLLM(
         by_purpose={
             "profile_generalization": _generalization_reply(ids),
             "profile_reflection": _llm_reply(),
@@ -551,7 +520,7 @@ async def test_a_low_confidence_claim_never_reaches_the_card(clean_db):
     await _seed_doc(clean_db)
     ids = await _seed_triple(clean_db)
     cards: list = []
-    llm = FakeLLM(
+    llm = RecordingFakeLLM(
         by_purpose={
             "profile_generalization": _generalization_reply(ids, confidence=0.1),
             "profile_reflection": _llm_reply(),
@@ -593,7 +562,7 @@ async def test_a_generalization_activity_blow_up_still_cards(clean_db):
             async with _flow_worker(
                 env.client,
                 clean_db,
-                llm=FakeLLM(response=_llm_reply()),
+                llm=RecordingFakeLLM(response=_llm_reply()),
                 cards=cards,
                 drop=("propose_generalizations",),
                 extra=[exploding],

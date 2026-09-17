@@ -25,8 +25,10 @@ from typing import Any
 
 import httpx
 import structlog
-from aegis.services import feeds
+from aegis.services import feeds, feeds_config
+from aegis.services.settings_store import get_setting
 from aegis.services.url_guard import UnsafeURLError, guarded_hooks
+from aegis.services.user_agent import bot_user_agent
 from temporalio import activity
 
 from aegis_worker.activities.channels import _decode_config
@@ -39,6 +41,14 @@ logger = structlog.get_logger()
 class FetchFeedInput:
     url: str
     since_cursor: str | None = None  # ISO timestamp
+    # The external id of the entry the cursor stopped at (#584). With it the
+    # cursor is the pair `(since_cursor, since_cursor_id)` and an entry is new
+    # when its own `(published, id)` pair is greater, so entries that share
+    # the cursor's timestamp are not all dropped. "" is the lowest id: every
+    # entry AT the timestamp is offered again. None keeps the old rule, an
+    # entry is new only when its timestamp is later, for a run that started
+    # before the change.
+    since_cursor_id: str | None = None
 
 
 @dataclass
@@ -57,15 +67,17 @@ class FetchFeedResult:
 # parsing.
 _FEED_TIMEOUT = httpx.Timeout(30.0)
 _FEED_MAX_BYTES = 20 * 1024 * 1024
-# The headers feedparser sent when it fetched the feed itself, so a feed that
-# served feedparser still serves this.
-_FEED_HEADERS = {
-    "User-Agent": "feedparser/6.0 +https://github.com/kurtmckee/feedparser/",
-    "Accept": (
-        "application/atom+xml,application/rdf+xml,application/rss+xml,"
-        "application/x-netcdf,application/xml;q=0.9,text/xml;q=0.2,*/*;q=0.1"
-    ),
-}
+# The Accept header feedparser sent when it fetched the feed itself, so a feed
+# that served feedparser still serves this. The User-Agent is AEGIS's own
+# (`services/user_agent.py`), naming the deployment's contact URL.
+_FEED_ACCEPT = (
+    "application/atom+xml,application/rdf+xml,application/rss+xml,"
+    "application/x-netcdf,application/xml;q=0.9,text/xml;q=0.2,*/*;q=0.1"
+)
+
+
+def feed_headers(user_agent: str = "") -> dict[str, str]:
+    return {"User-Agent": user_agent or bot_user_agent(), "Accept": _FEED_ACCEPT}
 
 
 def gate_pattern(terms: list[str]) -> re.Pattern[str] | None:
@@ -92,7 +104,7 @@ def passes_gate(pattern: re.Pattern[str] | None, entry: dict) -> bool:
     return bool(pattern.search(f"{entry.get('title') or ''} {entry.get('summary') or ''}"))
 
 
-async def _download_feed(url: str) -> tuple[bytes, dict[str, str], str]:
+async def _download_feed(url: str, user_agent: str = "") -> tuple[bytes, dict[str, str], str]:
     """`(body, headers for feedparser, error)`: the feed's bytes, or why there
     are none. Never raises. An HTTP error, a refused hop, a network failure and
     a body past `_FEED_MAX_BYTES` are all a failed fetch."""
@@ -102,7 +114,7 @@ async def _download_feed(url: str) -> tuple[bytes, dict[str, str], str]:
                 timeout=_FEED_TIMEOUT,
                 follow_redirects=True,
                 event_hooks=guarded_hooks(),
-                headers=_FEED_HEADERS,
+                headers=feed_headers(user_agent),
             ) as client,
             client.stream("GET", url) as resp,
         ):
@@ -155,11 +167,20 @@ def _as_uuid(value: str) -> uuid.UUID | None:
 @dataclass
 class RssActivities:
     db_pool: Any
+    # The User-Agent feed fetches send (__main__: `bot_user_agent(settings)`).
+    user_agent: str = ""
+
+    @activity.defn
+    async def load_feeds_config(self) -> dict:
+        """The `feeds_config` row merged over its defaults (`services/
+        feeds_config.py`), for the flow: a workflow cannot read the DB, and
+        the thresholds it applies are the deployment's, not the code's."""
+        return await feeds_config.get_feeds_config(self.db_pool)
 
     @activity.defn
     async def fetch_feed(self, input: FetchFeedInput) -> FetchFeedResult:
         """Fetch and parse a feed. Entry dicts: {id, title, link, summary, published}."""
-        body, headers, error = await _download_feed(input.url)
+        body, headers, error = await _download_feed(input.url, self.user_agent)
         if error:
             return FetchFeedResult(error=error)
 
@@ -194,12 +215,20 @@ class RssActivities:
                 else:
                     published_iso = getattr(e, "published", "") or getattr(e, "updated", "")
 
-                if input.since_cursor and published_iso and published_iso <= input.since_cursor:
-                    continue
+                entry_id = getattr(e, "id", "") or getattr(e, "link", "")
+                if input.since_cursor and published_iso:
+                    if input.since_cursor_id is None:
+                        if published_iso <= input.since_cursor:
+                            continue
+                    elif (published_iso, entry_id) <= (
+                        input.since_cursor,
+                        input.since_cursor_id,
+                    ):
+                        continue
 
                 entries.append(
                     {
-                        "id": getattr(e, "id", "") or getattr(e, "link", ""),
+                        "id": entry_id,
                         "title": getattr(e, "title", ""),
                         "link": getattr(e, "link", ""),
                         "summary": getattr(e, "summary", "")[:500]
@@ -227,9 +256,7 @@ class RssActivities:
         for r in rows:
             topics = _decode_config(r["config"]).get("topics") or []
             terms += [t for t in topics if isinstance(t, str)] if isinstance(topics, list) else []
-        value = await self.db_pool.fetchval(
-            "SELECT value FROM settings WHERE key = $1", TRACKED_TOPICS_SETTING
-        )
+        value = await get_setting(self.db_pool, TRACKED_TOPICS_SETTING)
         terms += tracked_search_terms(value)
         seen: set[str] = set()
         out: list[str] = []
@@ -279,7 +306,7 @@ class RssActivities:
 
         * `fetch_failures` / `fetch_successes`: fetches in a row that failed /
           worked; each resets the other. A failing feed resolves on
-          `feeds.RECOVERED_AFTER` good fetches in a row, not on the first.
+          `feeds_config.recovered_after` good fetches in a row, not on the first.
         * `last_stored_at`: the newest entry the store kept for the feed
           (`feed_entries.seen_at`, failed entries left out) — what staleness is
           measured from.

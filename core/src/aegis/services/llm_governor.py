@@ -37,6 +37,9 @@ from typing import Any
 
 import structlog
 
+from aegis.errors import error_text
+from aegis.services.settings_store import get_setting, put_setting
+
 logger = structlog.get_logger()
 
 GOVERNOR_KEY = "llm_governor"
@@ -65,11 +68,10 @@ async def get_governor_config(pool: Any) -> dict[str, Any]:
     """Governor knobs, with defaults for a missing/garbage row. Never raises."""
     cfg = dict(_DEFAULT_GOVERNOR)
     try:
-        row = await pool.fetchrow("SELECT value FROM settings WHERE key = $1", GOVERNOR_KEY)
+        value = await get_setting(pool, GOVERNOR_KEY)
     except Exception as exc:  # noqa: BLE001 — a settings read must not break the flow
-        logger.warning("llm_governor_config_read_failed", error=str(exc)[:200])
+        logger.warning("llm_governor_config_read_failed", error=error_text(exc))
         return cfg
-    value = row["value"] if row else None
     if isinstance(value, dict):
         cfg["daily_token_budget"] = _coerce_int(value.get("daily_token_budget"))
         model_filter = value.get("model_filter")
@@ -89,12 +91,11 @@ async def get_kill_switch(pool: Any, *, use_cache: bool = True) -> dict[str, Any
 
     state = dict(_INACTIVE)
     try:
-        row = await pool.fetchrow("SELECT value FROM settings WHERE key = $1", KILL_KEY)
+        value = await get_setting(pool, KILL_KEY)
     except Exception as exc:  # noqa: BLE001 — fail open, see docstring
-        logger.warning("llm_kill_switch_read_failed", error=str(exc)[:200])
+        logger.warning("llm_kill_switch_read_failed", error=error_text(exc))
         return dict(_INACTIVE)
 
-    value = row["value"] if row else None
     if isinstance(value, dict):
         state = {
             "active": bool(value.get("active", False)),
@@ -108,12 +109,7 @@ async def get_kill_switch(pool: Any, *, use_cache: bool = True) -> dict[str, Any
 async def set_kill_switch(pool: Any, *, active: bool, reason: str, set_by: str) -> None:
     """Upsert the kill switch and invalidate the cache so it applies at once."""
     value = {"active": bool(active), "reason": reason or "", "set_by": set_by or ""}
-    await pool.execute(
-        "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW()) "
-        "ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()",
-        KILL_KEY,
-        value,
-    )
+    await put_setting(pool, KILL_KEY, value)
     invalidate_kill_cache()
     logger.info("llm_kill_switch_set", active=bool(active), set_by=set_by, reason=reason[:200])
 

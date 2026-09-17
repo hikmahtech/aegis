@@ -12,6 +12,7 @@ from typing import Any
 
 import asyncpg
 from aegis.clarify_note import AGENT_REPLY_PREFIX, CLARIFY_NOTE_PREFIX
+from aegis.services.settings_store import get_setting
 from temporalio import activity
 
 _ASSIGNEE_LABELS = {"@me", "@sebas", "@raphael", "@maou", "@pandora"}
@@ -732,11 +733,9 @@ class TodoistActivities:
 
         # Already bootstrapped via settings row? Self-heal when keys are missing.
         async with self.db_pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT value FROM settings WHERE key = 'todoist_managed_project_ids'"
-            )
-            if row is not None and row["value"]:
-                existing = dict(row["value"])
+            stored = await get_setting(conn, "todoist_managed_project_ids")
+            if stored:
+                existing = dict(stored)
                 # Expected keys = inbox (adopted) + every key listed in seed YAML
                 from pathlib import Path
 

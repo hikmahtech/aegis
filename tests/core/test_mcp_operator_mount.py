@@ -24,7 +24,7 @@ AGENT = "zzd1-operator-agent"
 
 # Granted in the DB so the ungated mount must strip them and the operator
 # mount must keep them.
-TOOL_SET = ["whats_next", "dispatch_agent_run", "stop_agent_run", "call_mcp_tool"]
+TOOL_SET = ["whats_next", "dispatch_agent_run", "stop_agent_run"]
 
 
 def _settings(**over) -> Settings:
@@ -124,12 +124,6 @@ async def test_operator_mount_serves_the_run_spawning_tools(client):
     assert "stop_agent_run" in names
 
 
-async def test_operator_mount_still_withholds_the_mcp_passthrough(client):
-    """Confused-deputy risk does not depend on who opened the door."""
-    resp = await _list(client, f"/api/mcp-server/{AGENT}/operator", ADMIN_KEY)
-    assert "call_mcp_tool" not in _names(resp)
-
-
 async def test_every_mount_answers_get_with_405_behind_the_spa(db_pool, agent_row, tmp_path, monkeypatch):
     """Claude Code's MCP client probes the URL it mounted with a GET, asking
     for a server stream. The streamable-HTTP spec's answer for "none" is 405.
@@ -164,4 +158,3 @@ async def test_the_run_mount_still_withholds_run_spawning_tools(client):
     names = _names(resp)
     assert "dispatch_agent_run" not in names
     assert "stop_agent_run" not in names
-    assert "call_mcp_tool" not in names

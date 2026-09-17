@@ -601,6 +601,65 @@ threshold decides what is ever *asked*, the cache decides what the answer was.
 Turning the whole sweep off is not an alternative to either — it also stops
 suppression promotion and projection.
 
+### When a resolve never arrives
+
+Every producer on the hub has a way back except one, and the exception cost a
+problem 15 hours and a chore that could never end (#551).
+
+Alertmanager resolves a problem **only** when its `resolved` webhook arrives,
+and it keeps its firing alerts in memory. So a restart — a monitoring redeploy,
+a config reload, an OOM, a node move — makes it forget every alert it was
+holding, and those webhooks are never sent. The same hole swallows a resolve
+sent during an ingress outage, which is the outage the ingress canary above
+exists to catch. Every other lane recovers on its own: the heartbeat re-checks
+the swarm each tick, and the watchdogs resolve what they stop finding.
+
+`HubSweepFlow` now asks alertmanager what it is still holding and resolves the
+live problems it no longer lists. Set the internal address on the sweep's
+`activities.config` row — the public host is behind an identity proxy:
+
+```sql
+UPDATE activities SET config = config || '{"alertmanager_url": "http://alertmanager:9093"}'::jsonb,
+  updated_at = now()
+WHERE workflow_type = 'HubSweepFlow';
+```
+
+Empty, the default, disables it; a fork ships nobody's monitoring host.
+
+**Every part of it fails closed**, because the cost of getting this wrong is
+resolving a live estate in one tick:
+
+- unreachable, timed out, or a non-200 → nothing is resolved, because a
+  monitoring stack that cannot answer must never read as "everything
+  recovered";
+- **alertmanager up for less than `alertmanager_min_uptime_seconds` (900) →
+  nothing is resolved.** This is the guard the original defect taught: a
+  freshly restarted alertmanager holds no alerts at all until Prometheus
+  re-sends them, so reconciling against that empty set would close every open
+  problem. Prometheus re-sends on the order of a minute, so the default leaves
+  a wide margin;
+- a problem whose **last** occurrence is younger than ten minutes is left
+  alone: an alert that just fired is firing now, whatever alertmanager has
+  managed to group. (Bounding the FIRST occurrence instead, as the first version
+  did, let a four-day-old problem that fired thirty seconds ago straight
+  through — #561.);
+- a problem is judged on **every fingerprint it has ever had**, and resolved
+  only if alertmanager lists none of them. A fingerprint hashes the label set,
+  so a recurring fault arrives under a new one each time — one problem here had
+  26 across 27 occurrences — and judging on the first meant comparing against a
+  hash that could never be active again, which closed a live problem within a
+  minute of every legitimate reopen;
+- a **group** problem is left alone: its subject is `*`, it stands for a class
+  rather than one alert, and no single fingerprint speaks for it.
+
+A silenced or inhibited alert counts as still firing — someone has only asked
+not to be told — so its problem stays live.
+
+The timeline says what is actually known: *alertmanager no longer lists this
+alert*. Not that the alert cleared. Only the first of those is evidenced, and
+a hub that overstates its evidence is how you end up trusting a closed problem
+that is still broken.
+
 ### A problem and its task stay in step
 
 The task is a view of the problem, and four rules keep the two agreeing
@@ -796,8 +855,10 @@ key is pasted.)
 
 #### The infra list and the infra repo
 
-Both live in the `infra_alert_routing` settings row. Read and replace it over
-the admin API:
+Both live in the `infra_alert_routing` settings row, editable on the admin
+**Problems** page under *Hub configuration* — the infra repo, the extra
+alertnames, and what to tell an investigation about this cluster. The same row
+over the admin API, for a script:
 
 ```bash
 curl -sS -H "X-API-Key: $AEGIS_API_KEY" "$AEGIS_URL/api/admin/infra-alert-routing"
@@ -815,10 +876,10 @@ curl -sS -X PUT "$AEGIS_URL/api/admin/infra-alert-routing" \
   your setup goes here. Names are compared lowercased.
 - `repo` is the `owner/name` (the resource's GitHub repo) that infra alerts
   are investigated in. Unset means infra alerts get an LLM-only investigation.
-  It is also the repo that a connector or service alert expands to, on the
-  grounds that the config which deploys a thing is as likely to be at fault as
-  the thing. Before #505 that expansion looked for a repo whose path ended in
-  `infra-gitops`, so it never fired for anyone who named theirs otherwise.
+  There is no expansion to it from an application alert: the candidate query
+  admits only coding-enabled repositories (#35), so a connector or a service is
+  never among the picks. A rule that claimed otherwise was deleted in #505 —
+  it had been unreachable since that allow-list landed.
 - `platform_hint` is one or two sentences saying what the cluster IS and how to
   read it. The instructions AEGIS puts in front of an infra investigation name
   no orchestrator, because it has no way to know whether you run Swarm, k8s,
@@ -990,19 +1051,13 @@ name, except that a restart of one service in a group problem does not count
 against another.
 
 The window is 60 minutes. Change it, or set `0` to restart every time as
-before, in the `alert_remediation` settings row. The worker reads it on every
-restart, so a change applies to the next alert; no restart. A value that is
-not a whole number of minutes counts as 60.
-
-```sql
-INSERT INTO settings (key, value)
-VALUES ('alert_remediation', '{"repeat_window_minutes": 60}')
-ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now();
-```
-
-Both changes are behind `workflow.patched` ids, `gate2-only-for-decisions`
-and `auto-restart-once-per-window`, so a run that was waiting on its card
-when the worker was redeployed finishes the way it started.
+before, on the admin **Problems** page → *Hub configuration* → *Automatic
+restart* (the `alert_remediation` settings row, `GET/PUT
+/api/admin/alert-remediation`, `services/alert_remediation.py`). The page
+refuses anything but a whole number of minutes from 0 to 1440, and every save
+is audited. The worker reads the row on every restart, so a change applies to
+the next alert; no restart. A stored value that is not a whole number of
+minutes counts as 60.
 
 ### After Open PR: following the fix to a verified fix
 
@@ -1464,9 +1519,46 @@ it is env-only (`AEGIS_BOOKS_PATH`), because it is a container path, not a choic
 |---|---|
 | `books_repo_url` | The books repo, SSH form (`git@github.com:<org>/books.git`). Empty = posting disabled: money mail is still parsed and indexed, never written to a journal |
 | `books_deploy_key` | The private half of an ed25519 deploy key with write access on that repo. Paste the PEM or its base64 |
+| `home_currency` | The ISO code the books report in. hledger converts every balance and check to it, and a posting naming no currency is written in it |
 | `books_ignored_mailboxes` | Comma-separated mailbox labels whose money is not yours (an employer's account, say). Their mail is classified `ignore` |
-| `books_mailbox_entities` | `label=entity,...` where entity is `personal` or `hikmah` — which set of books a mailbox's money belongs to. An unlisted mailbox is `personal` |
-| `books_todoist_projects` | `personal=<project id>,hikmah=<project id>` — where dated dues are captured. Unset = the Inbox |
+| `books_mailbox_entities` | `label=entity,...` — which set of books a mailbox's money belongs to, naming an entity from the chart below. An unlisted mailbox belongs to the default entity |
+| `books_todoist_projects` | `<entity>=<project id>,...` — where dated dues are captured. Unset = the Inbox |
+
+### The chart of accounts
+
+Which sets of books exist, and which category posts to which account, are
+configuration too (#561) — the `settings` row keyed `books_chart`, read on every
+post, so a change needs no restart. Edit it on the admin **Money** page, under
+*Its entities* (`GET/PUT /api/admin/money/chart`); `services/books_chart.py` is
+the only reader and the only writer.
+
+An **entity** is one set of books: an id (which names its journal directory), a
+label, an account-name **segment**, its two **unknown** accounts and its
+category → account map. The segment is what tells an account's entity from its
+name: with a segment of `acme`, `expenses:acme:rent` and `income:acme:fees`
+belong to `acme`. The **default entity** has an empty segment and owns every
+expense and income account no other entity claims. Assets, liabilities and
+equity are entity-neutral by design — every set of books shares the bank
+accounts — which is what lets a cross-entity correction happen at all.
+
+Reading is lenient and writing is strict, deliberately: a malformed row must
+never stop money being posted, but a typo saved with a 200 would misfile
+transactions for months. The PUT 400s on an entity id that is not
+`[a-z0-9_-]{1,32}`, a default entity that is not one of the entities, an account
+name that is not colon-separated lowercase segments, an unknown-IN account
+outside `income:` or an unknown-OUT outside `expenses:`, two entities claiming
+one segment, and a non-default entity with no segment (nothing in an account
+name could point at it). A refused save writes nothing.
+
+Nothing here creates an account. hledger's own `account` declarations are still
+the chart, and `check --strict` refuses a block naming anything they do not
+declare — a category pointed at an undeclared account falls back to the
+entity's unknown account rather than writing it.
+
+A fresh deployment starts on the code default: one entity, `personal`, no
+segment, generic categories. Migration `049_books_chart.sql` seeds an existing
+one with the chart the code used to carry, so the day after the deploy posts
+where the day before did.
 
 The whole money lane, books included, is gated on **Money Hygiene**
 (`money_hygiene_enabled` / `AEGIS_MONEY_HYGIENE_ENABLED`). With that off no money
@@ -1687,7 +1779,7 @@ Raphael researches with five chat tools and one flow (#509).
 | `read_url` | One page's readable text, bounded. Public http(s) hosts only |
 | `paper_search` | arXiv and Semantic Scholar together: title, authors, date, abstract, citation count, and an id for `paper_read`. One engine failing still returns the other's papers |
 | `paper_read` | A paper's text from its PDF, by arXiv id, `s2:<id>` or PDF URL |
-| `research_topic` | Hands the question to `ResearchFlow` and waits up to 45s for the answer |
+| `research_topic` | Hands the question to `ResearchFlow` and waits `wait_seconds` (45 by default) for the answer |
 
 The four reads fetch and return; nothing is stored. They are on the MCP gated
 endpoint's read-only list, and they stay there: fetching is not writing.
@@ -1706,9 +1798,11 @@ the same question again replaces the old answer. Only a real answer is saved: a
 run whose synthesis failed says so and stores nothing.
 
 - **From chat**, the run's id is `research-<hash of the question>`, so a retried
-  turn re-attaches to the run in flight. Past 45s the tool answers "still
-  researching", and the flow posts the answer to the agent's channel when it
-  lands.
+  turn re-attaches to the run in flight. Past `wait_seconds` the tool answers
+  "still researching", and the flow posts the answer to the agent's channel
+  when it lands. The run belongs to the calling agent, else to whoever holds
+  the `research` capability tag; with no such agent the answer is still made
+  and nobody's channel gets the late copy.
 - **A `#research` task** assigned to an agent goes to the `research` verb
   (`agent_task_verbs`): the task gets a hub problem (`ensure_problem_for_task`,
   as a `@code` task does), the answer is posted as one comment with its numbered
@@ -1727,6 +1821,39 @@ UPDATE agents
  WHERE id = 'raphael'
    AND NOT (metadata->'tool_set' ? 'web_search');
 ```
+
+### Configuring the lane (Admin → Research)
+
+Nothing about one person or one installation is in the code: the lane's
+knobs are `settings` rows, each merged over code defaults that equal the old
+constants, edited on **Admin → Research** (`routes/research_admin.py`,
+`GET/PUT /api/admin/research/*`). Every PUT validates and answers 400 with a
+reason; the generic `/api/settings` editor validates nothing, so use the page.
+
+| Row | Page card | What it holds | Defaults |
+|---|---|---|---|
+| `intelligence_topics` | Tracked topics | The registry the scans and the feed gate read, edited whole under the same advisory lock `track_topic` takes; each topic may carry its own `threshold` | (empty) |
+| `research_topics_config` | Topic thresholds | `attention` per priority, `digest_items` | high 2, medium 3, low 5; 10 |
+| `feeds_config` | Feed health | `failing_after`, `recovered_after`, `stale_after_days`, `unused_after_days`, `stale_review_hour`, `default_ingest` | 3, 2, 30, 90, 3, `full` |
+| `research_config` | Research limits | `wait_seconds`, per-depth `pages`/`web_results`/`papers`, `page_chars`, `report_chars`, `knowledge_hits`, `note_hits`, `academic_terms` | 45; quick 3/8/5, thorough 6/15/10; 6000; 8000; 5; 3; the paper words |
+| `library_config` | Library limits | `read_chars`, `passages`, `passage_chars`, `pdf_default_pages`, `research_book_hits`, `research_passage_min_similarity`, `research_passage_chars`, `research_pdf_scan_pages`, `stopwords` | 12000, 4, 1200, 5, 3, 0.5, 3000, 60, the list |
+
+Core sees a save within 30 s (`services/config_rows.py` caches each row that
+long); the worker reads `feeds_config` through the `load_feeds_config`
+activity at the start of every `RssIngestFlow` run and the others on each
+activity call. Three more things moved to the Integrations page:
+`semantic_scholar_api_key` (sent as `x-api-key`; blank is the public tier),
+`bot_contact_url` (named in the `AegisBot/2.0 (+url)` User-Agent every fetch
+sends; blank falls back to `aegis_ui_url`) and `elevenlabs_stt_model`. The
+intel scans' searxng query per topic is `query_template` on each scan row's
+`activities.config` (`{topic}` = the term); the seed rows carry the built-in
+queries. The curiosity detectors' thresholds are on the `curiosity-daily` row
+(`min_attendee_events`, `min_project_tasks`, `empty_search_days`,
+`min_empty_searches`, `search_miss_below`). What stays in code, on purpose:
+`url_guard.py`, the fetch size and time caps, the untrusted-text framing, the
+tool schema caps (`_MAX_CHARS_CAP`, 40,000 characters and 30 pages a book
+read), the Calibre read-only and no-redirect rules, and the `#research` /
+`#feeds` tag vocabulary.
 
 Every fetch of a URL that a model chose, a page named or a feed publishes goes
 through `services/url_guard.py`. The first request and every redirect must
@@ -1766,15 +1893,17 @@ prompt actually used. Admin → Channels shows it per feed, and so do
 
 - entries and stored documents in the last 30 days, plus how many were
   abstract only;
-- documents used in the last 30 and 90 days;
+- documents used in the last 30 days and over `unused_after_days` (90 by
+  default; the columns keep their `_90d` names);
 - the last entry, the backlog and consecutive fetch failures.
 
 Chat turns and research runs write the injection log (`source` `chat` and
 `research`). A briefing or a rollup does not log what it reads, so "used" is a
 floor.
 
-On the 1st of each month, Raphael's briefing names the active feeds that have
-90 days of history and no use in that time. The migration backfills history
+On the 1st of each month (`feed_review_day` on the briefing row; 0 = every
+run), Raphael's briefing names the active feeds that have `unused_after_days`
+of history and no use in that time. The migration backfills history
 by host (an arXiv entry lives on arxiv.org). A feed whose links point
 elsewhere, like Hacker News, starts its history at the deploy.
 
@@ -1821,9 +1950,11 @@ or `paper_read`.
 
 ### When a feed breaks
 
-- **Failing:** three fetches in a row that fail (an HTTP error, a response
-  that is not a feed, or a fetch the URL guard refused) are a `feeds` hub
-  finding of class `feed_failing`. The feed itself is fetched through
+- **Failing:** `failing_after` fetches in a row that fail (three by default;
+  an HTTP error, a response that is not a feed, or a fetch the URL guard
+  refused) are a `feeds` hub finding of class `feed_failing`. The numbers in
+  this section are the `feeds_config` row (Admin → Research → Feed health);
+  `stale_after_days` alone can also be set per feed. The feed itself is fetched through
   `url_guard` (every redirect checked, 30 s, 20 MB), and only the bytes go to
   feedparser. The finding records an occurrence when the feed crosses that
   line and once a day at the review hour; the hourly runs in between only keep
@@ -1840,8 +1971,8 @@ or `paper_read`.
   recorded entry, else its first poll (`channels.config.tracking_since`).
   That is `feeds.tracking_since`, the same date the feed stats show.
 - **Recovery:** a stale finding resolves when the feed stores an entry again.
-  A failing one resolves only after two good fetches in a row
-  (`feeds.RECOVERED_AFTER`, counted in `channels.config.fetch_successes`).
+  A failing one resolves only after `recovered_after` good fetches in a row
+  (two by default, counted in `channels.config.fetch_successes`).
   One good fetch, a failure under the threshold, or a run whose feed record
   could not be written keeps the problem open without adding an occurrence
   (`hub_watch.reconcile_findings`, `record: False`). The problem's subject is
@@ -1851,6 +1982,17 @@ or `paper_read`.
 A `process_content` that returns `status: error` now counts as a failure. The
 entry's claim is released and the cursor is fenced, so the next run retries it
 instead of counting it as ingested.
+
+The cursor is a pair: `channels.config.last_cursor` (the entry's `published`
+timestamp) and `last_cursor_id` (its id, else its link). An entry is new when
+its `(published, id)` pair comes after the cursor's. Before #584 the cursor
+was the timestamp alone. arXiv publishes a whole day as one burst of entries
+that share one timestamp, so a capped run moved the cursor onto that
+timestamp and the rest of the burst was dropped: exactly 30 stored per
+announcement day. A channel with only `last_cursor` still works. A missing id
+counts as the lowest id, so the entries at that timestamp are offered once
+more. The ones already stored come back as duplicates, and the cursor moves
+past them. To make a feed start over, clear both keys, not just one.
 
 ### Retention (dry run only)
 
@@ -1900,12 +2042,15 @@ bulk text is exactly what not to index.
   (everything the tools and flows share: EPUB chapters and PDF pages, passage
   search, the index row), `services/tools/library.py`, and the worker's
   `CalibreActivities` + `CalibreSyncFlow`.
-- **Never the public host.** `calibre.hikmahtech.in` is behind Cloudflare
-  Access: every path, `/opds` included, 302s to a login page — the trap that
-  broke Miniflux (#70). The connector refuses that host and treats any redirect
-  as an error. Use the internal address `http://calibre-web_calibre-web:8083`:
-  aegis-core and the worker both sit on the `traefik_public` overlay with
-  calibre-web.
+- **Never a host behind an SSO login page.** A calibre-web fronted by an
+  identity proxy (Cloudflare Access, Authelia, oauth2-proxy) answers every
+  path, `/opds` included, with a 302 to its login page — the trap that broke
+  Miniflux (#70). No host is named in code: the connector follows no redirect
+  at all, so any 3xx is an error, never a login page parsed as "no books".
+  Point `calibre_url` at the address the stack reaches calibre-web directly
+  (on this deployment `http://calibre-web_calibre-web:8083`, the
+  `traefik_public` overlay both aegis-core and the worker share). There is no
+  default URL: blank means not configured.
 - **Reading:** EPUB is read by chapter (the book's own table of contents names
   them), PDF by page (at most 30 pages a read; a query scans the first 150, or
   the first 60 inside research). MOBI and AZW3 cannot be read. Files over 80 MB
@@ -1922,9 +2067,11 @@ bulk text is exactly what not to index.
 1. In calibre-web (Admin → Users → Add new user), create a user for AEGIS:
    allow **download**; do not allow upload, edit, delete or admin. Basic auth
    and OPDS are on by default.
-2. On AEGIS's Integrations page, group **Calibre (library)**: set the user and
-   password, and leave the URL at the internal default. Core uses the new
-   values at once; restart the worker for `CalibreSyncFlow`.
+2. On AEGIS's Integrations page, group **Calibre (library)**: set the URL
+   (the internal address — there is no default), the user and the password.
+   `calibre_max_book_mb` (80) and `calibre_max_books` (3000) are the caps on
+   a book file and on the catalogue. Core uses the new values at once; restart
+   the worker for `CalibreSyncFlow`.
 3. Grant Raphael the four tools. The DB `tool_set` wins over the seed:
 
    ```sql
@@ -1940,24 +2087,110 @@ bulk text is exactly what not to index.
 Until step 2 the tools answer "not configured" and the flow reports
 `not_configured`; both are the intended inert state.
 
+### When calibre-web answers 500: SQLite over NFS
+
+A `disk I/O error` from calibre-web is almost never a broken database. It is
+what SQLite reports when a read on an open file handle fails, and on an NFS
+mount the usual reason is **ESTALE** — the server restarted, the client's state
+recovery failed, and every long-held handle is dead for good.
+
+That is how Calibre was down for two days (2026-09-13). calibre-web's `/config`
+is an NFS mount from the TrueNAS box, which sits on the homelab's failing power
+domain (`homelab-gitops/docs/infrastructure/power-domains-and-outages.md`). The
+server went away at 06:24:43 and the kernel said so:
+
+```
+NFSv4: state recovery failed for open file config/app.db, error = -116   (×11)
+```
+
+SQLAlchemy's connection pool held eleven handles on `app.db` and never
+revalidates one, so every request that drew a stale connection returned 500 for
+ever. Nothing restarts the process on its own.
+
+How to tell it apart from a corrupt database, in the order that settles it
+fastest — a fresh process opens the file by name and gets the *current* inode,
+so the first two steps succeed on a stale-handle fault and fail on a real one:
+
+```bash
+# 1. Does a fresh process read it? (`.tables` as the app's user, on the node)
+docker exec <cid> s6-setuidgid abc sqlite3 file:/config/app.db?mode=ro .tables
+# 2. Can a fresh process write? (begin immediate takes the lock, rollback undoes it)
+docker exec <cid> s6-setuidgid abc sqlite3 /config/app.db 'begin immediate; rollback;'
+# 3. Then the deciding one: what do the RUNNING process's handles point at?
+sudo ls -l /proc/$(docker inspect -f '{{.State.Pid}}' <cid>)/fd | grep app.db
+#    `/config/app.db (deleted)` and `stat: Stale file handle` = ESTALE, not corruption
+sudo dmesg -T | grep 'state recovery failed'
+```
+
+The fix is to restart the service so it reopens the file
+(`docker service update --force calibre-web_calibre-web`); no data is lost,
+because nothing was ever wrong with the file. The durable fix is to stop putting
+a SQLite database on NFS — `/config` is calibre-web's private state and belongs
+on a local volume, which is a homelab-gitops change. `/books` holds the library
+itself and can stay where it is.
+
+AEGIS's own part of this was the silence, not the outage: the connector failed
+its threshold, posted one Slack line and then said nothing for two days. That is
+fixed (#571) — see below.
+
+## A dead connector is a hub problem
+
+`services/connector_health.py` counts consecutive failures per connector in a
+`settings` row keyed `connector_health:<name>`, and a connector at or past its
+threshold (3 fetches; 1 for a boot-time caller, whose next retry is a whole
+restart away) becomes a `connectordown` problem on the hub, source `connector`,
+subject the connector's name. It gets a task, an owner and a timeline like any
+other operational signal, and **recovery resolves it by itself** through
+`hub_watch.reconcile_findings`.
+
+That last part is the whole point of #571. The tracker used to do one thing:
+post a Slack system event when the count crossed the threshold, then set
+`alerted: true` so it would not speak again until the connector came back. One
+notification per outage, for the entire outage — and no record behind it. Calibre
+sat at `{"alerted": true, "consecutive_failures": 3}` for two days with no
+problem, no task and nothing in any digest. A flag also cannot tell "recovered"
+from "nobody looked"; the absence of a finding can. So `alerted` still suppresses
+repeat *pings* and no longer decides whether the failure is visible.
+
+Two details worth knowing before you add a connector to it:
+
+- **The sweep reads every `connector_health:*` row, not the one being recorded.**
+  `reconcile_findings` resolves any problem of its classes that is absent from
+  the findings it is handed, so handing it one connector's state would resolve
+  every other connector's live problem — a healthy Calibre would close a dead
+  Miniflux.
+- **The row stores `down`, and the sweep reads that rather than the count.** The
+  threshold is a per-call argument, so a bare `consecutive_failures` says nothing
+  about whether some *other* connector is past its own. A row written before
+  `down` existed falls back to the default threshold.
+
+There is no settle window on these problems, and they need none: the
+consecutive-failure threshold already is one.
+
 ## Tracked topics (Raphael)
 
 A topic you ask Raphael to track (`track_topic`, or "yes" to a "track this?"
 card) is two things (#513, spec
 `docs/superpowers/specs/2026-09-12-research-hub-design.md`):
 
-- **Its search terms**, in the `intelligence_topics` settings row. The intel
-  scans search them and the RSS gate matches on them.
+- **Its entry**, in the `intelligence_topics` settings row: a name and its
+  match terms. The intel scans search the topic once, by its name, and give
+  each topic a fair share of the results they score (#585). The RSS gate and
+  the round match on the terms.
 - **Its round of news**, a hub problem: class `topic`, source `research`,
   owned by Raphael. Every intel-scan item or stored feed entry that names one
   of the terms (whole word, any case) is an occurrence, keyed on the URL, so
   one story arriving by two paths counts once.
 
 A round stays in the hub and Raphael's briefing ("Your topics") until it
-holds enough items: 2 for a `high` topic, 3 for `medium`, 5 for `low`. Then
-it becomes one `#research @raphael @next` task listing the items; later items
-are collapsed comments. Ticking the task off means "seen": the round resolves
-and closes, and the next matching article opens a fresh one.
+holds enough items: the topic's own `threshold`, else its priority's number
+in `research_topics_config` (2 for `high`, 3 for `medium`, 5 for `low` by
+default — Admin → Research → Topic thresholds). Then it becomes one
+`#research @raphael @next` task listing the items (`digest_items`, 10); later
+items are collapsed comments. Ticking the task off means "seen": the round
+resolves and closes, and the next matching article opens a fresh one. The
+whole registry can be edited on Admin → Research → Tracked topics, which
+writes under the same lock `track_topic` takes.
 
 Feed findings (`feed_failing`, `feed_stale`) are Raphael's too, as
 `#feeds @raphael @next` tasks. The agent sweep never works them; you fix or
@@ -1990,60 +2223,139 @@ each round — the noise #513 removed.
 
 ## The vault (Raphael)
 
-The user's Obsidian vault (`arshadansari27/arshad-workspace`) is Raphael's
-record; the knowledge store is only its index (#514, spec
-`docs/superpowers/specs/2026-09-12-raphael-notes-design.md`).
+The user's Obsidian vault (`you/your-vault`) is the research agent's record;
+the knowledge store is only its index (#514, spec
+`docs/superpowers/specs/2026-09-12-raphael-notes-design.md`). "Raphael" below
+is the example agent that holds the `research` capability; nothing in the
+lane names it — a run with no agent resolves that capability's holder.
+
+Where the notes go and what an entry looks like is the **vault layout**, a
+settings row (`vault_layout`) edited on the admin **Vault** page. The shipped
+defaults are one vault's conventions (the ones the lane was written against),
+so a deployment with no row behaves exactly as before. The paths below are
+those defaults.
 
 - **Reads:** `NotesSyncFlow` (`notes-sync-hourly`, minute :19) pulls the vault
-  and indexes every changed `.md` note as `source_type='note'`, skipping
-  `.obsidian/`, `_templates/`, `backups/`, `_attachments/` and `.trash/`, at
-  most `max_files` (300) per run. Encrypted meld-encrypt blocks are stripped
-  before anything is stored. Notes rank above raw documents (`rank_boost`
-  1.25). Progress is `settings.notes_index_state`. `raphael/questions/` is
-  not indexed: `ResearchFlow` already keeps each answer in the store as
-  `aegis://research/<hash>`, and indexing the note too put every answer in
-  retrieval twice. Any row an earlier run made for such a note is removed on
-  the next run.
-- **Writes, insert-only:** only under `raphael/` (research answers in
-  `raphael/questions/`, and whatever Raphael writes with `note_write` /
-  `note_link`) and the daylog's journal notes. A write creates a note or
-  inserts one block into it; nothing the user wrote is ever changed or moved
-  (`is_one_insertion` refuses anything else). Each block carries a hidden
-  `%% aegis:<key> %%` marker, so a re-run adds nothing twice.
-- **The journal:** notes are filed as the vault files its own. With the vault
-  configured, the nightly daylog writes to
-  `journal/<YYYY>/<NN. Mon>/DD MMM YY.md`, the weekly rollup to the week's
-  `W<ww> MMM YY.md` in its Monday's month folder (the vault's weeks start on
-  Monday, with ISO numbers) and the monthly one to the month folder's own note,
-  `journal/<YYYY>/<NN. Mon>/<NN. Mon>.md`. If the user already has the day's or
-  week's note open at the `journal/` root, where periodic-notes creates it,
-  Raphael writes into that one instead. The entry is a `- #raphael day log`
-  bullet (`week in review`, `month in review`) with the text as an indented
-  outline under it: one bullet per prose paragraph, and in the daylog's
-  fallback format each `Label:` line with its items nested under it. It is
-  placed at the end of the note's own section: `Journal` for a day,
-  `Review` for a week or a month (an older month note's `Month Review`),
-  found by its heading text at any level. The section ends at the next
-  heading, a `---` line or a code fence, so the month note's folder card stays
-  last. A note without the section gets `## Journal` / `## Review` and the
-  block at its end. A new note is rendered from the vault's own
-  template, without its open checkboxes and without the empty `- ` placeholder
-  in that section. No `daylog` knowledge row is filed then; if the vault write
-  fails the row is filed as before and the run reports `vault_error`.
+  and indexes every changed `.md` note as `source_type='note'`, skipping the
+  layout's `index_skip_prefixes` (`.obsidian/`, `_templates/`, `backups/`,
+  `_attachments/`, `.trash/`), at most `max_files` (300) per run, one note cut
+  at the row's `index_max_chars` (100,000). Encrypted meld-encrypt blocks are
+  stripped before anything is stored. Notes rank above raw documents
+  (`rank_boost` 1.25). Progress is `settings.notes_index_state`. The layout's
+  `questions_dir` (`raphael/questions/`) is not indexed: `ResearchFlow` already
+  keeps each answer in the store as `aegis://research/<hash>`, and indexing
+  the note too put every answer in retrieval twice. Any row an earlier run
+  made for such a note is removed on the next run.
+- **Writes, insert-only:** only under the layout's `agent_dir` (`raphael/`:
+  research answers in `questions_dir`, and whatever the agent writes with
+  `note_write` / `note_link`) and the daylog's journal notes. A write creates
+  a note or inserts one block into it; nothing the user wrote is ever changed
+  or moved (`is_one_insertion` refuses anything else). Each block carries a
+  hidden `%% aegis:<key> %%` marker, so a re-run adds nothing twice. A commit
+  is authored by the owning agent under its `agents.name`
+  (`<id>@aegis.local`), with the id as the message prefix (`raphael: journal
+  2026-09-12`); with no agent it is `AEGIS <aegis@aegis.local>`.
+- **The journal:** notes are filed as the layout says. With the defaults the
+  nightly daylog writes to `journal/<YYYY>/<NN. Mon>/DD MMM YY.md`, the weekly
+  rollup to the week's `W<ww> MMM YY.md` in its first day's month folder
+  (weeks start on Monday, ISO numbers) and the monthly one to the month
+  folder's own note, `journal/<YYYY>/<NN. Mon>/<NN. Mon>.md`. If the user
+  already has the day's or week's note open in the layout's `live_folder`
+  (`journal/`, where periodic-notes creates it), the agent writes into that
+  one instead. The entry is a `- #raphael day log` bullet (`week in review`,
+  `month in review`; the tag and labels are the layout's) with the text as an
+  indented outline under it (the layout's indent — a tab by default): one
+  bullet per prose paragraph, and in the daylog's fallback format each
+  `Label:` line with its items nested under it. It is placed at the end of
+  the note's own section — the layout's `sections` for the kind: `Journal`
+  for a day, `Review` for a week or a month (an older month note's `Month
+  Review`) — found by its heading text at any level. The section ends at the
+  next heading and, unless the layout says otherwise, a `---` line or a code
+  fence, so the month note's folder card stays last. A note without the
+  section gets `## <first section>` and the block at its end. A new note is
+  rendered from the layout's template for the kind, without its open
+  checkboxes and without the empty `- ` placeholder in that section (both
+  switchable). No `daylog` knowledge row is filed then; if the vault write
+  fails the row is filed as before and the run reports `vault_error`. A kind
+  switched off in the layout files its knowledge row too.
 - **Conflicts:** `obsidian-git` commits from the phone and laptop. A push
-  rejected as not a fast-forward, or a conflicting rebase, drops Raphael's own
-  unpushed commit, pulls fresh and retries once; a second failure is reported
-  and nothing is kept. Raphael never force-pushes. Any other git failure — no
-  network, a refused deploy key, a missing repository — is reported at once
-  without a retry, with a short reason such as "the remote refused the deploy
-  key" and no URL or git output in it.
+  rejected as not a fast-forward, or a conflicting rebase, drops the agent's
+  own unpushed commit, pulls fresh and retries once; a second failure is
+  reported and nothing is kept. It never force-pushes. Any other git failure
+  — no network, a refused deploy key, a missing repository — is reported at
+  once without a retry, with a short reason such as "the remote refused the
+  deploy key" and no URL or git output in it.
 - **Dates:** a dated heading (`note_write` with no heading, a research
-  answer's section) and the time on a journal note Raphael creates are on the
-  user's clock, the `user_timezone` settings row, not the container's UTC.
-- **What insert-only rules out:** Raphael cannot fill in a placeholder that
+  answer's section — the layout's `date_heading_format`), the time on a
+  journal note the agent creates and the day the daylog logs are on the
+  user's clock, the `user_timezone` settings row (Vault page, "Your clock"),
+  not the container's UTC. The nightly run logs the last complete local day
+  (the local date of its clock, minus one) and bounds it on that clock, and
+  the weekly and monthly rollups anchor on the same day; so the crons can sit
+  at any time after local midnight, east or west of UTC. `day_offset` walks
+  further back from there.
+- **What insert-only rules out:** the agent cannot fill in a placeholder that
   is already in a note, such as an empty `- ` bullet the template left. It
-  inserts its own block instead. Only a note Raphael creates from a template
-  loses its empty placeholders.
+  inserts its own block instead. Only a note it creates from a template loses
+  its empty placeholders.
+
+### The layout (Vault page)
+
+`GET/PUT /api/admin/notes/layout` (`services/vault_layout.py`). The read path
+is lenient — a bad key in the row reads as its default, with a warning — and
+the write path is strict: the PUT returns 400 naming the first bad key, so a
+typo cannot quietly move the journal. `GET /api/admin/notes/layout/preview?date=`
+renders the saved layout for a date, and `POST …/preview` a candidate, with
+the same code that writes the notes; the page shows that preview live.
+
+| Key | Default | What it does |
+|---|---|---|
+| `agent_dir` | `raphael` | The one folder the agent may write its own notes in. One folder name. |
+| `questions_dir` | `raphael/questions` | Where research answers are filed; inside `agent_dir`; never indexed. |
+| `locale` | `en` | Month and day names for `MMM`/`MMMM`/`ddd`/`dddd` (the `LOCALES` table is the extension point). |
+| `week_start` | `monday` | `monday` or `sunday`: the rollup's week and the weekly note's first day. |
+| `week_numbering` | `iso` | `iso` (week 1 holds January 4th) or `locale_us` (week 1 holds January 1st): what `ww` renders and the rollup's `YYYY-Www` label. |
+| `date_heading_format` | `YYYY-MM-DD` | The heading a dated section gets. |
+| `index_skip_prefixes` | `.obsidian/`, `_templates/`, `backups/`, `_attachments/`, `.trash/` | Path prefixes the index leaves out. |
+| `entry.tag` | `#raphael` | The tag on the agent's bullet; empty for none. |
+| `entry.indent` | `tab` | `tab`, `two_spaces` or `four_spaces`: the outline's indent (the rollup reads it back with the same). |
+| `entry.max_outline_depth` | `4` | How deep the outline may nest. |
+| `new_note.drop_open_tasks` | `true` | A note the agent creates loses the template's unticked checkboxes. |
+| `new_note.drop_empty_bullets_in_section` | `true` | …and the empty `- ` placeholders in the target section. |
+| `section_ends_at_rule_or_fence` | `true` | A section ends at a `---` rule or a code fence, not only at the next heading. |
+| `language.*` | English | `name` (the language the day log and rollups are written in — English adds nothing to the prompts), and the fixed words of a day log written without a model: `daylog_title`, `quiet_day`, the six labels, `rollup_header`, `journal_title`, `also_in_note`. |
+| `daily` / `weekly` / `monthly` | see below | One block per kind: `enabled`, `folder`, `format`, `live_folder`, `template`, `sections`, `label`. |
+
+Per kind, the defaults: daily `folder "[journal/]YYYY/MM[. ]MMM"`, `format
+"DD MMM YY"`, `live_folder "journal"`, `template
+"_templates/{{tp_title_today}}.md"`, `sections ["Journal"]`, `label "day
+log"`; weekly `format "[W]ww MMM YY"`, `template
+"_templates/weekly-{{tp_title_today}}.md"`, `sections ["Review"]`, `label
+"week in review"` (folder and name rendered for the week's first day);
+monthly `format "MM[. ]MMM"`, `live_folder ""`, `template
+"_templates/monthly.md"`, `sections ["Review", "Month Review"]`, `label "month
+in review"` (rendered for the 1st). Folders and formats are moment.js
+formats; bracket every literal (`[journal/]`), because a bare letter is a
+token. The rules the PUT enforces: a format renders to a non-empty name with
+no slash; a folder is relative with no `..` or dot segment; a day's format
+needs a day token and a month or year token, a week's a week or day token,
+and the month's name must differ from the day's; `agent_dir` is one plain
+segment and `questions_dir` is inside it; `sections` is non-empty; a tag is
+empty or `#` plus one word; a template is a plain relative `.md` path; the
+vocabularies are closed. The journal-path regexes the write gate uses are
+generated from the layout — there is no second copy of the paths in code.
+
+**Changing the layout later.** The PUT keeps the layout in force before the
+change as `previous`. The writer treats a day's paths under the previous
+layout as "already written" too, so a re-run or a backfill after a change
+never writes a day twice, and the rollups still read a day filed under the
+old layout. Nothing is ever moved: existing notes stay where they are.
+
+What stays in code, on purpose: insert-only and `is_one_insertion`, the
+marker format and the forged-marker guard, the path safety refusals,
+pushed-only / never force-push, the flock, the encrypted-block stripping, the
+scrubbing of git output, never running a Templater tag, and the tools' size
+caps.
 
 ### Setting it up
 
@@ -2051,32 +2363,36 @@ record; the knowledge store is only its index (#514, spec
    deploy key **with write access** (GitHub → Settings → Deploy keys). Keep
    the private half out of chat and out of the repo.
 2. On AEGIS's Integrations page, group **Notes (vault)**: set
-   `notes_repo_url` (`git@github.com:arshadansari27/arshad-workspace.git`) and
-   paste the private key into `notes_deploy_key`. Restart core and the worker
-   (the key is written to disk, mode 0600, at boot). The checkout is
+   `notes_repo_url` (`git@github.com:you/your-vault.git`) and paste the
+   private key into `notes_deploy_key`. Restart core and the worker (the key
+   is written to disk, mode 0600, at boot). The checkout is
    `/app/config/notes`, beside the books; no infra change is needed.
-3. Grant Raphael the four tools. The DB `tool_set` wins over the seed:
+3. On the Vault page, set your timezone and — if your vault files its journal
+   differently from the defaults — the layout. Check the preview.
+4. Grant your research agent the four tools. The DB `tool_set` wins over the
+   seed:
 
    ```sql
    UPDATE agents SET metadata = jsonb_set(metadata, '{tool_set}',
      (metadata->'tool_set') || '["note_search","note_read","note_write","note_link"]'::jsonb)
-   WHERE id = 'raphael' AND NOT (metadata->'tool_set' ? 'note_search');
+   WHERE id = '<your research agent id>' AND NOT (metadata->'tool_set' ? 'note_search');
    ```
-4. Build the index without waiting for :19: `temporal schedule trigger
+5. Build the index without waiting for :19: `temporal schedule trigger
    --schedule-id notes-sync-hourly`. The first pass over ~1,000 notes takes a
    few runs (`remaining` in the summary counts down).
-5. The daylog's knowledge rows reach the journal through `NotesBackfillFlow`,
+6. The daylog's knowledge rows reach the journal through `NotesBackfillFlow`,
    which runs weekly (`notes-backfill-weekly`, Sunday 04:47 UTC; the schedule
    appears on its own through `schedule_sync`). It files any day whose vault
    write failed and fell back to its knowledge row, and it uses the live
    markers, so a week with nothing missing writes nothing. The schedule looks
-   only at rows filed in the last `since_days` (14) days: the pre-vault rows
-   are still in the store, and rereading them every week would put back a
-   block you deleted from an old journal note. To move every old row (the
-   first time, or after a vault outage longer than two weeks), start it by
-   hand, where `since_days` defaults to 0 (every row): `temporal workflow
-   start --type NotesBackfillFlow --task-queue aegis-main --workflow-id
-   notes-backfill-journal --input '{"agent_id": "raphael"}'`.
+   only at rows filed in the last `since_days` (14) days, `batch` (50)
+   entries per commit: the pre-vault rows are still in the store, and
+   rereading them every week would put back a block you deleted from an old
+   journal note. To move every old row (the first time, or after a vault
+   outage longer than two weeks), start it by hand, where `since_days`
+   defaults to 0 (every row) and the `research` holder signs the commits:
+   `temporal workflow start --type NotesBackfillFlow --task-queue aegis-main
+   --workflow-id notes-backfill-journal --input '{}'`.
 
 Until step 2 every part reports `not_configured` and the daylog files its
 knowledge rows exactly as before.

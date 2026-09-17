@@ -1,6 +1,5 @@
 """Shared test fixtures for AEGIS v2."""
 
-import asyncio
 import os
 import signal
 import sys
@@ -9,7 +8,11 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import pytest_asyncio
 from aegis.config import Settings
+from aegis.db import create_pool
+
+from tests import pg_test_db as testdb
 
 # ---------------------------------------------------------------------------
 # aegis#190: never leave an orphaned Temporal ephemeral server behind
@@ -191,6 +194,8 @@ def pytest_runtest_teardown(item: pytest.Item):
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     _reap_temporal_servers(_own_leaked_servers(), "leaked")
+    if _is_controller(session.config):
+        _drop_run_databases(session.config)
 
 
 def pytest_sessionstart(session: pytest.Session) -> None:
@@ -219,12 +224,11 @@ def pytest_sessionstart(session: pytest.Session) -> None:
     import aegis
 
     pkg_file = getattr(aegis, "__file__", None)
-    if not pkg_file:
-        return  # namespace package with no __file__: nothing to check
-    pkg_path = Path(pkg_file).resolve()
+    # A namespace package has no __file__: nothing to check.
+    pkg_path = Path(pkg_file).resolve() if pkg_file else None
     rootdir = Path(str(session.config.rootdir)).resolve()
 
-    if rootdir != pkg_path and rootdir not in pkg_path.parents:
+    if pkg_path is not None and rootdir != pkg_path and rootdir not in pkg_path.parents:
         pytest.exit(
             f"aegis#96 guard: `aegis` package imported from {pkg_path}, which "
             f"is outside the pytest rootdir {rootdir}. This checkout's editable "
@@ -234,61 +238,281 @@ def pytest_sessionstart(session: pytest.Session) -> None:
             returncode=1,
         )
 
-# Postgres server from `docker compose up -d postgres`. Tests get their own
-# database on it (below) — never the long-lived `aegis` dev database.
-_PG_SERVER = "postgresql://aegis:aegis_dev@localhost:25432"
-# One database PER xdist worker. Every worker is its own pytest session and so
-# runs this fixture independently — sharing a name means worker B drops and
-# recreates the database worker A is mid-test on. Plain (non-xdist) runs have
-# no PYTEST_XDIST_WORKER and keep the historical `aegis_test`.
-_TEST_DB = "aegis_test" + (
-    f"_{os.environ['PYTEST_XDIST_WORKER']}" if os.environ.get("PYTEST_XDIST_WORKER") else ""
-)
+    if _is_controller(session.config):
+        _prepare_run(session.config)
+
+
+# ---------------------------------------------------------------------------
+# aegis#325: one set of test databases per pytest invocation
+# ---------------------------------------------------------------------------
+#
+# Tests get their own databases on the `docker compose` Postgres — never the
+# long-lived `aegis` dev database. Names, the run id and the clean-up rules
+# live in tests/pg_test_db.py. The old scheme named them after the xdist
+# worker alone (`aegis_test_gw0`), so two runs on one host dropped each other's
+# databases mid-test and produced hundreds of errors that looked like real
+# failures.
+
 _REPO_ROOT = Path(__file__).resolve().parent.parent
+_RUN_ID = pytest.StashKey[str]()
+# Set when this run must not drop its databases at the end: another run is
+# using them (the in-use check below), or the caller asked to keep them.
+_KEEP_DATABASES = pytest.StashKey[bool]()
+_WORKERINPUT_KEY = "aegis_test_run_id"
+_WORKEROUTPUT_KEEP = "aegis_test_keep_databases"
+
+
+def _is_controller(config: pytest.Config) -> bool:
+    """The xdist controller, or the only process of a run without xdist."""
+    return not hasattr(config, "workerinput")
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Fix this run's id once. Workers take the controller's, never their own."""
+    if not _is_controller(config):
+        config.stash[_RUN_ID] = config.workerinput[_WORKERINPUT_KEY]
+        return
+    try:
+        config.stash[_RUN_ID] = testdb.run_id()
+    except ValueError as exc:
+        raise pytest.UsageError(str(exc)) from exc
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_configure_node(node) -> None:
+    """xdist: hand the controller's run id to each worker before it starts."""
+    node.workerinput[_WORKERINPUT_KEY] = node.config.stash[_RUN_ID]
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_testnodedown(node, error) -> None:
+    """xdist: a worker that found its database in use says so in its output,
+    and the controller must then leave the run's databases alone at the end."""
+    if getattr(node, "workeroutput", {}).get(_WORKEROUTPUT_KEEP):
+        node.config.stash[_KEEP_DATABASES] = True
+
+
+def _keep_databases(config: pytest.Config) -> None:
+    """Mark this run's databases as not ours to drop, from whichever process
+    found out: a worker reports it to the controller, which does the drop."""
+    if _is_controller(config):
+        config.stash[_KEEP_DATABASES] = True
+    else:
+        config.workeroutput[_WORKEROUTPUT_KEEP] = True
+
+
+def _prepare_run(config: pytest.Config) -> None:
+    """Controller, before any worker starts: sweep dead runs' databases, and
+    stop at once if this run's databases are already in use.
+
+    Best-effort except for the in-use stop: with no Postgres there is nothing
+    to sweep, and the database tests skip on their own.
+    """
+    if os.getenv("TEST_DATABASE_URL"):
+        return  # caller-managed database: nothing of ours to create or sweep
+    run = config.stash[_RUN_ID]
+
+    async def _housekeeping() -> tuple[dict[str, int], list[str]]:
+        conn = await testdb.connect_admin()
+        try:
+            in_use = await testdb.databases_in_use(conn, run)
+            swept = await testdb.sweep_stale(
+                conn, my_host=testdb.host_tag(), my_pid=os.getpid()
+            )
+            return in_use, swept
+        finally:
+            await conn.close()
+
+    try:
+        in_use, swept = testdb.run_sync(_housekeeping)
+    except OSError:
+        return  # no Postgres reachable
+    except Exception as exc:  # never let housekeeping sink the run
+        print(f"\n[aegis#325] test-database housekeeping skipped: {exc!r}", file=sys.stderr)
+        return
+    if swept:
+        print(
+            f"\n[aegis#325] dropped {len(swept)} test database(s) of dead runs: "
+            + ", ".join(swept),
+            file=sys.stderr,
+        )
+    if in_use:
+        _keep_databases(config)  # they are someone else's now
+        busy = ", ".join(f"{name} ({n} connection(s))" for name, n in sorted(in_use.items()))
+        pytest.exit(
+            f"aegis#325: this run's test database(s) are already in use: {busy}. "
+            f"Another pytest run is using the same run id {run!r} — most likely the "
+            f"same {testdb.RUN_ID_ENV}. Unset it to get a private name, or wait for "
+            "the other run to finish.",
+            returncode=1,
+        )
+
+
+def _drop_run_databases(config: pytest.Config) -> None:
+    """Controller, at the very end: drop every database this run created,
+    including a crashed worker's. Runs on failure and Ctrl-C too; only a
+    killed process skips it, and the next run's sweep covers that."""
+    if (
+        os.getenv("TEST_DATABASE_URL")
+        or os.getenv(testdb.KEEP_ENV)
+        or config.stash.get(_KEEP_DATABASES, False)
+        or _RUN_ID not in config.stash
+    ):
+        return
+    run = config.stash[_RUN_ID]
+
+    async def _drop() -> None:
+        conn = await testdb.connect_admin()
+        try:
+            await testdb.drop_run_databases(conn, run)
+        finally:
+            await conn.close()
+
+    try:
+        testdb.run_sync(_drop)
+    except OSError:
+        pass  # no Postgres reachable: nothing was created
+    except Exception as exc:
+        print(f"\n[aegis#325] could not drop this run's test databases: {exc!r}", file=sys.stderr)
+
+
+# The `settings` table as migrations + seeds left it, taken when this process
+# created its test database: (url, key -> jsonb text). None until then, and
+# always None with TEST_DATABASE_URL (a caller-managed database is not ours to
+# reset).
+_settings_baseline: tuple[str, dict[str, str]] | None = None
 
 
 @pytest.fixture(scope="session")
-def test_db_url() -> str | None:
+def test_db_url(request: pytest.FixtureRequest) -> str | None:
     """URL of a freshly-created, freshly-migrated + seeded session-scoped
     test database.
 
     `TEST_DATABASE_URL` overrides everything (caller-managed: no drop/create,
-    no migrate). Otherwise `aegis_test` is dropped, recreated, migrated from
-    this checkout's migrations/, and seeded from config/seed/ (same as core
-    boot) once per session — sharing the dev `aegis` database broke the suite
-    whenever a parallel branch applied a divergent migration to it (e.g. the
+    no migrate). Otherwise this process's database (`aegis_test_<run>_<gwN>`,
+    see tests/pg_test_db.py) is created, migrated from this checkout's
+    migrations/, and seeded from config/seed/ (same as core boot) once per
+    session — sharing the dev `aegis` database broke the suite whenever a
+    parallel branch applied a divergent migration to it (e.g. the
     maou→finance schema rename).
 
     Returns None when no Postgres is reachable; db_pool fixtures then skip.
     """
+    global _settings_baseline
     override = os.getenv("TEST_DATABASE_URL")
     if override:
         return override
+    name = testdb.database_name(
+        request.config.stash[_RUN_ID], os.environ.get("PYTEST_XDIST_WORKER")
+    )
 
-    async def _prepare() -> str:
-        import asyncpg
+    async def _prepare() -> tuple[str, dict[str, str]] | int:
         from aegis.db import create_pool, run_migrations
         from aegis.seed import load_seeds
 
-        admin = await asyncpg.connect(f"{_PG_SERVER}/aegis")
+        admin = await testdb.connect_admin()
         try:
-            await admin.execute(f"DROP DATABASE IF EXISTS {_TEST_DB} WITH (FORCE)")
-            await admin.execute(f"CREATE DATABASE {_TEST_DB}")
+            # The name is this run's alone, so a connection to it means another
+            # run shares the id (the same AEGIS_TEST_RUN_ID). Dropping it would
+            # wreck that run; stop instead.
+            busy = await testdb.databases_in_use(admin, request.config.stash[_RUN_ID])
+            if busy.get(name):
+                return busy[name]
+            await admin.execute(f"DROP DATABASE IF EXISTS {name} WITH (FORCE)")
+            await admin.execute(f"CREATE DATABASE {name}")
         finally:
             await admin.close()
-        url = f"{_PG_SERVER}/{_TEST_DB}"
+        url = f"{testdb.PG_SERVER}/{name}"
         pool = await create_pool(url, min_size=1, max_size=2)
         try:
             await run_migrations(pool, _REPO_ROOT / "migrations")
             await load_seeds(pool, _REPO_ROOT / "config" / "seed")
+            async with pool.acquire() as conn:
+                baseline = await testdb.settings_snapshot(conn)
         finally:
             await pool.close()
-        return url
+        return url, baseline
 
     try:
-        return asyncio.run(_prepare())
+        prepared = testdb.run_sync(_prepare)
     except OSError:
         return None
+    if isinstance(prepared, int):
+        msg = (
+            f"aegis#325: test database {name} is already in use ({prepared} "
+            "connection(s)) by another pytest run with the same run id "
+            f"({testdb.RUN_ID_ENV}). Stopping rather than dropping it under that run."
+        )
+        _keep_databases(request.config)
+        request.session.shouldstop = msg
+        pytest.fail(msg, pytrace=False)
+    url, baseline = prepared
+    _settings_baseline = (url, baseline)
+    return url
+
+
+@pytest_asyncio.fixture(loop_scope="function")
+async def db_pool(test_db_url):
+    """Real asyncpg pool on the session's fresh, migrated test database
+    (see `test_db_url` above).
+
+    Skips the test when no Postgres is reachable (e.g. in CI without a
+    postgres service). Set TEST_DATABASE_URL to point at a managed test DB.
+    """
+    if test_db_url is None:
+        pytest.skip("no Postgres reachable for the test database")
+    try:
+        pool = await create_pool(test_db_url, min_size=1, max_size=5)
+    except OSError as exc:
+        pytest.skip(f"no Postgres at {test_db_url}: {exc}")
+    try:
+        yield pool
+    finally:
+        await pool.close()
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _reset_settings_between_files(request: pytest.FixtureRequest):
+    """aegis#569: every test file starts from the seeded `settings` table.
+
+    Settings rows are process-wide state in the worker's database, and
+    `--dist loadfile` decides which files share a worker — an order that
+    changes whenever files are added. A file that leaves a row behind (the
+    migration-011 test left the `todoist_capture_enabled` kill switch off)
+    silently breaks whichever file lands after it. Resetting at each file
+    boundary makes that impossible without touching tests within a file,
+    which keep their own order.
+
+    A no-op until this process has created its test database, so files that
+    never touch Postgres cost nothing. Set AEGIS_TEST_SETTINGS_LEAKS to a file
+    path to have each reset logged there (one line per leaking file).
+    AEGIS_TEST_SETTINGS_RESET=off turns the reset off; tests/core/
+    test_test_isolation.py uses it to prove a file cleans up after itself.
+    """
+    yield
+    if _settings_baseline is None or os.getenv("AEGIS_TEST_SETTINGS_RESET") == "off":
+        return
+    url, baseline = _settings_baseline
+
+    async def _restore() -> list[str]:
+        import asyncpg
+
+        conn = await asyncpg.connect(url, timeout=5)
+        try:
+            return await testdb.restore_settings(conn, baseline)
+        finally:
+            await conn.close()
+
+    try:
+        touched = testdb.run_sync(_restore)
+    except Exception as exc:
+        print(f"\n[aegis#569] could not reset settings after {request.node.nodeid}: {exc!r}",
+              file=sys.stderr)
+        return
+    log = os.getenv("AEGIS_TEST_SETTINGS_LEAKS")
+    if touched and log:
+        with open(log, "a", encoding="utf-8") as fh:
+            fh.write(f"{request.node.nodeid}\t{','.join(touched)}\n")
 
 # Defaults for Settings fields that are now REQUIRED (no production default)
 # but still need a value to instantiate the model in tests.
@@ -307,6 +531,15 @@ _TEST_REQUIRED_SETTINGS: dict = {
 def test_settings() -> Settings:
     """Settings with test-safe defaults."""
     return Settings(**_TEST_REQUIRED_SETTINGS)
+
+
+@pytest.fixture
+def chart():
+    """The chart of accounts the money lane reads in these tests — this
+    deployment's real one, from `tests/books_chart_data.py` (#560)."""
+    from tests.books_chart_data import CHART
+
+    return CHART
 
 
 def _make_pool_acquire(fetchval_return=None):
@@ -349,6 +582,23 @@ def _load_model_tiers_for_tests() -> None:
     from aegis.llm.tier import set_model_tiers
 
     set_model_tiers({"fast": "gemma4:e2b", "balanced": "qwen3:14b", "smart": "qwen3:32b"})
+
+
+@pytest.fixture(autouse=True)
+def _clear_settings_row_caches():
+    """Every `SettingsRow` holds a 30s per-process cache of its merged value.
+
+    A test that writes a settings row straight to the database — rather than
+    through `save`, which clears its own row — would otherwise read whatever
+    the previous test in the same process left cached. That is an
+    order-dependent flake, and `--dist loadfile` changes the order whenever a
+    file is added, so clear the lot around every test instead of remembering to
+    do it per file."""
+    from aegis.services.config_rows import clear_all_caches
+
+    clear_all_caches()
+    yield
+    clear_all_caches()
 
 
 @pytest.fixture(autouse=True)

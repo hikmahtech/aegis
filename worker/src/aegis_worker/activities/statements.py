@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 import structlog
+from aegis.services.settings_store import get_setting, put_setting
 from temporalio import activity
 
 logger = structlog.get_logger()
@@ -52,7 +53,7 @@ async def _folder_config(pool: Any) -> dict:
     An unconfigured lane is not an error — a fork of AEGIS has no Drive folder
     and must not fail a scheduled flow to say so.
     """
-    raw = await pool.fetchval("SELECT value FROM settings WHERE key = $1", FOLDER_SETTING)
+    raw = await get_setting(pool, FOLDER_SETTING)
     if raw is None:
         return {}
     cfg = raw if isinstance(raw, dict) else json.loads(raw)
@@ -152,13 +153,23 @@ class StatementActivities:
         the month's digest marker. That is the mode a person reads before
         letting a schedule touch the books.
         """
-        from aegis.services import books, statement_findings, statement_match, statement_post
+        from aegis.services import (
+            books,
+            books_chart,
+            statement_findings,
+            statement_match,
+            statement_post,
+        )
         from aegis.services import journal_index as ji
-        from aegis.services.reconciled import mark_reconciled
+        from aegis.services.journal_index import mark_reconciled
 
         accounts = await _folder_config(self.db_pool)
         if not accounts or self.books_cfg is None:
             return {"status": "skipped", "reason": "not_configured", "statements": 0}
+
+        # Read once for the whole run and passed down. A chart read inside the
+        # posting closure would be a DB call under the books flock.
+        chart = await books_chart.get_chart(self.db_pool)
 
         statements = await load_statements(self.db_pool)
         rows = [r for s in statements for r in s.rows]
@@ -184,6 +195,7 @@ class StatementActivities:
             declared=declared,
             entity_for_instrument=_entity_map(accounts),
             rates=rates,
+            currency=self.books_cfg.currency,
         )
         outcomes = {o.row_id: o for o in run.outcomes}
 
@@ -230,7 +242,8 @@ class StatementActivities:
                     # over the full dict.
                     outcomes,
                     self.books_cfg,
-                    entity=account.get("post_entity") or "personal",
+                    entity=account.get("post_entity") or chart.default_entity,
+                    chart=chart,
                     rules=rules,
                     # Every row of every OTHER account, so §8.4 can see both
                     # sides of a transfer. Passing this statement's own rows
@@ -648,18 +661,13 @@ async def _due_digest(
     delivery decision that belongs to the flow.
     """
     month = today.strftime("%Y-%m")
-    if await pool.fetchval("SELECT value FROM settings WHERE key = $1", DIGEST_SETTING) == month:
+    if await get_setting(pool, DIGEST_SETTING) == month:
         return ""
     digest = findings_mod.monthly_digest(run, period=month, statements=statements)
-    await pool.execute(
-        "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW()) "
-        "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
-        DIGEST_SETTING,
-        # The bare string: the pool's jsonb codec applies `json.dumps` itself,
-        # and pre-dumping it here lands a double-encoded scalar that never
-        # compares equal to the month on the next tick.
-        month,
-    )
+    # The bare string: the pool's jsonb codec applies `json.dumps` itself, and
+    # pre-dumping it here lands a double-encoded scalar that never compares
+    # equal to the month on the next tick.
+    await put_setting(pool, DIGEST_SETTING, month)
     return digest
 
 

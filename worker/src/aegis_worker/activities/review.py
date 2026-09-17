@@ -16,8 +16,12 @@ from dataclasses import dataclass
 from typing import Any
 
 import asyncpg
+from aegis.errors import error_text
 from aegis.llm import parse_llm_json
+from aegis.services.settings_store import get_setting
 from temporalio import activity
+
+from aegis_worker.shared.jsonb import decode_jsonb
 
 # review-copilot thresholds; override live via settings key 'review_config'.
 # ponytail: code default, no migration — tune with PUT /api/settings/review_config.
@@ -104,10 +108,10 @@ class ReviewActivities:
     llm_client: object | None = None
     frame_model: str = "gpt-oss:20b"
     todoist_connector: object | None = None
-    # Owning agent — matches the review flows' config default. Threaded into
-    # the `llm_calls` row for `frame_review` so the weekly review's LLM spend is
-    # attributable rather than NULL (same pattern as IntelligenceActivities).
-    agent_id: str = "sebas"
+    # Owning agent — the `gtd` holder, resolved at boot in `__main__` (#579).
+    # Threaded into the `llm_calls` row for `frame_review` so the weekly
+    # review's LLM spend is attributable; "" records no agent.
+    agent_id: str = ""
 
     @activity.defn
     async def gather_daily_digest(self) -> dict:
@@ -131,9 +135,7 @@ class ReviewActivities:
         if self.db_pool is None:
             return empty
         async with self.db_pool.acquire() as conn:
-            managed = await conn.fetchval(
-                "SELECT value FROM settings WHERE key='todoist_managed_project_ids'"
-            )
+            managed = await get_setting(conn, "todoist_managed_project_ids")
             if not isinstance(managed, dict):
                 return empty
             inbox_id = managed.get("inbox")
@@ -249,9 +251,7 @@ class ReviewActivities:
         if self.db_pool is None:
             return empty
         async with self.db_pool.acquire() as conn:
-            managed = await conn.fetchval(
-                "SELECT value FROM settings WHERE key='todoist_managed_project_ids'"
-            )
+            managed = await get_setting(conn, "todoist_managed_project_ids")
             if not isinstance(managed, dict):
                 return empty
             inbox_id = managed.get("inbox")
@@ -394,16 +394,12 @@ class ReviewActivities:
         if self.db_pool is None:
             return base
         async with self.db_pool.acquire() as conn:
-            cfg_raw = await conn.fetchval(
-                "SELECT value FROM settings WHERE key='review_config'"
-            )
+            cfg_raw = await get_setting(conn, "review_config")
             cfg = {**_REVIEW_DEFAULTS,
                    **(cfg_raw if isinstance(cfg_raw, dict) else {})}
             base["_top_n"] = int(cfg["top_n"])
             # Inbox id for the claimed-stale detector below (None-safe).
-            managed = await conn.fetchval(
-                "SELECT value FROM settings WHERE key='todoist_managed_project_ids'"
-            )
+            managed = await get_setting(conn, "todoist_managed_project_ids")
             inbox_id = managed.get("inbox") if isinstance(managed, dict) else None
 
             # Stalled: leaf work-stream project (has a parent AREA project;
@@ -613,7 +609,7 @@ class ReviewActivities:
                 model=self.frame_model,
                 db_pool=self.db_pool,
                 purpose="review_frame",
-                agent_id=self.agent_id,
+                agent_id=self.agent_id or None,
             )
             raw = result.get("response", "") if isinstance(result, dict) else (result or "")
             parsed = parse_llm_json(raw) or {}
@@ -631,7 +627,7 @@ class ReviewActivities:
                 decisions = ranked
             return {"narrative": narrative, "decisions": decisions[:top_n]}
         except Exception as exc:  # noqa: BLE001
-            activity.logger.warning("frame_review_llm_failed err=%s", str(exc)[:200])
+            activity.logger.warning("frame_review_llm_failed err=%s", error_text(exc))
             return {"narrative": fallback, "decisions": decisions[:top_n]}
 
     @activity.defn
@@ -735,9 +731,7 @@ class ReviewActivities:
         if self.db_pool is None:
             return []
         async with self.db_pool.acquire() as conn:
-            managed = await conn.fetchval(
-                "SELECT value FROM settings WHERE key='todoist_managed_project_ids'"
-            )
+            managed = await get_setting(conn, "todoist_managed_project_ids")
             # Someday is the @someday label now (Todoist restructure, 2026-07),
             # already covered by the _STATE_LABELS exclusion below — only
             # Inbox is still a managed-project id to exclude.
@@ -786,9 +780,7 @@ class ReviewActivities:
         if self.db_pool is None:
             return []
         async with self.db_pool.acquire() as conn:
-            cfg_raw = await conn.fetchval(
-                "SELECT value FROM settings WHERE key='review_config'"
-            )
+            cfg_raw = await get_setting(conn, "review_config")
             cfg = {**_REVIEW_DEFAULTS,
                    **(cfg_raw if isinstance(cfg_raw, dict) else {})}
             lead_days = int(cfg.get("key_dates_lead_days",
@@ -965,7 +957,9 @@ class ReviewActivities:
         # We schedule a delayed re-fire via the Temporal client. Best-effort:
         # failure logs but does not unfresh the acknowledgement.
         snoozed = False
-        if kind == "daily" and choice == "need_time" and self.temporal_host:
+        # The re-fire runs as this class's owner (the `gtd` holder), never an
+        # example id (#579); with no owner there is nobody to run it as.
+        if kind == "daily" and choice == "need_time" and self.temporal_host and self.agent_id:
             try:
                 import uuid as _uuid
                 from datetime import timedelta as _td
@@ -977,7 +971,7 @@ class ReviewActivities:
                 # scheduled one. Tagged 'snooze' so prod logs make sense.
                 await client.start_workflow(
                     "DailyReviewFlow",
-                    {"agent_id": "sebas", "activity_name": "gtd-daily-review-snoozed"},
+                    {"agent_id": self.agent_id, "activity_name": "gtd-daily-review-snoozed"},
                     id=f"daily-review-snooze-{_uuid.uuid4()}",
                     task_queue=self.task_queue,
                     start_delay=_td(hours=1),
@@ -989,7 +983,7 @@ class ReviewActivities:
             except Exception as exc:  # noqa: BLE001
                 activity.logger.warning(
                     "daily_review_snooze_failed interaction=%s err=%s",
-                    interaction_id, str(exc)[:200],
+                    interaction_id, error_text(exc),
                 )
         return {
             "acknowledged": True,
@@ -1223,19 +1217,13 @@ def format_meeting_week(data: dict) -> str:
 
 
 def _decode_counts(value: Any) -> dict:
-    """review_digest_log.counts is jsonb — a dict when asyncpg's jsonb codec
-    is registered, else a raw string. Accept both; {} on anything odd."""
-    if isinstance(value, dict):
-        return value
-    if isinstance(value, str):
-        import json
-
-        try:
-            parsed = json.loads(value)
-            return parsed if isinstance(parsed, dict) else {}
-        except (ValueError, TypeError):
-            return {}
-    return {}
+    """A jsonb column as a dict, `{}` for anything that is not one — a broken
+    row costs the digest one line, never the whole weekly review."""
+    try:
+        decoded = decode_jsonb(value, {})
+    except (ValueError, TypeError):
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
 
 
 def _waiting_streak(task_id: str, prior_weeklies: list[dict]) -> int:

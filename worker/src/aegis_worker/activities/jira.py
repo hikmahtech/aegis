@@ -33,6 +33,7 @@ from typing import Any
 
 import asyncpg
 import httpx
+from aegis.errors import error_text
 from temporalio import activity
 
 from aegis_worker.shared.todoist_write import submit_or_queue
@@ -94,12 +95,12 @@ class JiraActivities:
         try:
             states = await self._search_issues(sorted(by_key))
         except Exception as exc:
-            activity.logger.warning("jira_search_failed err=%s", str(exc)[:200])
+            activity.logger.warning("jira_search_failed err=%s", error_text(exc))
             return {
                 "checked": len(by_key),
                 "resolved": [],
                 "unresolved": 0,
-                "reason": f"jira_error: {str(exc)[:120]}",
+                "reason": f"jira_error: {error_text(exc, 120)}",
             }
 
         resolved, unresolved = [], 0

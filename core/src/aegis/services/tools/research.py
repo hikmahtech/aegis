@@ -1,4 +1,4 @@
-"""Raphael's research tools (#509).
+"""The research agent's research tools (#509).
 
 Four read-only tools over the shared steps in `services/research.py` —
 `web_search`, `read_url`, `paper_search`, `paper_read` — and `research_topic`,
@@ -18,17 +18,24 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Annotated
+from typing import Annotated, Literal
 
 import asyncpg
 import structlog
 from pydantic import Field
 
+from aegis.errors import error_text
 from aegis.services import research as rs
+from aegis.services import research_config
+from aegis.services.agents import resolve_tag
 from aegis.services.tools.base import ToolContext
 from aegis.services.tools.registry import aegis_tool
 
 logger = structlog.get_logger()
+
+
+def _s2_key(ctx: ToolContext) -> str:
+    return str(getattr(ctx.settings, "semantic_scholar_api_key", "") or "")
 
 
 @aegis_tool
@@ -57,8 +64,8 @@ async def _exec_web_search(
             ctx.search_connector, query, limit=max(1, min(int(limit), 20)), site=site
         )
     except Exception as exc:  # noqa: BLE001 — a failed search is an answer, not a crash
-        logger.warning("web_search_failed", error=str(exc)[:200])
-        return json.dumps({"error": f"web search failed: {str(exc)[:200]}"})
+        logger.warning("web_search_failed", error=error_text(exc))
+        return json.dumps({"error": f"web search failed: {error_text(exc)}"})
     return json.dumps({"query": query, "results": results})
 
 
@@ -95,7 +102,9 @@ async def _exec_paper_search(
         since: Only papers published on or after this date: YYYY, YYYY-MM or YYYY-MM-DD.
         limit: How many papers (1-25).
     """
-    return json.dumps(await rs.paper_search(query, since=since, limit=limit))
+    return json.dumps(
+        await rs.paper_search(query, since=since, limit=limit, api_key=_s2_key(ctx))
+    )
 
 
 @aegis_tool
@@ -112,24 +121,38 @@ async def _exec_paper_read(
         paper_id: An arXiv id (2401.01234), an id from paper_search (arxiv:… or s2:…), or a PDF URL.
         max_chars: The most characters of text to return (500-60000).
     """
-    return json.dumps(await rs.paper_read(paper_id, max_chars=max_chars))
+    return json.dumps(await rs.paper_read(paper_id, max_chars=max_chars, api_key=_s2_key(ctx)))
 
 
-async def _exec_research_topic(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
-    """Hand a research question to `ResearchFlow` and relay its answer.
+@aegis_tool
+async def _exec_research_topic(
+    pool: asyncpg.Pool,
+    ctx: ToolContext,
+    *,
+    query: str,
+    depth: Literal["quick", "thorough"] | None = None,
+    domains: list[str] | None = None,
+) -> str:
+    """Research a question: search the knowledge store, the web and (for academic questions) papers, read the best sources, and answer with numbered citations. Runs in the background as a research flow and waits a short while for it; a longer run posts its answer to the channel when it is ready. The answer is saved, replacing any earlier answer to the same question.
 
-    Never raises. Three outcomes: the run finished inside the wait and its
-    answer comes back; it did not, and the model is told it is still running
-    (the flow posts the answer to the agent's channel when it lands); or it
-    could not be started at all, in which case nothing ran.
+    Args:
+        query: What to research
+        depth: Search depth (default: quick)
+        domains: Limit web search to specific domains
+
+    Returns:
+        Never raises. Three outcomes: the run finished inside the wait and its
+        answer comes back; it did not, and the model is told it is still running
+        (the flow posts the answer to the agent's channel when it lands); or it
+        could not be started at all, in which case nothing ran.
     """
     from temporalio.exceptions import WorkflowAlreadyStartedError
 
-    question = str(args.get("query") or "").strip()
+    question = str(query or "").strip()
     if not question:
         return json.dumps({"error": "query is required"})
-    depth = args.get("depth") if args.get("depth") in rs.DEPTHS else "quick"
-    domains = rs.clean_domains(args.get("domains"))
+    depth = depth if depth in rs.DEPTHS else "quick"
+    domains = rs.clean_domains(domains)
     client = ctx.temporal_client
     if client is None:
         return json.dumps(
@@ -138,17 +161,24 @@ async def _exec_research_topic(pool: asyncpg.Pool, args: dict, ctx: ToolContext)
                 "Nothing ran; try again once it is back."
             }
         )
+    # The run belongs to the calling agent, else to whoever holds the
+    # `research` tag; a deployment with no such agent still gets its answer,
+    # the flow just has nobody's channel to post a late one to.
+    agent_id = ctx.agent_id or ""
+    if not agent_id and pool is not None:
+        agent_id = await resolve_tag(pool, "research") or ""
+    wait_s = int((await research_config.get_research_config(pool))["wait_seconds"])
     workflow_id = rs.research_workflow_id(question, depth, domains)
     reattached = False
     try:
         handle = await client.start_workflow(
             rs.RESEARCH_FLOW,
             {
-                "agent_id": ctx.agent_id or "raphael",
+                "agent_id": agent_id,
                 "question": question,
                 "depth": depth,
                 "domains": domains,
-                "reply_after_seconds": rs.RESEARCH_WAIT_S,
+                "reply_after_seconds": wait_s,
             },
             id=workflow_id,
             task_queue=rs.TASK_QUEUE,
@@ -157,10 +187,10 @@ async def _exec_research_topic(pool: asyncpg.Pool, args: dict, ctx: ToolContext)
         reattached = True
         handle = client.get_workflow_handle(workflow_id)
     except Exception as exc:  # noqa: BLE001 — a dispatch failure is an answer, not a crash
-        logger.warning("research_dispatch_failed", error=str(exc)[:200])
-        return json.dumps({"error": f"research could not be started: {str(exc)[:200]}"})
+        logger.warning("research_dispatch_failed", error=error_text(exc))
+        return json.dumps({"error": f"research could not be started: {error_text(exc)}"})
     try:
-        result = await asyncio.wait_for(handle.result(), timeout=rs.RESEARCH_WAIT_S)
+        result = await asyncio.wait_for(handle.result(), timeout=wait_s)
     except TimeoutError:
         # Cancelling `handle.result()` stops the WAIT, not the research: the
         # run carries on and posts its answer to the agent's channel.
@@ -169,14 +199,14 @@ async def _exec_research_topic(pool: asyncpg.Pool, args: dict, ctx: ToolContext)
             {
                 "status": "running",
                 "workflow_id": workflow_id,
-                "message": f"Still researching after {rs.RESEARCH_WAIT_S}s. The answer will "
+                "message": f"Still researching after {wait_s}s. The answer will "
                 "be posted to this channel when it is ready. Do not start it again.",
             }
         )
     except Exception as exc:  # noqa: BLE001 — the run failed; say so, don't raise
-        logger.warning("research_failed", workflow_id=workflow_id, error=str(exc)[:200])
+        logger.warning("research_failed", workflow_id=workflow_id, error=error_text(exc))
         return json.dumps(
-            {"error": f"research failed: {str(exc)[:200]}", "workflow_id": workflow_id}
+            {"error": f"research failed: {error_text(exc)}", "workflow_id": workflow_id}
         )
     result = result if isinstance(result, dict) else {}
     sources = [s for s in (result.get("sources") or []) if isinstance(s, dict)]

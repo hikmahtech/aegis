@@ -291,9 +291,9 @@ When a `todoist_task_id` is on the alert (pandora APP-<n>: clarify path, or the 
 
 ## Chat with Tool Calling
 
-`POST /api/chat` (non-streaming) and `POST /api/chat/stream` (SSE). 59 tools in `CHAT_TOOLS`, gated per-agent by `agents.metadata.tool_set` (the runtime source of truth, edited on the admin **Behavior** tab); `AGENT_TOOL_SETS` in `core/src/aegis/services/chat.py` is only the seed-time default for the four example agents, and an agent with no configured tool set falls back to the minimal read-only `_FALLBACK_TOOL_SET`.
+`POST /api/chat` (non-streaming) and `POST /api/chat/stream` (SSE). 78 tools in `CHAT_TOOLS`, gated per-agent by `agents.metadata.tool_set` (the runtime source of truth, edited on the admin **Behavior** tab); `AGENT_TOOL_SETS` in `core/src/aegis/services/chat.py` is only the seed-time default for the four example agents, and an agent with no configured tool set falls back to the minimal read-only `_FALLBACK_TOOL_SET`.
 
-`CHAT_TOOLS` and `TOOL_EXECUTORS` stay in `chat.py` as the single registry, but the executor *bodies* for extracted domains live in `core/src/aegis/services/tools/<domain>.py` (today `infra.py`, `vercel.py` and `ledger.py`); `ToolContext` lives in `services/tools/base.py` and is re-exported from `chat.py`.
+`CHAT_TOOLS` and `TOOL_EXECUTORS` stay in `chat.py` as the single registry, but every executor *body* lives in `core/src/aegis/services/tools/<domain>.py`, decorated with `@aegis_tool` so its advertised schema is generated from its typed signature and docstring (`tools/registry.py`); `CHAT_TOOLS` is a hand-ordered list of `_registry_schema("<name>")` calls. `ToolContext` lives in `services/tools/base.py` and is re-exported from `chat.py`.
 
 Tool loop: max iterations bounded by the service config; per-tool timeout via `asyncio.wait_for` (default `tool_timeout_seconds`, with per-tool overrides in `_TOOL_TIMEOUT_OVERRIDES` for long-running tools like `aegis_self_diagnose`); result truncation per `max_bytes`. Every tool call recorded to `chat_tool_calls`.
 
@@ -312,8 +312,6 @@ Tool counts a fresh install actually gets (from `config/seed/agents.yaml`, which
 
 Startup validator: Core refuses to boot if `AGENT_TOOL_SETS` references a tool that isn't in `CHAT_TOOLS` (`_validate_agent_tool_sets`), and warns on any DB `metadata.tool_set` entry naming a missing executor.
 
-`call_mcp_tool` is the single passthrough to external [MCP](https://modelcontextprotocol.io) servers. It is default-deny on three independent gates — `settings.mcp_enabled`, the tool being in the agent's `tool_set`, and a per-server/per-tool grant in `agents.metadata.mcp_servers`. Remote tool names are never spliced into `CHAT_TOOLS`. Setup and the threat model are in [`development.md`](../development.md#mcp-servers-external-tool-servers).
-
 ### Proactive knowledge context
 
 Before every LLM call, `_gather_knowledge_context()` runs a semantic chunk search via the native `KnowledgeService.search`. Results are boosted per-personality domain affinity, capped at 2000 chars injected into the system prompt. 5s timeout (`knowledge_context_timeout_seconds`) — never blocks chat. Each result that survives the threshold is logged to `knowledge_injection_log`.
@@ -323,7 +321,7 @@ Before every LLM call, `_gather_knowledge_context()` runs a semantic chunk searc
 
 33 route modules in `core/src/aegis/api/routes/`. All `/api/*` routes require Basic auth or `X-API-Key` (API keys are generated from the admin **Integrations** page and stored encrypted in the DB; `AEGIS_API_KEY` is the env fallback). Auth can be switched off entirely with `AEGIS_AUTH_DISABLED=true` — for deployments fronted by an authenticating proxy only. Exceptions: `GET /health` and webhook paths under `/api/webhooks/*` (HMAC-verified).
 
-Route modules: `activities`, `agents`, `api_key`, `assets_admin`, `audit`, `capture`, `channels`, `chat`, `expiring_items_admin`, `gmail_reauth`, `health`, `homelab`, `infra`, `infra_admin` (infrastructure registry CRUD + provisioning + k8s/cloud ops — see [`infrastructure.md`](../infrastructure.md)), `integrations`, `interactions`, `knowledge`, `llm_backend`, `market`, `mcp`, `money`, `observability`, `overview`, `people_admin`, `problems_admin` (the hub's list, timeline, mute / resolve / close / merge and the deploy windows), `references`, `resources`, `settings`, `slack`, `social_auth`, `system_status`, `temporal`, `todoist`, `webhooks`.
+Route modules: `activities`, `agents`, `api_key`, `assets_admin`, `audit`, `capture`, `channels`, `chat`, `expiring_items_admin`, `gmail_reauth`, `health`, `homelab`, `infra`, `infra_admin` (infrastructure registry CRUD + provisioning + k8s/cloud ops — see [`infrastructure.md`](../infrastructure.md)), `integrations`, `interactions`, `knowledge`, `llm_backend`, `market`, `mcp_server`, `money`, `observability`, `overview`, `people_admin`, `problems_admin` (the hub's list, timeline, mute / resolve / close / merge and the deploy windows), `references`, `resources`, `settings`, `slack`, `social_auth`, `system_status`, `temporal`, `todoist`, `webhooks`.
 
 Inbound webhooks are `/api/webhooks/{todoist,github,sentry,alert}` plus `POST /api/webhooks/life/{source}` — the signed personal-data push lane (location / health / observation), off until a secret is configured. Signing, replay window, body cap and per-source behaviour are documented in [`production.md`](../production.md#life-data-push-post-apiwebhookslifesource).
 

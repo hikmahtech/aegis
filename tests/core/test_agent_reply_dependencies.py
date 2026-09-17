@@ -54,7 +54,6 @@ async def test_agent_reply_forwards_every_dependency():
         "search_connector": object(),
         "remote_script_connector": object(),
         "vercel_connector": object(),
-        "mcp_manager": object(),
     }
     fake = AsyncMock(
         return_value={"response": "ok", "model": "m", "tool_calls": [], "error": None}

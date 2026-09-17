@@ -22,6 +22,8 @@ from temporalio.common import RetryPolicy
 from temporalio.exceptions import ApplicationError
 
 with workflow.unsafe.imports_passed_through():
+    from aegis.errors import error_text
+
     from aegis_worker.activities.interactions import (
         ApplyTimeoutInput,
         InsertInteractionInput,
@@ -144,7 +146,7 @@ class InteractionFlow:
                     start_to_close_timeout=_ACT_TIMEOUT,
                 )
         except Exception as exc:
-            workflow.logger.warning("interaction_card_dispatch_failed: %s", str(exc)[:200])
+            workflow.logger.warning("interaction_card_dispatch_failed: %s", error_text(exc))
 
         if input.timeout_policy == "hold":
             await workflow.wait_condition(lambda: self._resolved)
@@ -203,7 +205,7 @@ class InteractionFlow:
                             )
                         except Exception as exc:
                             workflow.logger.warning(
-                                "interaction_escalation_dispatch_failed: %s", str(exc)[:200]
+                                "interaction_escalation_dispatch_failed: %s", error_text(exc)
                             )
             if timed_out:
                 await workflow.execute_activity(
@@ -242,7 +244,7 @@ class InteractionFlow:
                     "interaction_post_resolve_failed activity=%s id=%s err=%s",
                     input.post_resolve_activity,
                     interaction_id,
-                    str(exc)[:200],
+                    error_text(exc),
                 )
         return InteractionResult(
             interaction_id=interaction_id,

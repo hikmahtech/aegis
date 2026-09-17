@@ -3,7 +3,30 @@
 from __future__ import annotations
 
 import pytest
+import pytest_asyncio
 from aegis.db import run_migrations
+
+
+@pytest_asyncio.fixture(autouse=True, loop_scope="function")
+async def _restore_capture_switch(db_pool):
+    """aegis#569: two tests here rewrite the `todoist_capture_enabled` kill
+    switch, and one ends on `false`. Left behind, that switched Todoist capture
+    off for every later file on the same xdist worker — hub-projection tests
+    then saw no task and failed for no visible reason. Put the row back exactly
+    as it was (value as text, cast server-side, so the pool's jsonb codec
+    cannot double-encode it)."""
+    before = await db_pool.fetchval(
+        "SELECT value::text FROM settings WHERE key = 'todoist_capture_enabled'"
+    )
+    yield
+    if before is None:
+        await db_pool.execute("DELETE FROM settings WHERE key = 'todoist_capture_enabled'")
+    else:
+        await db_pool.execute(
+            "INSERT INTO settings (key, value) VALUES ('todoist_capture_enabled', $1::text::jsonb) "
+            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            before,
+        )
 
 
 @pytest.mark.asyncio

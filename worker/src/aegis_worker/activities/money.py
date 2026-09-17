@@ -10,14 +10,15 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
-from zoneinfo import ZoneInfo
 
 import structlog
 from aegis.api.models.money import MoneyEvent, payee_key
-from aegis.services import books, ledger_write, reconciled, trading_desk
+from aegis.errors import error_text
+from aegis.services import books, books_chart, ledger_write, trading_desk
 from aegis.services import journal_index as ji
 from aegis.services.bank_parsers import has_money_shape, is_autopay, parse_any
-from aegis.services.books import UNKNOWN, account_for, instrument_account
+from aegis.services.books import instrument_account
+from aegis.services.user_time import user_now, user_zone
 from temporalio import activity
 
 from aegis_worker.activities import money_render
@@ -244,7 +245,9 @@ class MoneyActivities:
     db_pool: Any
     llm: Any  # LLMClient (for Haiku batch extraction)
     delivery: Any  # DeliveryActivities
-    agent_id: str = "maou"
+    # The `finance` holder, resolved at boot in `__main__` (#579); "" = no
+    # persona, no llm_calls agent, and comms' default channel.
+    agent_id: str = ""
     home_currency: str = "INR"
     # Receipt extraction needs reliable structured JSON. The local fast model
     # (gemma4:e2b) parse-failed ~81% of receipt-shaped mail in prod — wire the
@@ -255,7 +258,8 @@ class MoneyActivities:
     ignored_mailboxes: frozenset[str] = frozenset()
     mailbox_entities: dict[str, str] = field(default_factory=dict)
     capture: Any = None  # CaptureActivities, for dues (set after construction in __main__)
-    home_tz: str = "Asia/Kolkata"
+    # "Today" and a mail's local date are the user's: the `user_timezone`
+    # settings row through `services/user_time.py` (UTC when unset).
     # FinanceConnector — keyless FX quotes for the books' price file. None =
     # no provider wired, and `refresh_fx_prices` reports itself disabled.
     finance: Any = None
@@ -395,6 +399,7 @@ class MoneyActivities:
         """One MoneyEvent for one stored email (spec §2 step 3): deterministic
         parsers, else the LLM on the full body; then mailbox entity, rules,
         account fallback, date fallback."""
+        chart = await books_chart.get_chart(self.db_pool)
         mailbox = receipt.get("account", "")
         if mailbox in self.ignored_mailboxes:
             return MoneyEvent(kind="ignore", entity="none", parser="mailbox").model_dump(
@@ -443,14 +448,18 @@ class MoneyActivities:
         # business instrument — that is stronger evidence than which inbox the
         # mail happened to land in.
         #
-        # SECURITY: only a deterministic parser may reach the `hikmah` branch.
+        # SECURITY: only a deterministic parser may name a non-default entity.
         # That holds because `_LLM_EVENT_FIELDS` in `aegis/llm/__init__.py`
         # does NOT include `entity`, so an extraction can never carry one. If
         # that allowlist ever gains `entity`, this guard stops being a guard
-        # and mail whose body says "this is a Hikmah invoice" routes itself
-        # into the business books.
-        if ev.entity != "hikmah":
-            ev.entity = self.mailbox_entities.get(mailbox, "personal")  # type: ignore[assignment]
+        # and mail whose body claims to be a company invoice routes itself into
+        # that company's books.
+        #
+        # `resolve`, not a bare comparison: an entity the chart does not
+        # configure IS the default one, so a name nothing defines must not beat
+        # the mailbox's answer.
+        if chart.resolve(ev.entity) == chart.default_entity:
+            ev.entity = self.mailbox_entities.get(mailbox, chart.default_entity)
         # `ev.direction`, because a rule may name one (issue #396): a rule from
         # an inbound answer must not file this payee's next PAYMENT into an
         # income account. `ev.direction` is nullable and that is passed through
@@ -461,7 +470,7 @@ class MoneyActivities:
                 ev.kind, ev.entity, ev.parser = "ignore", "none", f"{ev.parser}+rule"
                 ev.payee_key = payee_key(ev.payee)
                 return ev.model_dump(mode="json")
-            if rule.get("entity") in ("personal", "hikmah"):
+            if rule.get("entity") in chart.ids:
                 ev.entity = rule["entity"]
             if rule.get("payee"):
                 ev.payee = str(rule["payee"])
@@ -497,13 +506,13 @@ class MoneyActivities:
             # where nobody reviews it. The unknown account is the review queue.
             low = ev.parser == "llm" and ev.confidence < 0.8
             ev.account = (
-                UNKNOWN["hikmah" if ev.entity == "hikmah" else "personal"][side]
+                chart.unknown(ev.entity, side)
                 if low
-                else account_for(ev.category, ev.direction, ev.entity)
+                else chart.account_for(ev.category, ev.direction, ev.entity)
             )
         if ev.occurred_on is None and ev.kind == "transaction" and receipt.get("received_at"):
             received = datetime.fromisoformat(receipt["received_at"])
-            ev.occurred_on = received.astimezone(ZoneInfo(self.home_tz)).date()
+            ev.occurred_on = received.astimezone(await user_zone(self.db_pool)).date()
         ev.payee_key = payee_key(ev.payee)
         # Does this mail say the money moves on its own? Read from the text
         # here, where the body still exists — `capture_due` sees only the
@@ -564,7 +573,7 @@ class MoneyActivities:
             return None
         canon_instrument = books.canonical_instrument(ev.instrument, declared)
         try:
-            watermark = await reconciled.reconciled_through(self.db_pool, canon_instrument)
+            watermark = await ji.reconciled_through(self.db_pool, canon_instrument)
         except Exception as exc:  # noqa: BLE001 — fail open, see docstring
             activity.logger.warning(
                 "reconciled_watermark_unreadable instrument=%s error=%s — posting as normal",
@@ -586,6 +595,7 @@ class MoneyActivities:
         """Route one event (spec §2 step 4, §5.4, §7.1). Transactions are
         posted or linked; everything else is indexed only."""
         ev = MoneyEvent(**{k: v for k, v in event.items() if not k.startswith("_")})
+        chart = await books_chart.get_chart(self.db_pool)
         msgid = ji.msgid_for(mailbox, message_id)
         # Only read the chart when there is an instrument to canonicalise --
         # most events have none (199 of 245 live rows), and each read spawns
@@ -737,7 +747,7 @@ class MoneyActivities:
                     return result
                 # Either way the index records what actually happened —
                 # `posted`, with the block it wrote.
-                rel = await books.post_event(ev, msgid, cfg)
+                rel = await books.post_event(ev, msgid, cfg, chart=chart)
                 await ji.upsert(
                     self.db_pool, msgid, mailbox, ev, journal_file=rel, declared=declared
                 )
@@ -887,13 +897,13 @@ class MoneyActivities:
         """
         if self.finance is None or self.books_cfg is None:
             return {"written": 0, "errors": ["disabled"]}
-        today = datetime.now(ZoneInfo(self.home_tz)).date().isoformat()
+        today = (await user_now(self.db_pool)).date().isoformat()
         lines: list[str] = []
         errors: list[str] = []
         try:
             quotes = await self.finance.get_quotes(list(self._FX_SYMBOLS))
         except Exception as exc:  # noqa: BLE001 — a dead provider is not a flow failure
-            return {"written": 0, "errors": [f"quotes: {str(exc)[:120]}"]}
+            return {"written": 0, "errors": [f"quotes: {error_text(exc, 120)}"]}
         for q in quotes or []:
             sym = self._FX_SYMBOLS.get(str(q.get("symbol")))
             price = q.get("price")
@@ -905,7 +915,7 @@ class MoneyActivities:
             try:
                 await books.append_prices(lines, self.books_cfg)
             except Exception as exc:  # noqa: BLE001 — see the docstring
-                return {"written": 0, "errors": [*errors, f"books: {str(exc)[:120]}"]}
+                return {"written": 0, "errors": [*errors, f"books: {error_text(exc, 120)}"]}
         return {"written": len(lines), "errors": errors}
 
     async def _hl(self, args: list[str], fmt: str = "text") -> str:
@@ -922,17 +932,19 @@ class MoneyActivities:
         brief still ships the index half rather than nothing, which is what
         keeps an unconfigured or mid-clone checkout from silencing the lane.
         """
-        today = datetime.now(ZoneInfo(self.home_tz)).date()
+        chart = await books_chart.get_chart(self.db_pool)
+        today = (await user_now(self.db_pool)).date()
         since = today - timedelta(days=days)
         end = (today + timedelta(days=1)).isoformat()
         brief: dict = {
             "as_of": today.isoformat(),
             "since": since.isoformat(),
             "books_ok": True,
-            "entities": {
-                "personal": {"income": "0", "expenses": "0"},
-                "hikmah": {"income": "0", "expenses": "0"},
-            },
+            # One bucket per configured set of books, in the chart's own order,
+            # and their labels beside them — the renderer names them from this
+            # rather than knowing any of them.
+            "entities": {e: {"income": "0", "expenses": "0"} for e in chart.ids},
+            "entity_labels": {e: chart.label(e) for e in chart.ids},
             "by_account": [],
             "top_payees": [],
             "forecast": [],
@@ -958,11 +970,12 @@ class MoneyActivities:
                     continue
                 account, balance = row[0], row[1]
                 unconverted.update(unconverted_commodities(balance))
-                ent = (
-                    "hikmah"
-                    if account.startswith(("expenses:hikmah", "income:hikmah"))
-                    else "personal"
-                )
+                # The chart decides which set of books an account belongs to —
+                # the same call `post_event` files it by, so the brief's split
+                # and the journal's can never disagree. An entity-neutral
+                # account cannot appear here (the query asks for `income` and
+                # `expenses` only), but the default is the honest fallback.
+                ent = chart.entity_of(account) or chart.default_entity
                 side = "income" if account.startswith("income") else "expenses"
                 brief["entities"][ent][side] = str(
                     Decimal(brief["entities"][ent][side]) + amount_from_cell(balance)
@@ -1003,7 +1016,7 @@ class MoneyActivities:
             brief["bal_text"] = await self._hl(bal_args)
             brief["unpushed"] = await books.unpushed_commits(self.books_cfg)
         except books.BooksError as exc:
-            logger.warning("money_brief_books_unavailable", error=str(exc)[:200])
+            logger.warning("money_brief_books_unavailable", error=error_text(exc))
             brief["books_ok"] = False
             brief["bal_text"] = ""
         if unconverted:
@@ -1145,7 +1158,7 @@ class MoneyActivities:
         closed is the one BEFORE today's, and the income statement carries the
         month before that as its comparison column.
         """
-        today = datetime.now(ZoneInfo(self.home_tz)).date()
+        today = (await user_now(self.db_pool)).date()
         this_first = today.replace(day=1)
         last = this_first - timedelta(days=1)
         month_first = last.replace(day=1)
@@ -1200,7 +1213,7 @@ class MoneyActivities:
             total = sum((amount_from_cell(r[1]) for r in recurring), Decimal("0"))
             close["recurring_total"] = str(total.quantize(Decimal("0.01")))
         except books.BooksError as exc:
-            logger.warning("month_close_books_unavailable", error=str(exc)[:200])
+            logger.warning("month_close_books_unavailable", error=error_text(exc))
             close["books_ok"] = False
         if unconverted:
             logger.warning("month_close_fx_stale", commodities=sorted(unconverted))
@@ -1234,7 +1247,7 @@ class MoneyActivities:
             close["desk"] = await trading_desk.month_summary(self.db_pool, month_first, this_first)
             await trading_desk.reconcile_expectation(self.db_pool, close["desk"])
         except Exception as exc:  # noqa: BLE001
-            logger.warning("month_close_desk_failed", error=str(exc)[:200])
+            logger.warning("month_close_desk_failed", error=error_text(exc))
             close["desk"] = None
         return close
 
@@ -1285,4 +1298,4 @@ class MoneyActivities:
         try:
             await books.write_report(rel_path, text, self.books_cfg)
         except books.BooksError as exc:
-            logger.warning("money_report_write_failed", path=rel_path, error=str(exc)[:200])
+            logger.warning("money_report_write_failed", path=rel_path, error=error_text(exc))

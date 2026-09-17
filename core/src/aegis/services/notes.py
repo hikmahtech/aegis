@@ -1,4 +1,4 @@
-"""Raphael's notes: the Obsidian vault is the record (#514).
+"""The agent's notes: the user's Obsidian vault is the record (#514).
 
 Spec: `docs/superpowers/specs/2026-09-12-raphael-notes-design.md`.
 
@@ -8,19 +8,18 @@ research lane, the `note_write`/`note_link` chat tools through `notes_write.py`
 and every caller relies on them:
 
 * **Insert-only.** A write creates a note, or inserts ONE contiguous block
-  into it: a journal entry at the end of the note's own section (`Journal`,
-  `Review`, or an older note's `Month Review`, at whatever heading level the
-  note uses), anything else at the end of the note. It
-  never rewrites, reorders or deletes a line the user wrote, and `_apply`
-  checks exactly that (`is_one_insertion`) before it writes. Each block carries
-  a hidden Obsidian comment marker (`%% aegis:<key> %%`), and a write whose
-  marker is already in the note is a no-op — so a re-run or a retry can
-  neither duplicate a block nor change one.
-* **Only where Raphael may write.** Anything under `raphael/`, and the journal
-  notes the daylog owns, filed as the vault files them
-  (`journal/<YYYY>/<NN. Mon>/`). A live periodic-notes note at the `journal/`
-  root takes the write only when it already exists; it is never created.
-  Every other path is refused before git is touched.
+  into it: a journal entry at the end of the note's own section (the layout's
+  `sections` for the kind, at whatever heading level the note uses), anything
+  else at the end of the note. It never rewrites, reorders or deletes a line
+  the user wrote, and `_apply` checks exactly that (`is_one_insertion`) before
+  it writes. Each block carries a hidden Obsidian comment marker
+  (`%% aegis:<key> %%`), and a write whose marker is already in the note is a
+  no-op — so a re-run or a retry can neither duplicate a block nor change one.
+* **Only where the agent may write.** Anything under the layout's `agent_dir`,
+  and the journal notes the daylog owns, filed as the layout files them. A live
+  periodic-notes note in the layout's `live_folder` takes the write only when it
+  already exists; it is never created. Every other path is refused before git
+  is touched.
 * **A write counts only once it is pushed.** The phone and laptop auto-commit
   through `obsidian-git`, so a push can be rejected and a rebase can conflict.
   The writer then drops its own unpushed commit, pulls fresh and re-applies the
@@ -29,6 +28,13 @@ and every caller relies on them:
 * **Encrypted blocks never leave the file.** meld-encrypt keeps ciphertext
   between `%%🔐` and `🔐%%` inside ordinary notes. :func:`strip_encrypted` runs
   before anything is indexed, shown by a tool or sent to a model.
+
+Where things go and how a block looks is the vault's **layout**
+(`services/vault_layout.py`, the `vault_layout` settings row): folders, file
+name formats, templates, section headings, the week rule, the outline's tag and
+indent. Every function here takes a `layout`, defaulting to the shipped one, so
+a deployment with no row behaves as it always did. The rules above are not
+layout and are not configurable.
 
 The git plumbing is the books layer (`books.py`), reused rather than copied:
 the clone happens inside the flock, `.aegis.lock` lives in the checkout, and a
@@ -42,33 +48,39 @@ import hashlib
 import os
 import re
 import subprocess
-from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+import unicodedata
+from dataclasses import dataclass, field, replace
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
 import structlog
 
+from aegis.errors import error_text
 from aegis.services import books
+from aegis.services import vault_layout as vl
+from aegis.services.vault_layout import DEFAULT_LAYOUT, KINDS, Layout, moment_format
 
 logger = structlog.get_logger()
 
+__all__ = ["DEFAULT_LAYOUT", "Layout", "moment_format"]
+
 DEPLOY_KEY_NAME = "notes_deploy_key"
-RAPHAEL_DIR = "raphael"
-# Folders that are configuration, templates or binaries, not notes.
-SKIP_PREFIXES = (".obsidian/", "_templates/", "backups/", "_attachments/", ".trash/")
 # One note is indexed whole up to this; a longer one is cut (a note that long
-# is a paste, not a note).
+# is a paste, not a note). The `notes-sync-hourly` row's `index_max_chars`
+# overrides it.
 INDEX_MAX_CHARS = 100_000
 # What a chat tool may read back in one call.
 READ_MAX_CHARS = 60_000
+# The shipped layout's values, for callers and tests that want them by name.
+SKIP_PREFIXES = DEFAULT_LAYOUT.index_skip_prefixes
+TEMPLATES = {kind: DEFAULT_LAYOUT.kind(kind).template for kind in KINDS}
+JOURNAL_SECTIONS = {kind: DEFAULT_LAYOUT.kind(kind).sections for kind in KINDS}
+JOURNAL_LABELS = {kind: DEFAULT_LAYOUT.kind(kind).label for kind in KINDS}
+DAILY_FORMAT = DEFAULT_LAYOUT.daily.format
+WEEKLY_FORMAT = DEFAULT_LAYOUT.weekly.format
+MONTHLY_FORMAT = DEFAULT_LAYOUT.monthly.format
 
-_GIT_IDENTITY = {
-    "GIT_AUTHOR_NAME": "Raphael",
-    "GIT_AUTHOR_EMAIL": "raphael@aegis.local",
-    "GIT_COMMITTER_NAME": "Raphael",
-    "GIT_COMMITTER_EMAIL": "raphael@aegis.local",
-}
 _LOCK_NAME = ".aegis.lock"
 
 # meld-encrypt 1.6.2 (the vault's version) writes `%%🔐<ciphertext> 🔐%%`, and
@@ -97,26 +109,56 @@ class NotesConflict(NotesError):  # noqa: N818 — a state, as NotesDisabled / B
 
 
 class NotesPathError(NotesError):
-    """A path Raphael may not write."""
+    """A path the agent may not write."""
+
+
+class JournalKindDisabled(NotesError):  # noqa: N818 — a state, as NotesDisabled
+    """The layout has this journal kind switched off; the daylog files its
+    knowledge row instead."""
 
 
 # ----------------------------------------------------------------- config
 
 
 @dataclass(frozen=True)
+class Author:
+    """Who a commit is from. Derived from the owning agent's `agents.name`
+    (`author_for`); a write with no known agent is AEGIS's own."""
+
+    name: str = "AEGIS"
+    email: str = "aegis@aegis.local"
+    # The commit message's prefix: `raphael: journal 2026-09-12`.
+    prefix: str = "aegis"
+
+
+DEFAULT_AUTHOR = Author()
+
+
+@dataclass(frozen=True)
 class NotesConfig:
-    """The vault checkout. Same attribute names as `books.BooksConfig`, which
-    is what lets this module reuse the books git layer."""
+    """The vault checkout, and who commits to it. Same attribute names as
+    `books.BooksConfig`, which is what lets this module reuse the books git
+    layer."""
 
     path: Path
     repo_url: str = ""
     deploy_key: Path | None = None
+    author: Author = DEFAULT_AUTHOR
 
     @property
     def configured(self) -> bool:
         """Both halves of the integration are set. Until then nothing writes,
         indexes or reads the vault, and the daylog keeps its old behaviour."""
         return bool(self.repo_url) and self.deploy_key is not None
+
+
+def author_for(agent_id: str | None, name: str | None = None) -> Author:
+    """The `Author` for an agent: its display name, `<id>@aegis.local`, and the
+    id as the commit prefix."""
+    aid = re.sub(r"[^a-z0-9._-]+", "-", (agent_id or "").strip().lower()).strip("-")
+    if not aid:
+        return DEFAULT_AUTHOR
+    return Author(name=(name or "").strip() or aid, email=f"{aid}@aegis.local", prefix=aid)
 
 
 def config_from_settings(settings: Any) -> NotesConfig:
@@ -182,15 +224,16 @@ def strip_encrypted(text: str) -> str:
     return "".join(out)
 
 
-def split_section(text: str, key: str) -> tuple[str, str]:
+def split_section(text: str, key: str, *, indent_width: int = 2) -> tuple[str, str]:
     """What a journal write put under `key`, and the note without it.
     `("", text)` when the marker is not in the note, or not on a bullet.
 
-    The block (`journal_block`) is a `- #raphael … %% aegis:<key> %%` bullet
+    The block (`journal_block`) is a `- <tag> … %% aegis:<key> %%` bullet
     whose indented child bullets are the outline. Each depth-1 child comes
     back as a paragraph, and a deeper one as a `- ` item indented two spaces
     a level under it, which is the text `body_outline` laid out in the first
-    place."""
+    place. `indent_width` is the layout's spaces per level (a tab is always
+    one level), so a block written with four-space indents reads back too."""
     mark = marker(key)
     at = text.find(mark)
     if at < 0:
@@ -202,7 +245,7 @@ def split_section(text: str, key: str) -> tuple[str, str]:
     if not line.lstrip().startswith("- "):
         return "", text
     indent = len(line) - len(line.lstrip())
-    base = _indent_levels(line)
+    base = _indent_levels(line, indent_width)
     end = line_end
     paras: list[str] = []
     while end < len(text):
@@ -212,7 +255,7 @@ def split_section(text: str, key: str) -> tuple[str, str]:
         if not row.strip() or len(row) - len(row.lstrip()) <= indent:
             break
         item = _BULLET_RE.sub("", row.strip(), count=1)
-        depth = max(1, _indent_levels(row) - base)
+        depth = max(1, _indent_levels(row, indent_width) - base)
         if depth == 1 or not paras:
             paras.append(item)
         else:
@@ -223,165 +266,60 @@ def split_section(text: str, key: str) -> tuple[str, str]:
 
 # ------------------------------------------------------ dates and names
 
-_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
-_MONTHS_LONG = (
-    "January", "February", "March", "April", "May", "June",
-    "July", "August", "September", "October", "November", "December",
-)
-_DAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
-_DAYS_LONG = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+
+def week_start(d: date, layout: Layout = DEFAULT_LAYOUT) -> date:
+    """The first day of `d`'s week under the layout's rule. The shipped rule
+    is Monday-first (the calendar plugin's `weekStart: locale` in a Monday-first
+    locale); `week_start: sunday` is the other."""
+    return vl.week_start_of(d, layout.week_start)
 
 
-def week_start(d: date) -> date:
-    """The Monday that starts `d`'s week. The vault's weekly notes have been
-    dated from their Monday since 2023 (`W40 Oct 23` opens `# Oct 02, 2023`,
-    `W05 Jan 23` is Mon 30 Jan): the calendar plugin follows the system locale
-    (`weekStart: locale`), which is Monday-first. Its 2022 notes were
-    Sunday-dated; the current convention is the one Raphael writes."""
-    return d - timedelta(days=d.weekday())
+def locale_week(d: date, layout: Layout = DEFAULT_LAYOUT) -> int:
+    """moment's `ww` under the layout's rule. The shipped rule (Monday-first,
+    ISO numbering — `en-gb`) is the ISO week number: Mon 29 Dec 2025 is week
+    1 of 2026."""
+    return vl.week_of(d, layout.week_start, layout.week_numbering)[1]
 
 
-def locale_week(d: date) -> int:
-    """moment's `ww` in that Monday-first locale (`en-gb`: dow 1, doy 4), which
-    is the ISO week number: `W40 Oct 23` is Mon 2 Oct 2023, and Mon 29 Dec
-    2025 is week 1 of 2026."""
-    return d.isocalendar().week
+def daily_note_path(d: date, layout: Layout = DEFAULT_LAYOUT) -> str:
+    """The day's note, filed where the layout files it — as shipped,
+    `journal/2023/10. Oct/24 Oct 23.md`."""
+    return layout.note_path("daily", d)
 
 
-# Longest first, so `MMMM` is never read as `MM` + `MM`.
-_TOKENS = (
-    "YYYY", "MMMM", "dddd", "MMM", "ddd", "YY", "MM", "DD", "Do", "HH", "hh", "mm", "ss",
-    "ww", "M", "D", "H", "h", "w", "A", "a",
-)
-
-
-def _ordinal(n: int) -> str:
-    """moment's `Do`: 1st, 2nd, 3rd, 4th … 11th, 12th, 13th … 21st, 22nd."""
-    suffix = "th" if 11 <= n % 100 <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
-    return f"{n}{suffix}"
-
-
-def moment_format(fmt: str, when: date | datetime) -> str:
-    """A small moment.js `format()`: the tokens Obsidian's date settings use,
-    and `[...]` for literal text. Anything unrecognised is copied as is."""
-    if not isinstance(when, datetime):
-        when = datetime(when.year, when.month, when.day)
-    values = {
-        "YYYY": f"{when.year:04d}",
-        "YY": f"{when.year % 100:02d}",
-        "MMMM": _MONTHS_LONG[when.month - 1],
-        "MMM": _MONTHS[when.month - 1],
-        "MM": f"{when.month:02d}",
-        "M": str(when.month),
-        "DD": f"{when.day:02d}",
-        "Do": _ordinal(when.day),
-        "D": str(when.day),
-        "dddd": _DAYS_LONG[when.weekday()],
-        "ddd": _DAYS[when.weekday()],
-        "HH": f"{when.hour:02d}",
-        "H": str(when.hour),
-        "hh": f"{(when.hour % 12) or 12:02d}",
-        "h": str((when.hour % 12) or 12),
-        "mm": f"{when.minute:02d}",
-        "ss": f"{when.second:02d}",
-        "ww": f"{locale_week(when.date()):02d}",
-        "w": str(locale_week(when.date())),
-        "A": "AM" if when.hour < 12 else "PM",
-        "a": "am" if when.hour < 12 else "pm",
-    }
-    out: list[str] = []
-    i = 0
-    while i < len(fmt):
-        if fmt[i] == "[":
-            close = fmt.find("]", i + 1)
-            if close > 0:
-                out.append(fmt[i + 1 : close])
-                i = close + 1
-                continue
-        for tok in _TOKENS:
-            if fmt.startswith(tok, i):
-                out.append(values[tok])
-                i += len(tok)
-                break
-        else:
-            out.append(fmt[i])
-            i += 1
-    return "".join(out)
-
-
-# The vault's periodic-notes settings (`.obsidian/plugins/periodic-notes`).
-DAILY_FORMAT = "DD MMM YY"
-WEEKLY_FORMAT = "[W]ww MMM YY"
-MONTHLY_FORMAT = "MM. MMM"
-
-TEMPLATES = {
-    "daily": "_templates/{{tp_title_today}}.md",
-    "weekly": "_templates/weekly-{{tp_title_today}}.md",
-    "monthly": "_templates/monthly.md",
-}
-
-
-def _month_folder(d: date) -> str:
-    """`journal/<YYYY>/<NN. Mon>`: where the vault files a month's notes."""
-    return f"journal/{d.year:04d}/{d.month:02d}. {_MONTHS[d.month - 1]}"
-
-
-def daily_note_path(d: date) -> str:
-    """The day's note, filed in its month folder as every filed daily note in
-    the vault is: `journal/2023/10. Oct/24 Oct 23.md`."""
-    return f"{_month_folder(d)}/{moment_format(DAILY_FORMAT, d)}.md"
-
-
-def daily_root_path(d: date) -> str:
+def daily_root_path(d: date, layout: Layout = DEFAULT_LAYOUT) -> str:
     """Where periodic-notes creates today's note before the user files it
-    (`journal/25 Oct 23.md`). Raphael appends to it when it exists and never
-    creates it."""
-    return f"journal/{moment_format(DAILY_FORMAT, d)}.md"
+    (`journal/25 Oct 23.md` as shipped). Appended to when it exists, never
+    created. Empty when the layout has no live folder for days."""
+    return layout.root_path("daily", d)
 
 
-def weekly_note_path(d: date) -> str:
-    """The week holding `d`, named from its Monday and filed in that Monday's
-    month folder: `journal/2023/10. Oct/W40 Oct 23.md`. The daylog's weekly
-    rollup is an ISO week, Monday to Sunday — the same week."""
-    ws = week_start(d)
-    return f"{_month_folder(ws)}/{moment_format(WEEKLY_FORMAT, ws)}.md"
+def weekly_note_path(d: date, layout: Layout = DEFAULT_LAYOUT) -> str:
+    """The week holding `d`, named from its first day and filed in that day's
+    folder: `journal/2023/10. Oct/W40 Oct 23.md` as shipped. The daylog's
+    weekly rollup uses the same week rule, so it is the same week."""
+    return layout.note_path("weekly", d)
 
 
-def weekly_root_path(d: date) -> str:
-    """The week's live periodic-notes note at the journal root, if the user made one."""
-    return f"journal/{moment_format(WEEKLY_FORMAT, week_start(d))}.md"
+def weekly_root_path(d: date, layout: Layout = DEFAULT_LAYOUT) -> str:
+    """The week's live periodic-notes note, if the user made one."""
+    return layout.root_path("weekly", d)
 
 
-def monthly_note_path(d: date) -> str:
-    """The month folder's own folder note, as the vault's months are
-    (`journal/2023/08. Aug/08. Aug.md`). `MM. MMM` has no year, so a month
-    note only ever lives inside its year."""
-    return f"{_month_folder(d)}/{moment_format(MONTHLY_FORMAT, d)}.md"
+def monthly_note_path(d: date, layout: Layout = DEFAULT_LAYOUT) -> str:
+    """The month's note — as shipped, the month folder's own folder note
+    (`journal/2023/08. Aug/08. Aug.md`)."""
+    return layout.note_path("monthly", d)
 
 
-_MON_RE = r"[A-Z][a-z]{2}"
-_FOLDER_RE = rf"journal/\d{{4}}/\d{{2}}\. {_MON_RE}"
-# The journal notes the daylog may create: filed daily, weekly and monthly notes.
-_JOURNAL_RES = (
-    re.compile(rf"^{_FOLDER_RE}/\d{{2}} {_MON_RE} \d{{2}}\.md$"),
-    re.compile(rf"^{_FOLDER_RE}/W\d{{2}} {_MON_RE} \d{{2}}\.md$"),
-    re.compile(rf"^journal/\d{{4}}/(\d{{2}}\. {_MON_RE})/\1\.md$"),
-)
-# A live periodic-notes note at the journal root: written only when it exists.
-_JOURNAL_ROOT_RES = (
-    re.compile(rf"^journal/\d{{2}} {_MON_RE} \d{{2}}\.md$"),
-    re.compile(rf"^journal/W\d{{2}} {_MON_RE} \d{{2}}\.md$"),
-)
+def is_journal_path(rel: str, layout: Layout = DEFAULT_LAYOUT) -> bool:
+    """A journal note the daylog may create (filed in its folder)."""
+    return layout.is_journal_path(rel)
 
 
-def is_journal_path(rel: str) -> bool:
-    """A journal note the daylog may create (filed in its month folder)."""
-    return any(r.match(rel) for r in _JOURNAL_RES)
-
-
-def is_journal_root_path(rel: str) -> bool:
-    """A daily or weekly note at the journal root: appended to, never created."""
-    return any(r.match(rel) for r in _JOURNAL_ROOT_RES)
+def is_journal_root_path(rel: str, layout: Layout = DEFAULT_LAYOUT) -> bool:
+    """A live daily or weekly note: appended to, never created."""
+    return layout.is_journal_root_path(rel)
 
 
 # ------------------------------------------------------------ templates
@@ -390,11 +328,13 @@ _PLACEHOLDER_RE = re.compile(r"\{\{\s*(date|time|title)(?:\s*:\s*([^}]*?))?\s*\}
 _TEMPLATER_RE = re.compile(r"<%[\s\S]*?%>")
 
 
-def render_template(text: str, *, title: str, when: datetime) -> str:
-    """Obsidian's core-template placeholders, rendered. The vault's templates
-    use only `{{date:FMT}}`, `{{date}}`, `{{time}}` and `{{title}}`; a
-    Templater tag (`<% … %>`) is dropped — Raphael never executes one, and
-    never writes one into a note either."""
+def render_template(
+    text: str, *, title: str, when: datetime, layout: Layout = DEFAULT_LAYOUT
+) -> str:
+    """Obsidian's core-template placeholders, rendered: `{{date:FMT}}`,
+    `{{date}}`, `{{time}}` and `{{title}}`. A Templater tag (`<% … %>`) is
+    dropped — the agent never executes one, and never writes one into a note
+    either."""
     text = _TEMPLATER_RE.sub("", text)
 
     def sub(m: re.Match) -> str:
@@ -402,8 +342,8 @@ def render_template(text: str, *, title: str, when: datetime) -> str:
         if kind == "title":
             return title
         if kind == "time":
-            return moment_format(fmt or "HH:mm", when)
-        return moment_format(fmt or "YYYY-MM-DD", when)
+            return layout.render(fmt or "HH:mm", when)
+        return layout.render(fmt or "YYYY-MM-DD", when)
 
     return _PLACEHOLDER_RE.sub(sub, text)
 
@@ -434,18 +374,22 @@ class Append:
     body      the text to write
     heading   `## <heading>` before the body; empty = one inline line whose
               marker sits at its end (a link). Not used with `section`.
-    template  `daily` / `weekly` / `monthly`: render the vault's template when
-              the note does not exist yet
+    template  `daily` / `weekly` / `monthly`: render the layout's template for
+              the kind when the note does not exist yet
     title     `# <title>` for a new note that has no template
     when      the date a template's placeholders are rendered for
     journal   the path is a journal note (only the daylog writes those)
-    alt_rel   a live journal note at the root that takes the write instead of
-              `rel` when it already exists; never created
+    alt_rel   a live journal note that takes the write instead of `rel` when
+              it already exists; never created
+    also_rels other notes where the marker counts as written — the paths a
+              previous layout gave the same entry — never written to
     section   heading texts, in order of preference (`("Review", "Month
-              Review")`): insert a `#raphael` bullet block at the end of the
-              first such section of the note, at any heading level, instead
-              of appending at the end
-    label     the block's title after `#raphael` (`day log`)
+              Review")`): insert a tagged bullet block at the end of the first
+              such section of the note, at any heading level, instead of
+              appending at the end
+    label     the block's title after the tag (`day log`)
+    layout    the vault layout the append was built for: the gate, the
+              template, the block's tag and indent all follow it
     """
 
     rel: str
@@ -457,12 +401,14 @@ class Append:
     when: datetime | None = None
     journal: bool = False
     alt_rel: str = ""
+    also_rels: tuple[str, ...] = ()
     section: tuple[str, ...] = ()
     label: str = ""
+    layout: Layout = DEFAULT_LAYOUT
 
 
-def check_path(rel: str, *, journal: bool = False) -> str:
-    """`rel` if Raphael may write it, else NotesPathError. Nothing is
+def check_path(rel: str, *, journal: bool = False, layout: Layout = DEFAULT_LAYOUT) -> str:
+    """`rel` if the agent may write it, else NotesPathError. Nothing is
     normalised away: a path that needs normalising is refused."""
     if not rel or "\x00" in rel or "\\" in rel or rel.startswith("/"):
         raise NotesPathError(f"not a vault path: {rel!r}")
@@ -471,12 +417,13 @@ def check_path(rel: str, *, journal: bool = False) -> str:
         raise NotesPathError(f"not a vault path: {rel!r}")
     if not rel.endswith(".md"):
         raise NotesPathError(f"only markdown notes can be written: {rel!r}")
-    if parts[0] == RAPHAEL_DIR and len(parts) > 1:
+    if parts[0] == layout.agent_dir and len(parts) > 1:
         return rel
-    if journal and is_journal_path(rel):
+    if journal and is_journal_path(rel, layout):
         return rel
     raise NotesPathError(
-        f"Raphael may only write under {RAPHAEL_DIR}/ (and the daylog's journal notes): {rel!r}"
+        f"notes may only be written under {layout.agent_dir}/ "
+        f"(and the daylog's journal notes): {rel!r}"
     )
 
 
@@ -487,22 +434,16 @@ def _section(ap: Append) -> str:
     return f"\n## {ap.heading}\n{marker(ap.key)}\n\n{body}\n"
 
 
-# A journal entry goes into the note's own section, as the user's bullets do.
-# Matched by heading TEXT at any level: the current templates use `## Review`,
-# older notes `### Review` and, for the month, `### Month Review`.
-JOURNAL_SECTIONS: dict[str, tuple[str, ...]] = {
-    "daily": ("Journal",),
-    "weekly": ("Review",),
-    "monthly": ("Review", "Month Review"),
-}
-JOURNAL_LABELS = {"daily": "day log", "weekly": "week in review", "monthly": "month in review"}
 _HEADING_RE = re.compile(r"^#{1,6} ")
 
 
-def _is_boundary(line: str) -> bool:
-    """A line that ends a section: the next heading, a `---` rule or a code fence."""
+def _is_boundary(line: str, rule_or_fence: bool = True) -> bool:
+    """A line that ends a section: the next heading and, unless the layout
+    says otherwise, a `---` rule or a code fence."""
+    if _HEADING_RE.match(line):
+        return True
     s = line.strip()
-    return bool(_HEADING_RE.match(line)) or s == "---" or s.startswith("```")
+    return rule_or_fence and (s == "---" or s.startswith("```"))
 
 
 def _heading_text(line: str) -> str | None:
@@ -529,18 +470,19 @@ def _find_section(lines: list[str], names: tuple[str, ...]) -> int | None:
 
 _BULLET_RE = re.compile(r"^[-*+•]\s+")
 _NUMBERED_RE = re.compile(r"^\d+[.)]\s+")
-MAX_OUTLINE_DEPTH = 4
+MAX_OUTLINE_DEPTH = DEFAULT_LAYOUT.max_outline_depth
 
 
-def _indent_levels(line: str) -> int:
-    """Leading indentation in outline levels: a tab or two spaces each."""
+def _indent_levels(line: str, space_width: int = 2) -> int:
+    """Leading indentation in outline levels: a tab, or `space_width` spaces,
+    each."""
     lead = line[: len(line) - len(line.lstrip(" \t"))]
-    return lead.count("\t") + lead.count(" ") // 2
+    return lead.count("\t") + lead.count(" ") // max(1, space_width)
 
 
-def body_outline(body: str) -> list[tuple[int, str]]:
+def body_outline(body: str, max_depth: int = MAX_OUTLINE_DEPTH) -> list[tuple[int, str]]:
     """`body` as outline nodes `(depth, text)`, depth 1 sitting directly under
-    the `#raphael` bullet. Both kinds of daylog text go through here:
+    the tagged bullet. Both kinds of daylog text go through here:
 
     * an LLM narrative — prose paragraphs split by blank lines — gives one
       depth-1 node per paragraph, its wrapped lines joined with a space;
@@ -551,7 +493,7 @@ def body_outline(body: str) -> list[tuple[int, str]]:
     lines join into one; a blank line, a label, a list item or an indented
     line ends that join. A plain unindented line ending in `:` is a label.
     Depth is 1 plus the line's indent (a tab or two spaces a level), at most
-    one deeper than the node before and never past `MAX_OUTLINE_DEPTH`. A
+    one deeper than the node before and never past `max_depth`. A
     `-`/`*`/`+`/`•` marker (or a number) is dropped, a heading becomes bold,
     and the text is otherwise kept as it is."""
     nodes: list[tuple[int, str]] = []
@@ -580,51 +522,60 @@ def body_outline(body: str) -> list[tuple[int, str]]:
             text = text[bullet.end() :]
         if text:
             prev = nodes[-1][0] if nodes else 0
-            nodes.append((min(1 + levels, prev + 1, MAX_OUTLINE_DEPTH), text))
+            nodes.append((min(1 + levels, prev + 1, max_depth), text))
     flush()
     return nodes
 
 
-def journal_block(key: str, label: str, body: str) -> str:
-    """Raphael's entry in the user's own bullet style (they write `- ` bullets
-    under `## Journal`, with obsidian-outliner)::
+def journal_block(key: str, label: str, body: str, layout: Layout = DEFAULT_LAYOUT) -> str:
+    """The agent's entry in the user's own bullet style (they write `- `
+    bullets under the section, with obsidian-outliner)::
 
         - #raphael day log %% aegis:<key> %%
         <TAB>- <first paragraph, as one line>
         <TAB>- Completed:
         <TAB><TAB>- <an item under that label>
 
-    The body is laid out by :func:`body_outline`. The marker is an Obsidian
+    The tag and the indent are the layout's (`entry.tag`, `entry.indent`); the
+    body is laid out by :func:`body_outline`. The marker is an Obsidian
     comment, so reading view shows the tag, the label and the outline."""
-    title = " ".join(p for p in ("#raphael", clean_body(label).replace("\n", " ")) if p)
-    rows = [f"- {title} {marker(key)}"] + ["\t" * d + f"- {t}" for d, t in body_outline(body)]
+    title = " ".join(
+        p for p in (layout.entry_tag, clean_body(label).replace("\n", " ")) if p
+    )
+    head = f"- {title} {marker(key)}" if title else f"- {marker(key)}"
+    rows = [head] + [
+        layout.indent_text * d + f"- {t}"
+        for d, t in body_outline(body, layout.max_outline_depth)
+    ]
     return "\n".join(rows) + "\n"
 
 
-def _section_end(lines: list[str], names: tuple[str, ...]) -> int | None:
+def _section_end(lines: list[str], names: tuple[str, ...], rule_or_fence: bool = True) -> int | None:
     """The index just after the last non-blank line of the section (just after
     its heading when it is empty), or None when the note has no such heading.
-    The section ends before the next heading, a `---` rule or a code fence —
-    the monthly note's `ccard` fence included."""
+    The section ends before the next heading and, by default, a `---` rule or
+    a code fence — the monthly note's `ccard` fence included."""
     i = _find_section(lines, names)
     if i is None:
         return None
     last = i
     for j in range(i + 1, len(lines)):
-        if _is_boundary(lines[j]):
+        if _is_boundary(lines[j], rule_or_fence):
             break
         if lines[j].strip():
             last = j
     return last + 1
 
 
-def insert_block(text: str, names: tuple[str, ...], block: str) -> str:
+def insert_block(
+    text: str, names: tuple[str, ...], block: str, rule_or_fence: bool = True
+) -> str:
     """`text` with `block` inserted at the end of the section — after its last
-    non-blank line, before the next heading, `---` or code fence — or, when
+    non-blank line, before the next heading (`---` or code fence) — or, when
     the note has none of `names`, a `## <first name>` heading and the block at
     the end. Nothing that is there moves or changes."""
     lines = text.splitlines(keepends=True)
-    at = _section_end(lines, names)
+    at = _section_end(lines, names, rule_or_fence)
     if at is None:
         base = text if not text or text.endswith("\n") else text + "\n"
         return f"{base}\n## {names[0]}\n{block}"
@@ -634,16 +585,16 @@ def insert_block(text: str, names: tuple[str, ...], block: str) -> str:
     return before + block + "".join(lines[at:])
 
 
-def drop_placeholders(text: str, names: tuple[str, ...]) -> str:
+def drop_placeholders(text: str, names: tuple[str, ...], rule_or_fence: bool = True) -> str:
     """A new note's target section without its empty `- ` placeholder bullets:
-    Raphael fills that section, and a lone `- ` left above the entry would be
-    an empty bullet in the note. Every other line of the template stays."""
+    the agent fills that section, and a lone `- ` left above the entry would
+    be an empty bullet in the note. Every other line of the template stays."""
     lines = text.splitlines(keepends=True)
     i = _find_section(lines, names)
     if i is None:
         return text
     j = i + 1
-    while j < len(lines) and not _is_boundary(lines[j]):
+    while j < len(lines) and not _is_boundary(lines[j], rule_or_fence):
         j += 1
     kept = [ln for ln in lines[i + 1 : j] if ln.strip() not in ("-", "*", "+")]
     return "".join(lines[: i + 1] + kept + lines[j:])
@@ -667,15 +618,19 @@ def append_text(existing: str | None, ap: Append, new_note: str = "") -> str | N
     """The note's new text, or None when its marker is already there. The
     result is always `existing` with ONE block inserted — at the end of
     the `ap.section` it finds for a journal entry, at the end of the note
-    otherwise — and
-    `_apply` checks that again before writing."""
+    otherwise — and `_apply` checks that again before writing."""
     if not _KEY_RE.match(ap.key):
         raise NotesError(f"bad marker key {ap.key!r}")
     if existing is not None and marker(ap.key) in existing:
         return None
     base = existing if existing is not None else new_note
     if ap.section:
-        return insert_block(base, ap.section, journal_block(ap.key, ap.label, ap.body))
+        return insert_block(
+            base,
+            ap.section,
+            journal_block(ap.key, ap.label, ap.body, ap.layout),
+            ap.layout.section_ends_at_rule_or_fence,
+        )
     if base and not base.endswith("\n"):
         base += "\n"
     return base + _section(ap)
@@ -686,29 +641,35 @@ _OPEN_TASK_RE = re.compile(r"^[ \t]*[-*+] \[ \][^\n]*(?:\n|$)", re.M)
 
 
 def drop_open_tasks(text: str) -> str:
-    """`text` without its unticked task lines. The vault's templates carry
+    """`text` without its unticked task lines. A vault's templates carry
     prompts for the person filling the day in ("- [ ] #admin Plan the day").
-    In a note Raphael creates they are to-dos nobody can do: the day has
+    In a note the agent creates they are to-dos nobody can do: the day has
     already passed, and obsidian-checklist-plugin lists every open box in the
-    vault, so the 2026-09-12 backfill added 125 of them. Ticked boxes, headings
-    and everything else in the template stay."""
+    vault (a backfill once added 125 of them). Ticked boxes, headings and
+    everything else in the template stay."""
     return _OPEN_TASK_RE.sub("", text)
 
 
 def _new_note_text(cfg: NotesConfig, ap: Append) -> str:
-    """What a note starts with when Raphael creates it: the vault's own
+    """What a note starts with when the agent creates it: the vault's own
     template for a journal note (read at write time, so edits to the template
     apply) without its open tasks, else a `# title` line. A note that already
     exists is never touched here — only the text of a brand-new note."""
     stem = Path(ap.rel).stem
+    layout = ap.layout
     if ap.template:
-        tpl = cfg.path / TEMPLATES[ap.template]
-        if tpl.is_file():
+        template = layout.kind(ap.template).template
+        tpl = cfg.path / template if template else None
+        if tpl is not None and tpl.is_file():
             when = ap.when or datetime.now()
-            rendered = drop_open_tasks(
-                render_template(tpl.read_text("utf-8"), title=stem, when=when)
-            )
-            return drop_placeholders(rendered, ap.section) if ap.section else rendered
+            rendered = render_template(tpl.read_text("utf-8"), title=stem, when=when, layout=layout)
+            if layout.drop_open_tasks:
+                rendered = drop_open_tasks(rendered)
+            if ap.section and layout.drop_empty_bullets_in_section:
+                rendered = drop_placeholders(
+                    rendered, ap.section, layout.section_ends_at_rule_or_fence
+                )
+            return rendered
         return f"# {stem}\n"
     title = clean_body(ap.title or stem).replace("\n", " ")
     return f"# {title}\n"
@@ -718,7 +679,14 @@ def _new_note_text(cfg: NotesConfig, ap: Append) -> str:
 
 
 def _env(cfg: NotesConfig) -> dict[str, str]:
-    env = {**os.environ, **_GIT_IDENTITY}
+    author = getattr(cfg, "author", None) or DEFAULT_AUTHOR
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": author.name,
+        "GIT_AUTHOR_EMAIL": author.email,
+        "GIT_COMMITTER_NAME": author.name,
+        "GIT_COMMITTER_EMAIL": author.email,
+    }
     if cfg.deploy_key:
         env["GIT_SSH_COMMAND"] = (
             f"ssh -i {cfg.deploy_key} -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes"
@@ -808,7 +776,7 @@ def _ensure_checkout(cfg: NotesConfig) -> None:
             exclude.write_text(current + ("" if current.endswith("\n") or not current else "\n")
                                + _LOCK_NAME + "\n", "utf-8")
     except OSError as exc:  # pragma: no cover — cosmetic only
-        logger.warning("notes_exclude_write_failed", error=str(exc)[:200])
+        logger.warning("notes_exclude_write_failed", error=error_text(exc))
 
 
 def _drop_local(cfg: NotesConfig, paths: list[str]) -> None:
@@ -821,7 +789,7 @@ def _drop_local(cfg: NotesConfig, paths: list[str]) -> None:
     try:
         books._revert_sync(cfg, paths)  # type: ignore[arg-type]
     except books.BooksError as exc:  # pragma: no cover — best effort
-        logger.warning("notes_revert_failed", error=str(exc)[:200])
+        logger.warning("notes_revert_failed", error=error_text(exc))
 
 
 def _pull(cfg: NotesConfig) -> None:
@@ -850,10 +818,11 @@ def _target_rel(cfg: NotesConfig, ap: Append) -> str:
 
 def _apply(cfg: NotesConfig, ap: Append) -> tuple[str, bool]:
     """Apply one append to the working copy: `(the note it went to, whether it
-    changed)`. The marker in EITHER place means the write is already done —
-    the user may have filed the root note since Raphael wrote into it."""
+    changed)`. The marker in ANY of its places means the write is already
+    done — the user may have filed the root note since the agent wrote into
+    it, or the entry may sit where a previous layout put it (`also_rels`)."""
     rel = _target_rel(cfg, ap)
-    for other in (ap.rel, ap.alt_rel):
+    for other in (ap.rel, ap.alt_rel, *ap.also_rels):
         if other and other != rel:
             path = cfg.path / other
             if path.is_file() and marker(ap.key) in path.read_text("utf-8"):
@@ -904,8 +873,11 @@ class _Lock:
         self._inner.__exit__(*exc)
 
 
-def write_sync(cfg: NotesConfig, appends: list[Append], summary: str) -> dict:
-    """Apply `appends` in one commit and push it.
+def write_sync(
+    cfg: NotesConfig, appends: list[Append], summary: str, *, author: Author | None = None
+) -> dict:
+    """Apply `appends` in one commit and push it, as `cfg.author` (or
+    `author`).
 
     `{"status": "written" | "exists", "paths", "changed", "outcomes",
     "attempts"}` — `outcomes` is one `{"path", "changed"}` per append, in
@@ -915,15 +887,17 @@ def write_sync(cfg: NotesConfig, appends: list[Append], summary: str) -> dict:
     """
     if not cfg.configured:
         raise NotesDisabled("the vault is not configured (notes_repo_url and notes_deploy_key)")
+    if author is not None and author != cfg.author:
+        cfg = replace(cfg, author=author)
     for ap in appends:
-        check_path(ap.rel, journal=ap.journal)
-        if ap.alt_rel and not (ap.journal and is_journal_root_path(ap.alt_rel)):
+        check_path(ap.rel, journal=ap.journal, layout=ap.layout)
+        if ap.alt_rel and not (ap.journal and is_journal_root_path(ap.alt_rel, ap.layout)):
             raise NotesPathError(f"not a live journal note: {ap.alt_rel!r}")
-        if ap.template and ap.template not in TEMPLATES:
+        if ap.template and ap.template not in KINDS:
             raise NotesError(f"unknown template {ap.template!r}")
     # Everything a write here could touch, so a failed one is undone whole.
     touchable = list(dict.fromkeys(p for ap in appends for p in (ap.rel, ap.alt_rel) if p))
-    summary = clean_body(summary).replace("\n", " ")[:120] or "raphael: notes"
+    summary = clean_body(summary).replace("\n", " ")[:120] or f"{cfg.author.prefix}: notes"
     with _Lock(cfg):
         _ensure_checkout(cfg)
         last = ""
@@ -955,9 +929,11 @@ def write_sync(cfg: NotesConfig, appends: list[Append], summary: str) -> dict:
 _ASYNC_LOCK = asyncio.Lock()
 
 
-async def write(cfg: NotesConfig, appends: list[Append], summary: str) -> dict:
+async def write(
+    cfg: NotesConfig, appends: list[Append], summary: str, *, author: Author | None = None
+) -> dict:
     async with _ASYNC_LOCK:
-        return await asyncio.to_thread(write_sync, cfg, appends, summary)
+        return await asyncio.to_thread(write_sync, cfg, appends, summary, author=author)
 
 
 # --------------------------------------------------------------- reads
@@ -966,22 +942,19 @@ async def write(cfg: NotesConfig, appends: list[Append], summary: str) -> dict:
 def _safe_read_path(rel: str) -> str:
     """Any note in the vault may be READ (the user's decision on #514), but
     only a plain relative `.md` path inside it."""
-    if not rel or "\x00" in rel or "\\" in rel or rel.startswith("/"):
-        raise NotesPathError(f"not a vault path: {rel!r}")
-    if any(p in ("", ".", "..") for p in rel.split("/")) or not rel.endswith(".md"):
-        raise NotesPathError(f"not a vault note: {rel!r}")
-    if rel.startswith(".obsidian/"):
-        raise NotesPathError(f"not a vault note: {rel!r}")
-    return rel
+    try:
+        return vl.safe_note_path(rel)
+    except ValueError as exc:
+        raise NotesPathError(str(exc)) from None
 
 
 def _pull_quietly(cfg: NotesConfig) -> None:
     """A read uses the freshest vault it can get, and the local copy when the
-    pull fails — an unreachable GitHub must not stop Raphael reading."""
+    pull fails — an unreachable GitHub must not stop the agent reading."""
     try:
         _pull(cfg)
     except NotesError as exc:
-        logger.warning("notes_pull_failed", error=str(exc)[:200])
+        logger.warning("notes_pull_failed", error=error_text(exc))
 
 
 def read_many_sync(cfg: NotesConfig, rels: list[str], *, pull: bool = False) -> dict[str, str]:
@@ -999,7 +972,7 @@ def read_many_sync(cfg: NotesConfig, rels: list[str], *, pull: bool = False) -> 
                 try:
                     out[rel] = strip_encrypted(path.read_text("utf-8", errors="replace"))
                 except OSError as exc:  # pragma: no cover
-                    logger.warning("notes_read_failed", path=rel, error=str(exc)[:200])
+                    logger.warning("notes_read_failed", path=rel, error=error_text(exc))
     return out
 
 
@@ -1017,14 +990,30 @@ async def read_note(cfg: NotesConfig, rel: str, max_chars: int = READ_MAX_CHARS)
     return {"path": rel, "text": text[:limit], "truncated": len(text) > limit}
 
 
-def read_journal_days_sync(cfg: NotesConfig, days: list[date]) -> dict[str, str]:
+def journal_paths(kind: str, d: date, layout: Layout = DEFAULT_LAYOUT) -> list[str]:
+    """Every note the entry for `kind` on `d` may sit in: the filed note and
+    the live one, under this layout and the one before it. Deduplicated, in
+    that order."""
+    out: list[str] = []
+    for lay in (layout, layout.previous):
+        if lay is None or not lay.kind(kind).enabled:
+            continue
+        out.append(lay.note_path(kind, d))
+        if lay.root_path(kind, d):
+            out.append(lay.root_path(kind, d))
+    return list(dict.fromkeys(out))
+
+
+def read_journal_days_sync(
+    cfg: NotesConfig, days: list[date], layout: Layout = DEFAULT_LAYOUT
+) -> dict[str, str]:
     """`{YYYY-MM-DD: note text}` for the days that have a journal note: the
-    filed one, the live one at the journal root (where periodic-notes makes
-    today's note before the user files it), or both, joined — the day is
-    whatever either holds."""
+    filed one, the live one (where periodic-notes makes today's note before
+    the user files it), or both, joined — the day is whatever either holds. A
+    note a previous layout filed is read too."""
     by_rel: dict[str, str] = {}
     for d in days:
-        for rel in (daily_note_path(d), daily_root_path(d)):
+        for rel in journal_paths("daily", d, layout):
             by_rel[rel] = d.isoformat()
     found = read_many_sync(cfg, list(by_rel), pull=True)
     out: dict[str, str] = {}
@@ -1037,10 +1026,8 @@ def read_journal_days_sync(cfg: NotesConfig, days: list[date]) -> dict[str, str]
 # --------------------------------------------------------------- index
 
 
-def is_indexable(rel: str) -> bool:
-    if not rel.endswith(".md") or rel.startswith(SKIP_PREFIXES):
-        return False
-    return not any(part.startswith(".") for part in rel.split("/"))
+def is_indexable(rel: str, layout: Layout = DEFAULT_LAYOUT) -> bool:
+    return layout.is_indexable(rel)
 
 
 def note_url(rel: str) -> str:
@@ -1067,12 +1054,14 @@ class VaultChanges:
     full: bool = False
 
 
-def _ls_files(cfg: NotesConfig) -> list[str]:
+def _ls_files(cfg: NotesConfig, layout: Layout) -> list[str]:
     out = _run(["git", "ls-files", "-z"], cfg).stdout
-    return sorted(p for p in out.split("\0") if p and is_indexable(p))
+    return sorted(p for p in out.split("\0") if p and is_indexable(p, layout))
 
 
-def vault_changes_sync(cfg: NotesConfig, since: str | None) -> VaultChanges:
+def vault_changes_sync(
+    cfg: NotesConfig, since: str | None, layout: Layout = DEFAULT_LAYOUT
+) -> VaultChanges:
     """What changed since commit `since` — every note on a first run, or when
     `since` is no longer in the history (a force-push upstream). A rename is a
     delete plus an add, so the old url leaves the index."""
@@ -1088,14 +1077,14 @@ def vault_changes_sync(cfg: NotesConfig, since: str | None) -> VaultChanges:
             ["git", "cat-file", "-e", f"{since}^{{commit}}"], cfg, check=False
         ).returncode == 0
         if not known:
-            return VaultChanges(head=head, changed=_ls_files(cfg), full=True)
+            return VaultChanges(head=head, changed=_ls_files(cfg, layout), full=True)
         diff = _run(
             ["git", "diff", "--name-status", "--no-renames", "-z", since, head], cfg
         ).stdout.split("\0")
         changed: list[str] = []
         deleted: list[str] = []
         for status, rel in zip(diff[0::2], diff[1::2], strict=False):
-            if not rel or not is_indexable(rel):
+            if not rel or not is_indexable(rel, layout):
                 continue
             (deleted if status.startswith("D") else changed).append(rel)
         return VaultChanges(head=head, changed=sorted(changed), deleted=sorted(deleted))
@@ -1110,24 +1099,36 @@ def journal_key(kind: str, label: str) -> str:
     return f"daylog:{label}" if kind == "daily" else f"daylog:{kind}:{label}"
 
 
-def journal_append(kind: str, day: date, label: str, body: str, now: datetime) -> Append:
+def journal_append(
+    kind: str,
+    day: date,
+    label: str,
+    body: str,
+    now: datetime,
+    layout: Layout = DEFAULT_LAYOUT,
+) -> Append:
     """The daylog's entry for one day, week or month.
 
     kind   `daily` / `weekly` / `monthly`
-    day    the day; the ISO week's Monday; the month's first day
+    day    the day; the week's first day; the month's first day
     label  the daylog's own label: `2026-09-12`, `2026-W37`, `2026-09`
+
+    Raises `JournalKindDisabled` when the layout has the kind switched off.
     """
-    if kind == "daily":
-        rel, alt = daily_note_path(day), daily_root_path(day)
-    elif kind == "weekly":
-        rel, alt = weekly_note_path(day), weekly_root_path(day)
-    elif kind == "monthly":
-        rel, alt = monthly_note_path(day), ""
-    else:
+    if kind not in KINDS:
         raise NotesError(f"unknown journal kind {kind!r}")
-    # A weekly note is named from its week's Monday, so its template's dates
-    # are that Monday's too (the user's own: `W40 Oct 23` opens `# Oct 02, 2023`).
-    when = datetime.combine(week_start(day) if kind == "weekly" else day, now.time())
+    k = layout.kind(kind)
+    if not k.enabled:
+        raise JournalKindDisabled(f"{kind} journal notes are switched off in the vault layout")
+    rel, alt = layout.note_path(kind, day), layout.root_path(kind, day)
+    # A weekly note is named from its week's first day, so its template's
+    # dates are that day's too (`W40 Oct 23` opens `# Oct 02, 2023`).
+    when = datetime.combine(layout.anchor(kind, day), now.time())
+    prev = layout.previous
+    also = tuple(
+        p for p in (journal_paths(kind, day, prev) if prev is not None else ())
+        if p not in (rel, alt)
+    )
     return Append(
         rel=rel,
         key=journal_key(kind, label),
@@ -1136,29 +1137,39 @@ def journal_append(kind: str, day: date, label: str, body: str, now: datetime) -
         when=when,
         journal=True,
         alt_rel=alt,
-        section=JOURNAL_SECTIONS[kind],
-        label=JOURNAL_LABELS[kind],
+        also_rels=also,
+        section=k.sections,
+        label=k.label,
+        layout=layout,
     )
 
 
 def _slug(text: str, limit: int = 60) -> str:
-    base = re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
+    """A file-name slug that keeps letters in any script: `¿Qué es RAG?` →
+    `qué-es-rag`, `什么是RAG` → `什么是rag`. Only punctuation, symbols and
+    whitespace become hyphens."""
+    norm = unicodedata.normalize("NFKC", text or "").casefold()
+    base = re.sub(r"[^\w]+|_+", "-", norm).strip("-")
     return (base or "question")[:limit].strip("-") or "question"
 
 
-def question_append(question: str, report: str, asked: datetime) -> Append:
-    """A research answer as `raphael/questions/<slug>-<hash>.md`. The marker is
+def question_append(
+    question: str, report: str, asked: datetime, layout: Layout = DEFAULT_LAYOUT
+) -> Append:
+    """A research answer as `<questions_dir>/<slug>-<hash>.md`. The marker is
     keyed on the question AND the answer: the same answer is never appended
-    twice, and a different one later is a new dated section."""
+    twice, and a different one later is a new dated section, headed by the
+    layout's `date_heading_format`."""
     from aegis.services.research import normalise_question
 
     norm = normalise_question(question)
     qh = hashlib.sha256(norm.encode()).hexdigest()[:10]
     ah = hashlib.sha256((report or "").encode()).hexdigest()[:10]
     return Append(
-        rel=f"{RAPHAEL_DIR}/questions/{_slug(norm)}-{qh}.md",
+        rel=f"{layout.questions_dir.strip('/')}/{_slug(norm)}-{qh}.md",
         key=f"question:{qh}:{ah}",
         body=report,
-        heading=asked.strftime("%Y-%m-%d"),
+        heading=layout.render(layout.date_heading_format, asked),
         title=question.strip()[:200],
+        layout=layout,
     )

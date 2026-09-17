@@ -10,14 +10,6 @@ from temporalio.testing import ActivityEnvironment
 
 
 @pytest.fixture
-def mock_db_pool():
-    pool = AsyncMock()
-    pool.fetchrow.return_value = None
-    pool.execute.return_value = "OK"
-    return pool
-
-
-@pytest.fixture
 def mock_llm():
     llm = AsyncMock()
     llm.think.return_value = {

@@ -17,7 +17,7 @@ from datetime import UTC, datetime
 
 import pytest
 import pytest_asyncio
-from aegis.connectors.homelab import _envelope
+from aegis.connectors._base import envelope
 from aegis.services.hub import Event, ingest_event
 from aegis_worker.activities import alerts as alerts_mod
 from aegis_worker.activities.alerts import AlertActivities
@@ -38,11 +38,11 @@ class FakeHomelab:
 
     async def restart_service(self, service_name: str) -> dict:
         self.restarted.append(service_name)
-        return _envelope(True, data={"output": service_name})
+        return envelope(True, data={"output": service_name})
 
     async def list_services(self) -> dict:
         names = {t["service"] for t in self.tasks} or set(self.restarted)
-        return _envelope(
+        return envelope(
             True,
             data=[
                 {
@@ -59,7 +59,7 @@ class FakeHomelab:
         )
 
     async def service_ps(self, service_name: str) -> dict:
-        return _envelope(
+        return envelope(
             True,
             data=[
                 {

@@ -27,8 +27,12 @@ on:
       - "tests/api/**"
       - "tests/integration/**"
       - "tests/conftest.py"
+      # Test-database names and clean-up; tests/conftest.py imports it (#325).
+      - "tests/pg_test_db.py"
       # A shared helper the notes tests import (#514); not under tests/core/.
       - "tests/notes_vault.py"
+      # The chart of accounts the books tests post against (#560); same reason.
+      - "tests/books_chart_data.py"
       - "config/**"
       - "migrations/**"
       - "personalities/**"
@@ -36,6 +40,9 @@ on:
       # /app/config mount, which is what gives the books ONE checkout.
       - "docker-compose.yml"
       - "pyproject.toml"
+      # The books tests SKIP without hledger, and this is what installs it
+      # — a version bump here must re-run them, or the skip is silent (#170).
+      - "docker/install-hledger.sh"
       - ".github/workflows/core.yml"
   pull_request:
     branches: [main]
@@ -52,8 +59,12 @@ on:
       - "tests/api/**"
       - "tests/integration/**"
       - "tests/conftest.py"
+      # Test-database names and clean-up; tests/conftest.py imports it (#325).
+      - "tests/pg_test_db.py"
       # A shared helper the notes tests import (#514); not under tests/core/.
       - "tests/notes_vault.py"
+      # The chart of accounts the books tests post against (#560); same reason.
+      - "tests/books_chart_data.py"
       - "config/**"
       - "migrations/**"
       - "personalities/**"
@@ -61,6 +72,9 @@ on:
       # /app/config mount, which is what gives the books ONE checkout.
       - "docker-compose.yml"
       - "pyproject.toml"
+      # The books tests SKIP without hledger, and this is what installs it
+      # — a version bump here must re-run them, or the skip is silent (#170).
+      - "docker/install-hledger.sh"
       - ".github/workflows/core.yml"
 
 # Cancel superseded runs on the same PR branch; never cancel main pushes —
@@ -108,25 +122,19 @@ jobs:
           pip install -e "core[dev,google]"
 
       - name: Lint
-        run: ruff check core/src/ tests/core/ tests/api/ tests/integration/ tests/conftest.py tests/notes_vault.py
+        run: ruff check core/src/ tests/core/ tests/api/ tests/integration/ tests/conftest.py tests/pg_test_db.py tests/notes_vault.py
 
       # tests/core/test_books.py exercises the real journal write protocol —
       # append, `hledger check --strict`, revert-on-failure, commit — against a
       # throwaway git repo, and every one of those tests SKIPS when the binary
       # is absent. Without this step CI reports green while the books' entire
       # safety net goes unrun, which is the #170 failure mode in another guise.
-      # Same pinned release and checksum as core/Dockerfile and worker/Dockerfile.
+      # The version and its checksum live in docker/install-hledger.sh, which
+      # both images run too — so CI cannot drift onto a different binary from
+      # the one production uses to write the same journal.
       - name: Install hledger
-        env:
-          HLEDGER_VERSION: "1.52.3"
-          HLEDGER_SHA256: "d14a4fc2ac804b556f481b64e8c54efa380db1ac85b3723c9df7b1eeade74b3a"
         run: |
-          curl -fsSL -o /tmp/hledger.tgz \
-            "https://github.com/simonmichael/hledger/releases/download/${HLEDGER_VERSION}/hledger-linux-x64.tar.gz"
-          echo "${HLEDGER_SHA256}  /tmp/hledger.tgz" | sha256sum -c -
-          tar -xzf /tmp/hledger.tgz -C /tmp hledger
-          sudo install -m 0755 /tmp/hledger /usr/local/bin/hledger
-          rm -f /tmp/hledger.tgz /tmp/hledger
+          sudo ./docker/install-hledger.sh
           hledger --version
 
       # poppler-utils gives `pdftotext`, which is how a statement PDF becomes

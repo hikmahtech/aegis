@@ -8,7 +8,9 @@ from html import escape as _esc
 from typing import Any
 
 import httpx
+from aegis.errors import error_text, logged_failure
 from aegis.services.health import HEALTH_SOURCE
+from aegis.services.settings_store import get_setting, put_setting
 from temporalio import activity
 
 # How old `settings.current_place` (written by the location webhook, B5) may
@@ -51,10 +53,10 @@ class BriefingActivities:
     core_api_url: str = ""
     api_key: str = ""
     frame_model: str = "gpt-oss:20b"
-    # Owning agent — matches DailyBriefingFlow's config default. Threaded into
-    # the `llm_calls` row for `frame_briefing` so the briefing's LLM spend is
-    # attributable rather than NULL (same pattern as IntelligenceActivities).
-    agent_id: str = "sebas"
+    # Owning agent — the `gtd` holder, resolved at boot in `__main__` (#579).
+    # Threaded into the `llm_calls` row for `frame_briefing` so the briefing's
+    # LLM spend is attributable; "" (nobody holds the tag) records no agent.
+    agent_id: str = ""
     # DeliveryActivities, wired in `__main__.py` after it is constructed (the
     # same pattern HomelabActivities/MoneyActivities use). Needed because the
     # health block is rendered and sent inside ONE activity — see
@@ -67,7 +69,7 @@ class BriefingActivities:
             return {"events": [], "count": 0}
 
         events = []
-        try:
+        with logged_failure("gather_calendar_failed", logger=activity.logger, field="error"):
             rows = await self.db_pool.fetch(
                 "SELECT key, value FROM settings WHERE key LIKE 'calendar_events_%'"
             )
@@ -82,8 +84,6 @@ class BriefingActivities:
                         events.extend(parsed)
                 except (json.JSONDecodeError, TypeError):
                     pass
-        except Exception as exc:
-            activity.logger.warning("gather_calendar_failed error=%s", str(exc)[:200])
 
         activity.logger.info("calendar_events_gathered count=%d", len(events))
         return {"events": events, "count": len(events)}
@@ -100,7 +100,7 @@ class BriefingActivities:
                 resp.raise_for_status()
                 return resp.json()
         except Exception as exc:
-            activity.logger.warning("gather_market_data_failed error=%s", str(exc)[:200])
+            activity.logger.warning("gather_market_data_failed error=%s", error_text(exc))
             return {"available": False}
 
     @activity.defn
@@ -144,7 +144,7 @@ class BriefingActivities:
                 source_type="intelligence",
             )
         except Exception as exc:
-            activity.logger.warning("recent_intelligence_query_failed: %s", str(exc)[:200])
+            activity.logger.warning("recent_intelligence_query_failed: %s", error_text(exc))
             return []
 
         from datetime import timedelta
@@ -196,7 +196,7 @@ class BriefingActivities:
                 activity.logger.warning(
                     "references_filed_query_failed source_type=%s err=%s",
                     st,
-                    str(exc)[:200],
+                    error_text(exc),
                 )
                 continue
             for it in items or []:
@@ -251,7 +251,7 @@ class BriefingActivities:
                 limit=200, source_type="email"
             )
         except Exception as exc:
-            activity.logger.warning("email_digest_query_failed err=%s", str(exc)[:200])
+            activity.logger.warning("email_digest_query_failed err=%s", error_text(exc))
             return []
 
         from datetime import timedelta
@@ -288,18 +288,10 @@ class BriefingActivities:
 
         prior: dict = {}
         if self.db_pool:
-            try:
-                row = await self.db_pool.fetchrow(
-                    "SELECT value FROM settings WHERE key='briefing_state'"
-                )
-                if row and row["value"]:
-                    prior = (
-                        json.loads(row["value"])
-                        if isinstance(row["value"], str)
-                        else row["value"]
-                    )
-            except Exception as exc:
-                activity.logger.warning("briefing_state_read_failed err=%s", str(exc)[:200])
+            with logged_failure("briefing_state_read_failed", logger=activity.logger):
+                value = await get_setting(self.db_pool, "briefing_state")
+                if value:
+                    prior = json.loads(value) if isinstance(value, str) else value
 
         now = datetime.now(UTC)
         last_raw = prior.get("last_briefing_at")
@@ -322,7 +314,7 @@ class BriefingActivities:
         # intelligence: reuse the existing gather, then sig>=4 + dedup by id
         intel_out: list[dict] = []
         new_intel_ids: list[str] = []
-        try:
+        with logged_failure("briefing_intel_diff_failed", logger=activity.logger):
             items = await self.gather_intelligence_summary(hours=max(24, min(elapsed_h, 72)))
             for r in items:
                 meta = r.get("metadata") or {}
@@ -339,8 +331,6 @@ class BriefingActivities:
                     "topic": meta.get("topic", ""),
                     "url": r.get("url") or r.get("source_url") or "",
                 })
-        except Exception as exc:
-            activity.logger.warning("briefing_intel_diff_failed err=%s", str(exc)[:200])
 
         # collected: references filed (raindrop / RSS / email / chat) since the
         # last briefing — the "what I learned from what I collected" digest. The
@@ -366,7 +356,7 @@ class BriefingActivities:
         # exactly one section.
         collected_out: list[dict] = []
         new_ref_ids: list[str] = []
-        try:
+        with logged_failure("briefing_collected_diff_failed", logger=activity.logger):
             refs = await self.gather_references_filed(hours=max(24, min(elapsed_h, 72)))
             for r in refs:
                 cid = str(r.get("content_id") or r.get("id") or r.get("title") or "")
@@ -380,8 +370,6 @@ class BriefingActivities:
                 })
                 if len(collected_out) >= 12:
                     break
-        except Exception as exc:
-            activity.logger.warning("briefing_collected_diff_failed err=%s", str(exc)[:200])
 
         # topics: tracked topics (#513) whose round gained items since the last
         # briefing. The hub holds these now, where the intel scans used to file
@@ -389,7 +377,7 @@ class BriefingActivities:
         # round earns one, so this line is how the rest reach the user.
         topics_out: list[dict] = []
         if self.db_pool:
-            try:
+            with logged_failure("briefing_topics_failed", logger=activity.logger):
                 trows = await self.db_pool.fetch(
                     "SELECT COALESCE(p.metadata->>'topic', p.subject) AS topic, "
                     "       p.todoist_task_id IS NOT NULL AS tasked, "
@@ -413,8 +401,6 @@ class BriefingActivities:
                     }
                     for r in trows
                 ]
-            except Exception as exc:
-                activity.logger.warning("briefing_topics_failed err=%s", str(exc)[:200])
 
         # inbox: the `important_read` mail AEGIS filed and marked read without
         # ever showing the owner. Same diff-and-dedup shape as `collected`.
@@ -422,7 +408,7 @@ class BriefingActivities:
         seen_email = set(prior_email_ids)
         emails_out: list[dict] = []
         new_email_ids: list[str] = []
-        try:
+        with logged_failure("briefing_email_diff_failed", logger=activity.logger):
             mail = await self.gather_email_digest(hours=max(24, min(elapsed_h, 72)))
             # CI notifications repeat the same subject for the same commit
             # several times a day and are ~40% of this tier by volume. Collapse
@@ -439,14 +425,12 @@ class BriefingActivities:
                 emails_out.append(m)
                 if len(emails_out) >= 12:
                     break
-        except Exception as exc:
-            activity.logger.warning("briefing_email_diff_failed err=%s", str(exc)[:200])
 
         # what broke: failed runs + new open drift since cursor
         failed_runs: list[dict] = []
         new_drift: list[dict] = []
         if self.db_pool:
-            try:
+            with logged_failure("briefing_failed_runs_failed", logger=activity.logger):
                 # Also catch runs that ran to completion but whose own return
                 # value encodes a failure (e.g. `{"status": "error", "reason":
                 # "Connection error."}` — AgentChatReplyFlow's synth-failure
@@ -473,9 +457,7 @@ class BriefingActivities:
                         "error": str(err)[:160],
                         "completed_at": r["completed_at"].isoformat() if r["completed_at"] else None,
                     })
-            except Exception as exc:
-                activity.logger.warning("briefing_failed_runs_failed err=%s", str(exc)[:200])
-            try:
+            with logged_failure("briefing_drift_failed", logger=activity.logger):
                 drows = await self.db_pool.fetch(
                     "SELECT service_name, severity FROM pandoras_actor.homelab_drift "
                     "WHERE detected_at > $1 AND resolved_at IS NULL "
@@ -483,14 +465,12 @@ class BriefingActivities:
                     cursor,
                 )
                 new_drift = [{"service": r["service_name"], "severity": r["severity"]} for r in drows]
-            except Exception as exc:
-                activity.logger.warning("briefing_drift_failed err=%s", str(exc)[:200])
 
         # calendar: today's events, flag ids not seen before
         cal_today: list[dict] = []
         new_cal_ids: list[str] = []
         all_cal_ids: list[str] = []
-        try:
+        with logged_failure("briefing_calendar_diff_failed", logger=activity.logger):
             cal = await self.gather_calendar_events()
             for evt in cal.get("events", []):
                 eid = str(evt.get("id") or evt.get("summary") or "")
@@ -501,8 +481,6 @@ class BriefingActivities:
                                   "start": evt.get("start", "")})
                 if eid not in seen_cal:
                     new_cal_ids.append(eid)
-        except Exception as exc:
-            activity.logger.warning("briefing_calendar_diff_failed err=%s", str(exc)[:200])
 
         # location: where the owner currently is, as a LABEL (B5). The KV holds
         # {"place": "home", "at": iso} — never a coordinate — and a pointer
@@ -511,11 +489,8 @@ class BriefingActivities:
         # degrades to no place line, never a dead briefing.
         place: dict = {}
         if self.db_pool:
-            try:
-                prow = await self.db_pool.fetchrow(
-                    "SELECT value FROM settings WHERE key='current_place'"
-                )
-                raw = prow["value"] if prow else None
+            with logged_failure("briefing_place_failed", logger=activity.logger):
+                raw = await get_setting(self.db_pool, "current_place")
                 current = json.loads(raw) if isinstance(raw, str) else raw
                 if not isinstance(current, dict):
                     current = {}
@@ -527,8 +502,6 @@ class BriefingActivities:
                     seen_at = seen_at.replace(tzinfo=UTC)
                 if name and now - seen_at <= timedelta(hours=_PLACE_STALE_HOURS):
                     place = {"place": name, "at": seen_at.isoformat()}
-            except Exception as exc:
-                activity.logger.warning("briefing_place_failed err=%s", str(exc)[:200])
 
         # Health (B6) is deliberately NOT gathered here — see `_recent_health`.
         # It is read at render time, inside `frame_briefing`, so that no body
@@ -596,7 +569,7 @@ class BriefingActivities:
             )
             return {r["metric"]: r["value"] for r in rows if r["value"] is not None}
         except Exception as exc:
-            activity.logger.warning("briefing_health_failed err=%s", str(exc)[:200])
+            activity.logger.warning("briefing_health_failed err=%s", error_text(exc))
             return {}
 
     @activity.defn
@@ -627,12 +600,12 @@ class BriefingActivities:
                     model=self.frame_model,
                     db_pool=self.db_pool,
                     purpose="briefing_frame",
-                    agent_id=self.agent_id,
+                    agent_id=self.agent_id or None,
                 )
                 raw = result.get("response", "") if isinstance(result, dict) else (result or "")
                 narrative = (raw or "").strip() or fallback
             except Exception as exc:  # noqa: BLE001
-                activity.logger.warning("frame_briefing_llm_failed err=%s", str(exc)[:200])
+                activity.logger.warning("frame_briefing_llm_failed err=%s", error_text(exc))
                 # Keep shipping the briefing — "you always get one" is the point
                 # of the fallback — but SAY that it is the degraded one. This
                 # ran silently for six days: the flow reported `delivered`, the
@@ -648,21 +621,23 @@ class BriefingActivities:
     async def feed_review_line(self) -> str:
         """The monthly "drop it?" line for the research agent (#511).
 
-        Names the active feeds with at least 90 days of history that no prompt
-        used in the last 90 days, and says how to drop one. "" when every feed
-        earns its keep, or none is old enough to judge.
+        Names the active feeds with at least `unused_after_days` (the
+        `feeds_config` row; 90 by default) of history that no prompt used in
+        that time, and says how to drop one. "" when every feed earns its
+        keep, or none is old enough to judge.
         """
         if not self.db_pool:
             return ""
-        from aegis.services import feeds
+        from aegis.services import feeds, feeds_config
 
         rows = await feeds.unused_feeds(self.db_pool)
         if not rows:
             return ""
+        days = int((await feeds_config.get_feeds_config(self.db_pool))["unused_after_days"])
         names = ", ".join(r["label"] for r in rows[:8])
         more = f" and {len(rows) - 8} more" if len(rows) > 8 else ""
         return (
-            f"Feeds no prompt used in 90 days: {names}{more}. "
+            f"Feeds no prompt used in {days} days: {names}{more}. "
             'Drop any? Tell me "unsubscribe <name>".'
         )
 
@@ -811,11 +786,7 @@ class BriefingActivities:
         """Persist the new briefing snapshot (cursor + counts + seen ids)."""
         if not self.db_pool:
             return
-        await self.db_pool.execute(
-            "INSERT INTO settings (key, value) VALUES ('briefing_state', $1) "
-            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
-            state,
-        )
+        await put_setting(self.db_pool, "briefing_state", state)
 
     @activity.defn
     async def ingest_briefing(self, briefing_text: str, date: str) -> bool:
@@ -832,5 +803,5 @@ class BriefingActivities:
             )
             return True
         except Exception as exc:
-            activity.logger.warning("briefing_ingest_failed: %s", str(exc))
+            activity.logger.warning("briefing_ingest_failed: %s", error_text(exc, 500))
             return False

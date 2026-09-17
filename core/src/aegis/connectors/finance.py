@@ -27,6 +27,7 @@ import httpx
 import structlog
 
 from aegis.connectors._base import HTTPConnector
+from aegis.errors import error_text
 
 logger = structlog.get_logger()
 
@@ -191,9 +192,9 @@ class FinanceConnector(HTTPConnector):
                 "finance_quote_failed",
                 provider=self._provider,
                 symbol=symbol,
-                error=str(exc)[:200],
+                error=error_text(exc),
             )
-            return {"symbol": symbol, "error": str(exc)[:200]}
+            return {"symbol": symbol, "error": error_text(exc)}
 
     async def get_overview(self) -> list[dict]:
         """Quotes for the configured market-overview indices."""
@@ -203,10 +204,14 @@ class FinanceConnector(HTTPConnector):
     async def daily_bars(self, symbol: str, start: date, end: date) -> list[dict]:
         """Daily bars from Yahoo, oldest first, for the trading desk.
 
-        Each bar is ``{"day", "close", "split_ratio", "dividend"}``. Yahoo rewrites
-        a past ``close`` after a later split, so a caller that needs the traded
-        price keeps the first value it sees (the desk does). ``[]`` when Yahoo
-        has no data for the symbol; raises on any other HTTP or network error.
+        Each bar is ``{"day", "open", "close", "split_ratio", "dividend"}``. Yahoo
+        rewrites a past ``open`` and ``close`` after a later split, so a caller
+        that needs the traded price keeps the first value it sees (the desk
+        does). Either price may be None: a day the market was shut comes back
+        with both None, and the bar for a session still in progress has a
+        settled ``open`` and a ``close`` that is really the live price. ``[]``
+        when Yahoo has no data for the symbol; raises on any other HTTP or
+        network error.
         """
         client = await self._ensure_client()
         t0 = time.monotonic()
@@ -223,7 +228,7 @@ class FinanceConnector(HTTPConnector):
                 return []
             resp.raise_for_status()
         except httpx.HTTPError as exc:
-            await self._record("daily_bars", "error", int((time.monotonic() - t0) * 1000), str(exc)[:200])
+            await self._record("daily_bars", "error", int((time.monotonic() - t0) * 1000), error_text(exc))
             raise
         await self._record("daily_bars", "ok", int((time.monotonic() - t0) * 1000))
         result = ((resp.json() or {}).get("chart") or {}).get("result") or []
@@ -235,12 +240,22 @@ class FinanceConnector(HTTPConnector):
         def day_of(ts: object) -> date:
             return datetime.fromtimestamp(int(ts) + offset, UTC).date()
 
-        closes = (((chart.get("indicators") or {}).get("quote") or [{}])[0]).get("close") or []
+        quote = (((chart.get("indicators") or {}).get("quote") or [{}])[0])
+        closes = quote.get("close") or []
+        # Yahoo carries the open in the same quote block. It is the session's
+        # first print, so unlike `close` it is settled from the moment trading
+        # starts and does not move for the rest of the day — which is what makes
+        # a same-day fill possible at all. A day the market did not trade comes
+        # back with both fields None.
+        opens = quote.get("open") or []
         bars: dict[date, dict] = {}
-        for ts, close in zip(chart.get("timestamp") or [], closes, strict=False):
+        for i, ts in enumerate(chart.get("timestamp") or []):
             day = day_of(ts)
+            close = closes[i] if i < len(closes) else None
+            opening = opens[i] if i < len(opens) else None
             bars[day] = {
                 "day": day,
+                "open": float(opening) if opening is not None else None,
                 "close": float(close) if close is not None else None,
                 "split_ratio": None,
                 "dividend": None,

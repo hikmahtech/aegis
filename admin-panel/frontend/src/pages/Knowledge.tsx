@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { api } from '../api/client';
 import ErrorBanner from '../components/ErrorBanner';
+import KnowledgeRankingPanel from '../components/KnowledgeRankingPanel';
 
 function extractFolderId(s: string): string {
   const m = s.match(/\/folders\/([^/?#]+)/);
@@ -222,6 +223,8 @@ export default function Knowledge() {
         </table>
         </div>
       </div>
+
+      <KnowledgeRankingPanel />
     </div>
   );
 }

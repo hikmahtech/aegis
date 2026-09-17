@@ -53,6 +53,7 @@ from temporalio import workflow
 with workflow.unsafe.imports_passed_through():
     from html import escape as _html_escape
 
+    from aegis.errors import error_text, logged_failure
     from aegis.personalities import voice_line
 
     from aegis_worker.activities.agent_registry import AgentRegistryActivities
@@ -86,17 +87,18 @@ with workflow.unsafe.imports_passed_through():
 # default seeds that resolves to `pandoras-actor`, so behavior is unchanged.
 _MAX_HINT_ROUNDS = 3
 
-# `workflow.patched` ids. A run can wait 48h on its Gate-2 card, so some are
-# always in flight across a deploy and replay their recorded commands through
-# this code; each id keeps the old command sequence for them. Delete a guard
-# (and its old branch) once no run started before it is open.
+# Retired `workflow.patched` ids. The old branches are gone; the markers stay
+# one release longer as `workflow.deprecate_patch`, because a run that RECORDED
+# one is wedged by a worker whose code no longer mentions it at all
+# ("[TMPRL1100] Non-deprecated patch marker encountered"). A run here can wait
+# 48h on its Gate-2 card, so some always are. Drop the calls and these ids in
+# the release after next — see #614.
 #
 # #500: no Gate-2 card for a verdict with nothing to decide.
 _PATCH_NO_CARD = "gate2-only-for-decisions"
 # #501: look the problem up before an automatic restart; record every attempt.
 _PATCH_RESTART_ONCE = "auto-restart-once-per-window"
-# #502: the verdict goes to the knowledge store once the operator has decided,
-# tagged with the decision, instead of before the card went out.
+# #502: the verdict goes to the knowledge store once the operator has decided.
 _PATCH_KG_AFTER_DECISION = "kg-verdict-after-decision"
 
 
@@ -322,7 +324,7 @@ class AlertInvestigationFlow:
                 retry_policy=NO_RETRY,
             )
         except Exception as exc:
-            workflow.logger.warning("%s err=%s reason=raised", log_event, str(exc)[:200])
+            workflow.logger.warning("%s err=%s reason=raised", log_event, error_text(exc))
             return
         if isinstance(result, dict) and not result.get("ok"):
             workflow.logger.warning(
@@ -406,7 +408,7 @@ class AlertInvestigationFlow:
             return str((recorded or {}).get("task_id") or "")
         except Exception as exc:  # noqa: BLE001
             workflow.logger.warning(
-                "alert_record_investigation_failed step=%s err=%s", step, str(exc)[:200]
+                "alert_record_investigation_failed step=%s err=%s", step, error_text(exc)
             )
         return ""
 
@@ -463,7 +465,7 @@ class AlertInvestigationFlow:
                 retry_policy=NO_RETRY,
             )
         except Exception as exc:
-            workflow.logger.warning("alert_remediate_infra_failed err=%s", str(exc)[:200])
+            workflow.logger.warning("alert_remediate_infra_failed err=%s", error_text(exc))
             return None
         if not rem.get("attempted"):
             return None
@@ -532,7 +534,7 @@ class AlertInvestigationFlow:
                 retry_policy=FAST,
             )
         except Exception as exc:  # noqa: BLE001
-            workflow.logger.warning("alert_recent_auto_restart_failed err=%s", str(exc)[:200])
+            workflow.logger.warning("alert_recent_auto_restart_failed err=%s", error_text(exc))
             return None
         return found if found.get("repeat") else None
 
@@ -627,31 +629,24 @@ class AlertInvestigationFlow:
             )
 
         # ── Step 2.65: Routing config — infra_cluster (#91) ──
-        # is_infra_alert can't read Settings/DB from
-        # workflow code, so fetch the configured cluster label once here via
-        # a tiny activity. workflow.patched guards in-flight runs started
-        # before this change so they keep replaying the pre-patch (env-only)
-        # behavior instead of non-deterministically diverging mid-history.
-        infra_cluster = ""
-        owner_mention = ""
-        # What the cluster IS, in the operator's words (#505). Read off the
-        # routing result the activity below already returns, so this needs no
-        # patch: an old history replays a dict without the key and gets "".
-        platform_hint = ""
-        # None = the pre-#498 built-in infra list, which is what a history
-        # recorded before the list moved to the DB must replay against.
-        infra_alertnames: list[str] | None = None
-        if workflow.patched("infra-cluster-from-settings"):
-            routing = await workflow.execute_activity_method(
-                AlertActivities.get_alert_routing_config,
-                start_to_close_timeout=TIMEOUT_FAST,
-                retry_policy=FAST,
-            )
-            infra_cluster = routing.get("infra_cluster") or ""
-            owner_mention = routing.get("slack_owner_member_id") or ""
-            platform_hint = str(routing.get("platform_hint") or "").strip()
-            if workflow.patched("infra-alertnames-from-settings"):
-                infra_alertnames = routing.get("infra_alertnames")
+        # is_infra_alert can't read Settings/DB from workflow code, so fetch
+        # the configured cluster label once here via a tiny activity. The
+        # cluster in the operator's own words (#505) and the effective infra
+        # list from the `infra_alert_routing` settings row (#498) come off the
+        # same result; a missing key is "" or None, which matches no name.
+        # deprecate_patch: remove after the next release, see #614
+        workflow.deprecate_patch("infra-cluster-from-settings")
+        routing = await workflow.execute_activity_method(
+            AlertActivities.get_alert_routing_config,
+            start_to_close_timeout=TIMEOUT_FAST,
+            retry_policy=FAST,
+        )
+        infra_cluster = routing.get("infra_cluster") or ""
+        owner_mention = routing.get("slack_owner_member_id") or ""
+        platform_hint = str(routing.get("platform_hint") or "").strip()
+        # deprecate_patch: remove after the next release, see #614
+        workflow.deprecate_patch("infra-alertnames-from-settings")
+        infra_alertnames: list[str] | None = routing.get("infra_alertnames")
 
         # ── Step 3: Verification delay ──
         # A flat per-class wait (`hub.verify_seconds`, served by the hub
@@ -687,7 +682,7 @@ class AlertInvestigationFlow:
                 workflow.logger.warning(
                     "alert_verification_status_failed problem_id=%s err=%s",
                     problem_id,
-                    str(exc)[:200],
+                    error_text(exc),
                 )
                 resolved_check = {"resolved": False}
             if resolved_check.get("resolved"):
@@ -715,6 +710,32 @@ class AlertInvestigationFlow:
                     "investigation": "",
                 }
 
+            # ── Step 3.5: learn the task, now the window is out (#537) ──
+            # The delay above IS the settle window — same number, same class —
+            # so a problem still open here has earned its task, and projecting
+            # mints it. Learn the id NOW rather than at step 4, because every
+            # note in between posts to an empty id and is silently dropped: the
+            # restart-repeat evidence, the "tried a restart and it did not
+            # recover" note, the repo-unconfirmed note. Worse, the `_record`
+            # calls on that path mint the task themselves and move its
+            # watermark past the very events they just wrote, which are marked
+            # `posted` — so the projector never replays them either, and the
+            # task a human opens says nothing about the restart already tried.
+            #
+            # The `item-` clause also upgrades an outbox temp id to the real one
+            # once the drain has committed it; `project()` resolves those.
+            # deprecate_patch: remove after the next release, see #614
+            workflow.deprecate_patch("task-id-after-delay")
+            if not track_task_id or track_task_id.startswith("item-"):
+                with logged_failure("alert_project_after_delay_failed", logger=workflow.logger):
+                    projected = await workflow.execute_activity_method(
+                        HubActivities.project_problem,
+                        args=[problem_id],
+                        start_to_close_timeout=TIMEOUT_STANDARD,
+                        retry_policy=NO_RETRY,
+                    )
+                    track_task_id = projected.get("task_id") or track_task_id or None
+
         # ── Step 4: Resolve to resource ──
         # Infra/swarm alerts (NodeDown, DockerServiceDown, cluster=homelab-swarm, ...)
         # have no application code repo. Resolve them deterministically to
@@ -736,12 +757,12 @@ class AlertInvestigationFlow:
             # restart did not hold, so the next one would not either; it goes
             # to the investigation and to one card, with the first restart's
             # evidence.
-            record_restart = bool(
-                problem_id
-                and is_remediable_alert(alert)
-                and workflow.patched(_PATCH_RESTART_ONCE)
-            )
+            record_restart = bool(problem_id and is_remediable_alert(alert))
             if record_restart:
+                # Guarded, not bare: the marker sat at the end of an `and`
+                # chain, so it was recorded only when this branch was taken.
+                # deprecate_patch: remove after the next release, see #614
+                workflow.deprecate_patch(_PATCH_RESTART_ONCE)
                 restart_repeat = await self._recent_auto_restart(problem_id, alert)
             if restart_repeat is not None:
                 await self._safe_event(
@@ -777,7 +798,7 @@ class AlertInvestigationFlow:
                 )
             except Exception as exc:
                 workflow.logger.warning(
-                    "alert_resolve_infra_resource_failed err=%s", str(exc)[:200]
+                    "alert_resolve_infra_resource_failed err=%s", error_text(exc)
                 )
                 resource = {
                     "resource_id": None,
@@ -808,7 +829,7 @@ class AlertInvestigationFlow:
                 # LLM-only investigate() path instead of dying here.
                 workflow.logger.warning(
                     "alert_resolve_alert_resource_failed_fallback_to_null err=%s",
-                    str(exc)[:200],
+                    error_text(exc),
                 )
                 resource = {
                     "resource_id": None,
@@ -832,10 +853,11 @@ class AlertInvestigationFlow:
         # a bug in that repo: investigate it as code (fix branch allowed, no
         # swarm framing) and skip Gate-0, because the claim is the operator's
         # explicit mapping and the content scorer cannot confirm it.
-        claimed = resource.get("source") == "label_claim" and workflow.patched(
-            "alert-label-claims"
-        )
+        claimed = resource.get("source") == "label_claim"
         if claimed:
+            # Guarded: the marker was the second operand of an `and`.
+            # deprecate_patch: remove after the next release, see #614
+            workflow.deprecate_patch("alert-label-claims")
             _is_infra = False
 
         # ── Step 4.4: Gate-0 — confirm the repo is relevant before kimi ──
@@ -966,12 +988,9 @@ class AlertInvestigationFlow:
         # is what lifts the deferral, so the id exists only now. Learn it, or
         # every comment below posts to an empty id and is dropped — the task
         # would carry the occurrence text and nothing the investigation found.
-        #
-        # Patched: a history recorded before this fix has no post-task-note
-        # commands on this path (it was holding None), so replaying it with the
-        # id filled in would issue commands its history does not have.
-        if workflow.patched("task-id-from-projection"):
-            track_task_id = track_task_id or minted or None
+        # deprecate_patch: remove after the next release, see #614
+        workflow.deprecate_patch("task-id-from-projection")
+        track_task_id = track_task_id or minted or None
 
         # ── Step 4.5: Post start-comment on the track-task ──
         # We have the resource picked now, which is the useful piece of
@@ -1063,7 +1082,7 @@ class AlertInvestigationFlow:
                 workflow.logger.warning(
                     "alert_run_investigation_raised title=%s exc=%s",
                     title,
-                    str(exc)[:200],
+                    error_text(exc),
                 )
                 inv_result = {
                     "status": "timed_out",
@@ -1100,7 +1119,7 @@ class AlertInvestigationFlow:
                     workflow.logger.warning(
                         "alert_claude_fallback_raised title=%s exc=%s",
                         title,
-                        str(exc)[:200],
+                        error_text(exc),
                     )
 
             inv_status = inv_result.get("status")
@@ -1240,23 +1259,8 @@ class AlertInvestigationFlow:
             verdict_status = "actionable"
             verdict["status"] = "actionable"
 
-        # ── Step 7b: Persist verdict + transcript to the KG ──
-        # Since #502 this happens once the outcome is known (Step 7.9, and
-        # at each answer on the card that ends the run), tagged with it: here,
-        # before the card, a verdict the operator went on to discard was
-        # stored exactly like one they acted on. The old write stays for the
-        # runs that recorded it — a history without the marker replays it.
-        kg_after_decision = workflow.patched(_PATCH_KG_AFTER_DECISION)
-        if not kg_after_decision:
-            try:
-                await workflow.execute_activity_method(
-                    AlertActivities.record_verdict_to_kg,
-                    args=[alert, verdict, investigation_output],
-                    start_to_close_timeout=TIMEOUT_STANDARD,
-                    retry_policy=NO_RETRY,
-                )
-            except Exception:
-                workflow.logger.warning("alert_record_verdict_to_kg_failed")
+        # deprecate_patch: remove after the next release, see #614
+        workflow.deprecate_patch(_PATCH_KG_AFTER_DECISION)
 
         # ── Step 7.5: Gate 2 — post-verdict decision gate ──
         # A card only when there is a decision (#500): a fix branch to open,
@@ -1292,24 +1296,20 @@ class AlertInvestigationFlow:
         proposed_cmds: list[str] = (
             extract_proposed_commands(investigation_output) if _is_infra else []
         )
-        # Asked only when the answer can change something, so a run that does
-        # carry a decision replays exactly as it did before the patch. #518's
-        # stricter rule (commands only on an actionable verdict) sits under
-        # the same id: it only skips more cards, and the guard is asked
-        # exactly where one is skipped, so a history without the marker still
-        # takes the card path it recorded.
-        no_decision_card = (
-            not gate_skipped
-            and not gate2_needs_decision(
-                branches=branches,
-                proposed_cmds=proposed_cmds,
-                escalate=_escalate,
-                restart_repeat=restart_repeat is not None,
-                verdict_status=verdict_status,
-            )
-            and workflow.patched(_PATCH_NO_CARD)
+        # Asked only when the answer can change something (#500), and #518
+        # narrows it further: proposed commands earn a card only on an
+        # actionable verdict.
+        no_decision_card = not gate_skipped and not gate2_needs_decision(
+            branches=branches,
+            proposed_cmds=proposed_cmds,
+            escalate=_escalate,
+            restart_repeat=restart_repeat is not None,
+            verdict_status=verdict_status,
         )
         if no_decision_card:
+            # Guarded: the marker was the last operand of an `and`.
+            # deprecate_patch: remove after the next release, see #614
+            workflow.deprecate_patch(_PATCH_NO_CARD)
             gate_skipped = True
             workflow.logger.info("alert_gate2_no_decision_no_card verdict=%s", verdict_status)
         # What the operator answered on the card ("" when none went out), and
@@ -1447,7 +1447,7 @@ class AlertInvestigationFlow:
                         workflow.logger.warning(
                             "alert_gate2_recheck_failed_keep_waiting fingerprint=%s err=%s",
                             fingerprint,
-                            str(exc)[:200],
+                            error_text(exc),
                         )
                         continue
                     if recheck.get("resolved"):
@@ -1471,8 +1471,7 @@ class AlertInvestigationFlow:
                     track_task_id or "",
                     "⏭ Gate-2 archived (no decision in 48h). Skipping verdict ping.",
                 )
-                if kg_after_decision:
-                    await self._store_verdict(alert, verdict, investigation_output, "expired")
+                await self._store_verdict(alert, verdict, investigation_output, "expired")
                 return {
                     "status": "gate2_archived",
                     "task_id": None,
@@ -1483,10 +1482,7 @@ class AlertInvestigationFlow:
                 # The self-resolve race auto-closed the card because the alert
                 # recovered while we awaited the human. Log for dedup and short
                 # out — there's no decision to act on.
-                if kg_after_decision:
-                    await self._store_verdict(
-                        alert, verdict, investigation_output, "self_resolved"
-                    )
+                await self._store_verdict(alert, verdict, investigation_output, "self_resolved")
                 await self._safe_post_note(
                     track_task_id or "",
                     "✅ Self-resolved while awaiting your decision — card closed automatically.",
@@ -1506,8 +1502,7 @@ class AlertInvestigationFlow:
             if v2 == "run_fix" and proposed_cmds:
                 # The operator took the fix: that is the outcome, whatever
                 # the commands then do (the problem's timeline has that).
-                if kg_after_decision:
-                    await self._store_verdict(alert, verdict, investigation_output, "run_fix")
+                await self._store_verdict(alert, verdict, investigation_output, "run_fix")
                 # A free-text note on the card overrides the parsed commands
                 # (one command per line) — lets the operator correct/replace
                 # what the LLM proposed without re-running the investigation.
@@ -1539,7 +1534,7 @@ class AlertInvestigationFlow:
                     # The activity timed out or raised (NO_RETRY). Don't strand
                     # the human-approved run silently — post an explicit manual-
                     # verify note to task + chat and return a distinct status.
-                    err = str(exc)[:200]
+                    err = error_text(exc)
                     workflow.logger.warning(
                         "alert_remediation_activity_failed title=%s err=%s", title, err
                     )
@@ -1620,11 +1615,8 @@ class AlertInvestigationFlow:
                     voice_line(agent_id, "fix_discarded"),
                 )
                 # Stored, tagged `discarded`, so a discarded fix never comes
-                # back as a "prior diagnosis": recall leaves those out. Until
-                # #502 this comment said the write was skipped, while Step 7b
-                # had already made it, untagged, before the card went out.
-                if kg_after_decision:
-                    await self._store_verdict(alert, verdict, investigation_output, "discarded")
+                # back as a "prior diagnosis": recall leaves those out.
+                await self._store_verdict(alert, verdict, investigation_output, "discarded")
                 await self._record(
                     problem_id, "waiting_human", "Proposed fix discarded.", step="discard"
                 )
@@ -1785,15 +1777,14 @@ class AlertInvestigationFlow:
         # operator answered with something that does not end the run. The
         # answers that do end it (expired, self-resolved, run fix, discard)
         # stored theirs where they return.
-        if kg_after_decision:
-            if gate_skipped:
-                outcome = "no_card"
-            elif v2 == "open_all_prs":
-                outcome = "opened_pr" if opened_pr_urls else "pr_failed"
-            else:
-                # "ack", or any answer the flow carries on past like one.
-                outcome = "muted" if v2 == "mute_24h" else "acknowledged"
-            await self._store_verdict(alert, verdict, investigation_output, outcome)
+        if gate_skipped:
+            outcome = "no_card"
+        elif v2 == "open_all_prs":
+            outcome = "opened_pr" if opened_pr_urls else "pr_failed"
+        else:
+            # "ack", or any answer the flow carries on past like one.
+            outcome = "muted" if v2 == "mute_24h" else "acknowledged"
+        await self._store_verdict(alert, verdict, investigation_output, outcome)
 
         # ── Step 8: Compute final status (no task creation in v3) ──
         final_status = "logged"
@@ -1850,7 +1841,7 @@ class AlertInvestigationFlow:
                         str(upload_res.get("error"))[:200],
                     )
             except Exception as exc:
-                workflow.logger.warning("alert_kimi_log_upload_raised exc=%s", str(exc)[:200])
+                workflow.logger.warning("alert_kimi_log_upload_raised exc=%s", error_text(exc))
 
         if track_task_id and not track_task_id.startswith("item-"):
             root_cause_full = (verdict.get("root_cause") or "").strip()
@@ -1938,15 +1929,13 @@ class AlertInvestigationFlow:
         voice_text = f"Investigation complete for {title}. Status: {final_status}."
         if preview_src:
             voice_text += f" {preview_src[:600]}"
-        try:
+        with logged_failure("alert_verdict_voice_failed", logger=workflow.logger):
             await workflow.execute_activity_method(
                 DeliveryActivities.send_voice,
                 args=[agent_id, voice_text],
                 start_to_close_timeout=TIMEOUT_FAST,
                 retry_policy=NO_RETRY,
             )
-        except Exception as exc:
-            workflow.logger.warning("alert_verdict_voice_failed err=%s", str(exc)[:200])
 
         # ── Step 10: Record the outcome on the problem ──
         # `resolved` closes the problem; an opened fix PR keeps it `fixing`

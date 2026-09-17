@@ -34,6 +34,7 @@ import structlog
 from aegis.connectors._ssh import build_ssh_args
 from aegis.connectors._subprocess import kill_and_wait
 from aegis.crypto import decrypt_secret, encrypt_secret
+from aegis.slugs import slugify, unique_slug
 
 logger = structlog.get_logger()
 
@@ -66,8 +67,6 @@ _EDITABLE_FIELDS = (
     "cloud",
 )
 
-_SLUG_RE = re.compile(r"[^a-z0-9]+")
-
 _SSH_TIMEOUT = 30
 _KUBECTL_TIMEOUT = 30
 _PROVISION_STDOUT_CAP = 16 * 1024
@@ -91,8 +90,7 @@ _K8S_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{0,252}$")
 
 
 def _slugify(name: str) -> str:
-    slug = _SLUG_RE.sub("-", name.strip().lower()).strip("-")
-    return slug or "infra"
+    return slugify(name, fallback="infra")
 
 
 # ── coding-agent (remote script) config block ────────────────────────────────
@@ -532,15 +530,6 @@ def cloud_auth_env(
 k8s_auth_env = cloud_auth_env
 
 
-async def _unique_slug(pool: asyncpg.Pool, base: str) -> str:
-    slug = base
-    n = 2
-    while await pool.fetchval("SELECT 1 FROM infra WHERE slug = $1", slug):
-        slug = f"{base}-{n}"
-        n += 1
-    return slug
-
-
 async def list_infra(pool: asyncpg.Pool) -> list[dict]:
     rows = await pool.fetch(f"SELECT {_SELECT_COLS} FROM infra ORDER BY name")
     return [public_infra(dict(r)) for r in rows]
@@ -570,7 +559,7 @@ async def create_infra(pool: asyncpg.Pool, data: dict[str, Any], secret_key: str
     if not name:
         raise ValueError("name is required")
     slug = (data.get("slug") or "").strip()
-    slug = await _unique_slug(pool, _slugify(slug or name))
+    slug = await unique_slug(pool, _slugify(slug or name), table="infra")
     kind = data.get("kind") or "ssh_host"
     if kind not in _INFRA_KINDS:
         raise ValueError(f"unknown kind {kind!r}; expected one of {list(_INFRA_KINDS)}")

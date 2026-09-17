@@ -123,6 +123,36 @@ def test_brief_markdown_mirrors_html():
     assert "- Airtel · ₹5,306.46" in md
 
 
+def test_the_brief_names_whatever_sets_of_books_are_configured():
+    """The renderer knows no entity by name (#560): `build_money_brief` sends
+    one bucket per configured entity plus its label, so a fork with one set of
+    books gets one line and a fork with three gets three — and neither gets an
+    empty row for a set of books it does not have.
+
+    Break `render_money_brief` back to reading `entities["personal"]` and
+    `entities["hikmah"]` and this renders two lines of zeros instead.
+    """
+    out = render_money_brief({
+        **BRIEF,
+        "entities": {
+            "me": {"income": "-100.00", "expenses": "200.00"},
+            "acme": {"income": "-5.00", "expenses": "0"},
+            "third": {"income": "0", "expenses": "1.00"},
+        },
+        "entity_labels": {"me": "Mine", "acme": "Acme Ltd"},
+    })
+
+    assert "Mine: in ₹100.00 · out ₹200.00" in out["html"]
+    assert "Acme Ltd: in ₹5.00 · out ₹0.00" in out["html"]
+    # No label sent ⇒ the id, title-cased. Nothing is dropped for want of one.
+    assert "Third: in ₹0.00 · out ₹1.00" in out["html"]
+    assert "Personal:" not in out["html"] and "Hikmah:" not in out["html"]
+    # Every one of them is bulleted in Markdown, for the same reason the two
+    # always were: adjacent unbulleted lines fold into one paragraph.
+    for line in ("Mine", "Acme Ltd", "Third"):
+        assert f"- {line}: in " in out["markdown"]
+
+
 def test_brief_markdown_bullets_every_standalone_line():
     """Two adjacent unbulleted lines are ONE paragraph to every Markdown
     renderer, so an unbulleted entity pair renders as `…₹6,250.00 Hikmah: in…`
@@ -597,6 +627,19 @@ def test_month_close_names_the_days_a_risk_halt_sold_the_book():
     desk = {**_DESK, "halts": [{"day": "2026-09-22", "note": "DAILY_LOSS fired on 2026-09-19."}]}
     md = render_month_close({"month": "2026-09", "books_ok": False, "desk": desk})["markdown"]
     assert "Risk halt on 2026-09-22: the desk sold its whole book. DAILY_LOSS fired on 2026-09-19." in md
+
+
+def test_month_close_counts_the_weekdays_the_desk_sat_out():
+    """A run of these is the signal — one is a market holiday. Without the line
+    the six-day stale-calendar alarm is the first thing that says anything."""
+    desk = {**_DESK, "idle_weekdays": 4}
+    md = render_month_close({"month": "2026-09", "books_ok": False, "desk": desk})["markdown"]
+    assert "Idle weekdays: 4 — no new market day to act on" in md
+
+
+def test_month_close_says_nothing_about_idle_weekdays_when_there_were_none():
+    md = render_month_close({"month": "2026-09", "books_ok": False, "desk": {**_DESK, "idle_weekdays": 0}})
+    assert "Idle weekdays" not in md["markdown"]
 
 
 def test_month_close_without_a_desk_has_no_desk_section():

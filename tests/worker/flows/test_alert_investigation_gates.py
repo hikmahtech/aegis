@@ -259,6 +259,14 @@ async def stub_record_investigation(inp: dict) -> dict:
     return {"recorded": True, "status_changed": True}
 
 
+@activity.defn(name="project_problem")
+async def stub_project_problem(problem_id: str) -> dict:
+    """Asked for once the verification delay is out, to learn a task the settle
+    window deferred (#537). These tests always have one already."""
+    _HUB.setdefault("projected", []).append(problem_id)
+    return {"task_id": "task-hub-1", "skipped": ""}
+
+
 @activity.defn(name="mute_problem")
 async def stub_mute_problem(problem_id: str, hours: float, by: str = "") -> dict:
     _HUB["mute"].append((problem_id, hours))
@@ -282,6 +290,7 @@ ALL_STUBS = [
     stub_ingest_alert,
     stub_problem_status,
     stub_record_investigation,
+    stub_project_problem,
     stub_mute_problem,
     stub_verification_delay,
     stub_resolve_agents,

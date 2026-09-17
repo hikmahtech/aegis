@@ -20,6 +20,7 @@ from fastapi.responses import RedirectResponse
 from aegis.api.auth import verify_auth
 from aegis.api.deps import get_settings
 from aegis.config import Settings
+from aegis.errors import error_text
 
 logger = structlog.get_logger()
 
@@ -48,7 +49,7 @@ _SCOPES = [
 
 
 def _redirect_uri(settings: Settings, label: str) -> str:
-    base = (settings.aegis_ui_url or "").rstrip("/")
+    base = (settings.aegis_public_url or settings.aegis_ui_url or "").rstrip("/")
     return f"{base}/api/admin/gmail/reauth/{label}/callback"
 
 
@@ -65,7 +66,7 @@ async def _build_flow(request: Request, settings: Settings, label: str):
     try:
         from google_auth_oauthlib.flow import Flow
     except ImportError as exc:
-        logger.error("google_auth_oauthlib_missing", error=str(exc))
+        logger.error("google_auth_oauthlib_missing", error=error_text(exc, 500))
         raise HTTPException(status_code=503, detail="oauth_library_not_installed") from exc
 
     from aegis.services.google_oauth import get_google_client_config
@@ -155,7 +156,7 @@ async def callback_reauth(
                 logger.warning(
                     "gmail_reauth_resolve_failed",
                     interaction_id=interaction_id,
-                    error=str(exc)[:200],
+                    error=error_text(exc),
                 )
 
     return {"ok": True, "label": label, "interaction_resolved": interaction_id}

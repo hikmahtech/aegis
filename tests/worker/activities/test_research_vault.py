@@ -49,6 +49,39 @@ async def test_an_answer_is_also_kept_in_the_vault_once(vault):
     assert text.startswith("# What is RAG?\n") and text.count("RAG [1].") == 1
 
 
+@needs_git
+async def test_an_answer_follows_the_vault_layout_and_is_signed_by_its_agent(vault, db_pool):
+    """#567: a non-default `questions_dir` and `date_heading_format` reach
+    research answers, and the commit is the owning agent's, under its name."""
+    from aegis.services import vault_layout as vl
+
+    from tests.notes_vault import git
+
+    await db_pool.execute("DELETE FROM settings WHERE key = $1", vl.SETTINGS_KEY)
+    vl.invalidate_cache()
+    try:
+        await vl.save_layout(
+            db_pool, {"questions_dir": "raphael/answers", "date_heading_format": "DD/MM/YYYY"}
+        )
+        acts = ResearchActivities(
+            knowledge_connector=_kc(), settings=vault["settings"], db_pool=db_pool,
+            agent_id="raphael",
+        )
+        out = await ActivityEnvironment().run(
+            acts.research_save, "What is RAG?", "RAG [1].", [{"n": 1, "kind": "web", "title": "A"}]
+        )
+    finally:
+        await db_pool.execute("DELETE FROM settings WHERE key = $1", vl.SETTINGS_KEY)
+        vl.invalidate_cache()
+    path = out["vault"]["path"]
+    assert path.startswith("raphael/answers/what-is-rag-")
+    text = remote_file(vault, path)
+    assert "\n## " in text and "/" in text.split("\n## ", 1)[1].split("\n", 1)[0], "a DD/MM/YYYY heading"
+    name = await db_pool.fetchval("SELECT name FROM agents WHERE id = 'raphael'")
+    log = git("log", "-1", "--format=%an <%ae>%n%s", "main", cwd=vault["remote"])
+    assert log == f"{name} <raphael@aegis.local>\nraphael: research answer\n"
+
+
 async def test_no_vault_means_the_save_is_unchanged():
     out = await ActivityEnvironment().run(
         ResearchActivities(knowledge_connector=_kc()).research_save, "q", "a", []

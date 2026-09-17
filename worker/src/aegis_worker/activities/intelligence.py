@@ -5,10 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from aegis.errors import error_text
 from aegis.llm import parse_llm_json
 from aegis.services.content_extract import fetch_and_extract
 from aegis.services.knowledge import _content_id_for
 from aegis.services.research_topics import TOPICS_SETTING, parse_topics
+from aegis.services.settings_store import get_setting
 from temporalio import activity
 
 from aegis_worker.activities.content import _MIN_CONTENT_LENGTH, detect_content_type
@@ -26,20 +28,20 @@ class IntelligenceActivities:
 
     knowledge_connector: Any = None
     llm_client: Any = None
-    # Scoring model. NOTE: this default is only used by direct construction —
-    # __main__.py passes `model_light=model_balanced`, so in a real worker the
-    # significance score runs on whatever the BALANCED tier resolves to, not on
-    # gemma4:e2b. An earlier comment here claimed the fast tier; it was never
-    # wired that way, and that mismatch is what made issue #137 read the
-    # 2026-07-22 balanced-tier remap (gemma4:e2b/gpt-oss:20b -> kimi-k2.5) as
-    # "fast-tier calls went invisible". Change the wiring in __main__.py if you
-    # want a different tier — changing this default alone does nothing.
-    model_light: str = "gemma4:e2b"
+    # Scoring model. __main__.py passes `model_light=model_balanced`, so in a
+    # real worker the significance score runs on whatever the BALANCED tier
+    # resolves to. The default is blank on purpose: a model name here would be
+    # dead config right up until a wiring gap made it the live model (#137),
+    # and `think()` on a blank name fails loudly rather than scoring on a
+    # decommissioned model. Change the wiring in __main__.py for a different
+    # tier — changing this default alone does nothing.
+    model_light: str = ""
     db_pool: Any = None
-    # Owning agent — matches IntelligenceScanFlow's config default. Threaded
-    # into llm_calls rows so intel_score_significance stops recording NULL
-    # agent_id (same pattern as MoneyActivities.agent_id).
-    agent_id: str = "raphael"
+    # Owning agent: the holder of the `research` tag, resolved in __main__ at
+    # boot. Threaded into llm_calls rows so intel_score_significance records
+    # who asked (same pattern as MoneyActivities.agent_id); "" = no agent, and
+    # the row is written with NULL rather than a made-up id.
+    agent_id: str = ""
 
     @activity.defn
     async def dedup_items(self, items: list[dict]) -> list[dict]:
@@ -84,7 +86,7 @@ class IntelligenceActivities:
                 activity.logger.warning(
                     "intel_dedup_lookup_failed url=%s err=%s",
                     url[:120],
-                    str(exc)[:200],
+                    error_text(exc),
                 )
             novel.append(item)
         return novel
@@ -120,7 +122,7 @@ class IntelligenceActivities:
             max_tokens=1500,
             db_pool=self.db_pool,
             purpose="intel_score_significance",
-            agent_id=self.agent_id,
+            agent_id=self.agent_id or None,
         )
         scores = parse_llm_json(result["response"])
         try:
@@ -143,7 +145,8 @@ class IntelligenceActivities:
 
     @activity.defn
     async def load_tracked_topics(self) -> list[str]:
-        """Search terms for the topics tracked from chat, in the order added.
+        """The names of the topics tracked from chat, in the order added —
+        what a scan searches, one query per topic (#585).
 
         `track_topic` writes them to the settings row `intelligence_topics`.
         Until #508 nothing read that row, so the tool answered "added" and no
@@ -152,10 +155,8 @@ class IntelligenceActivities:
         """
         if not self.db_pool:
             return []
-        value = await self.db_pool.fetchval(
-            "SELECT value FROM settings WHERE key = $1", TRACKED_TOPICS_SETTING
-        )
-        return tracked_search_terms(value)
+        value = await get_setting(self.db_pool, TRACKED_TOPICS_SETTING)
+        return tracked_topic_names(value)
 
     @activity.defn
     async def attach_topic_items(self, items: list[dict], origin: str) -> dict:
@@ -183,7 +184,7 @@ class IntelligenceActivities:
             text, _title = await fetch_and_extract(url, content_type)
         except Exception as exc:  # noqa: BLE001 — one unreadable page must not sink the batch
             activity.logger.warning(
-                "intel_page_read_failed url=%s err=%s", url[:120], str(exc)[:200]
+                "intel_page_read_failed url=%s err=%s", url[:120], error_text(exc)
             )
             return ""
         return text if len(text) >= _MIN_CONTENT_LENGTH else ""
@@ -239,7 +240,7 @@ class IntelligenceActivities:
                     activity.logger.warning(
                         "intel_ingest_content_failed url=%s err=%s",
                         url[:120],
-                        str(exc)[:200],
+                        error_text(exc),
                     )
             else:
                 # The third outcome, and until now the invisible one: the item
@@ -268,8 +269,9 @@ class IntelligenceActivities:
 
 
 def tracked_search_terms(value: Any) -> list[str]:
-    """The search terms in an `intelligence_topics` settings value: each
-    topic's queries, or its name when it has none.
+    """The match terms in an `intelligence_topics` settings value: each
+    topic's queries, or its name when it has none. The RSS gate matches on
+    these; the intel scans search `tracked_topic_names` instead.
 
     The row has one parser, `research_topics.parse_topics` — the one the
     hub's rounds read — so the scans, the RSS gate and the rounds agree on
@@ -278,3 +280,16 @@ def tracked_search_terms(value: Any) -> list[str]:
     config read.
     """
     return [term for topic in parse_topics(value) for term in topic.terms]
+
+
+def tracked_topic_names(value: Any) -> list[str]:
+    """The topic names in an `intelligence_topics` settings value, in the
+    order added: what an intel scan searches, one query per topic.
+
+    A scan used to search every match term instead — 107 queries for 20
+    topics, each scan, three scans a night — and the configured topics,
+    searched first, filled every result slot, so no tracked topic's result
+    was ever scored (#585). The terms decide what belongs to a topic, not
+    what to search. Lenient, like `tracked_search_terms`.
+    """
+    return [topic.name for topic in parse_topics(value)]

@@ -22,6 +22,7 @@ from aegis.api.deps import get_settings
 from aegis.config import Settings
 from aegis.connectors._ssh import build_ssh_args
 from aegis.connectors._subprocess import kill_and_wait
+from aegis.errors import error_text
 from aegis.services.infra import get_aegis_host, ssh_key_file
 
 logger = structlog.get_logger()
@@ -37,8 +38,8 @@ async def _probe_db(pool) -> dict[str, Any]:
 
         return await check_health(pool)
     except Exception as exc:
-        logger.warning("system_status_db_probe_failed", error=str(exc))
-        return {"status": "error", "error": str(exc)}
+        logger.warning("system_status_db_probe_failed", error=error_text(exc, 500))
+        return {"status": "error", "error": error_text(exc, 500)}
 
 
 async def _probe_temporal(settings: Settings) -> dict[str, Any]:
@@ -52,7 +53,7 @@ async def _probe_temporal(settings: Settings) -> dict[str, Any]:
             resp.raise_for_status()
         return {"status": "ok"}
     except Exception as exc:
-        return {"status": "error", "error": str(exc)[:300]}
+        return {"status": "error", "error": error_text(exc, 300)}
 
 
 def _stack_filter_args(stack: str) -> list[str]:
@@ -133,7 +134,7 @@ async def _probe_services(pool, settings: Settings) -> dict[str, Any]:
     try:
         aegis_host = await get_aegis_host(pool)
     except Exception as exc:
-        return {"status": "error", "error": str(exc)[:300], "services": []}
+        return {"status": "error", "error": error_text(exc, 300), "services": []}
 
     if not aegis_host:
         return {
@@ -168,7 +169,7 @@ async def _probe_services(pool, settings: Settings) -> dict[str, Any]:
                 "note": "hosts_aegis entry has neither docker_context nor complete ssh fields",
             }
     except Exception as exc:
-        return {"status": "error", "error": str(exc)[:300], "services": []}
+        return {"status": "error", "error": error_text(exc, 300), "services": []}
 
     result["infra_slug"] = aegis_host["slug"]
     return result

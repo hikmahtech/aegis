@@ -4,7 +4,7 @@ and only group on a yes."""
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 import pytest
 from temporalio import activity, workflow
@@ -144,6 +144,13 @@ async def test_sweep_promotes_then_projects_and_reports():
         "group_candidates": 0,
         "grouped": 0,
         "folded": 0,
+        # No alertmanager configured in this fixture, so the reconciliation
+        # step declines to act and says why (#551).
+        "alertmanager_resolved": 0,
+        "alertmanager_skipped": "",
+        # -1 says the step did not run, which is a different fact from "ran and
+        # found nothing" — the two used to be indistinguishable here.
+        "alertmanager_checked": -1,
     }
     # Promotion first, so a just-promoted problem gets its task in the same
     # tick; completed tasks and merged fixes next, so what they resolve or
@@ -207,86 +214,6 @@ async def test_sweep_leaves_a_cluster_the_judge_rejects_alone():
     assert "apply" not in _calls
 
 
-# --- the completed-task step (#473) --------------------------------------------
-
-
-@workflow.defn(name="HubSweepFlow")
-class _SweepBeforeCompletedTasks:
-    """HubSweepFlow as it ran before step 2 existed: the same activities in
-    the same order, minus `reconcile_completed_tasks`. Kept so a history it
-    wrote can be replayed against today's flow."""
-
-    @workflow.run
-    async def run(self, config: HubSweepConfig) -> dict:
-        short = timedelta(seconds=30)
-        await workflow.execute_activity(
-            "promote_expired_suppressions", start_to_close_timeout=short
-        )
-        await workflow.execute_activity("project_pending", start_to_close_timeout=short)
-        await workflow.execute_activity(
-            "find_group_candidates", args=[0, 0.0], start_to_close_timeout=short
-        )
-        return {}
-
-
-@pytest.mark.asyncio
-async def test_a_sweep_started_before_the_deploy_replays_on_the_new_worker():
-    """HubSweepFlow runs every five minutes, so a deploy can land mid-run and
-    the new worker replays a history with no `reconcile_completed_tasks` in
-    it. The step is behind `workflow.patched`, which is what keeps that replay
-    deterministic.
-
-    Falsifiable: call the activity without the `patched` guard and this
-    replay raises a nondeterminism error.
-    """
-    _, history = await _run(
-        [_promote, _project, _finder([])],
-        workflows=(_SweepBeforeCompletedTasks,),
-        flow=_SweepBeforeCompletedTasks,
-    )
-    await Replayer(workflows=[HubSweepFlow]).replay_workflow(history)
-
-
-@workflow.defn(name="HubSweepFlow")
-class _SweepBeforeFixVerification:
-    """HubSweepFlow as it ran before #502: the completed-task step behind its
-    patch, and no `verify_fixes`. Kept so a history it wrote can be replayed
-    against today's flow."""
-
-    @workflow.run
-    async def run(self, config: HubSweepConfig) -> dict:
-        short = timedelta(seconds=30)
-        await workflow.execute_activity(
-            "promote_expired_suppressions", start_to_close_timeout=short
-        )
-        if workflow.patched("hub-sweep-completed-tasks"):
-            await workflow.execute_activity(
-                "reconcile_completed_tasks", start_to_close_timeout=short
-            )
-        await workflow.execute_activity("project_pending", start_to_close_timeout=short)
-        await workflow.execute_activity(
-            "find_group_candidates", args=[0, 0.0], start_to_close_timeout=short
-        )
-        return {}
-
-
-@pytest.mark.asyncio
-async def test_a_sweep_started_before_fix_verification_replays_on_the_new_worker():
-    """#502 put `verify_fixes` between the completed-task step and projection.
-    A sweep in flight across the deploy replays a history without it, so the
-    step is behind `workflow.patched`.
-
-    Falsifiable: call the activity without the guard and this replay raises a
-    nondeterminism error.
-    """
-    _, history = await _run(
-        [_promote, _reconcile, _project, _finder([])],
-        workflows=(_SweepBeforeFixVerification,),
-        flow=_SweepBeforeFixVerification,
-    )
-    await Replayer(workflows=[HubSweepFlow]).replay_workflow(history)
-
-
 @pytest.mark.asyncio
 async def test_the_new_sweep_replays_its_own_history():
     _, history = await _run(
@@ -330,3 +257,48 @@ async def test_the_sweep_resolves_a_problem_whose_task_a_person_completed(db_poo
 
     assert out["task_completed"] >= 1
     assert (await get_problem(db_pool, r.problem_id))["status"] == "resolved"
+
+
+@activity.defn(name="reconcile_alertmanager")
+async def _reconcile_am(url: str, min_uptime_seconds: int = 900) -> dict:
+    _calls.append(f"reconcile_alertmanager:{url}:{min_uptime_seconds}")
+    return {"checked": 4, "resolved": 2, "problems": ["p-1", "p-2"], "active_alerts": 7}
+
+
+@pytest.mark.asyncio
+async def test_the_sweep_reconciles_alertmanager_before_it_projects():
+    """A problem whose alert alertmanager forgot is resolved in the same tick it
+    is projected, so the resolve reaches the Todoist task now rather than in
+    five minutes (#551).
+
+    Falsifiable: drop the step and `reconcile_alertmanager` never appears; move
+    it after `project_pending` and the order assertion fails.
+    """
+    _calls.clear()
+    _verify_args.clear()
+    out, _ = await _run(
+        [_promote, _reconcile, _verify, _project, _reconcile_am, _finder([]), _judge(True), _apply],
+        config=HubSweepConfig(
+            agent_id="pandoras-actor",
+            alertmanager_url="http://alertmanager:9093",
+            alertmanager_min_uptime_seconds=1200,
+        ),
+    )
+
+    assert out["alertmanager_resolved"] == 2
+    assert "reconcile_alertmanager:http://alertmanager:9093:1200" in _calls
+    assert _calls.index("reconcile_alertmanager:http://alertmanager:9093:1200") < _calls.index(
+        "project"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_sweep_does_not_ask_an_alertmanager_it_has_no_address_for():
+    """Unset means off: a fork must not probe a guessed monitoring host."""
+    _calls.clear()
+    _verify_args.clear()
+    out, _ = await _run(
+        [_promote, _reconcile, _verify, _project, _reconcile_am, _finder([]), _judge(True), _apply]
+    )
+    assert out["alertmanager_resolved"] == 0
+    assert not [c for c in _calls if c.startswith("reconcile_alertmanager")]

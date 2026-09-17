@@ -7,7 +7,10 @@ from aegis_worker.flows.service_drift import _compute_drift_inline
 
 
 def _make_homelab_act(delivery):
-    return HomelabActivities(db_pool=None, homelab=None, delivery=delivery)
+    # The owner `__main__` resolves from the `infra` tag and passes in (#579).
+    return HomelabActivities(
+        db_pool=None, homelab=None, delivery=delivery, agent_id="pandoras-actor"
+    )
 
 
 @pytest.mark.asyncio

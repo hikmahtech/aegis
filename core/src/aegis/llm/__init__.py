@@ -15,6 +15,8 @@ import structlog
 from openai import AsyncOpenAI
 from opentelemetry import trace
 
+from aegis.errors import error_text
+
 logger = structlog.get_logger()
 _tracer = trace.get_tracer(__name__)
 
@@ -511,6 +513,44 @@ class LLMClient:
             response_format=response_format,
         )
 
+    async def _complete(
+        self,
+        span: Any,
+        kwargs: dict[str, Any],
+        *,
+        db_pool: Any,
+        purpose: str | None,
+        agent_id: str | None,
+        started: float,
+    ) -> tuple[Any, float | None]:
+        """One upstream completion, under this model's concurrency cap.
+
+        `think()` and `chat()` differ in everything they do with an answer and
+        in nothing about how they ask for one: both cap concurrency per model,
+        both read the proxy's own cost off the response, and both write an
+        `llm_calls` error row BEFORE letting the exception out — a call that
+        failed upstream must never be invisible in the ledger. The span is the
+        caller's, because what it records about the answer is the caller's.
+        """
+        sem = self._semaphore_for(kwargs["model"])
+        try:
+            if sem is not None:
+                async with sem:
+                    return await _create_with_cost(self._client, kwargs)
+            return await _create_with_cost(self._client, kwargs)
+        except Exception as exc:
+            span.set_attribute("llm.status", "error")
+            await self._record_call(
+                db_pool,
+                kwargs["model"],
+                purpose,
+                agent_id,
+                started,
+                status=_classify_llm_error(exc),
+                error=error_text(exc, 500),
+            )
+            raise
+
     async def _think_once(
         self,
         messages: list[dict[str, Any]],
@@ -535,7 +575,6 @@ class LLMClient:
         """
         import time
 
-        sem = self._semaphore_for(model)
         create_kwargs: dict[str, Any] = {
             "model": model,
             "messages": messages,
@@ -551,24 +590,14 @@ class LLMClient:
             span.set_attribute("llm.max_tokens", max_tokens)
             _set_genai_request(span, "text_completion", model, max_tokens)
             _t0 = time.monotonic()
-            try:
-                if sem is not None:
-                    async with sem:
-                        completion, cost_usd = await _create_with_cost(self._client, create_kwargs)
-                else:
-                    completion, cost_usd = await _create_with_cost(self._client, create_kwargs)
-            except Exception as exc:
-                span.set_attribute("llm.status", "error")
-                await self._record_call(
-                    db_pool,
-                    model,
-                    purpose,
-                    agent_id,
-                    _t0,
-                    status=_classify_llm_error(exc),
-                    error=str(exc)[:500],
-                )
-                raise
+            completion, cost_usd = await self._complete(
+                span,
+                create_kwargs,
+                db_pool=db_pool,
+                purpose=purpose,
+                agent_id=agent_id,
+                started=_t0,
+            )
 
             choice = completion.choices[0]
             response = choice.message.content or ""
@@ -784,7 +813,6 @@ class LLMClient:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
 
-        sem = self._semaphore_for(model)
         with _tracer.start_as_current_span("llm.call") as span:
             span.set_attribute("llm.model", model)
             span.set_attribute("llm.operation", "chat")
@@ -792,24 +820,14 @@ class LLMClient:
             span.set_attribute("llm.tools_count", len(tools) if tools else 0)
             _set_genai_request(span, "chat", model, max_tokens)
             _t0 = time.monotonic()
-            try:
-                if sem is not None:
-                    async with sem:
-                        completion, cost_usd = await _create_with_cost(self._client, kwargs)
-                else:
-                    completion, cost_usd = await _create_with_cost(self._client, kwargs)
-            except Exception as exc:
-                span.set_attribute("llm.status", "error")
-                await self._record_call(
-                    db_pool,
-                    model,
-                    purpose,
-                    agent_id,
-                    _t0,
-                    status=_classify_llm_error(exc),
-                    error=str(exc)[:500],
-                )
-                raise
+            completion, cost_usd = await self._complete(
+                span,
+                kwargs,
+                db_pool=db_pool,
+                purpose=purpose,
+                agent_id=agent_id,
+                started=_t0,
+            )
 
             choice = completion.choices[0]
             message = choice.message
@@ -916,14 +934,14 @@ class LLMClient:
         except LLMTruncationError as exc:
             logger.warning(
                 "extract_money_batch_truncated",
-                error=str(exc)[:200],
+                error=error_text(exc),
                 count=len(receipts),
             )
             return [dict(stub) for _ in receipts]
         except Exception as exc:
             logger.warning(
                 "extract_money_batch_failed",
-                error=str(exc)[:200],
+                error=error_text(exc),
                 count=len(receipts),
             )
             raise
@@ -1024,7 +1042,6 @@ class LLMClient:
 # modules are leaves (they import nothing from `aegis.llm`), so the names are
 # resolved from module globals by the time `think()` runs.
 from aegis.llm.routes import (  # noqa: E402
-    get_routes,
     merge_routes,
     route_for_purpose,
     set_routes,
@@ -1039,7 +1056,6 @@ __all__ = [
     "LLMClient",
     "LLMKillSwitchError",
     "LLMTruncationError",
-    "get_routes",
     "merge_routes",
     "parse_llm_json",
     "resolve_model_for_agent",

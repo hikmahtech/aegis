@@ -25,6 +25,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from aegis.services.config_rows import SettingsRow
+
 SETTINGS_KEY = "project_repo_map"
 
 # owner/repo — GitHub's own allowed character set for both segments.
@@ -65,23 +67,27 @@ def lookup(project_name: str | None, mapping: dict[str, str]) -> str:
     return mapping.get(str(project_name).strip().lower(), "")
 
 
+def merge(value: Any) -> dict[str, str]:
+    """The lenient READ: the stored mapping, or empty on anything malformed.
+
+    The same normalisation as the write, because there is only one right answer
+    to "which repo is this project?" — but a bad entry degrades the resolver to
+    its later tiers rather than raising, which is what the write path does."""
+    try:
+        return validate_map(value if isinstance(value, dict) else {})
+    except ValueError:
+        return {}
+
+
+ROW = SettingsRow(SETTINGS_KEY, merge, validate_map)
+
+
 async def get_project_repo_map(pool: Any) -> dict[str, str]:
     """Effective mapping (validated). Empty on unset or on ANY read/parse error —
     a bad config must degrade the resolver to its later tiers, never break it."""
-    try:
-        row = await pool.fetchrow("SELECT value FROM settings WHERE key = $1", SETTINGS_KEY)
-        return validate_map(row["value"] if row and row["value"] else {})
-    except Exception:  # noqa: BLE001 — repo resolution is best-effort, never fatal
-        return {}
+    return await ROW.get(pool)
 
 
 async def save_project_repo_map(pool: Any, raw: Any) -> dict[str, str]:
     """Persist the mapping (validated); returns the normalized result."""
-    validated = validate_map(raw)
-    await pool.execute(
-        "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW()) "
-        "ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()",
-        SETTINGS_KEY,
-        validated,
-    )
-    return validated
+    return await ROW.save(pool, raw)

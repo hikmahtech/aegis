@@ -10,7 +10,7 @@ from aegis.services.chat import ToolContext, _exec_configure_triage
 @pytest.fixture
 def mock_pool():
     pool = AsyncMock()
-    pool.fetchrow = AsyncMock(return_value=None)
+    pool.fetchval = AsyncMock(return_value=None)
     pool.execute = AsyncMock()
     return pool
 
@@ -49,7 +49,7 @@ async def test_add_sentry_project(mock_pool, ctx):
 
 
 async def test_add_sentry_project_existing(mock_pool, ctx):
-    mock_pool.fetchrow = AsyncMock(return_value={"value": ["php_core_api"]})
+    mock_pool.fetchval = AsyncMock(return_value=["php_core_api"])
     result = json.loads(
         await _exec_configure_triage(
             mock_pool,
@@ -61,7 +61,7 @@ async def test_add_sentry_project_existing(mock_pool, ctx):
 
 
 async def test_add_sentry_project_dedup(mock_pool, ctx):
-    mock_pool.fetchrow = AsyncMock(return_value={"value": ["php_core_api"]})
+    mock_pool.fetchval = AsyncMock(return_value=["php_core_api"])
     result = json.loads(
         await _exec_configure_triage(
             mock_pool,
@@ -73,7 +73,7 @@ async def test_add_sentry_project_dedup(mock_pool, ctx):
 
 
 async def test_remove_sentry_project(mock_pool, ctx):
-    mock_pool.fetchrow = AsyncMock(return_value={"value": ["php_core_api", "other"]})
+    mock_pool.fetchval = AsyncMock(return_value=["php_core_api", "other"])
     result = json.loads(
         await _exec_configure_triage(
             mock_pool,

@@ -91,6 +91,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from aegis.services import books
+from aegis.services.bank_parsers import amount_from
 from aegis.services.statements import (
     PARSED,
     REFUSED,
@@ -213,12 +214,16 @@ class CardTotals:
 
 
 def _d(text: str) -> date:
+    """This card's own date, and deliberately NOT `statements._d`: that one
+    normalises `-` to `/` first, because the bank's account statements print
+    both separators. The card prints `/` only, so accepting `-` here would
+    read a date shape this layout never emits."""
     return datetime.strptime(text, "%d/%m/%Y").date()
 
 
 def _amount(token: str) -> Decimal:
     try:
-        return Decimal(token.replace(",", "")).quantize(_CENT)
+        return amount_from(token)
     except InvalidOperation as exc:  # pragma: no cover — the regex fixes the shape
         raise ValueError(f"unreadable amount: {token!r}") from exc
 

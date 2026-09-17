@@ -26,7 +26,7 @@ from typing import Any
 
 import pytest
 import pytest_asyncio
-from aegis.connectors.homelab import _envelope
+from aegis.connectors._base import envelope
 from aegis.services.hub import get_problem, list_events, slug
 from aegis_worker.activities.homelab import HomelabActivities
 from aegis_worker.activities.hub import HubActivities
@@ -34,6 +34,8 @@ from temporalio import activity, workflow
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment, WorkflowEnvironment
 from temporalio.worker import Replayer, Worker
+
+from tests.delivery_stub import FakeDelivery
 
 with workflow.unsafe.imports_passed_through():
     from aegis_worker.flows.cert_radar import CertRadarConfig, CertRadarFlow
@@ -248,28 +250,10 @@ class FakeHomelab:
     async def probe_tls(self, domain: str, port: int = 443) -> dict:
         c = self.certs[domain]
         if "error" in c:
-            return _envelope(False, error=c["error"], retryable=True)
-        return _envelope(
+            return envelope(False, error=c["error"], retryable=True)
+        return envelope(
             True, data={"domain": domain, "not_after": c["not_after"], "serial": c["serial"]}
         )
-
-
-class FakeDelivery:
-    """`DeliveryActivities.send_message`: records the card, answers ok."""
-
-    def __init__(self) -> None:
-        self.sent: list[str] = []
-
-    async def send_message(
-        self,
-        agent_id: str,
-        message: str,
-        chat_id: int = 0,
-        thread_ref: dict | None = None,
-        thread_overflow: bool = False,
-    ) -> dict:
-        self.sent.append(message)
-        return {"ok": True}
 
 
 @pytest_asyncio.fixture(loop_scope="function")

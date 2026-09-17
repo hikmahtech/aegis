@@ -44,7 +44,7 @@ async def test_collect_infra_state_node_failure_is_not_ok():
 @pytest.mark.asyncio
 async def test_read_heartbeat_state_defaults_when_unset():
     pool = AsyncMock()
-    pool.fetchrow.return_value = None
+    pool.fetchval.return_value = None
     state = await _act(db_pool=pool).read_heartbeat_state()
     assert state == {
         "nodes": {},
@@ -61,15 +61,13 @@ async def test_read_heartbeat_state_keeps_a_row_that_still_carries_the_old_clock
     (`stale_stuck_problems`). A state row still carrying them must read back
     without complaint; the extra keys simply go unread."""
     pool = AsyncMock()
-    pool.fetchrow.return_value = {
-        "value": {
-            "nodes": {"baa": "Ready"},
-            "stuck": ["a"],
-            "confirmed": ["a"],
-            "confirmed_at": {"a": "2026-09-01T00:00:00+00:00"},
-            "reinvestigated_at": {},
-            "fail_count": 0,
-        }
+    pool.fetchval.return_value = {
+        "nodes": {"baa": "Ready"},
+        "stuck": ["a"],
+        "confirmed": ["a"],
+        "confirmed_at": {"a": "2026-09-01T00:00:00+00:00"},
+        "reinvestigated_at": {},
+        "fail_count": 0,
     }
     state = await _act(db_pool=pool).read_heartbeat_state()
     assert state["confirmed"] == ["a"] and state["stuck"] == ["a"]
@@ -95,7 +93,7 @@ async def test_ping_deadman_noop_without_url():
 @pytest.mark.asyncio
 async def test_read_heartbeat_state_returns_fresh_containers_each_call():
     pool = AsyncMock()
-    pool.fetchrow.return_value = None
+    pool.fetchval.return_value = None
     act = _act(db_pool=pool)
     first = await act.read_heartbeat_state()
     first["stuck"].append("phantom_service")

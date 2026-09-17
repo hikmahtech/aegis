@@ -65,6 +65,7 @@ from dataclasses import dataclass
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
+from aegis.errors import error_text
 from aegis.llm import parse_llm_json
 from aegis.services import hub
 from aegis.services.content_routes import (
@@ -81,6 +82,9 @@ from aegis.services.gtd_rules import (
 from aegis.services.hub_project import FEEDS_SOURCE_TAG, MONEY_SOURCE_TAG, RESEARCH_SOURCE_TAG
 from aegis.services.hub_project import SOURCE_TAG as HUB_SOURCE_TAG
 from aegis.services.knowledge import _content_id_for
+from aegis.services.settings_store import get_setting
+
+from aegis_worker.shared.jsonb import decode_jsonb
 
 
 class _RuleSet:
@@ -168,41 +172,31 @@ async def get_content_routes(pool) -> list[dict]:
 #
 # The addressable list + assignee vocabulary + context-hook gating are all
 # DERIVED from the active agents (issue #36): mention_aliases give the labels,
-# capabilities give the behavior tag that picks the context pre-fetch. The
-# literals below are the shipped-seed fallback when there's no DB / the read
-# fails — behavior stays identical for the default 4-agent set.
-_DEFAULT_AGENT_REG: dict[str, dict] = {
-    "sebas": {"aliases": ["@sebas"], "caps": {"gtd"}},
-    "raphael": {"aliases": ["@raphael"], "caps": {"research"}},
-    "maou": {"aliases": ["@maou"], "caps": {"finance"}},
-    "pandoras-actor": {"aliases": ["@pandora"], "caps": {"infra"}},
-}
+# capabilities give the behavior tag that picks the context pre-fetch. There
+# is no list of example agent ids behind it (#556): with no pool or no active
+# agents nothing is addressable, and a failed read keeps the last registry
+# read, so a fork that renamed its agents never routes to one it lacks.
 
 _agent_reg_cache: dict = {"reg": None, "ts": 0.0}
 
 
 def _decode_jsonish(value, empty):
-    """asyncpg returns jsonb as a Python object when the codec is registered,
-    else a raw string. Accept both; fall back to `empty` on anything odd."""
-    if value is None:
-        return empty
-    if isinstance(value, (dict, list)):
-        return value
+    """A jsonb column, with `empty` for anything that will not decode: a bad
+    row must cost one agent its registry entry, not the whole clarify run."""
     try:
-        import json
-
-        return json.loads(value)
-    except Exception:  # noqa: BLE001
+        return decode_jsonb(value, empty)
+    except (ValueError, TypeError):
         return empty
 
 
 async def get_agent_registry(pool) -> dict[str, dict]:
     """Active agents as {id: {"aliases": [@label...], "caps": {tag...}}}, 30s
     cached. Aliases come from metadata.mention_aliases (default [id]); caps from
-    the capabilities column. Falls back to the shipped defaults without a pool
-    or on read failure — routing must never break."""
+    the capabilities column. Without a pool it is empty; a failed read returns
+    the last registry read (or empty) and is not cached, so classification never
+    breaks and the next call reads again."""
     if pool is None:
-        return _DEFAULT_AGENT_REG
+        return {}
     import time
 
     now = time.monotonic()
@@ -217,9 +211,9 @@ async def get_agent_registry(pool) -> dict[str, dict]:
             raw_aliases = md.get("mention_aliases") or [r["id"]]
             aliases = [f"@{str(a).lstrip('@')}" for a in raw_aliases]
             reg[r["id"]] = {"aliases": aliases, "caps": caps}
-        reg = reg or _DEFAULT_AGENT_REG
-    except Exception:  # noqa: BLE001 — never let a config read break classification
-        reg = _DEFAULT_AGENT_REG
+    except Exception as exc:  # noqa: BLE001 — never let a config read break classification
+        activity.logger.warning("clarify_agent_registry_read_failed err=%s", error_text(exc))
+        return _agent_reg_cache["reg"] or {}
     _agent_reg_cache.update(reg=reg, ts=now)
     return reg
 
@@ -234,6 +228,16 @@ def _addressable_agents(reg: dict[str, dict]) -> list[tuple[str, str]]:
         for label in reg[aid]["aliases"]:
             out.append((label, f"{aid}_followup"))
     return out
+
+
+def _label_owner(reg: dict[str, dict], label: str) -> str | None:
+    """The agent (first by id) whose aliases include `label`, e.g. "@pandora"."""
+    return next((aid for aid in sorted(reg) if label in reg[aid]["aliases"]), None)
+
+
+def _cap_holder(reg: dict[str, dict], cap: str) -> str | None:
+    """The agent (first by id) holding behavior tag `cap`."""
+    return next((aid for aid in sorted(reg) if cap in reg[aid]["caps"]), None)
 
 
 def _assignee_labels(reg: dict[str, dict]) -> list[str]:
@@ -762,7 +766,7 @@ class ClarifyActivities:
         if self.db_pool is None:
             return default
         async with self.db_pool.acquire() as conn:
-            raw = await conn.fetchval("SELECT value FROM settings WHERE key=$1", key)
+            raw = await get_setting(conn, key)
         if raw is None:
             return default
         if isinstance(raw, bool):
@@ -1011,7 +1015,7 @@ class ClarifyActivities:
             "<!-- aegis:problem " in (task.get("description") or "")
             or await self._hub_owns(task)
         ):
-            return self._hub_owned("a research task the problem hub raised for Raphael")
+            return self._hub_owned("a research task the problem hub raised for the research agent")
 
         # Content-route branch. First encounter (no @pandora label yet — that
         # case returned in the @pandora block above). A `gate: true` route
@@ -1123,7 +1127,7 @@ class ClarifyActivities:
         if self.db_pool is None:
             return default
         async with self.db_pool.acquire() as conn:
-            raw = await conn.fetchval("SELECT value FROM settings WHERE key=$1", key)
+            raw = await get_setting(conn, key)
         if isinstance(raw, str):
             return raw
         return default
@@ -1330,7 +1334,7 @@ class ClarifyActivities:
             activity.logger.warning(
                 "agent_chat_recent_notes_fetch_failed task_id=%s err=%s",
                 task_id,
-                str(exc)[:200],
+                error_text(exc),
             )
             return []
 
@@ -1349,7 +1353,7 @@ class ClarifyActivities:
             activity.logger.warning(
                 "agent_chat_ks_prefetch_failed task_id=%s err=%s",
                 task.get("id"),
-                str(exc)[:200],
+                error_text(exc),
             )
             return synthetic_input
         if not results:
@@ -1387,7 +1391,7 @@ class ClarifyActivities:
             activity.logger.warning(
                 "agent_chat_tx_prefetch_failed task_id=%s err=%s",
                 task.get("id"),
-                str(exc)[:200],
+                error_text(exc),
             )
             return synthetic_input
         if not rows:
@@ -1706,11 +1710,18 @@ class ClarifyActivities:
             # commands are sent here — the spawned workflow does all
             # writes (chat + Todoist comment).
             #
-            # Agent id mapping is mostly classification.replace("_followup", "")
-            # except for pandora — the personality directory + agents.id
-            # is "pandoras-actor", not "pandora".
+            # "<id>_followup" names its agent. pandora_chat_followup names a
+            # label, not an id: the agent is whoever lists @pandora in its
+            # mention_aliases, else the `infra` holder — never an example id
+            # (#579). With neither, nobody can reply, so the task stays
+            # unclarified and is looked at again once one is configured.
             if classification == "pandora_chat_followup":
-                target_agent = "pandoras-actor"
+                target_agent = _label_owner(reg, "@pandora") or _cap_holder(reg, "infra")
+                if not target_agent:
+                    activity.logger.warning(
+                        "clarify_pandora_followup_no_agent task=%s", item_id
+                    )
+                    return {"applied": False, "commands_sent": 0, "outbox_queued": 0}
             else:
                 target_agent = classification.replace("_followup", "")
             # Fetch the recent comment thread so the agent sees its own
@@ -2266,7 +2277,7 @@ class ClarifyActivities:
         try:
             import httpx
         except ImportError:  # pragma: no cover
-            return ("transient", str(exc)[:200])
+            return ("transient", error_text(exc))
         if isinstance(exc, httpx.HTTPStatusError):
             code = exc.response.status_code
             if 400 <= code < 500:
@@ -2283,7 +2294,7 @@ class ClarifyActivities:
             return ("transient", f"http_{code}")
         if isinstance(exc, (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError)):
             return ("transient", type(exc).__name__)
-        return ("transient", str(exc)[:200])
+        return ("transient", error_text(exc))
 
     @activity.defn
     async def ingest_reference_to_ks(
@@ -2704,11 +2715,25 @@ class ClarifyActivities:
         )
         await safe_send_message(
             delivery,
-            agent_id="raphael",
+            agent_id=await self._agent_holding("research"),
             message=message,
             log_event="reference_filed_notify_failed",
         )
         return True
+
+    async def _agent_holding(self, tag: str) -> str:
+        """The active agent holding behavior tag `tag` — who speaks for the
+        library notices, never an example id (#579). "" when nobody does (or
+        there is no pool): comms then posts from its default."""
+        if self.db_pool is None:
+            return ""
+        from aegis.services.agents import resolve_tag
+
+        try:
+            return await resolve_tag(self.db_pool, tag) or ""
+        except Exception as exc:  # noqa: BLE001 — a notice never fails on its speaker
+            activity.logger.warning("clarify_agent_lookup_failed error=%s", error_text(exc))
+            return ""
 
     async def _notify_reference_demoted(self, title: str, reason: str) -> bool:
         """Send a raphael-voiced chat message that a reference couldn't be filed.
@@ -2733,7 +2758,7 @@ class ClarifyActivities:
         )
         await safe_send_message(
             delivery,
-            agent_id="raphael",
+            agent_id=await self._agent_holding("research"),
             message=message,
             log_event="reference_demoted_notify_failed",
         )

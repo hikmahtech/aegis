@@ -49,6 +49,7 @@ from decimal import Decimal
 from html import escape
 from typing import Any
 
+from aegis.errors import error_text, logged_failure
 from temporalio import activity
 
 from aegis_worker.activities.delivery import safe_send_message
@@ -60,7 +61,9 @@ _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 
 _DETECTORS = ("calendar_attendee", "unknown_payee", "todoist_project", "untracked_topic")
 # The knowledge tools whose empty answers the `untracked_topic` detector reads
-# (#513), and how often and how recently a subject must come up empty.
+# (#513). How often and how recently a subject must come up empty, and what
+# counts as empty, are the DEFAULT thresholds below; the `curiosity-daily`
+# row's `activities.config` sets the live ones (`CuriosityConfig`).
 _KNOWLEDGE_TOOLS = ("search_knowledge", "ask_knowledge", "find_reference")
 _EMPTY_SEARCH_DAYS = 14
 _MIN_EMPTY_SEARCHES = 2
@@ -72,6 +75,9 @@ _MIN_EMPTY_SEARCHES = 2
 # relevant hit: a search counted here found nothing, at the price of missing
 # some that found only noise — asking wrongly costs the user a card.
 _SEARCH_MISS_BELOW = 0.60
+# The card's two answers (`kind="choice"`): the button value is what
+# `apply_curiosity_answer` reads, so no English is parsed.
+TRACK_CHOICES = {"yes": "Yes, track it", "no": "No"}
 # `find_reference`'s whole answer when neither of its sources has anything
 # (`services/tools/gtd.py`). It is prose, so the chat loop records it as
 # `{"raw": ...}`.
@@ -242,8 +248,13 @@ class CuriosityActivities:
     delivery: Any = None
     # Thresholds are fields, not literals, so a deployment (and a test) can say
     # what "recurring" and "frequently hit" mean without editing the detector.
+    # `find_curiosity_gaps` takes the same five as an override dict, which is
+    # how the `curiosity-daily` row's config reaches them.
     min_attendee_events: int = 3
     min_project_tasks: int = 5
+    empty_search_days: int = _EMPTY_SEARCH_DAYS
+    min_empty_searches: int = _MIN_EMPTY_SEARCHES
+    search_miss_below: float = _SEARCH_MISS_BELOW
     # The operator's own email addresses (Settings.owner_emails — the DB-backed
     # `owner_emails` integration config). Google puts the calendar owner in
     # every event's `attendees`, so without this the owner is a "stranger you
@@ -256,22 +267,46 @@ class CuriosityActivities:
     budget_enabled: bool = False
     daily_budget: int = 8
 
+    def _thresholds(self, overrides: dict | None = None) -> dict:
+        """The five detector thresholds: the instance's fields, each replaced
+        by a usable value from `overrides` (the flow's config) when given."""
+        out = {
+            "min_attendee_events": self.min_attendee_events,
+            "min_project_tasks": self.min_project_tasks,
+            "empty_search_days": self.empty_search_days,
+            "min_empty_searches": self.min_empty_searches,
+            "search_miss_below": self.search_miss_below,
+        }
+        for key, current in list(out.items()):
+            raw = (overrides or {}).get(key)
+            if raw is None or isinstance(raw, bool):
+                continue
+            try:
+                out[key] = float(raw) if isinstance(current, float) else int(raw)
+            except (TypeError, ValueError):
+                activity.logger.warning("curiosity_threshold_ignored key=%s value=%r", key, raw)
+        return out
+
     @activity.defn
-    async def find_curiosity_gaps(self, agent_id: str = "sebas", limit: int = 5) -> list[dict]:
+    async def find_curiosity_gaps(
+        self, agent_id: str = "", limit: int = 5, thresholds: dict | None = None
+    ) -> list[dict]:
         """At most `limit` ranked gap candidates for `agent_id`.
 
         Returns `[{gap_type, subject, question, evidence, novelty_key}]`,
-        highest-signal first. Empty list when nothing is missing.
+        highest-signal first. Empty list when nothing is missing. `thresholds`
+        overrides the detector thresholds (see `_thresholds`).
         """
         known = await self._known_text(agent_id)
         scored: list[tuple[float, dict]] = []
+        th = self._thresholds(thresholds)
 
         for name in _DETECTORS:
             try:
-                scored += await getattr(self, f"_detect_{name}")(agent_id, known)
+                scored += await getattr(self, f"_detect_{name}")(agent_id, known, th)
             except Exception as exc:  # noqa: BLE001 — one bad detector must not kill the run
                 activity.logger.warning(
-                    "curiosity_detector_failed detector=%s err=%s", name, str(exc)[:200]
+                    "curiosity_detector_failed detector=%s err=%s", name, error_text(exc)
                 )
 
         if not scored:
@@ -342,9 +377,10 @@ class CuriosityActivities:
     # ---------------------------------------------------------------- detectors
 
     async def _detect_calendar_attendee(
-        self, agent_id: str, known: str
+        self, agent_id: str, known: str, th: dict | None = None
     ) -> list[tuple[float, dict]]:
         """A face the owner keeps meeting that AEGIS has never heard of."""
+        min_events = int((th or {}).get("min_attendee_events", self.min_attendee_events))
         rows = await self.db_pool.fetch(
             "SELECT c.content_id, k.chunk_text FROM knowledge_content c "
             "JOIN knowledge_chunks k ON k.content_id = c.content_id "
@@ -367,7 +403,7 @@ class CuriosityActivities:
             # The owner attends their own meetings — never a gap.
             if email in owners:
                 continue
-            if len(events) < self.min_attendee_events:
+            if len(events) < min_events:
                 continue
             local = email.split("@")[0]
             if email in known or local in known:
@@ -406,10 +442,12 @@ class CuriosityActivities:
 
             return books.latest_prices(self.books_cfg)
         except Exception as exc:  # noqa: BLE001 — a rank is not worth a failed run
-            activity.logger.warning("curiosity_prices_unreadable err=%s", str(exc)[:200])
+            activity.logger.warning("curiosity_prices_unreadable err=%s", error_text(exc))
             return {}
 
-    async def _detect_unknown_payee(self, agent_id: str, known: str) -> list[tuple[float, dict]]:
+    async def _detect_unknown_payee(
+        self, agent_id: str, known: str, th: dict | None = None
+    ) -> list[tuple[float, dict]]:
         """Money the books could not name — out of the account or into it.
 
         `expenses:unknown` and `income:unknown` are the books' review queue, so
@@ -558,7 +596,9 @@ class CuriosityActivities:
             )
         return out
 
-    async def _detect_todoist_project(self, agent_id: str, known: str) -> list[tuple[float, dict]]:
+    async def _detect_todoist_project(
+        self, agent_id: str, known: str, th: dict | None = None
+    ) -> list[tuple[float, dict]]:
         """Where the work actually goes, with no context on what it is."""
         rows = await self.db_pool.fetch(
             "SELECT p.name, COUNT(t.id) AS tasks FROM todoist_projects p "
@@ -566,7 +606,7 @@ class CuriosityActivities:
             "WHERE p.is_archived = FALSE AND t.is_completed = FALSE "
             "GROUP BY p.name HAVING COUNT(t.id) >= $1 "
             "ORDER BY COUNT(t.id) DESC LIMIT 20",
-            self.min_project_tasks,
+            int((th or {}).get("min_project_tasks", self.min_project_tasks)),
         )
         out: list[tuple[float, dict]] = []
         for r in rows:
@@ -591,7 +631,7 @@ class CuriosityActivities:
         return out
 
     async def _detect_untracked_topic(
-        self, agent_id: str, known: str
+        self, agent_id: str, known: str, th: dict | None = None
     ) -> list[tuple[float, dict]]:
         """A subject the owner keeps asking the knowledge store about that it
         has nothing on (#513). Maou's unknown-payee pattern applied to
@@ -604,17 +644,18 @@ class CuriosityActivities:
         """
         from aegis.services import research_topics
 
+        th = th or self._thresholds()
         rows = await self.db_pool.fetch(
             "SELECT tool_name, COALESCE(args->>'query', args->>'question', '') AS q, result "
             "FROM chat_tool_calls WHERE tool_name = ANY($1::text[]) AND surface = 'chat' "
             "AND status = 'success' AND created_at > now() - make_interval(days => $2) "
             "ORDER BY created_at DESC LIMIT 500",
             list(_KNOWLEDGE_TOOLS),
-            _EMPTY_SEARCH_DAYS,
+            int(th["empty_search_days"]),
         )
         asks: dict[str, int] = {}
         for r in rows:
-            if not self._empty_answer(r["tool_name"], r["result"]):
+            if not self._empty_answer(r["tool_name"], r["result"], float(th["search_miss_below"])):
                 continue
             subject = self._search_subject(r["q"])
             if subject:
@@ -628,7 +669,7 @@ class CuriosityActivities:
         out: list[tuple[float, dict]] = []
         for subject, n in asks.items():
             key = research_topics.slug(subject)
-            if n < _MIN_EMPTY_SEARCHES or not key or subject in tracked or key in tracked:
+            if n < int(th["min_empty_searches"]) or not key or subject in tracked or key in tracked:
                 continue
             if subject in known:
                 continue
@@ -640,8 +681,7 @@ class CuriosityActivities:
                         "subject": subject,
                         "question": (
                             f"You've asked me about \"{subject}\" {n} times lately and I had "
-                            "nothing on it. Want me to track it and collect what comes up? "
-                            "(yes/no)"
+                            "nothing on it. Want me to track it and collect what comes up?"
                         ),
                         "evidence": {"empty_searches": n},
                         "novelty_key": f"track:{key}",
@@ -651,7 +691,7 @@ class CuriosityActivities:
         return out
 
     @staticmethod
-    def _empty_answer(tool: str, result: Any) -> bool:
+    def _empty_answer(tool: str, result: Any, miss_below: float = _SEARCH_MISS_BELOW) -> bool:
         """Whether a knowledge tool's recorded result found nothing, in the
         shapes the chat loop records (`tools.base.recorded_result`: the tool's
         JSON, or `{"raw": ...}` when it answered in prose):
@@ -659,7 +699,7 @@ class CuriosityActivities:
         * `search_knowledge`: a list of documents, each with a `similarity` —
           or, cut to the result budget, `{"total", "results": [...],
           "truncated"}`. It always returns the nearest documents, so nothing
-          found is a best hit under `_SEARCH_MISS_BELOW` (or no documents).
+          found is a best hit under `miss_below` (or no documents).
         * `ask_knowledge`: `{answer, sources, confidence}`; nothing found is
           no sources.
         * `find_reference`: prose; nothing found is `_NO_REFERENCE`.
@@ -690,7 +730,7 @@ class CuriosityActivities:
         ]
         if not docs:
             return True
-        return bool(sims) and max(sims) < _SEARCH_MISS_BELOW
+        return bool(sims) and max(sims) < miss_below
 
     @staticmethod
     def _search_subject(query: str) -> str:
@@ -702,10 +742,15 @@ class CuriosityActivities:
 
     @staticmethod
     def _is_yes(answer: str) -> bool:
-        """A free-text answer to "track this?" that means yes. A no, or
-        anything unclear, leaves the topic untracked — asking wrongly costs one
-        card, tracking wrongly costs a feed of noise."""
+        """Whether the answer to "track this?" means yes. The card is a
+        `choice` whose button values are `TRACK_CHOICES` keys, so the normal
+        answer is exactly "yes" or "no"; the free-text reading remains for a
+        card raised before that (an `input` card still pending) — there a no,
+        or anything unclear, leaves the topic untracked: asking wrongly costs
+        one card, tracking wrongly costs a feed of noise."""
         a = (answer or "").strip().lower()
+        if a in TRACK_CHOICES:
+            return a == "yes"
         if not a or a.startswith(("no", "n ", "nah", "don't", "dont", "stop")) or a == "n":
             return False
         return a.startswith(("y", "sure", "ok", "track", "please", "go ahead"))
@@ -744,10 +789,10 @@ class CuriosityActivities:
                 agent_id=agent_id,
             )
         except Exception as exc:  # noqa: BLE001 — degrade to the template, never crash
-            activity.logger.warning("curiosity_phrasing_failed err=%s", str(exc)[:200])
+            activity.logger.warning("curiosity_phrasing_failed err=%s", error_text(exc))
             return candidates
 
-        try:
+        with logged_failure("curiosity_phrasing_parse_failed", logger=activity.logger):
             parsed = parse_llm_json(result.get("response", ""))
             for item in parsed or []:
                 if not isinstance(item, dict):
@@ -756,14 +801,12 @@ class CuriosityActivities:
                 text = (item.get("question") or "").strip()
                 if text and 0 <= idx < len(candidates):
                     candidates[idx]["question"] = text
-        except Exception as exc:  # noqa: BLE001
-            activity.logger.warning("curiosity_phrasing_parse_failed err=%s", str(exc)[:200])
         return candidates
 
     # -------------------------------------------------------------------- A7
 
     @activity.defn
-    async def check_curiosity_budget(self, agent_id: str = "sebas", max_per_day: int = 1) -> dict:
+    async def check_curiosity_budget(self, agent_id: str = "", max_per_day: int = 1) -> dict:
         """Read-only gate the flow consults BEFORE it spawns anything.
 
         Three reasons to stay quiet, checked in this order:
@@ -865,14 +908,20 @@ class CuriosityActivities:
             return {"recorded": False, "reason": "empty"}
 
         row = None
-        try:
+        with logged_failure("curiosity_answer_lookup_failed", logger=activity.logger):
             row = await self.db_pool.fetchrow(
                 "SELECT agent_id, prompt FROM interactions WHERE id = $1::uuid",
                 interaction_id,
             )
-        except Exception as exc:  # noqa: BLE001 — a malformed id must not lose the answer
-            activity.logger.warning("curiosity_answer_lookup_failed err=%s", str(exc)[:200])
-        agent_id = (row["agent_id"] if row else None) or str(meta.get("agent_id") or "sebas")
+        agent_id = (row["agent_id"] if row else None) or str(meta.get("agent_id") or "")
+        if not agent_id:
+            # Nobody named on the card: the GTD agent's question (#556).
+            from aegis.services.agents import resolve_tag
+
+            agent_id = await resolve_tag(self.db_pool, "gtd") or ""
+        if not agent_id:
+            activity.logger.warning("curiosity_answer_no_owner id=%s", interaction_id)
+            return {"recorded": False, "reason": "no_gtd_agent"}
         question = str(meta.get("question") or (row["prompt"] if row else "") or "").strip()
         subject = str(meta.get("subject") or "").strip()
 
@@ -906,7 +955,7 @@ class CuriosityActivities:
                     out["problem_id"] = res.get("problem_id")
                 except Exception as exc:  # noqa: BLE001 — the memory write stands
                     activity.logger.warning(
-                        "curiosity_track_failed subject=%s err=%s", subject, str(exc)[:200]
+                        "curiosity_track_failed subject=%s err=%s", subject, error_text(exc)
                     )
             out["tracked"] = tracked
 
@@ -918,7 +967,7 @@ class CuriosityActivities:
                     "curiosity_books_answer_failed id=%s subject=%s err=%s",
                     interaction_id,
                     subject,
-                    str(exc)[:200],
+                    error_text(exc),
                 )
                 out.update({"rule": None, "reason": "books_failed"})
             # Say what happened, when what happened is not what the owner would
@@ -951,9 +1000,10 @@ class CuriosityActivities:
         """
         from aegis.api.models.money import payee_key as payee_key_of
         from aegis.llm import parse_llm_json
-        from aegis.services import books
+        from aegis.services import books, books_chart
 
         cfg = self.books_cfg
+        chart = await books_chart.get_chart(self.db_pool)
         # Which half of the books the card asked about. A card raised before
         # the inbound lane shipped carries no direction and was outbound by
         # construction, and anything unrecognised is treated the same way —
@@ -1030,16 +1080,16 @@ class CuriosityActivities:
 
         # Which books the answer names. Both ledger tools already refuse the
         # cross-entity move this would otherwise make unattended: an AWS bill
-        # arrives in the personal mailbox, the owner says "that is the Hikmah
-        # infra bill", and `expenses:hikmah:infra` is declared and balances —
-        # so `check --strict` passes and nothing reverts, while the block sits
-        # in `personal/2026.journal` and the entity-less rule repeats it for
+        # arrives in the personal mailbox, the owner says "that is the company
+        # infra bill", and the company's infra account is declared and balances
+        # — so `check --strict` passes and nothing reverts, while the block
+        # sits in the personal journal and the entity-less rule repeats it for
         # every future AWS mail (`post_event` files by `event.entity`, which
         # the rule never corrected). `ledger_reclassify` then REFUSES to move
         # it back, so the repair path is narrower than the path that made it.
         # None means an entity-neutral account (assets, liabilities, equity),
-        # which belongs to both sets of books — no stamp and no filter.
-        entity = books.account_entity(account)
+        # which belongs to every set of books — no stamp and no filter.
+        entity = books.account_entity(chart, account)
 
         match = rule_match_for(key)
         if match:
@@ -1112,7 +1162,7 @@ class CuriosityActivities:
                 "curiosity_books_backlog_failed payee=%s account=%s err=%s",
                 payee,
                 account,
-                str(exc)[:200],
+                error_text(exc),
             )
             # `rewrite_events` reverts its own write, so the backlog is exactly
             # where it was — which is what the owner is now told, alongside the

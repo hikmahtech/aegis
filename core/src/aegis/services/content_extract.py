@@ -21,6 +21,7 @@ from pathlib import PurePosixPath
 import httpx
 import structlog
 
+from aegis.errors import error_text
 from aegis.services.url_guard import UnsafeURLError, guarded_hooks
 
 logger = structlog.get_logger()
@@ -52,7 +53,7 @@ def extract_pdf(data: bytes, max_chars: int = _MAX_TEXT) -> str:
 
         return (extract_text(io.BytesIO(data)) or "")[:max_chars].strip()
     except Exception as exc:  # noqa: BLE001
-        logger.warning("pdf_extract_failed", error=str(exc)[:200])
+        logger.warning("pdf_extract_failed", error=error_text(exc))
         return ""
 
 
@@ -118,7 +119,7 @@ async def fetch_and_extract(
     except UnsafeURLError:
         raise
     except Exception as exc:  # noqa: BLE001
-        logger.warning("fetch_failed", url=url[:200], error=str(exc)[:200])
+        logger.warning("fetch_failed", url=url[:200], error=error_text(exc))
         return "", None
 
     # %PDF- magic-byte sniff catches PDFs served as octet-stream / mislabeled.
@@ -166,5 +167,5 @@ async def fetch_youtube_transcript(url: str) -> tuple[str, dict]:
         text = " ".join(snippet.text for snippet in transcript).strip()
         return text, {"video_id": video_id, "segments": len(transcript)}
     except Exception as exc:  # noqa: BLE001 — no captions / blocked / API change
-        logger.warning("youtube_transcript_failed", video_id=video_id, error=str(exc)[:200])
+        logger.warning("youtube_transcript_failed", video_id=video_id, error=error_text(exc))
         return "", {"video_id": video_id}

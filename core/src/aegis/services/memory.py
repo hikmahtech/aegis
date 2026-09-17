@@ -12,6 +12,8 @@ from typing import Any
 
 import structlog
 
+from aegis.errors import error_text
+
 logger = structlog.get_logger()
 
 # Response fields that carry a human correction worth remembering.
@@ -139,7 +141,7 @@ async def record_correction_from_interaction(
         )
         logger.info("agent_memory_recorded", agent_id=agent_id, source="interaction_correction")
     except Exception as exc:  # noqa: BLE001 — memory write must never break resolve
-        logger.warning("agent_memory_record_failed", error=str(exc)[:200])
+        logger.warning("agent_memory_record_failed", error=error_text(exc))
 
 
 async def record_gmail_triage_correction(
@@ -180,7 +182,7 @@ async def record_gmail_triage_correction(
         logger.info("agent_memory_recorded", agent_id=agent_id, source="gmail_triage_correction")
         return True
     except Exception as exc:  # noqa: BLE001 — memory write must never break recheck
-        logger.warning("agent_memory_record_failed", error=str(exc)[:200])
+        logger.warning("agent_memory_record_failed", error=error_text(exc))
         return False
 
 

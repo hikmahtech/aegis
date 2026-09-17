@@ -127,3 +127,38 @@ async def test_missing_secret_setting_returns_503():
             headers={"X-Hub-Signature-256": "sha256=deadbeef"},
         )
     assert resp.status_code == 503
+
+
+async def test_ping_answers_204_so_the_canary_can_tell_core_from_a_proxy(client):
+    """The ingress canary's target (#548).
+
+    A proxy with no route to core answers 404, and so does a bare GET on any
+    webhook path — the admin SPA's catch-all claims every unmatched `/api/` GET
+    before Starlette can say 405. So 404 cannot distinguish "core answered" from
+    "the proxy answered", and the canary needs a status no proxy invents.
+
+    Falsifiable twice over: delete the route and the SPA catch-all answers 404;
+    change the status and the probe config that pins 204 starts failing.
+    """
+    resp = await client.get("/api/webhooks/ping")
+    assert resp.status_code == 204
+    # Nothing about the deployment is handed to an unauthenticated caller.
+    assert resp.content == b""
+
+
+async def test_a_bare_get_on_a_webhook_path_is_not_a_stable_canary_target(client):
+    """The other half of the reasoning, and the reason it is `ping` the canary
+    watches rather than a real webhook path.
+
+    Here — no built frontend, so no SPA mount — `GET /api/webhooks/github` is a
+    405 from Starlette, because the route exists for POST only. In production
+    the admin SPA IS bundled and its catch-all claims every unmatched `/api/`
+    GET first, so the same request answers 404 (measured from inside the worker
+    container on 2026-09-13).
+
+    So the status depends on how the image was built, and 404 is also what a
+    proxy with no route to core answers. That is two reasons a webhook path
+    cannot assert who replied, and why `ping` returns a 204 instead.
+    """
+    resp = await client.get("/api/webhooks/github")
+    assert resp.status_code == 405, "the route is POST-only; the SPA is what makes prod 404"

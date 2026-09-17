@@ -8,7 +8,6 @@ import json
 import pytest
 from aegis_worker.activities.inventory import (
     InventoryActivities,
-    UpsertResourcesBatchInput,
     WorkspaceReposInput,
     _aegis_webhook_present,
     dedupe_workspace_repos,
@@ -517,131 +516,6 @@ async def test_check_github_webhooks_ignores_inconclusive_run_as_baseline(db_poo
 
     assert result["missing_webhooks"] == ["acme/beta", "acme/delta"]
     assert result["webhooks_newly_missing"] == []
-
-
-# =====================================================================
-# upsert_resources_batch — exercises real Postgres
-# =====================================================================
-
-
-@pytest.mark.asyncio
-async def test_upsert_resources_batch_inserts_new_rows(db_pool):
-    await _clean_test_resources(db_pool)
-    inv = _make_inv(db_pool=db_pool)
-    env = ActivityEnvironment()
-    summary = await env.run(
-        inv.upsert_resources_batch,
-        UpsertResourcesBatchInput(
-            items=[
-                {
-                    "kind": "repository",
-                    "slug": f"{_TEST_SLUG_PREFIX}new-a",
-                    "title": "Inv Test A",
-                    "url": "https://example.com/a",
-                    "tags": ["github", "test"],
-                    "metadata": {"path": "new-a", "github_repo": "org/new-a"},
-                },
-                {
-                    "kind": "endpoint",
-                    "slug": f"{_TEST_SLUG_PREFIX}new-b",
-                    "title": "Inv Test B",
-                    "url": "https://b.example.com",
-                    "tags": ["other", "test"],
-                    "metadata": {"note": "arbitrary second kind for upsert test"},
-                },
-            ]
-        ),
-    )
-    assert summary == {"inserted": 2, "updated": 0, "total": 2}
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT slug, kind, title, tags, metadata::text FROM resources "
-            "WHERE slug LIKE $1 ORDER BY slug",
-            f"{_TEST_SLUG_PREFIX}%",
-        )
-    assert len(rows) == 2
-    a = rows[0]
-    assert a["slug"] == f"{_TEST_SLUG_PREFIX}new-a"
-    assert a["kind"] == "repository"
-    assert a["title"] == "Inv Test A"
-    assert set(a["tags"]) == {"github", "test"}
-    meta_a = json.loads(a["metadata"])
-    assert meta_a == {"path": "new-a", "github_repo": "org/new-a"}
-    await _clean_test_resources(db_pool)
-
-
-@pytest.mark.asyncio
-async def test_upsert_resources_batch_tag_union_metadata_merge(db_pool):
-    """Existing row should get tags UNIONED, metadata SHALLOW-MERGED (right wins).
-    Title and URL are insert-only — must NOT change on conflict."""
-    await _clean_test_resources(db_pool)
-    slug = f"{_TEST_SLUG_PREFIX}existing"
-    async with db_pool.acquire() as conn:
-        # NOTE: the asyncpg pool has a JSONB codec installed
-        # (core/src/aegis/db/pool.py::_init_connection) that auto-encodes
-        # dicts via json.dumps. Pre-stringifying double-encodes and stores
-        # a JSONB string primitive rather than an object.
-        await conn.execute(
-            "INSERT INTO resources (kind, slug, title, url, tags, metadata) "
-            "VALUES ($1, $2, $3, $4, $5, $6)",
-            "repository",
-            slug,
-            "Hand-curated Title",
-            "https://hand.example.com",
-            ["hand-tag-1", "hand-tag-2"],
-            {
-                "path": "existing",
-                "description": "old desc",
-                "hand_added": "keep this",
-            },
-        )
-
-    inv = _make_inv(db_pool=db_pool)
-    env = ActivityEnvironment()
-    summary = await env.run(
-        inv.upsert_resources_batch,
-        UpsertResourcesBatchInput(
-            items=[
-                {
-                    "kind": "repository",
-                    "slug": slug,
-                    "title": "Auto-Generated Title",
-                    "url": "https://api.example.com/new",
-                    "tags": ["hand-tag-2", "github", "auto-added"],
-                    "metadata": {
-                        "description": "new desc from API",
-                        "default_branch": "main",
-                        "archived": False,
-                    },
-                }
-            ]
-        ),
-    )
-    assert summary == {"inserted": 0, "updated": 1, "total": 1}
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT title, url, tags, metadata::text FROM resources WHERE slug=$1", slug
-        )
-    assert row["title"] == "Hand-curated Title"
-    assert row["url"] == "https://hand.example.com"
-    assert set(row["tags"]) == {"hand-tag-1", "hand-tag-2", "github", "auto-added"}
-    meta = json.loads(row["metadata"])
-    assert meta["description"] == "new desc from API"
-    assert meta["default_branch"] == "main"
-    assert meta["archived"] is False
-    assert meta["hand_added"] == "keep this"
-    assert meta["path"] == "existing"
-    await _clean_test_resources(db_pool)
-
-
-@pytest.mark.asyncio
-async def test_upsert_resources_batch_empty_returns_zero(db_pool):
-    inv = _make_inv(db_pool=db_pool)
-    env = ActivityEnvironment()
-    summary = await env.run(
-        inv.upsert_resources_batch, UpsertResourcesBatchInput(items=[])
-    )
-    assert summary == {"inserted": 0, "updated": 0, "total": 0}
 
 
 # =====================================================================

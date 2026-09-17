@@ -12,6 +12,8 @@ from datetime import timedelta
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
+    from aegis.errors import error_text
+
     from aegis_worker.activities.intel_scan import (
         SearchSourceInput,
         SearchSourceResult,
@@ -41,13 +43,17 @@ def merge_topics(configured: list[str], tracked: list[str]) -> list[str]:
 
 @dataclass
 class IntelligenceScanInput:
-    agent_id: str = "raphael"
+    # The scheduled row's agent; "" (a hand-started run) records no agent.
+    agent_id: str = ""
     source: str = "hn"  # hn | news | finance
     topics: list[str] = field(default_factory=list)
     max_results: int = 20
     # schedule_sync always passes config's threshold; this default is the
     # fallback for direct/admin-trigger construction.
     significance_threshold: int = 5
+    # The searxng query per topic (`{topic}` is the term), from the row's
+    # `activities.config.query_template`; "" = the source's built-in query.
+    query_template: str = ""
 
 
 @workflow.defn(name="IntelligenceScanFlow")
@@ -64,6 +70,11 @@ class IntelligenceScanFlow:
         # 0. Topics tracked from chat (#508). `track_topic` wrote them to a
         # settings row that nothing read, so "added" changed no scan. A failed
         # read is not a failed scan: it runs on its configured topics and says so.
+        # A tracked topic arrives as its NAME and is searched once (#585): the
+        # scan used to search every match term (107 queries for 20 topics) and
+        # the configured topics, searched first, filled every result slot.
+        # `search_source` now gives each topic a turn. The commands this flow
+        # issues did not change, so there is no patch.
         try:
             tracked = await workflow.execute_activity(
                 "load_tracked_topics",
@@ -74,7 +85,7 @@ class IntelligenceScanFlow:
             workflow.logger.warning(
                 "intel_tracked_topics_degraded source=%s err=%s",
                 input.source,
-                str(exc)[:200],
+                error_text(exc),
             )
             tracked = []
             notes["tracked_topics_degraded"] = True
@@ -94,6 +105,7 @@ class IntelligenceScanFlow:
                 source=input.source,
                 topics=topics,
                 max_results=input.max_results,
+                query_template=input.query_template,
             ),
             result_type=SearchSourceResult,
             start_to_close_timeout=_SCAN_TIMEOUT,
@@ -140,7 +152,7 @@ class IntelligenceScanFlow:
                 "intel_dedup_degraded source=%s raw=%d err=%s",
                 input.source,
                 raw_count,
-                str(exc)[:200],
+                error_text(exc),
             )
             novel = items
             notes["dedup_degraded"] = True
@@ -175,7 +187,7 @@ class IntelligenceScanFlow:
                 "intel_score_degraded source=%s novel=%d err=%s",
                 input.source,
                 novel_count,
-                str(exc)[:200],
+                error_text(exc),
             )
             return {
                 "source": input.source,
@@ -213,7 +225,7 @@ class IntelligenceScanFlow:
                 notes["topic_items"] = attached["attached"]
         except Exception as exc:
             workflow.logger.warning(
-                "intel_topic_attach_degraded source=%s err=%s", input.source, str(exc)[:200]
+                "intel_topic_attach_degraded source=%s err=%s", input.source, error_text(exc)
             )
             notes["topics_degraded"] = True
 

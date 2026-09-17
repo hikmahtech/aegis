@@ -32,8 +32,10 @@ async def test_vercel_get_project_without_connector_returns_error():
 
 @pytest.mark.asyncio
 async def test_vercel_get_project_requires_project_arg():
+    # Blank, not absent: the schema's `required` stops an absent one before the
+    # executor, so blank is the shape a model can actually get this far with.
     ctx = ToolContext(vercel_connector=AsyncMock())
-    out = json.loads(await _exec_vercel_get_project(None, {}, ctx))
+    out = json.loads(await _exec_vercel_get_project(None, {"project": "  "}, ctx))
     assert out == {"error": "project is required"}
 
 
@@ -85,7 +87,7 @@ async def test_vercel_list_deployments_rejects_bad_since_hours():
 @pytest.mark.asyncio
 async def test_vercel_get_deployment_requires_id():
     ctx = ToolContext(vercel_connector=AsyncMock())
-    out = json.loads(await _exec_vercel_get_deployment(None, {}, ctx))
+    out = json.loads(await _exec_vercel_get_deployment(None, {"deployment_id": "  "}, ctx))
     assert out == {"error": "deployment_id is required"}
 
 

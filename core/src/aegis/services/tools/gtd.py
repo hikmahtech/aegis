@@ -18,6 +18,8 @@ from typing import Literal
 import asyncpg
 import structlog
 
+from aegis.errors import error_text
+from aegis.services.settings_store import get_setting
 from aegis.services.todoist_config import resolve_todoist_api_key
 from aegis.services.tools.base import ToolContext
 from aegis.services.tools.registry import aegis_tool
@@ -55,14 +57,10 @@ async def _capture_to_inbox_impl(
     if pool is None:
         return None
     async with pool.acquire() as conn:
-        kill = await conn.fetchval(
-            "SELECT value FROM settings WHERE key = 'todoist_capture_enabled'"
-        )
+        kill = await get_setting(conn, "todoist_capture_enabled")
         if kill is False or (isinstance(kill, dict) and kill.get("value") is False):
             return None
-        managed = await conn.fetchval(
-            "SELECT value FROM settings WHERE key = 'todoist_managed_project_ids'"
-        )
+        managed = await get_setting(conn, "todoist_managed_project_ids")
         inbox_id = (managed or {}).get("inbox") if isinstance(managed, dict) else None
         target = project_id or inbox_id
         if not target:
@@ -180,9 +178,10 @@ async def _stage_chat_tool_outbox(
 
 async def _assignee_labels(pool: asyncpg.Pool | None) -> list[str]:
     """Valid handoff assignee labels: @me plus every active agent's mention
-    aliases (metadata.mention_aliases, default [id]) — issue #36. Falls back to
-    the shipped 4-agent set without a pool or on read failure."""
-    fallback = ["@me", "@sebas", "@raphael", "@maou", "@pandora"]
+    aliases (metadata.mention_aliases, default [id]) — issue #36. Without a
+    pool or on a failed read only `@me` is valid: no agent is known, and a list
+    of the example agents' labels would name agents a fork may not have (#556)."""
+    fallback = ["@me"]
     if pool is None:
         return fallback
     try:
@@ -193,7 +192,7 @@ async def _assignee_labels(pool: asyncpg.Pool | None) -> list[str]:
             labels.extend(f"@{str(a).lstrip('@')}" for a in aliases)
         return labels or fallback
     except Exception as exc:  # noqa: BLE001 — never break the tool on a config read
-        logger.warning("handoff_assignee_labels_failed", error=str(exc)[:200])
+        logger.warning("handoff_assignee_labels_failed", error=error_text(exc))
         return fallback
 
 
@@ -430,9 +429,7 @@ async def _exec_whats_next(
     ]
     params: list = []
     async with pool.acquire() as conn:
-        managed = await conn.fetchval(
-            "SELECT value FROM settings WHERE key='todoist_managed_project_ids'"
-        )
+        managed = await get_setting(conn, "todoist_managed_project_ids")
         # Someday is excluded via the @someday state label above; only Inbox
         # is still a managed-project id to exclude.
         exclude = []
@@ -758,7 +755,7 @@ async def _exec_find_reference(
                     cid = item.get("content_id") or item.get("id") or ""
                     out.append(f"- [{cid}] {title} (score={score:.2f})")
         except Exception as exc:  # noqa: BLE001
-            logger.warning("find_reference_ks_failed", error=str(exc)[:200])
+            logger.warning("find_reference_ks_failed", error=error_text(exc))
     if not out:
         return "No reference matches."
     return "\n".join(out)

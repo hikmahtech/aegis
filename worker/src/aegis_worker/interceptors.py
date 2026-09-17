@@ -111,9 +111,11 @@ def _extract_agent_id(args: tuple[Any, ...]) -> str | None:
     if not args:
         return None
     first = args[0]
+    # "" is "no agent" (a flow config whose agent_id is resolved by tag at run
+    # time), and `workflow_runs.agent_id` is a foreign key: NULL, not "".
     if isinstance(first, dict):
-        return first.get("agent_id")
-    return getattr(first, "agent_id", None)
+        return first.get("agent_id") or None
+    return getattr(first, "agent_id", None) or None
 
 
 def _extract_todoist_task_ref(args: tuple[Any, ...]) -> str | None:

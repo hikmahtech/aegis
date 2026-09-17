@@ -184,9 +184,12 @@ def _fx_warning(data: dict, home_symbol: str) -> tuple[str, str] | None:
 
 
 def render_money_brief(brief: dict, home_symbol: str = "₹") -> dict:
+    # Whichever sets of books are configured, in the order the chart lists
+    # them. The renderer names none of them: `build_money_brief` sends the
+    # labels beside the figures, so a fork with one set of books, or five, gets
+    # one line each and no empty row for an entity it does not have.
     ent = brief.get("entities") or {}
-    p = ent.get("personal") or {}
-    h = ent.get("hikmah") or {}
+    labels = brief.get("entity_labels") or {}
     html: list[str] = [f"<b>Money brief · {brief['since']} → {brief['as_of']}</b>"]
     md: list[str] = [f"# Money brief · {brief['since']} → {brief['as_of']}", ""]
 
@@ -197,12 +200,16 @@ def render_money_brief(brief: dict, home_symbol: str = "₹") -> dict:
         html += [fx[0], ""]
         md += [fx[1], ""]
 
-    line = f"Personal: in {_money(p.get('income') or '0')} · out {_money(p.get('expenses') or '0')}"
-    line2 = f"Hikmah: in {_money(h.get('income') or '0')} · out {_money(h.get('expenses') or '0')}"
-    html += [line, line2, ""]
+    lines = [
+        f"{labels.get(key) or key.title()}: in {_money((totals or {}).get('income') or '0')}"
+        f" · out {_money((totals or {}).get('expenses') or '0')}"
+        for key, totals in ent.items()
+    ]
+    html += [*lines, ""]
     # Bulleted in Markdown: two adjacent unbulleted lines are ONE paragraph to
-    # every Markdown renderer, so GitHub would run the two entities together.
-    md += [f"- {line}", f"- {line2}", ""]
+    # every Markdown renderer, so GitHub would run the entities together.
+    md += [f"- {line}" for line in lines]
+    md += [""]
 
     if brief.get("books_ok") and brief.get("bal_text"):
         clipped, dropped = _clip(brief["bal_text"])
@@ -323,6 +330,11 @@ def desk_lines(desk: dict) -> list[str]:
         lines.append(
             f"Days held back: {sum(held_back.values())} "
             f"({held_back.get('held_stale', 0)} stale, {held_back.get('held_suspect', 0)} suspect)."
+        )
+    if desk.get("idle_weekdays"):
+        lines.append(
+            f"Idle weekdays: {desk['idle_weekdays']} — no new market day to act on "
+            "(a market holiday, or a day the price source did not serve)."
         )
     for halt in desk.get("halts") or []:
         lines.append(f"Risk halt on {halt['day']}: the desk sold its whole book. {halt['note']}".strip())

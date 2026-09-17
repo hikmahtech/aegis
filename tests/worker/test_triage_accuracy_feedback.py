@@ -45,7 +45,9 @@ def test_assess_correction_important_consistent_is_none():
 async def test_record_triage_outcome_first_sight_inserts(db_pool):
     async with db_pool.acquire() as conn:
         await conn.execute("DELETE FROM triage_accuracy WHERE email_id='E_FB1'")
-    act = GmailActivities(gmail_credentials_file="x", gmail_token_dir="x", db_pool=db_pool)
+    act = GmailActivities(
+        gmail_credentials_file="x", gmail_token_dir="x", db_pool=db_pool, agent_id="sebas"
+    )
     env = ActivityEnvironment()
     res = await env.run(act.record_triage_outcome, "E_FB1", "useless", ["INBOX"], "acct-b")
     assert res["outcome"] == "predicted"
@@ -66,7 +68,9 @@ async def test_record_triage_outcome_first_sight_inserts(db_pool):
 async def test_record_triage_outcome_resight_captures_correction(db_pool):
     async with db_pool.acquire() as conn:
         await conn.execute("DELETE FROM triage_accuracy WHERE email_id='E_FB2'")
-    act = GmailActivities(gmail_credentials_file="x", gmail_token_dir="x", db_pool=db_pool)
+    act = GmailActivities(
+        gmail_credentials_file="x", gmail_token_dir="x", db_pool=db_pool, agent_id="sebas"
+    )
     env = ActivityEnvironment()
     # First sight: AEGIS said useless.
     await env.run(act.record_triage_outcome, "E_FB2", "useless", ["INBOX"])
@@ -91,7 +95,9 @@ async def test_record_triage_outcome_resight_captures_correction(db_pool):
 async def test_record_triage_outcome_resight_consistent_no_update(db_pool):
     async with db_pool.acquire() as conn:
         await conn.execute("DELETE FROM triage_accuracy WHERE email_id='E_FB3'")
-    act = GmailActivities(gmail_credentials_file="x", gmail_token_dir="x", db_pool=db_pool)
+    act = GmailActivities(
+        gmail_credentials_file="x", gmail_token_dir="x", db_pool=db_pool, agent_id="sebas"
+    )
     env = ActivityEnvironment()
     await env.run(act.record_triage_outcome, "E_FB3", "useless", ["INBOX"])
     res = await env.run(act.record_triage_outcome, "E_FB3", "useless", ["INBOX"])
@@ -202,7 +208,9 @@ async def test_recheck_corrects_from_current_labels(db_pool, monkeypatch):
             {"E_RC1": "Board Bot <zz102-board@example.com>"},
         ),
     )
-    act = GmailActivities(gmail_credentials_file="x", gmail_token_dir="x", db_pool=db_pool)
+    act = GmailActivities(
+        gmail_credentials_file="x", gmail_token_dir="x", db_pool=db_pool, agent_id="sebas"
+    )
     res = await ActivityEnvironment().run(act.recheck_triage_outcomes, "acct")
     assert res == {
         "checked": 1,
@@ -229,7 +237,9 @@ async def test_recheck_consistent_stamps_only(db_pool, monkeypatch):
     monkeypatch.setattr(
         gmail_mod, "_build_gmail_service", lambda *a: _FakeGmail({"E_RC2": ["INBOX"]})
     )
-    act = GmailActivities(gmail_credentials_file="x", gmail_token_dir="x", db_pool=db_pool)
+    act = GmailActivities(
+        gmail_credentials_file="x", gmail_token_dir="x", db_pool=db_pool, agent_id="sebas"
+    )
     res = await ActivityEnvironment().run(act.recheck_triage_outcomes, "acct")
     assert res == {
         "checked": 1,
@@ -255,7 +265,9 @@ async def test_recheck_implicit_confirms_checked_and_never_checked_rows(db_pool)
     await _wipe(db_pool)
     await _seed_prediction(db_pool, "E_RC3", "useless", "8 days", checked_age="5 days")
     await _seed_prediction(db_pool, "E_RC4", "useless", "8 days")  # never checked
-    act = GmailActivities(gmail_credentials_file="x", gmail_token_dir="x", db_pool=db_pool)
+    act = GmailActivities(
+        gmail_credentials_file="x", gmail_token_dir="x", db_pool=db_pool, agent_id="sebas"
+    )
     res = await ActivityEnvironment().run(act.recheck_triage_outcomes, "acct")
     assert res == {
         "checked": 0,
@@ -288,7 +300,9 @@ async def test_recheck_unobservable_message_stamps_last_checked_at(db_pool, monk
     await _wipe(db_pool)
     await _seed_prediction(db_pool, "E_RC5", "useless", "2 hours")
     monkeypatch.setattr(gmail_mod, "_build_gmail_service", lambda *a: _FakeGmail({}))
-    act = GmailActivities(gmail_credentials_file="x", gmail_token_dir="x", db_pool=db_pool)
+    act = GmailActivities(
+        gmail_credentials_file="x", gmail_token_dir="x", db_pool=db_pool, agent_id="sebas"
+    )
     res = await ActivityEnvironment().run(act.recheck_triage_outcomes, "acct")
     assert res == {
         "checked": 0,
@@ -332,7 +346,9 @@ async def test_recheck_scopes_rows_to_their_owning_account(db_pool, monkeypatch)
             {"E_RC8": "Billing <zz260-billing@example.com>"},
         ),
     }
-    act = GmailActivities(gmail_credentials_file="x", gmail_token_dir="x", db_pool=db_pool)
+    act = GmailActivities(
+        gmail_credentials_file="x", gmail_token_dir="x", db_pool=db_pool, agent_id="sebas"
+    )
 
     # Accounts run in sequence within one GmailIngestFlow run.
     for account in ("acct-a", "acct-b"):
@@ -359,7 +375,9 @@ async def test_recheck_service_down_never_raises(db_pool, monkeypatch):
         raise RuntimeError("token refresh failed")
 
     monkeypatch.setattr(gmail_mod, "_build_gmail_service", _boom)
-    act = GmailActivities(gmail_credentials_file="x", gmail_token_dir="x", db_pool=db_pool)
+    act = GmailActivities(
+        gmail_credentials_file="x", gmail_token_dir="x", db_pool=db_pool, agent_id="sebas"
+    )
     res = await ActivityEnvironment().run(act.recheck_triage_outcomes, "acct")
     assert res == {
         "checked": 0,
@@ -387,7 +405,9 @@ async def test_recheck_correction_writes_agent_memory_once(db_pool, monkeypatch)
         "_build_gmail_service",
         lambda *a: _FakeGmail({"E_RC7": ["INBOX", "STARRED"]}, {"E_RC7": "Re: your order"}),
     )
-    act = GmailActivities(gmail_credentials_file="x", gmail_token_dir="x", db_pool=db_pool)
+    act = GmailActivities(
+        gmail_credentials_file="x", gmail_token_dir="x", db_pool=db_pool, agent_id="sebas"
+    )
 
     res = await ActivityEnvironment().run(act.recheck_triage_outcomes, "acct")
     assert res["memories_written"] == 1
@@ -519,7 +539,9 @@ async def test_correction_relearns_sender_and_flips_a_poisoned_cache(db_pool, mo
     )
     # No llm_client on purpose: a cache MISS falls through to source='fallback',
     # so 'cache' below cannot be an accident of the default return shape.
-    act = GmailActivities(gmail_credentials_file="x", gmail_token_dir="x", db_pool=db_pool)
+    act = GmailActivities(
+        gmail_credentials_file="x", gmail_token_dir="x", db_pool=db_pool, agent_id="sebas"
+    )
 
     before = await ActivityEnvironment().run(
         act.classify_email, {"id": "M0", "sender": f"Promo <{sender}>", "labels": []}, ""
@@ -580,7 +602,9 @@ async def test_recheck_requests_the_from_header_it_relearns_on(db_pool, monkeypa
         {"E_RC12": "Acct <zz102-acct@example.com>"},
     )
     monkeypatch.setattr(gmail_mod, "_build_gmail_service", lambda *a: fake)
-    act = GmailActivities(gmail_credentials_file="x", gmail_token_dir="x", db_pool=db_pool)
+    act = GmailActivities(
+        gmail_credentials_file="x", gmail_token_dir="x", db_pool=db_pool, agent_id="sebas"
+    )
     res = await ActivityEnvironment().run(act.recheck_triage_outcomes, "acct")
     assert fake.requested_headers == [["Subject", "From"]]
     assert res["senders_relearned"] == 1

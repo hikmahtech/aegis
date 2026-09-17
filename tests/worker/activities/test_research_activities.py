@@ -80,7 +80,7 @@ async def test_a_failed_search_is_an_error_line_not_a_failed_step():
     )
     assert out["web"] == []
     assert out["to_read"] == ["https://seed.example/x"]
-    assert any(e.startswith("web: searxng 502") for e in out["errors"])
+    assert any(e.startswith("web: RuntimeError: searxng 502") for e in out["errors"])
 
 
 # --------------------------------------------------------------------------
@@ -118,7 +118,7 @@ async def test_synthesis_is_recorded_in_llm_calls(db_pool):
     assertion would pass against a row that never landed (#137)."""
     await db_pool.execute("DELETE FROM llm_calls WHERE purpose = 'research_synthesis'")
     llm = StubbedLLMClient(db_pool=db_pool, content="RAG retrieves, then generates [1].")
-    act = ResearchActivities(llm_client=llm, model="stub-model", db_pool=db_pool)
+    act = ResearchActivities(llm_client=llm, model="stub-model", db_pool=db_pool, agent_id="raphael")
     try:
         out = await ActivityEnvironment().run(
             act.research_synthesize, "what is rag", "", _GATHERED, []

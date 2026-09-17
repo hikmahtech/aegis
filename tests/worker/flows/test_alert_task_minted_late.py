@@ -40,18 +40,30 @@ async def _status_without_a_task(problem_id: str) -> dict:
 
 @activity.defn(name="record_investigation")
 async def _record_that_mints(inp: dict) -> dict:
-    """The real activity projects, and that projection is what creates the task
-    once the status moves off `open`. Only that first move mints one."""
+    """Every `_record` projects, and once the settle window is out ANY
+    projection mints the task — status `open` included.
+
+    This fake used to mint only on `status == "investigating"`, and that single
+    divergence from the real projector is what hid the defect: it made the
+    restart path look like it had no task to lose.
+    """
     h.S.records.append(inp)
-    minted = MINTED if inp.get("status") == "investigating" else ""
-    return {"recorded": True, "status_changed": True, "task_id": minted}
+    return {"recorded": True, "status_changed": True, "task_id": MINTED}
+
+
+@activity.defn(name="project_problem")
+async def _project_mints(problem_id: str) -> dict:
+    """What the flow asks for as soon as its verification delay is over."""
+    h.S.records.append({"external_id": f"{problem_id}:project_problem"})
+    return {"task_id": MINTED, "skipped": ""}
 
 
 def _stubs() -> list:
-    swapped = {h.stub_problem_status, h.stub_record_investigation}
+    swapped = {h.stub_problem_status, h.stub_record_investigation, h.stub_project_problem}
     return [s for s in h.STUBS if s not in swapped] + [
         _status_without_a_task,
         _record_that_mints,
+        _project_mints,
     ]
 
 
@@ -73,6 +85,43 @@ async def test_a_deferred_task_still_hears_the_verdict():
     # And the one that matters is there: what the investigation concluded.
     assert any("upstream API was down" in body for _, body in h.S.notes)
     assert result.get("todoist_task_id") == MINTED
+
+
+async def test_a_deferred_task_hears_the_restart_that_was_already_tried():
+    """The evidence posted BEFORE step 4 was the hole the verdict fix left.
+
+    A swarm service below its replicas gets one automatic force-restart before
+    the repo is even resolved. For a settle-deferred problem that note went to
+    an empty id and vanished, and the `_record` beside it minted the task while
+    moving its watermark past the event it had just written — so the projector
+    would not replay it either. The human opened a task that said a service was
+    down and nothing about the restart already attempted on it.
+
+    Falsifiable: remove the step-3.5 projection and this fails — the note is
+    posted to "" and never reaches the recorder.
+    """
+    h.reset(
+        remediation={
+            "attempted": True,
+            "recovered": False,
+            "service": "shop_web",
+            "command": "docker service update --force shop_web",
+            "output": "converged=false",
+            "reason": "",
+            "diagnostics": [],
+        }
+    )
+
+    await h.run_flow(
+        AlertInvestigationFlow,
+        h.service_down_alert(todoist_task_id=None),
+        activities=_stubs(),
+    )
+
+    assert any("auto-restart" in body for _, body in h.S.notes), (
+        "the restart evidence never reached a task"
+    )
+    assert {task_id for task_id, _ in h.S.notes} == {MINTED}
 
 
 async def test_a_task_that_already_existed_is_not_replaced():

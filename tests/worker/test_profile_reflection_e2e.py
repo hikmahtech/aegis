@@ -51,6 +51,8 @@ from temporalio import activity
 from temporalio.testing import ActivityEnvironment, WorkflowEnvironment
 from temporalio.worker import Worker
 
+from tests.llm_stub import RecordingFakeLLM
+
 AGENT = "zza2e-profile"
 PURPOSE = "profile_reflection"
 
@@ -195,32 +197,29 @@ A5_TRIPLE = [
 ]
 
 
-class FakeLLM:
+def _a5_reply(kwargs: dict) -> str:
     """A5: the flow makes two calls. The generalisation one answers with the ids
     it can SEE in its own prompt — so if the pool query stopped excluding
-    already-promoted rows, this fake would name them again and the idempotence
+    already-promoted rows, this reply would name them again and the idempotence
     test below would fail."""
-
-    async def think(self, **kwargs):
-        if kwargs.get("purpose") == "profile_generalization":
-            ids = [int(m) for m in re.findall(r'"id":\s*(\d+)', kwargs.get("prompt") or "")]
-            body = (
-                [{"claim": A5_CLAIM, "supporting_memory_ids": ids, "confidence": 0.9}]
-                if len(ids) >= 3
-                else []
-            )
-        else:
-            body = {
-                "proposed_doc": PROPOSED_DOC,
-                "rationale": "the owner mentioned a homelab twice",
-                "changed_lines": ["+ Runs a homelab swarm called meem."],
-            }
-        return {
-            "response": json.dumps(body),
-            "model": "fake-balanced",
-            "prompt_tokens": 5,
-            "completion_tokens": 7,
+    if kwargs.get("purpose") == "profile_generalization":
+        ids = [int(m) for m in re.findall(r'"id":\s*(\d+)', kwargs.get("prompt") or "")]
+        body = (
+            [{"claim": A5_CLAIM, "supporting_memory_ids": ids, "confidence": 0.9}]
+            if len(ids) >= 3
+            else []
+        )
+    else:
+        body = {
+            "proposed_doc": PROPOSED_DOC,
+            "rationale": "the owner mentioned a homelab twice",
+            "changed_lines": ["+ Runs a homelab swarm called meem."],
         }
+    return json.dumps(body)
+
+
+def _a5_llm() -> RecordingFakeLLM:
+    return RecordingFakeLLM(responder=_a5_reply)
 
 
 def _stub_card():
@@ -235,7 +234,7 @@ def _stub_card():
 
 @asynccontextmanager
 async def _flow_worker(client, pool):
-    prof = ProfileActivities(db_pool=pool, llm_client=FakeLLM())
+    prof = ProfileActivities(db_pool=pool, llm_client=_a5_llm())
     inter = InteractionActivities(pool)
     task_queue = f"tq-{uuid4().hex[:8]}"
     async with Worker(
@@ -502,7 +501,7 @@ async def test_an_approved_promotion_does_not_come_back_next_week(
     assert len(revisions) == 1, "nothing was written, so nothing was promoted"
 
     # The second week. Same activity, same data, same fake model.
-    acts = ProfileActivities(db_pool=clean_db, llm_client=FakeLLM())
+    acts = ProfileActivities(db_pool=clean_db, llm_client=_a5_llm())
     again = await ActivityEnvironment().run(acts.propose_generalizations, AGENT)
 
     assert again["candidates"] == []
@@ -534,7 +533,7 @@ async def test_a_rejected_promotion_comes_back(clean_db, settings, auth_headers)
 
     assert await _revisions(clean_db) == []
 
-    acts = ProfileActivities(db_pool=clean_db, llm_client=FakeLLM())
+    acts = ProfileActivities(db_pool=clean_db, llm_client=_a5_llm())
     again = await ActivityEnvironment().run(acts.propose_generalizations, AGENT)
 
     assert again["excluded"] == 0

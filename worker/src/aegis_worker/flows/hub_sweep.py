@@ -34,6 +34,8 @@ from dataclasses import dataclass
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
+    from aegis.errors import logged_failure
+
     from aegis_worker.activities.hub import HubActivities
     from aegis_worker.shared.retry import (
         FAST,
@@ -41,17 +43,24 @@ with workflow.unsafe.imports_passed_through():
         TIMEOUT_FAST,
         TIMEOUT_LLM,
         TIMEOUT_LONG,
+        TIMEOUT_STANDARD,
     )
 
 # At most this many clusters are judged in one tick: grouping is not urgent,
 # and a sweep that runs every five minutes has no reason to spend four model
 # calls at once.
 _MAX_JUDGED_PER_TICK = 2
-# The patch ids for steps 2 and 3. The sweep runs every five minutes, so a
-# worker deployed mid-run replays a history that has no such activity in it.
+
+# Retired `workflow.patched` ids. The old branches are gone; the markers
+# stay one release longer as `workflow.deprecate_patch`, because a run that
+# RECORDED one is wedged by a worker whose code no longer mentions it at all
+# ("[TMPRL1100] Non-deprecated patch marker encountered"). Drop the calls and
+# these ids in the release after next — see #614.
+# The sweep runs every five minutes, so a worker deployed mid-run always has
+# some in flight.
 PATCH_COMPLETED_TASKS = "hub-sweep-completed-tasks"
 PATCH_FIX_VERIFICATION = "hub-sweep-fix-verification"
-
+PATCH_ALERTMANAGER_RECONCILE = "hub-sweep-alertmanager-reconcile"
 
 @dataclass
 class HubSweepConfig:
@@ -64,6 +73,14 @@ class HubSweepConfig:
     # to the old code (`fix_verify_hours` / `fix_grace_hours` on the row).
     fix_verify_hours: float = 24.0
     fix_grace_hours: float = 1.0
+    # Alertmanager's base URL, for resolving problems whose alert it no longer
+    # lists (#551). The INTERNAL address — the public host is behind an identity
+    # proxy — and empty, the default, disables the step: a fork ships nobody's
+    # monitoring host. `alertmanager_min_uptime_seconds` is the guard that
+    # matters: a freshly restarted alertmanager holds nothing until Prometheus
+    # re-sends, and reconciling against that empty set would resolve the estate.
+    alertmanager_url: str = ""
+    alertmanager_min_uptime_seconds: int = 900
 
 
 @workflow.defn
@@ -78,28 +95,48 @@ class HubSweepFlow:
         # Then read completions back: a task a person ticked off resolves its
         # problem, before projection, so the resolve reaches the task in this
         # tick. FAST retries are safe — nothing is touched twice.
-        completed: dict = {}
-        if workflow.patched(PATCH_COMPLETED_TASKS):
-            completed = await workflow.execute_activity_method(
-                HubActivities.reconcile_completed_tasks,
-                start_to_close_timeout=TIMEOUT_FAST,
-                retry_policy=FAST,
-            )
+        # deprecate_patch: remove after the next release, see #614
+        workflow.deprecate_patch(PATCH_COMPLETED_TASKS)
+        completed = await workflow.execute_activity_method(
+            HubActivities.reconcile_completed_tasks,
+            start_to_close_timeout=TIMEOUT_FAST,
+            retry_policy=FAST,
+        )
         # Then settle merged fixes, also before projection, so the resolve or
         # the "it came back" reaches the task in this tick. A failure here is
         # logged, not raised: projection matters more than a verdict that
         # the next tick can reach just as well.
         verified: dict = {}
-        if workflow.patched(PATCH_FIX_VERIFICATION):
-            try:
-                verified = await workflow.execute_activity_method(
-                    HubActivities.verify_fixes,
-                    args=[config.fix_verify_hours, config.fix_grace_hours],
-                    start_to_close_timeout=TIMEOUT_FAST,
+        # deprecate_patch: remove after the next release, see #614
+        workflow.deprecate_patch(PATCH_FIX_VERIFICATION)
+        with logged_failure("hub_sweep_verify_fixes_failed", logger=workflow.logger):
+            verified = await workflow.execute_activity_method(
+                HubActivities.verify_fixes,
+                args=[config.fix_verify_hours, config.fix_grace_hours],
+                start_to_close_timeout=TIMEOUT_FAST,
+                retry_policy=FAST,
+            )
+        # Then ask alertmanager what it is still holding, and resolve the live
+        # problems it no longer lists (#551). Alertmanager keeps its alerts in
+        # memory, so a restart loses every `resolved` webhook it owed — and that
+        # lane is the only one on the hub with no other way back, so a lost
+        # webhook stranded a problem and its Todoist task for good. Before
+        # projection, so a resolve reaches the task in this tick.
+        #
+        # A failure is logged, never raised: the activity already fails closed
+        # on an unreachable or freshly-restarted alertmanager, and projection
+        # matters more than a reconciliation the next tick can do just as well.
+        reconciled: dict = {}
+        # deprecate_patch: remove after the next release, see #614
+        workflow.deprecate_patch(PATCH_ALERTMANAGER_RECONCILE)
+        if config.alertmanager_url:
+            with logged_failure("hub_sweep_alertmanager_reconcile_failed", logger=workflow.logger):
+                reconciled = await workflow.execute_activity_method(
+                    HubActivities.reconcile_alertmanager,
+                    args=[config.alertmanager_url, config.alertmanager_min_uptime_seconds],
+                    start_to_close_timeout=TIMEOUT_STANDARD,
                     retry_policy=FAST,
                 )
-            except Exception as exc:  # noqa: BLE001
-                workflow.logger.warning("hub_sweep_verify_fixes_failed err=%s", str(exc)[:200])
         # Then project: a problem promoted a moment ago gets its task in the
         # same tick, and any comment a producer's inline projection could not
         # post is retried here.
@@ -149,6 +186,14 @@ class HubSweepFlow:
             "task_reopened": int(completed.get("tasks_reopened") or 0),
             "fix_resolved": int(verified.get("resolved") or 0),
             "fix_reopened": int(verified.get("reopened") or 0),
+            "alertmanager_resolved": int(reconciled.get("resolved") or 0),
+            "alertmanager_skipped": str(reconciled.get("skipped") or ""),
+            # -1 = the step did not run at all (no URL, or the patch is off in a
+            # replayed history). 0 or more = it ran and this many problems were
+            # in scope. Without the sentinel, "resolved 0, skipped nothing"
+            # reads identically whether it found nothing or never happened —
+            # which is the same trap as a canary whose pass looks like no probe.
+            "alertmanager_checked": int(reconciled.get("checked", -1)),
             "projected": int(projected.get("projected") or 0),
             "created": int(projected.get("created") or 0),
             "errors": int(projected.get("errors") or 0),

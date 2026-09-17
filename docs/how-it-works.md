@@ -289,19 +289,16 @@ user-authored:
 | a tag the table maps to `None`, or one no one has decided about | — | Park once, with a comment saying the task is yours and how to route tags like it. Never guessed at. (`#money` maps to `None`, but the sweep never picks those tasks up: `EXCLUDED_LABELS`) |
 
 **The verb table is a setting.** `DEFAULT_VERBS` in
-`worker/src/aegis_worker/activities/agent_task.py` holds the generic defaults,
+`core/src/aegis/services/agent_task_verbs.py` holds the generic defaults,
 with one entry — a verb or an explicit `None` — for every tag AEGIS captures
 under; `test_agent_task_verbs.py` fails when a new tag arrives without one.
 The `agent_task_verbs` settings row is merged over it, so a deployment
 reroutes a tag without a code change. `untagged` is the key for a task with
-no source tag. An entry naming a verb the lane does not have is ignored.
-
-```sql
--- leave calendar tasks to me; have agents take hand-written ones
-INSERT INTO settings (key, value) VALUES
-  ('agent_task_verbs', '{"#calendar": null, "untagged": "ask"}')
-ON CONFLICT (key) DO UPDATE SET value = excluded.value;
-```
+no source tag. Change it on the admin **Todoist** page → *Agent task verbs*:
+pick a verb per tag, or "left to you" (stored as `null`), and only the tags
+you change are saved. The page's `PUT /api/admin/todoist/agent-task-verbs`
+refuses an unknown verb or a malformed tag with a 400; the worker's read
+stays lenient and ignores an entry naming a verb the lane does not have.
 
 The agent is found through the agent registry — each agent's
 `metadata.mention_aliases`, defaulting to its id — the same lookup clarify's
@@ -488,9 +485,12 @@ regardless of where the alert came from:
   A redirect that lands somewhere else fails: an identity proxy would otherwise
   send the probe to its own login page, which answers 200 forever whether or
   not the origin is alive. So aim it at a path that proxy will not challenge —
-  a webhook path is ideal, and `ingress_expect_status: 405` then pins the
-  answer only core gives, which also catches a proxy serving its own 404 for a
-  route it has lost. It takes `ingress_fail_threshold` failures in a row
+  `/api/webhooks/ping` is the one to use: it answers **204**, which no proxy
+  invents on its own, so `ingress_expect_status: 204` catches a proxy serving
+  its own 404 for a route it has lost. (A plain webhook path answers 404 to a
+  bare GET, because the admin SPA's catch-all claims every unmatched `/api/`
+  GET before Starlette can say 405 — and 404 is exactly what a routeless proxy
+  says too, so it asserts less.) It takes `ingress_fail_threshold` failures in a row
   (default 2, so a 4-minute fuse) because one dropped request is what a rolling
   update of core looks like and this alert escalates. Empty `ingress_url`
   disables the whole thing.
@@ -583,6 +583,11 @@ The steps that make it trustworthy:
   feed, an agent's question — are projected on sight. Defaults are 180s, 300s
   for `NodeDown` / `DockerServiceDown`, and 0 for disk, memory and OOM classes,
   which are real the moment they fire:
+
+  Edit them on the admin **Problems** page, under *Hub configuration* — one row
+  per class, with the built-in defaults shown beside them so a blank field reads
+  as what it means. A bad value is refused with a reason rather than saved and
+  quietly ignored. The equivalent by hand, if you prefer:
 
   ```sql
   -- give a flappy service ten minutes to settle; never wait on a dead node
@@ -744,8 +749,10 @@ constructed in `main()`.
 For any human decision inside the flow, spawn `InteractionFlow` — don't build
 custom callback plumbing.
 
-**A new chat tool** — schema into `CHAT_TOOLS`, executor into
-`TOOL_EXECUTORS` (both `core/src/aegis/services/chat.py`), then **grant it
+**A new chat tool** — a `@aegis_tool`-decorated executor in its domain's
+module under `core/src/aegis/services/tools/` (the docstring generates the
+schema), then `_registry_schema("<name>")` into `CHAT_TOOLS` and the executor
+into `TOOL_EXECUTORS` (both `core/src/aegis/services/chat.py`), then **grant it
 via `metadata.tool_set`** — a DB write on the agent's Behavior tab (or seed
 YAML for fresh installs), *not* a code change: the DB tool set overrides the
 Python dict at runtime ([§2](#2-agents-and-capability-tags)). Core refuses to

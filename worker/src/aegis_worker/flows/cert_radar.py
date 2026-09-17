@@ -19,6 +19,8 @@ from dataclasses import dataclass, field
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
+    from aegis.errors import error_text, logged_failure
+
     from aegis_worker.activities.homelab import HomelabActivities
     from aegis_worker.activities.hub import HubActivities
     from aegis_worker.shared.retry import FAST, NO_RETRY, TIMEOUT_FAST, TIMEOUT_STANDARD
@@ -111,7 +113,7 @@ class CertRadarFlow:
                 except Exception:
                     pass
             if config.domains:
-                try:
+                with logged_failure("cert_radar_hub_failed", logger=workflow.logger):
                     await workflow.execute_activity_method(
                         HubActivities.reconcile_findings,
                         args=[
@@ -125,9 +127,7 @@ class CertRadarFlow:
                         start_to_close_timeout=TIMEOUT_STANDARD,
                         retry_policy=NO_RETRY,
                     )
-                except Exception as exc:  # noqa: BLE001 — the cards already went out
-                    workflow.logger.warning("cert_radar_hub_failed err=%s", str(exc)[:200])
         except Exception as exc:
-            workflow.logger.error("cert_radar_failed error=%s", str(exc)[:200])
+            workflow.logger.error("cert_radar_failed error=%s", error_text(exc))
             raise
         return {"alerts": alerts, "problems": len(findings)}

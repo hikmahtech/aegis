@@ -27,6 +27,8 @@ from aegis_worker.activities.money import (
 )
 from temporalio.testing import ActivityEnvironment
 
+from tests.books_chart_data import CHART
+
 HAS_HLEDGER = shutil.which("hledger") is not None and shutil.which("git") is not None
 
 # £ and € are declared because `refresh_fx_prices` writes a P line for each
@@ -100,13 +102,25 @@ def _repo(
     return books.BooksConfig(path=root)
 
 
+# The user's clock, which `MoneyActivities` reads through services/user_time.py.
+# Pinned rather than left unset, so `_today()` and the activity agree even if a
+# sibling file left a different zone behind.
+_USER_TZ = "Asia/Kolkata"
+
+
 @pytest_asyncio.fixture(autouse=True, loop_scope="function")
 async def _clean(db_pool):
     await db_pool.execute("DELETE FROM finance.journal_index WHERE mailbox = 'brief-t'")
     await db_pool.execute("DELETE FROM todoist_tasks WHERE id LIKE 'brief-t-task-%'")
+    await db_pool.execute(
+        "INSERT INTO settings (key, value) VALUES ('user_timezone', $1) "
+        "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        _USER_TZ,
+    )
     yield
     await db_pool.execute("DELETE FROM finance.journal_index WHERE mailbox = 'brief-t'")
     await db_pool.execute("DELETE FROM todoist_tasks WHERE id LIKE 'brief-t-task-%'")
+    await db_pool.execute("DELETE FROM settings WHERE key = 'user_timezone'")
 
 
 async def _task(db_pool, task_id: str, *, completed: bool) -> None:
@@ -121,24 +135,24 @@ async def _task(db_pool, task_id: str, *, completed: bool) -> None:
 
 
 def _today() -> date:
-    """"Today" as `MoneyActivities` computes it — in its own `home_tz`.
+    """"Today" as `MoneyActivities` computes it — on the user's clock, the
+    `user_timezone` row this file's `_clean` fixture pins (`_USER_TZ`).
 
     NOT `date.today()`, which is the RUNNER's timezone. Every window in this
     file (`as_of`, the 7-day brief, the 14-day forecast, the month the close
-    covers, the `P <date>` price lines) is derived by the activity from
-    `datetime.now(ZoneInfo(self.home_tz))`, so a test that builds the same
-    window from the runner's clock agrees only while the runner is in IST.
-    CI is UTC: for the 5.5 hours a day the two disagree on the date, the
-    activity says the 6th and the runner says the 5th, and every dated
-    assertion here fails at once. Measured on PR #397, job at 19:40 UTC.
+    covers, the `P <date>` price lines) is derived by the activity from the
+    user's clock, so a test that builds the same window from the runner's clock
+    agrees only while the runner is in that zone. CI is UTC: for the 5.5 hours
+    a day the two disagree on the date, the activity says the 6th and the
+    runner says the 5th, and every dated assertion here fails at once.
+    Measured on PR #397, job at 19:40 UTC.
 
-    Read off the class rather than an instance because `_repo(tmp_path, …)`
-    anchors the journal before any activity exists, and `_act` never overrides
-    the field — the same clock has to build the fixture and read the result.
-    (`tests/worker/activities/test_capture_due.py::_today` is the same fix on
-    the same trap, one file over.)
+    A constant rather than a DB read because `_repo(tmp_path, …)` anchors the
+    journal before any activity exists — the same clock has to build the
+    fixture and read the result. (`tests/worker/activities/test_capture_due.py
+    ::_today` is the same fix on the same trap, one file over.)
     """
-    return datetime.now(ZoneInfo(MoneyActivities.home_tz)).date()
+    return datetime.now(ZoneInfo(_USER_TZ)).date()
 
 
 def _prev_month_last() -> date:
@@ -244,13 +258,13 @@ async def test_build_money_brief_reads_books_and_index(db_pool, tmp_path):
     # able to fail this one for an unrelated reason.
     baseline = await ActivityEnvironment().run(act.build_money_brief, 7)
     await books.post_event(
-        _ev(amount=Decimal("6000"), payee="Unknown Big", payee_key="unknown big"), "brief-t/a", cfg)
+        _ev(amount=Decimal("6000"), payee="Unknown Big", payee_key="unknown big"), "brief-t/a", cfg, chart=CHART)
     await books.post_event(
         _ev(amount=Decimal("250"), payee="Grocer", payee_key="grocer",
-            account="expenses:groceries"), "brief-t/b", cfg)
+            account="expenses:groceries"), "brief-t/b", cfg, chart=CHART)
     await books.post_event(
         _ev(amount=Decimal("1000"), direction="in", payee="Stockopedia", payee_key="stockopedia",
-            entity="hikmah", account="income:hikmah:stockopedia", instrument=None), "brief-t/c", cfg)
+            entity="hikmah", account="income:hikmah:stockopedia", instrument=None), "brief-t/c", cfg, chart=CHART)
     await ji.upsert(db_pool, "brief-t/a", "brief-t",
                     _ev(amount=Decimal("6000"), payee="Unknown Big", payee_key="unknown big"),
                     journal_file="x")
@@ -289,6 +303,9 @@ async def test_build_money_brief_reads_books_and_index(db_pool, tmp_path):
     assert Decimal(brief["entities"]["personal"]["income"]) == Decimal("0")
     assert Decimal(brief["entities"]["hikmah"]["income"]) == Decimal("-1000.00")
     assert Decimal(brief["entities"]["hikmah"]["expenses"]) == Decimal("0")
+    # One bucket per CONFIGURED set of books, with the name the renderer will
+    # print (#560) — it knows no entity of its own.
+    assert brief["entity_labels"] == {"personal": "Personal", "hikmah": "Hikmah"}
     assert brief["fx_stale"] is False and brief["fx_unconverted"] == []
     assert [r["account"] for r in brief["by_account"]] == [
         "expenses:unknown", "expenses:groceries", "income:hikmah"]
@@ -332,10 +349,10 @@ async def test_money_brief_says_so_when_a_rate_is_missing_instead_of_lying(db_po
     cfg = _repo(tmp_path, today, prices="")
     await books.post_event(
         _ev(amount=Decimal("300"), account="expenses:saas", payee="Shop", payee_key="shop"),
-        "brief-t/r", cfg)
+        "brief-t/r", cfg, chart=CHART)
     await books.post_event(
         _ev(amount=Decimal("50"), currency="USD", account="expenses:saas", payee="Vendor",
-            payee_key="vendor"), "brief-t/s", cfg)
+            payee_key="vendor"), "brief-t/s", cfg, chart=CHART)
 
     brief = await ActivityEnvironment().run(_act(db_pool, cfg).build_money_brief, 7)
 
@@ -356,10 +373,10 @@ async def test_month_close_says_so_when_a_rate_is_missing(db_pool, tmp_path):
     cfg = _repo(tmp_path, prev_last, prices="")
     await books.post_event(
         _ev(amount=Decimal("300"), occurred_on=prev_last, account="expenses:saas", payee="Shop",
-            payee_key="shop"), "brief-t/t", cfg)
+            payee_key="shop"), "brief-t/t", cfg, chart=CHART)
     await books.post_event(
         _ev(amount=Decimal("50"), currency="USD", occurred_on=prev_last, account="expenses:saas",
-            payee="Vendor", payee_key="vendor"), "brief-t/u", cfg)
+            payee="Vendor", payee_key="vendor"), "brief-t/u", cfg, chart=CHART)
 
     close = await ActivityEnvironment().run(_act(db_pool, cfg).build_month_close)
 
@@ -639,7 +656,7 @@ async def test_build_money_brief_without_books_still_reports_index(db_pool, tmp_
     # `large_unexplained` is a table-wide aggregate with nothing to scope it
     # by, so it is a delta like every other count in this file. Asserted flat
     # it passes sequentially and fails the moment a sibling suite leaves an
-    # unexplained row in the shared `aegis_test_gwN` database.
+    # unexplained row in the worker's shared test database.
     baseline = await ActivityEnvironment().run(act.build_money_brief, 7)
     await ji.upsert(db_pool, "brief-t/z", "brief-t",
                     _ev(kind="due", due_on=_today(), payee="X", payee_key="x"),
@@ -930,7 +947,7 @@ async def test_build_month_close(db_pool, tmp_path):
     baseline = await ActivityEnvironment().run(act.build_month_close)
     await books.post_event(
         _ev(amount=Decimal("300"), occurred_on=prev_last, account="expenses:saas", payee="Saas",
-            payee_key="saas"), "brief-t/m", cfg)
+            payee_key="saas"), "brief-t/m", cfg, chart=CHART)
     await ji.upsert(db_pool, "brief-t/m", "brief-t",
                     _ev(amount=Decimal("300"), occurred_on=prev_last, account="expenses:saas",
                         payee="Saas", payee_key="saas"), journal_file="x")
@@ -1004,7 +1021,7 @@ async def test_refresh_fx_prices_never_raises_when_the_provider_fails(db_pool, t
     finance = AsyncMock()
     finance.get_quotes = AsyncMock(side_effect=RuntimeError("upstream 503"))
     out = await ActivityEnvironment().run(_act(db_pool, cfg, finance=finance).refresh_fx_prices)
-    assert out["written"] == 0 and out["errors"] == ["quotes: upstream 503"]
+    assert out["written"] == 0 and out["errors"] == ["quotes: RuntimeError: upstream 503"]
     assert (cfg.path / "prices.journal").read_text() == "P 2026-09-01 $ ₹84.00\n"
 
 
@@ -1042,5 +1059,5 @@ async def test_refresh_fx_prices_survives_a_books_error_it_was_not_told_about(
     )
     out = await ActivityEnvironment().run(_act(db_pool, cfg, finance=finance).refresh_fx_prices)
     assert out["written"] == 0
-    assert out["errors"] == ["books: [Errno 13] .aegis.lock"]
+    assert out["errors"] == ["books: PermissionError: [Errno 13] .aegis.lock"]
     assert (cfg.path / "prices.journal").read_text() == "P 2026-09-01 $ ₹84.00\n"
