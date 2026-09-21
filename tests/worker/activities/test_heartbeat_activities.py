@@ -101,3 +101,52 @@ async def test_read_heartbeat_state_returns_fresh_containers_each_call():
     second = await act.read_heartbeat_state()
     assert second["stuck"] == []
     assert second["nodes"] == {}
+
+
+def test_services_on_node_keeps_the_replicated_services_with_a_live_task():
+    """#633: what a node that went down was carrying. A task there keeps its
+    last state (`Running …`) because the node cannot report a change; the
+    managers already asked for it to shut down, so the desired state says
+    nothing. History rows and global services are left out."""
+    from aegis_worker.activities.homelab import services_on_node
+
+    tasks = [
+        # Pinned there, still reads Running while the node is down.
+        {"name": "postgres_postgres.1", "current_state": "Running 3 hours ago", "desired_state": "Shutdown"},
+        {"name": "clickhouse_clickhouse.1", "current_state": "Running 3 hours ago", "desired_state": "Running"},
+        # A second replica of the same service: one name.
+        {"name": "clickhouse_clickhouse.2", "current_state": "Starting 3 hours ago", "desired_state": "Running"},
+        {"name": "dagster_daemon.1", "current_state": "Preparing 3 hours ago", "desired_state": "Running"},
+        # History: not on the node now.
+        {"name": "loki_loki.1", "current_state": "Shutdown 2 days ago", "desired_state": "Shutdown"},
+        {"name": "old_app.1", "current_state": "Failed 5 hours ago", "desired_state": "Shutdown"},
+        {"name": "gone_app.1", "current_state": "Orphaned 2 days ago", "desired_state": "Shutdown"},
+        # Global: named `<service>.<node id>`, runs on every node.
+        {"name": "promtail_promtail.x9z8y7w6v5u4t3s2r1q0p9o8n", "current_state": "Running 3 hours ago",
+         "desired_state": "Shutdown"},
+        # The table format's history indent must not become part of a name.
+        {"name": " \\_ litellm_db.1", "current_state": "Running 3 hours ago", "desired_state": "Running"},
+        {"name": "", "current_state": "Running", "desired_state": "Running"},
+    ]
+    assert services_on_node(tasks) == [
+        "clickhouse_clickhouse",
+        "dagster_daemon",
+        "litellm_db",
+        "postgres_postgres",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_node_services_asks_once_and_raises_on_failure():
+    homelab = AsyncMock()
+    homelab.node_ps.return_value = {
+        "ok": True,
+        "data": [{"name": "postgres_postgres.1", "current_state": "Running 1 hour ago"}],
+    }
+    assert await _act(homelab=homelab).node_services("lam") == ["postgres_postgres"]
+    homelab.node_ps.assert_awaited_once_with("lam")
+    homelab.node_ps.return_value = {"ok": False, "error": "timeout", "data": None}
+    with pytest.raises(RuntimeError, match="timeout"):
+        await _act(homelab=homelab).node_services("lam")
+    # No connector: nothing to hold.
+    assert await _act(homelab=None).node_services("lam") == []

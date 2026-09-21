@@ -594,6 +594,10 @@ activities:
     # outage (#630). One `outage` problem is raised and the hub holds back the
     # other infra problems until it ends (default 2; quiet_nodes do not count;
     # 0 disables).
+    # config.outage_recent_hours: only a node that went not ready within this
+    # many hours counts toward outage_min_nodes (#633), so a node that has been
+    # off for days does not turn the next failure into an outage (default 6;
+    # 0 counts every node however long it has been down).
     config: {}
     active: true
 
