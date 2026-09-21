@@ -14,7 +14,7 @@ still in the store, so rereading all of them every week would put back a
 block the user had deleted from an old journal note on the phone.
 
 It can also be started by hand, with `since_days` 0 (every row) and no agent
-(the holder of the `research` capability signs the commits):
+(the holder of the `gtd` capability signs the commits):
 
     temporal workflow start --type NotesBackfillFlow --task-queue aegis-main \\
       --workflow-id notes-backfill-journal --input '{}'
@@ -29,18 +29,18 @@ from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
     from aegis.errors import logged_failure
+    from aegis.services.notes import JOURNAL_OWNER_TAG
 
     from aegis_worker.activities.agent_registry import AgentRegistryActivities
     from aegis_worker.activities.notes import BACKFILL_BATCH
     from aegis_worker.shared.retry import NO_RETRY, TIMEOUT_FAST
 
 _BACKFILL_TIMEOUT = timedelta(minutes=30)
-_OWNER_TAG = "research"
 
 
 @dataclass
 class NotesBackfillConfig:
-    # The agent whose name signs the commits; empty = the `research` holder.
+    # The agent whose name signs the commits; empty = the journal's owner.
     agent_id: str = ""
     # Daylog rows a run looks at, newest first.
     limit: int = 1000
@@ -60,11 +60,11 @@ class NotesBackfillFlow:
             with logged_failure("notes_backfill_owner_unresolved", logger=workflow.logger):
                 resolved = await workflow.execute_activity_method(
                     AgentRegistryActivities.resolve_agents,
-                    args=[[_OWNER_TAG]],
+                    args=[[JOURNAL_OWNER_TAG]],
                     start_to_close_timeout=TIMEOUT_FAST,
                     retry_policy=NO_RETRY,
                 )
-                agent_id = str((resolved or {}).get(_OWNER_TAG) or "")
+                agent_id = str((resolved or {}).get(JOURNAL_OWNER_TAG) or "")
         # NO_RETRY: every write is marker-idempotent, so a failed run is simply
         # next week's, or started again by hand; an automatic retry would only
         # hide the error.

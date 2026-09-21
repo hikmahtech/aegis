@@ -44,6 +44,20 @@ async def clean_state(db_pool):
     await db_pool.execute("DELETE FROM settings WHERE key = $1", INDEX_STATE_KEY)
 
 
+@pytest_asyncio.fixture(loop_scope="function")
+async def clean_layout(db_pool):
+    """No `vault_layout` row, so the block's tag is the shipped default. Files
+    in this package share one database under `--dist loadfile`, and the layout
+    route's tests leave rows behind."""
+    from aegis.services import vault_layout as vl
+
+    await db_pool.execute("DELETE FROM settings WHERE key = 'vault_layout'")
+    vl.invalidate_cache()
+    yield db_pool
+    await db_pool.execute("DELETE FROM settings WHERE key = 'vault_layout'")
+    vl.invalidate_cache()
+
+
 # ------------------------------------------------------------ journal write
 
 
@@ -83,6 +97,24 @@ async def test_journal_write_never_raises(vault):
         {"kind": "yearly", "day": "2026-09-12", "label": "2026", "text": "x"},
     )
     assert out["status"] == "error"
+
+
+@needs_git
+async def test_the_journal_block_and_the_commit_name_the_gtd_holder(vault, clean_layout):
+    """A journal write nobody named is the journal owner's — the same id in the
+    block's tag and in the commit's author, because both come from one lookup."""
+    holder = await clean_layout.fetchval(
+        "SELECT id FROM agents WHERE active AND capabilities @> '[\"gtd\"]'::jsonb "
+        "ORDER BY id LIMIT 1"
+    )
+    assert holder
+    acts = NotesActivities(settings=vault["settings"], db_pool=clean_layout)
+    entry = {"kind": "daily", "day": "2026-09-12", "label": "2026-09-12", "text": "A day."}
+    res = await ActivityEnvironment().run(acts.notes_journal_write, entry)
+
+    assert res["status"] == "written"
+    assert f"- #aegis/{holder} day log" in remote_file(vault, "journal/12 Sep 26.md")
+    assert (await acts._author(await acts._owner_id(""))).prefix == holder
 
 
 async def test_a_chat_write_when_the_vault_is_off_on_the_worker():

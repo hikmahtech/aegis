@@ -20,8 +20,8 @@ Where the notes go is the vault layout (`vault_layout` settings row), read
 from the pool on every call so a change on the admin page applies without a
 restart. A time written into a note (a new note's template placeholders) is
 on the user's clock (`user_timezone`), not the container's UTC one. A commit
-is authored by the owning agent — the one the flow ran for, else the holder
-of the `research` capability — under its `agents.name`.
+is authored by the owning agent — the one the flow ran for, else the holder of
+the `gtd` capability — under its `agents.name`.
 """
 
 from __future__ import annotations
@@ -48,8 +48,6 @@ INDEX_STATE_KEY = "notes_index_state"
 DEFAULT_INDEX_BATCH = 300
 # Journal entries per backfill commit (`notes-backfill-weekly`'s `batch`).
 BACKFILL_BATCH = 50
-# The capability whose holder owns a write no agent was named for.
-_OWNER_TAG = "research"
 
 # Newest first: a weekly run is for the recent days whose vault write failed
 # and fell back to their knowledge row; the old rows went in on the first run.
@@ -92,17 +90,26 @@ class NotesActivities:
     async def _layout(self) -> Layout:
         return await get_layout(self.db_pool)
 
-    async def _author(self, agent_id: str | None) -> notes.Author:
-        """The commit's author: the agent named, else the `research` holder,
-        under its `agents.name`. Never raises — a failed lookup is AEGIS's
-        own identity, not a lost write."""
+    async def _owner_id(self, agent_id: str | None) -> str:
+        """The agent a write belongs to: the one named, else the journal's
+        owner (`notes.JOURNAL_OWNER_TAG`). Never raises — an unresolved owner
+        is AEGIS's own identity, not a lost write."""
+        if agent_id:
+            return agent_id
         if self.db_pool is None:
+            return ""
+        try:
+            return await resolve_tag(self.db_pool, notes.JOURNAL_OWNER_TAG) or ""
+        except Exception as exc:  # noqa: BLE001 — the owner is a nicety
+            activity.logger.warning("notes_owner_lookup_failed err=%s", error_text(exc))
+            return ""
+
+    async def _author(self, agent_id: str) -> notes.Author:
+        """The commit's author, under the agent's `agents.name`. `agent_id` is
+        already resolved (`_owner_id`). Never raises."""
+        if not agent_id or self.db_pool is None:
             return notes.author_for(agent_id)
         try:
-            if not agent_id:
-                agent_id = await resolve_tag(self.db_pool, _OWNER_TAG)
-            if not agent_id:
-                return notes.DEFAULT_AUTHOR
             name = await self.db_pool.fetchval("SELECT name FROM agents WHERE id = $1", agent_id)
             return notes.author_for(agent_id, name)
         except Exception as exc:  # noqa: BLE001 — identity is a nicety
@@ -124,7 +131,11 @@ class NotesActivities:
                 "could not run. Nothing was written.",
             }
         return await nw.perform_write(
-            op, payload, cfg, layout=await self._layout(), author=await self._author(agent_id)
+            op,
+            payload,
+            cfg,
+            layout=await self._layout(),
+            author=await self._author(await self._owner_id(agent_id)),
         )
 
     @activity.defn
@@ -142,7 +153,8 @@ class NotesActivities:
         if not cfg.configured:
             return {"status": "not_configured"}
         layout = await self._layout()
-        author = await self._author(str(entry.get("agent_id") or ""))
+        owner = await self._owner_id(str(entry.get("agent_id") or ""))
+        author = await self._author(owner)
         try:
             ap = notes.journal_append(
                 str(entry["kind"]),
@@ -151,6 +163,7 @@ class NotesActivities:
                 str(entry.get("text") or ""),
                 await user_now(self.db_pool),
                 layout,
+                agent=owner,
             )
             res = await notes.write(
                 cfg, [ap], f"{author.prefix}: journal {entry['label']}", author=author
@@ -332,7 +345,8 @@ class NotesActivities:
             _BACKFILL_SQL, max(1, int(limit)), max(0, int(since_days or 0))
         )
         layout = await self._layout()
-        author = await self._author(agent_id)
+        owner = await self._owner_id(agent_id)
+        author = await self._author(owner)
         appends: list[notes.Append] = []
         skipped = 0
         now = await user_now(self.db_pool)
@@ -344,7 +358,8 @@ class NotesActivities:
                     label = str(meta["date"])
                     appends.append(
                         notes.journal_append(
-                            "daily", date.fromisoformat(label), label, text, now, layout
+                            "daily", date.fromisoformat(label), label, text, now, layout,
+                            agent=owner,
                         )
                     )
                 else:
@@ -352,7 +367,7 @@ class NotesActivities:
                     appends.append(
                         notes.journal_append(
                             kind, date.fromisoformat(str(meta["start"])), str(meta["label"]),
-                            text, now, layout,
+                            text, now, layout, agent=owner,
                         )
                     )
             except (KeyError, ValueError, notes.NotesError):
