@@ -2282,6 +2282,12 @@ its marker. The paths below are those defaults.
   switchable). No `daylog` knowledge row is filed then; if the vault write
   fails the row is filed as before and the run reports `vault_error`. A kind
   switched off in the layout files its knowledge row too.
+- **The weekly review** is filed in the same note. After `WeeklyReviewFlow` sends the review to
+  your channel it appends it to the vault's note for the week it covers, as a block marked
+  `aegis:review:<week>` and labelled by `language.review_label`. It is best-effort: an
+  unconfigured vault, a weekly kind switched off or a failed write are reported in the run's
+  `vault` field and never cost you the review. A second run for the same week adds nothing. A run
+  already in flight when the worker is deployed skips the step and reports `skipped`.
 - **Conflicts:** `obsidian-git` commits from the phone and laptop. A push
   rejected as not a fast-forward, or a conflicting rebase, drops the agent's
   own unpushed commit, pulls fresh and retries once; a second failure is
@@ -2327,7 +2333,7 @@ the same code that writes the notes; the page shows that preview live.
 | `new_note.drop_open_tasks` | `true` | A note the agent creates loses the template's unticked checkboxes. |
 | `new_note.drop_empty_bullets_in_section` | `true` | …and the empty `- ` placeholders in the target section. |
 | `section_ends_at_rule_or_fence` | `true` | A section ends at a `---` rule or a code fence, not only at the next heading. |
-| `language.*` | English | `name` (the language the day log and rollups are written in — English adds nothing to the prompts), and the fixed words of a day log written without a model: `daylog_title`, `quiet_day`, the six labels, `rollup_header`, `journal_title`, `also_in_note`. |
+| `language.*` | English | `name` (the language the day log and rollups are written in — English adds nothing to the prompts), and the fixed words of a day log written without a model: `daylog_title`, `quiet_day`, the six labels, `rollup_header`, `journal_title`, `also_in_note`, and `review_label` (the label on the weekly review's block). |
 | `daily` / `weekly` / `monthly` | see below | One block per kind: `enabled`, `folder`, `format`, `live_folder`, `template`, `sections`, `label`. |
 
 Per kind, the defaults: daily `folder "[journal/]YYYY/MM[. ]MMM"`, `format
