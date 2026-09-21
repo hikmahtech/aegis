@@ -60,3 +60,11 @@ def test_validate_accepts_a_nested_tag_and_the_placeholder(tag):
 def test_validate_still_refuses_a_bad_tag(bad):
     with pytest.raises(ValueError, match="^entry.tag"):
         vl.validate({"entry": {"tag": bad}})
+
+
+def test_the_shipped_tag_names_nobody_until_an_agent_writes():
+    """A default must name no agent: an OSS fork inherits neither Raphael nor
+    Sebas. `#aegis` is the parent, and the writer's id is the leaf."""
+    assert vl.DEFAULT_LAYOUT.entry_tag == "#aegis/{agent}"
+    assert vl.DEFAULTS["entry"]["tag"] == vl.DEFAULT_LAYOUT.entry_tag
+    assert vl.DEFAULT_LAYOUT.tag_for("sebas") == "#aegis/sebas"

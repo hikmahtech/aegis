@@ -118,7 +118,7 @@ DEFAULTS: dict[str, Any] = {
     "week_numbering": "iso",
     "date_heading_format": "YYYY-MM-DD",
     "index_skip_prefixes": [".obsidian/", "_templates/", "backups/", "_attachments/", ".trash/"],
-    "entry": {"tag": "#raphael", "indent": "tab", "max_outline_depth": 4},
+    "entry": {"tag": "#aegis/{agent}", "indent": "tab", "max_outline_depth": 4},
     "new_note": {"drop_open_tasks": True, "drop_empty_bullets_in_section": True},
     "section_ends_at_rule_or_fence": True,
     "language": dict(DEFAULT_LANGUAGE),
@@ -359,7 +359,7 @@ class Layout:
     week_numbering: str = "iso"
     date_heading_format: str = "YYYY-MM-DD"
     index_skip_prefixes: tuple[str, ...] = tuple(DEFAULTS["index_skip_prefixes"])
-    entry_tag: str = "#raphael"
+    entry_tag: str = "#aegis/{agent}"
     entry_indent: str = "tab"
     max_outline_depth: int = 4
     drop_open_tasks: bool = True

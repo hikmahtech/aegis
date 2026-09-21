@@ -247,7 +247,7 @@ def test_a_new_journal_note_is_rendered_from_the_template_and_pushed(vault):
     assert res["status"] == "written"
     text = _remote_file(vault, "journal/2026/09. Sep/13 Sep 26.md")
     assert text.startswith("---\n") and "# Sep 13, 2026" in text
-    assert "- #raphael day log" in text and "\t- Raphael's day." in text
+    assert "- #aegis day log" in text and "\t- Raphael's day." in text
     assert notes.marker("daylog:2026-09-13") in text
     assert "{{" not in text
     assert _remote_file(vault, "journal/13 Sep 26.md") == "", "a root note is never created"
@@ -260,7 +260,7 @@ def test_the_days_live_root_note_takes_the_entry_inside_its_journal(vault):
     assert res["outcomes"] == [{"path": "journal/12 Sep 26.md", "changed": True}]
     after = _remote_file(vault, "journal/12 Sep 26.md")
     assert notes.is_one_insertion(before, after)
-    assert after.index("- the user wrote this") < after.index("- #raphael day log")
+    assert after.index("- the user wrote this") < after.index("- #aegis day log")
     assert _remote_file(vault, "journal/2026/09. Sep/12 Sep 26.md") == ""
 
 
@@ -306,7 +306,7 @@ def test_a_push_rejected_by_a_device_commit_is_retried_after_a_fresh_pull(vault,
     assert res["status"] == "written" and res["attempts"] == 2
     text = _remote_file(vault, "journal/12 Sep 26.md")
     assert "- written on the phone" in text
-    assert text.index("- written on the phone") < text.index("- #raphael day log")
+    assert text.index("- written on the phone") < text.index("- #aegis day log")
 
 
 @needs_git

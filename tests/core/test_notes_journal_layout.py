@@ -51,7 +51,7 @@ def test_the_block_is_a_tagged_bullet_with_one_child_per_paragraph():
         "First line\nstill first.\n\nSecond.\n\n### Highlights\n- a\n- b",
     )
     assert block == (
-        "- #raphael day log %% aegis:daylog:2026-09-11 %%\n"
+        "- #aegis day log %% aegis:daylog:2026-09-11 %%\n"
         "\t- First line still first.\n"
         "\t- Second.\n"
         "\t- **Highlights**\n"
@@ -84,7 +84,7 @@ FALLBACK_BODY = (
     "  - Invoices/Receipts filed [reference]\n"
 )
 FALLBACK_BLOCK = (
-    "- #raphael day log %% aegis:daylog:2026-08-01 %%\n"
+    "- #aegis day log %% aegis:daylog:2026-08-01 %%\n"
     "\t- Day log for 2026-08-01.\n"
     "\t- Met / attended:\n"
     "\t\t- Team lunch\n"
@@ -132,7 +132,7 @@ def test_a_prose_narrative_is_one_child_per_paragraph():
         "By Friday the open threads were the invoice and the backup."
     )
     assert notes.journal_block("daylog:weekly:2026-W37", "week in review", body) == (
-        "- #raphael week in review %% aegis:daylog:weekly:2026-W37 %%\n"
+        "- #aegis week in review %% aegis:daylog:weekly:2026-W37 %%\n"
         "\t- Over the week the owner shipped the migration.\n"
         "\t- Most of Tuesday went on the importer, which ran out of memory twice.\n"
         "\t- By Friday the open threads were the invoice and the backup.\n"
@@ -193,7 +193,7 @@ def test_a_daily_entry_goes_at_the_end_of_the_users_journal_section():
     ap = _daily(date(2026, 9, 11))
     out = notes.append_text(existing, ap)
     assert notes.is_one_insertion(existing, out)
-    assert out.index("- mine two") < out.index("- #raphael day log") < out.index("---\n### Review")
+    assert out.index("- mine two") < out.index("- #aegis day log") < out.index("---\n### Review")
     assert out.count("- reviewed") == 1
 
 
@@ -209,7 +209,7 @@ def test_weekly_and_monthly_entries_go_into_their_review_sections(kind, day, lab
     ap = notes.journal_append(kind, day, label, "Review text.", datetime(2026, 9, 12, 19, 5))
     out = notes.append_text(existing, ap)
     assert notes.is_one_insertion(existing, out)
-    assert out.index(section) < out.index("- mine") < out.index("- #raphael") < out.index("---")
+    assert out.index(section) < out.index("- mine") < out.index("- #aegis") < out.index("---")
 
 
 def test_a_note_without_the_section_gets_it_at_the_end():
@@ -217,7 +217,7 @@ def test_a_note_without_the_section_gets_it_at_the_end():
     out = notes.append_text(existing, _daily(date(2026, 9, 11)))
     assert notes.is_one_insertion(existing, out)
     assert out.endswith(
-        "\n## Journal\n- #raphael day log %% aegis:daylog:2026-09-11 %%\n\t- The day, as Raphael saw it.\n"
+        "\n## Journal\n- #aegis day log %% aegis:daylog:2026-09-11 %%\n\t- The day, as Raphael saw it.\n"
     )
 
 
@@ -236,7 +236,7 @@ def test_the_section_is_found_by_its_text_at_any_heading_level(kind, day, label,
     out = notes.append_text(existing, ap)
     assert notes.is_one_insertion(existing, out)
     assert (
-        out.index(heading) < out.index("- mine") < out.index("- #raphael") < out.index("## Notes")
+        out.index(heading) < out.index("- mine") < out.index("- #aegis") < out.index("## Notes")
     )
 
 
@@ -246,7 +246,7 @@ def test_a_month_note_prefers_review_to_month_review():
         "monthly", date(2026, 8, 1), "2026-08", "Text.", datetime(2026, 9, 12, 19, 5)
     )
     out = notes.append_text(existing, ap)
-    assert out.index("- new") < out.index("- #raphael month in review")
+    assert out.index("- new") < out.index("- #aegis month in review")
 
 
 def test_a_missing_review_section_is_added_as_a_level_two_heading():
@@ -257,7 +257,7 @@ def test_a_missing_review_section_is_added_as_a_level_two_heading():
     out = notes.append_text(existing, ap)
     assert notes.is_one_insertion(existing, out)
     assert out.endswith(
-        "\n## Review\n- #raphael week in review %% aegis:daylog:weekly:2026-W37 %%\n\t- Text.\n"
+        "\n## Review\n- #aegis week in review %% aegis:daylog:weekly:2026-W37 %%\n\t- Text.\n"
     )
 
 
@@ -274,7 +274,7 @@ def test_the_month_review_ends_at_the_folder_card_fence():
         )
         out = notes.append_text(existing, ap)
         assert notes.is_one_insertion(existing, out)
-        assert out.index("- mine") < out.index("- #raphael") < out.index("```ccard")
+        assert out.index("- mine") < out.index("- #aegis") < out.index("```ccard")
         assert out.endswith(card)
 
 
@@ -319,7 +319,7 @@ NEW_TEMPLATES = {
             date(2026, 9, 11),
             "2026-09-11",
             "# Friday, Sep 11, 2026\n\n## Journal\n#journal\n"
-            "- #raphael day log %% aegis:daylog:2026-09-11 %%\n\t- Text.\n\n"
+            "- #aegis day log %% aegis:daylog:2026-09-11 %%\n\t- Text.\n\n"
             "## Notes\n- \n\n## Review\n#review\n- \n",
         ),
         (
@@ -327,14 +327,14 @@ NEW_TEMPLATES = {
             date(2026, 9, 9),
             "2026-W37",
             "# Week of Sep 07, 2026\n\n## Highlights\n- \n\n## Review\n#review\n"
-            "- #raphael week in review %% aegis:daylog:weekly:2026-W37 %%\n\t- Text.\n",
+            "- #aegis week in review %% aegis:daylog:weekly:2026-W37 %%\n\t- Text.\n",
         ),
         (
             "monthly",
             date(2026, 8, 1),
             "2026-08",
             "# 08. Aug Monthly\n\n## Highlights\n- \n\n## Review\n#review\n"
-            "- #raphael month in review %% aegis:daylog:monthly:2026-08 %%\n\t- Text.\n\n"
+            "- #aegis month in review %% aegis:daylog:monthly:2026-08 %%\n\t- Text.\n\n"
             "## In this folder\n```ccard\ntype: folder_brief_live\n```\n",
         ),
     ],
@@ -380,7 +380,7 @@ def test_a_day_without_a_live_note_is_filed_in_its_month_folder(tmp_path):
     v = make_vault(tmp_path)
     res = notes.write_sync(v["cfg"], [_daily(date(2026, 9, 13))], "journal")
     assert res["outcomes"] == [{"path": "journal/2026/09. Sep/13 Sep 26.md", "changed": True}]
-    assert "- #raphael day log" in remote_file(v, "journal/2026/09. Sep/13 Sep 26.md")
+    assert "- #aegis day log" in remote_file(v, "journal/2026/09. Sep/13 Sep 26.md")
     assert remote_file(v, "journal/13 Sep 26.md") == ""
 
 
@@ -466,4 +466,4 @@ def test_an_entry_lands_mid_note_when_the_journal_section_is_not_last(tmp_path):
     notes.write_sync(v["cfg"], [_daily(date(2026, 9, 12))], "journal")
     text = remote_file(v, "journal/12 Sep 26.md")
     assert notes.is_one_insertion(user_note, text)
-    assert text.index("- mine") < text.index("- #raphael day log") < text.index("---\n### Review")
+    assert text.index("- mine") < text.index("- #aegis day log") < text.index("---\n### Review")

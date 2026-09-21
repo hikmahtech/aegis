@@ -539,7 +539,7 @@ def journal_block(
     """The agent's entry in the user's own bullet style (they write `- `
     bullets under the section, with obsidian-outliner)::
 
-        - #raphael day log %% aegis:<key> %%
+        - #aegis/sebas day log %% aegis:<key> %%
         <TAB>- <first paragraph, as one line>
         <TAB>- Completed:
         <TAB><TAB>- <an item under that label>

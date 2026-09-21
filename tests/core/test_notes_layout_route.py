@@ -86,13 +86,22 @@ async def test_put_400s_on_a_bad_key_and_writes_nothing(app_client):
     assert (await app_client.get(URL, auth=AUTH)).json()["layout"] == vl.merge({})
 
 
-async def test_preview_renders_the_saved_layout_for_a_date(app_client):
+async def test_preview_renders_the_saved_layout_for_a_date(app_client, rules_pool):
+    # The sample block names the journal's owner, so the preview shows the tag
+    # the nightly run will really write. Read the owner through the capability.
+    holder = await rules_pool.fetchval(
+        "SELECT id FROM agents WHERE active AND capabilities @> '[\"gtd\"]'::jsonb "
+        "ORDER BY id LIMIT 1"
+    )
+    assert holder
     r = await app_client.get(f"{URL}/preview?date=2026-09-12", auth=AUTH)
     assert r.status_code == 200
     out = r.json()
     assert out["daily"]["path"] == "journal/2026/09. Sep/12 Sep 26.md"
     assert out["week"]["label"] == "2026-W37"
-    assert out["sample_block"].startswith("- #raphael day log %% aegis:daylog:2026-09-12 %%\n\t- ")
+    assert out["sample_block"].startswith(
+        f"- #aegis/{holder} day log %% aegis:daylog:2026-09-12 %%\n\t- "
+    )
     assert "Completed:" in out["sample_block"]
     assert (await app_client.get(f"{URL}/preview", auth=AUTH)).status_code == 200
     assert (await app_client.get(f"{URL}/preview?date=yesterday", auth=AUTH)).status_code == 400
