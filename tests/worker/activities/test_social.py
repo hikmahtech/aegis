@@ -1468,7 +1468,7 @@ async def test_refresh_keeps_long_lead_rows_eligible_regardless_of_created_at(st
     snapshot by the old created_at-only filter and would never refresh again.
 
     The `zzsa-history` control proves the relaxation did NOT become "refresh
-    everything": old row, old schedule_at, still excluded."""
+    everything": old row, old schedule_at, already PUBLISHED, still excluded."""
     account_id = await _seed_postiz_account(stuck_env, platform="linkedin")
     await _seed_outbox(
         stuck_env,
@@ -1485,16 +1485,16 @@ async def test_refresh_keeps_long_lead_rows_eligible_regardless_of_created_at(st
         "zzsa-history",
         "zzsa-pz-history",
         schedule_at=datetime.now(UTC) - timedelta(days=60),
-        state=None,
+        state="PUBLISHED",
         created_days_ago=60,
     )
     respx.get("https://postiz.example.com/api/public/v1/posts").respond(200, json={"posts": []})
     respx.get("https://postiz.example.com/api/public/v1/analytics/post/zzsa-pz-longlead").respond(
         200, json=[{"label": "Likes", "data": [{"total": "1", "date": "2026-08-01"}]}]
     )
-    respx.get("https://postiz.example.com/api/public/v1/analytics/post/zzsa-pz-history").respond(
-        200, json=[]
-    )
+    history = respx.get(
+        "https://postiz.example.com/api/public/v1/analytics/post/zzsa-pz-history"
+    ).respond(200, json=[])
 
     connector = SocialConnector(db_pool=stuck_env, settings=_settings_with_postiz())
     act = SocialActivities(db_pool=stuck_env, connector=connector)
@@ -1507,12 +1507,7 @@ async def test_refresh_keeps_long_lead_rows_eligible_regardless_of_created_at(st
             "SELECT metrics FROM social_outbox WHERE todoist_task_id = 'zzsa-longlead'"
         )
         assert fresh["series"] == {"likes": 1}
-        assert (
-            await stuck_env.fetchval(
-                "SELECT metrics FROM social_outbox WHERE todoist_task_id = 'zzsa-history'"
-            )
-            == {}
-        )
+        assert not history.called
     finally:
         await connector.close()
 
@@ -1523,10 +1518,10 @@ async def test_refresh_malformed_schedule_at_does_not_abort_the_pass(stuck_env):
     value aborts the whole statement — i.e. one junk row would silently kill
     metrics AND the watchdog that reads them.
 
-    The junk rows are seeded OLD on purpose: the eligibility clause is
-    `created_at recent OR schedule_at recent`, and Postgres short-circuits the
-    OR for a recent row, so a recent junk row would never evaluate the cast and
-    the test would pass with the guard removed."""
+    The junk rows are seeded OLD and PUBLISHED on purpose: an unpublished row
+    is eligible whatever its age (#623), and Postgres short-circuits the OR for
+    a recent row, so only an old, published junk row is guaranteed to reach
+    the `schedule_at` cast — anything else passes with the guard removed."""
     account_id = await _seed_postiz_account(stuck_env, platform="linkedin")
     await _seed_outbox(
         stuck_env,
@@ -1534,7 +1529,7 @@ async def test_refresh_malformed_schedule_at_does_not_abort_the_pass(stuck_env):
         "zzsa-junk",
         "zzsa-pz-junk",
         schedule_at="not-a-date",
-        state=None,
+        state="PUBLISHED",
         created_days_ago=60,
     )
     await _seed_outbox(
@@ -1543,7 +1538,7 @@ async def test_refresh_malformed_schedule_at_does_not_abort_the_pass(stuck_env):
         "zzsa-empty",
         "zzsa-pz-empty",
         schedule_at="",
-        state=None,
+        state="PUBLISHED",
         created_days_ago=60,
     )
     await _seed_outbox(
@@ -1556,26 +1551,154 @@ async def test_refresh_malformed_schedule_at_does_not_abort_the_pass(stuck_env):
         created_days_ago=60,
     )
     respx.get("https://postiz.example.com/api/public/v1/posts").respond(200, json={"posts": []})
-    for ref in ("zzsa-pz-junk", "zzsa-pz-empty", "zzsa-pz-good"):
-        respx.get(f"https://postiz.example.com/api/public/v1/analytics/post/{ref}").respond(
+    routes = {
+        ref: respx.get(f"https://postiz.example.com/api/public/v1/analytics/post/{ref}").respond(
             200, json=[]
         )
+        for ref in ("zzsa-pz-junk", "zzsa-pz-empty", "zzsa-pz-good")
+    }
 
     connector = SocialConnector(db_pool=stuck_env, settings=_settings_with_postiz())
     act = SocialActivities(db_pool=stuck_env, connector=connector)
     try:
-        # The two junk rows are simply not eligible (neither branch true); the
+        # The two junk rows are simply not eligible (no branch true); the
         # point is that the statement RAN at all instead of raising.
         assert await ActivityEnvironment().run(act.refresh_post_metrics, 14, 45, 200) == {
             "refreshed": 1,
             "failed": 0,
         }
-        assert (
-            await stuck_env.fetchval(
-                "SELECT metrics FROM social_outbox WHERE todoist_task_id = 'zzsa-junk'"
-            )
-            == {}
+        assert not routes["zzsa-pz-junk"].called
+        assert not routes["zzsa-pz-empty"].called
+    finally:
+        await connector.close()
+
+
+@respx.mock
+async def test_refresh_keeps_an_unpublished_row_eligible_after_it_ages_out(stuck_env):
+    """#623, replayed. The 2026-08-14 backlog was re-spread onto later Postiz
+    slots, but `payload.schedule_at` kept its August value. So each row left
+    the 14-day window on schedule, froze at QUEUE, and was reported stuck
+    every day after Postiz had published it.
+
+    Postiz's real `publishDate` here is also older than `now - window_days`.
+    `GET /posts` filters on it, so the list window has to reach back for the
+    row too; without that the row would be refreshed to `unknown` and still
+    read as stuck.
+
+    Control: an old row that is already PUBLISHED stays out of the pass."""
+    account_id = await _seed_postiz_account(stuck_env, platform="linkedin")
+    now = datetime.now(UTC)
+    published_at = now - timedelta(days=20)
+    await _seed_outbox(
+        stuck_env,
+        account_id,
+        "zzsa-frozen",
+        "zzsa-pz-frozen",
+        schedule_at=now - timedelta(days=36),
+        state="QUEUE",
+        publish_date=published_at,
+        created_days_ago=36,
+    )
+    await stuck_env.execute(
+        "UPDATE social_outbox SET metrics_at = now() - interval '22 days' "
+        "WHERE todoist_task_id = 'zzsa-frozen'"
+    )
+    await _seed_outbox(
+        stuck_env,
+        account_id,
+        "zzsa-done",
+        "zzsa-pz-done",
+        schedule_at=now - timedelta(days=60),
+        state="PUBLISHED",
+        publish_date=now - timedelta(days=60),
+        created_days_ago=60,
+    )
+
+    def _postiz_list(request):
+        start = datetime.fromisoformat(request.url.params["startDate"])
+        end = datetime.fromisoformat(request.url.params["endDate"])
+        post = {
+            "id": "zzsa-pz-frozen",
+            "state": "PUBLISHED",
+            "releaseURL": "https://www.linkedin.com/feed/update/zzsa-frozen",
+            "publishDate": published_at.isoformat(),
+        }
+        return Response(200, json={"posts": [post] if start <= published_at <= end else []})
+
+    respx.get("https://postiz.example.com/api/public/v1/posts").mock(side_effect=_postiz_list)
+    respx.get("https://postiz.example.com/api/public/v1/analytics/post/zzsa-pz-frozen").respond(
+        200, json=[]
+    )
+    done = respx.get(
+        "https://postiz.example.com/api/public/v1/analytics/post/zzsa-pz-done"
+    ).respond(200, json=[])
+
+    connector = SocialConnector(db_pool=stuck_env, settings=_settings_with_postiz())
+    act = SocialActivities(db_pool=stuck_env, connector=connector)
+    env = ActivityEnvironment()
+    try:
+        # The bug as prod saw it: the frozen QUEUE reads as stuck.
+        assert [f["subject"] for f in await env.run(act.find_stuck_posts, 6, 50)] == [
+            "zzsa-pz-frozen"
+        ]
+        assert await env.run(act.refresh_post_metrics, 14, 45, 200) == {
+            "refreshed": 1,
+            "failed": 0,
+        }
+        metrics = await stuck_env.fetchval(
+            "SELECT metrics FROM social_outbox WHERE todoist_task_id = 'zzsa-frozen'"
         )
+        assert metrics["state"] == "PUBLISHED"
+        assert metrics["release_url"] == "https://www.linkedin.com/feed/update/zzsa-frozen"
+        assert not done.called
+        assert await env.run(act.find_stuck_posts, 6, 50) == []
+    finally:
+        await connector.close()
+
+
+@respx.mock
+async def test_refresh_serves_rows_in_the_window_before_old_unpublished_ones(stuck_env, caplog):
+    """Unpublished rows now stay eligible forever, so they must not crowd out
+    the rows still inside the window. With room for one row, the pass takes
+    the long-lead post (created 60 days ago, due in 3) rather than the newer
+    but out-of-window ERROR row, and says it truncated."""
+    account_id = await _seed_postiz_account(stuck_env, platform="linkedin")
+    now = datetime.now(UTC)
+    await _seed_outbox(
+        stuck_env,
+        account_id,
+        "zzsa-lead",
+        "zzsa-pz-lead",
+        schedule_at=now + timedelta(days=3),
+        state=None,
+        created_days_ago=60,
+    )
+    await _seed_outbox(
+        stuck_env,
+        account_id,
+        "zzsa-error",
+        "zzsa-pz-error",
+        schedule_at=now - timedelta(days=30),
+        state="ERROR",
+        created_days_ago=30,
+    )
+    respx.get("https://postiz.example.com/api/public/v1/posts").respond(200, json={"posts": []})
+    lead = respx.get(
+        "https://postiz.example.com/api/public/v1/analytics/post/zzsa-pz-lead"
+    ).respond(200, json=[])
+    error = respx.get(
+        "https://postiz.example.com/api/public/v1/analytics/post/zzsa-pz-error"
+    ).respond(200, json=[])
+
+    connector = SocialConnector(db_pool=stuck_env, settings=_settings_with_postiz())
+    act = SocialActivities(db_pool=stuck_env, connector=connector)
+    try:
+        with caplog.at_level("WARNING"):
+            result = await ActivityEnvironment().run(act.refresh_post_metrics, 14, 45, 1)
+        assert result == {"refreshed": 1, "failed": 0}
+        assert lead.called
+        assert not error.called
+        assert any("social_refresh_post_metrics_truncated" in r.message for r in caplog.records)
     finally:
         await connector.close()
 

@@ -855,24 +855,65 @@ class SocialActivities:
         its first slot. `GET /posts` is one unpaginated call (~70 posts today),
         so the wider window costs nothing.
 
-        Eligibility is `created_at` recency **or** a `schedule_at` that is still
-        ahead / recently past. The old `created_at`-only filter aged long-lead
-        posts out of monitoring before they published: three prod rows created
-        2026-07-15 were frozen at a 2026-07-29 snapshot and would never have
-        refreshed again.
+        Eligibility is `created_at` recency, **or** a `schedule_at` that is
+        still ahead / recently past, **or** any row Postiz has not yet reported
+        PUBLISHED, whatever its age. The window only exists to stop re-polling
+        finished posts; it must never stop watching unfinished ones, because
+        `find_stuck_posts` judges every unpublished row with no age limit. Before
+        #623 a post Postiz held past its `schedule_at` (the 2026-08-14 backlog
+        was re-spread onto later slots and `schedule_at` never followed) aged
+        out at QUEUE and was reported stuck for weeks after it published.
+
+        `GET /posts` filters on Postiz's `publishDate`, so the list window
+        reaches back to the oldest date any selected row carries. Otherwise an
+        old row would be missing from the list and written back as `unknown`.
 
         `max_rows` bounds the per-pass Postiz analytics calls, one per row.
-        Hitting it is logged loudly — silent truncation is how a stuck post
-        would slip past the watchdog that reads what this writes.
+        Rows inside the window go first, so old unfinished rows can never starve
+        new ones. Hitting it is logged loudly — silent truncation is how a stuck
+        post would slip past the watchdog that reads what this writes.
         """
         if self.db_pool is None or self.connector is None:
             return {"refreshed": 0, "failed": 0}
 
+        rows = await self.db_pool.fetch(
+            f"""
+            SELECT o.id, o.posted_ref,
+                   LEAST(o.created_at, {_SCHEDULE_AT}, {_PUBLISH_DATE}) AS earliest
+            FROM social_outbox o
+            JOIN social_accounts a ON a.id = o.account_id
+            CROSS JOIN LATERAL (
+                SELECT coalesce(
+                    o.created_at > now() - make_interval(days => $1)
+                    OR {_SCHEDULE_AT} > now() - make_interval(days => $1),
+                    false
+                ) AS recent
+            ) w
+            WHERE o.status = 'posted'
+              AND o.posted_ref IS NOT NULL
+              AND a.meta ? 'postiz_integration_id'
+              AND (w.recent OR coalesce(o.metrics->>'state', '') <> '{PUBLISHED_STATE}')
+            ORDER BY w.recent DESC, o.created_at DESC
+            LIMIT $2
+            """,
+            window_days,
+            max_rows,
+        )
+        if len(rows) >= max_rows:
+            activity.logger.warning(
+                "social_refresh_post_metrics_truncated max_rows=%d — eligible rows were "
+                "dropped this pass; raise SocialMetricsFlow's max_rows",
+                max_rows,
+            )
+
         now = datetime.now(UTC)
+        since = min(
+            [now - timedelta(days=window_days)] + [r["earliest"] for r in rows if r["earliest"]]
+        )
         posts_by_ref: dict[str, dict] = {}
         try:
             posts = await self.connector.list_posts_window(
-                (now - timedelta(days=window_days)).isoformat(),
+                since.isoformat(),
                 (now + timedelta(days=lookahead_days)).isoformat(),
             )
             for p in posts:
@@ -888,31 +929,6 @@ class SocialActivities:
             # value; a failed list call just means state/release_url stay
             # unknown for this pass, not that we skip the pass entirely.
             activity.logger.warning("social_list_posts_window_failed err=%s", error_text(exc))
-
-        rows = await self.db_pool.fetch(
-            f"""
-            SELECT o.id, o.posted_ref
-            FROM social_outbox o
-            JOIN social_accounts a ON a.id = o.account_id
-            WHERE o.status = 'posted'
-              AND o.posted_ref IS NOT NULL
-              AND a.meta ? 'postiz_integration_id'
-              AND (
-                    o.created_at > now() - make_interval(days => $1)
-                    OR {_SCHEDULE_AT} > now() - make_interval(days => $1)
-                  )
-            ORDER BY o.created_at DESC
-            LIMIT $2
-            """,
-            window_days,
-            max_rows,
-        )
-        if len(rows) >= max_rows:
-            activity.logger.warning(
-                "social_refresh_post_metrics_truncated max_rows=%d — eligible rows were "
-                "dropped this pass; raise SocialMetricsFlow's max_rows",
-                max_rows,
-            )
 
         refreshed = failed = 0
         for r in rows:
@@ -953,7 +969,10 @@ class SocialActivities:
 
         Runs immediately after `refresh_post_metrics` inside SocialMetricsFlow,
         so `metrics.state` is the state Postiz reported seconds ago — checking a
-        day-old snapshot would be checking nothing.
+        day-old snapshot would be checking nothing. That holds for every row
+        this can flag only because the refresh keeps every unpublished row
+        eligible whatever its age (#623); a row left out of the pass (`max_rows`,
+        or its analytics call failed) is judged on its older snapshot.
 
         "Due" means Postiz's `publishDate` whenever Postiz reported one — see
         `_DUE_AT`. AEGIS's `payload.schedule_at` is a request, not a fact, and a
