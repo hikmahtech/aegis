@@ -95,6 +95,40 @@ async def test_log_dispatch_without_delivery_ref_keeps_legacy_shape(
     assert "delivery_ref" not in metadata
 
 
+async def test_log_dispatch_files_under_the_conversation_thread(app, auth_headers, mock_db_pool):
+    """#638: comms names the thread the user replies in (`slack-<channel>-<agent>`,
+    the inbound handler's id). The row must land there, not under the legacy
+    topic or `system`, or `send_message`'s history query never finds it — which
+    is how 222 of 222 prod dispatches were invisible to the agent."""
+    payload = {
+        "agent_id": "pandoras-actor",
+        "thread_id": "slack-C0BBX9UN996-pandoras-actor",
+        "topic_id": None,
+        "content": "PR opened: hikmahtech/trading-system-pipeline #434",
+        "kind": "deliver",
+        "delivery_ref": {"adapter": "slack", "channel": "C0BBX9UN996", "ts": "1790026053.394869"},
+    }
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post("/api/chat/dispatches", json=payload, headers=auth_headers)
+    assert resp.status_code == 200
+
+    _sql, agent, thread_id, _content, _metadata = mock_db_pool.execute.call_args[0]
+    assert agent == "pandoras-actor"
+    assert thread_id == "slack-C0BBX9UN996-pandoras-actor"
+
+
+async def test_log_dispatch_without_thread_or_topic_falls_back_to_system(
+    app, auth_headers, mock_db_pool
+):
+    """A system event names no thread and no topic: it stays under `system`."""
+    payload = {"agent_id": "system", "thread_id": None, "content": "worker restarted", "kind": "system_event"}
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post("/api/chat/dispatches", json=payload, headers=auth_headers)
+    assert resp.status_code == 200
+    _sql, _agent, thread_id, _content, _metadata = mock_db_pool.execute.call_args[0]
+    assert thread_id == "system"
+
+
 # ---------------------------------------------------------------------------
 # POST /api/chat — delivery_ref block on user row
 # ---------------------------------------------------------------------------

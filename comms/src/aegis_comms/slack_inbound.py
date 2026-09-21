@@ -42,6 +42,7 @@ import httpx
 import structlog
 
 from aegis_comms.adapters.base import DeliveryRef
+from aegis_comms.adapters.slack import slack_thread_id
 from aegis_comms.errors import error_text
 
 logger = structlog.get_logger()
@@ -929,7 +930,7 @@ class SlackInbound:
         if agent_id:
             self._sticky_set(channel_id, agent_id, now)
 
-        thread_id = f"slack-{channel_id}-{agent_id}"
+        thread_id = slack_thread_id(channel_id, agent_id)
 
         if mode == "async":
             triggered = await self._core.agent_reply_trigger(
@@ -1236,7 +1237,7 @@ class SlackInbound:
         result = await self._core.chat(
             agent_id=agent_id,
             message=text,
-            thread_id=f"slack-{channel_id}-{agent_id}",
+            thread_id=slack_thread_id(channel_id, agent_id),
             delivery_ref={"adapter": "slack", "channel": channel_id},
         )
         reply = result.get("response", "No response from agent.")

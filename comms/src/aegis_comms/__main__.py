@@ -20,7 +20,7 @@ from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel
 
 from aegis_comms.adapters.base import CardSpec, DeliveryRef
-from aegis_comms.adapters.slack import SlackAdapter
+from aegis_comms.adapters.slack import SlackAdapter, slack_thread_id
 from aegis_comms.config import CommsSettings
 from aegis_comms.errors import error_text
 
@@ -112,9 +112,19 @@ async def _log_dispatch(
     # whole neutral ref block so a Slack dispatch is logged with its
     # {adapter,channel,ts} (the core 5a route stores it).
     ref = send_result.get("delivery_ref") or {}
+    # The thread the user replies in. A Slack send knows its channel and the
+    # agent it posted as, and the inbound handler files the user's turns under
+    # slack_thread_id(channel, agent) — so log the dispatch under the same id,
+    # or the chat loader never sees it (#638: 222 of 222 prod dispatches sat
+    # under `system`). A system event, or a send with no channel, stays
+    # threadless and core files it under `system` as before.
+    thread_id: str | None = None
+    if ref.get("adapter") == "slack" and ref.get("channel") and agent_id and agent_id != "system":
+        thread_id = slack_thread_id(ref["channel"], agent_id)
     payload = {
         # "" = posted as AEGIS in the general channel, as system events are (#579).
         "agent_id": agent_id or "system",
+        "thread_id": thread_id,
         "topic_id": ref.get("topic_id", send_result.get("topic_id")),
         "chat_id": ref.get("chat_id", send_result.get("chat_id")),
         "message_id": ref.get("message_id", send_result.get("message_id")),

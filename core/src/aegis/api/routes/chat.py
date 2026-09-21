@@ -32,7 +32,12 @@ async def log_dispatch(request: Request, body: dict[str, Any]) -> dict[str, Any]
 
     Body shape:
       agent_id     — target agent (or "system" for general-topic events)
-      topic_id     — legacy numeric topic id; used as chat_history.thread_id
+      thread_id    — the chat_history thread the user replies in
+                     (Slack: `slack-<channel>-<agent>`, the id the inbound
+                     handler uses). This is what lets `send_message` fold
+                     the dispatch into that conversation (#638).
+      topic_id     — legacy numeric topic id; used as thread_id when no
+                     thread_id is given
       chat_id      — legacy chat id (stored in metadata for cleanup)
       message_id   — legacy numeric message id (stored in metadata under
                      the legacy `telegram_message_id` key; may be None)
@@ -60,7 +65,10 @@ async def log_dispatch(request: Request, body: dict[str, Any]) -> dict[str, Any]
     delivery_ref = body.get("delivery_ref")
     if delivery_ref is not None:
         metadata["delivery_ref"] = delivery_ref
-    thread_id = str(topic_id) if topic_id is not None else "system"
+    thread_id = (
+        str(body.get("thread_id") or "").strip()
+        or (str(topic_id) if topic_id is not None else "system")
+    )
     await pool.execute(
         "INSERT INTO chat_history (agent_id, thread_id, role, content, metadata) "
         "VALUES ($1, $2, 'dispatch', $3, $4)",
