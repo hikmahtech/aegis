@@ -109,6 +109,22 @@ def test_a_disabled_kind_has_no_pattern_and_no_append():
 _NOW = __import__("datetime").datetime(2026, 9, 12, 19, 5)
 
 
+def test_the_label_of_a_block_comes_from_its_slot():
+    layout = vl.layout_from({})
+    assert layout.label_for("", "daily") == "day log"
+    assert layout.label_for("", "weekly") == "week in review"
+    assert layout.label_for("review", "weekly") == "weekly review"
+    # A slot the wording does not name yet says its own name rather than
+    # nothing, so no block is ever written with a bare tag.
+    assert layout.label_for("dues", "weekly") == "dues"
+    # It is configuration: the row wins, and an unknown wording key is refused.
+    assert vl.layout_from({"language": {"review_label": "the week"}}).label_for(
+        "review", "weekly"
+    ) == "the week"
+    with pytest.raises(ValueError, match="language.reviewlabel"):
+        vl.validate({"language": {"reviewlabel": "x"}})
+
+
 # ---------------------------------------------------------------- merge
 
 

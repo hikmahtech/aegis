@@ -94,6 +94,9 @@ DEFAULT_LANGUAGE: dict[str, str] = {
     "rollup_header": "{period} log {label} — {n} day(s) recorded.",
     "journal_title": "Journal {day}",
     "also_in_note": "Also in the note:",
+    # The label on a block that is not the day log; one `<slot>_label` per slot
+    # (`Layout.label_for`), so a new slot is a word here, not a code change.
+    "review_label": "weekly review",
 }
 
 # ------------------------------------------------------------------ the agent
@@ -402,6 +405,16 @@ class Layout:
             return self.entry_tag.replace(AGENT_PLACEHOLDER, aid)
         bare = self.entry_tag.replace(AGENT_PLACEHOLDER, "").rstrip("/")
         return "" if bare == "#" else bare
+
+    def label_for(self, slot: str, kind: str) -> str:
+        """The block's label after the tag. The day log and the rollups use
+        their kind's own label; anything else filed in the same note (the
+        weekly review, a self-report, the week's dues) is named by its slot's
+        wording, and by the slot itself when the wording has no word for it
+        yet."""
+        if not slot:
+            return self.kind(kind).label
+        return self.words.get(f"{slot}_label") or slot
 
     @property
     def words(self) -> dict[str, str]:
