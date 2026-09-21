@@ -20,6 +20,7 @@ from datetime import UTC, datetime, timedelta
 import pytest_asyncio
 from aegis.services.hub import (
     OUTAGE_CLASS,
+    OUTAGE_MAX,
     OUTAGE_STATE,
     OUTAGE_TAIL,
     Event,
@@ -203,7 +204,8 @@ async def test_a_suppressed_problem_skips_investigation_and_projection_then_is_p
     assert outage.action == "created" and outage.investigate is True
     assert outage.suppressed is False
     window = await _window(db_pool)
-    assert window["state"] == OUTAGE_STATE and window["until_at"] is None
+    # It ends at most OUTAGE_MAX after the outage began (#633).
+    assert window["state"] == OUTAGE_STATE and window["until_at"] == NOW + OUTAGE_MAX
 
     t1 = NOW + timedelta(minutes=2)
     svc = f"svc_{uuid.uuid4().hex[:8]}"
@@ -303,7 +305,7 @@ async def test_an_expired_maintenance_row_gives_way_to_the_outage(db_pool):
         now=NOW,
     )
     window = await _window(db_pool)
-    assert window["state"] == OUTAGE_STATE and window["until_at"] is None
+    assert window["state"] == OUTAGE_STATE and window["until_at"] == NOW + OUTAGE_MAX
 
 
 async def test_resolving_the_outage_by_hand_ends_its_window(db_pool):
@@ -334,5 +336,90 @@ async def test_an_outage_that_returns_inside_the_tail_reopens_unsuppressed(db_po
         now=t2,
     )
     assert again.action == "reopened" and again.suppressed is False and again.investigate is True
-    # And its window is open-ended again.
-    assert (await _window(db_pool))["until_at"] is None
+    # And its window is up again, for OUTAGE_MAX from the reopen: a reopen
+    # keeps first_seen_at, and a second power cut the same day is a new
+    # stretch of the outage, not a late occurrence of the first (#633).
+    assert (await _window(db_pool))["until_at"] == t2 + OUTAGE_MAX
+
+
+# --- the cap (#633) -----------------------------------------------------------
+
+
+async def test_the_window_ends_outage_max_after_the_outage_began_whatever_follows(db_pool):
+    """noon stays off for days. A window as long as the outage held back every
+    unrelated fault for all that time; now it ends OUTAGE_MAX after the outage
+    began, later occurrences cannot move it, and the sweep then raises what is
+    still broken while the outage problem itself stays open."""
+    outage = await ingest_event(
+        db_pool,
+        event_from_alert(_am("ClusterOutage", labels={"aegis_class": "outage"}), occurred_at=NOW),
+        now=NOW,
+    )
+    # Six hours, as #633 decided; spelled out so a changed constant fails here.
+    end = NOW + timedelta(hours=6)
+    assert end == NOW + OUTAGE_MAX
+    t1 = NOW + timedelta(minutes=1)
+    svc = f"svc_{uuid.uuid4().hex[:8]}"
+    held = await ingest_event(db_pool, _occ("alertmanager", "DockerServiceDown", svc, t1), now=t1)
+    assert held.suppressed is True
+
+    # Repeat occurrences, from both producers, before and after the end.
+    for at in (NOW + timedelta(hours=5), end + timedelta(hours=1)):
+        again = await ingest_event(
+            db_pool,
+            event_from_alert(_heartbeat("ClusterOutage", "", aegis_class="outage"), occurred_at=at),
+            now=at,
+        )
+        assert again.problem_id == outage.problem_id and again.action == "attached"
+        window = await _window(db_pool)
+        assert window["until_at"] == end, at
+        assert window["set_by"] == f"hub:{outage.problem_id}"
+
+    assert held.problem_id not in await promote_expired_suppressions(
+        db_pool, now=end - timedelta(minutes=1)
+    )
+    promoted = await promote_expired_suppressions(db_pool, now=end + timedelta(seconds=1))
+    assert held.problem_id in promoted
+    # The outage is still open: only its window ended.
+    assert (await get_problem(db_pool, outage.problem_id))["status"] == "open"
+    # And a new infra fault on a healthy node is raised at once.
+    late = end + timedelta(hours=2)
+    fresh = await ingest_event(
+        db_pool, _occ("alertmanager", "DockerServiceDown", f"{svc}_b", late), now=late
+    )
+    assert fresh.suppressed is False and fresh.investigate is True
+
+
+async def test_the_sweep_ends_a_window_nothing_will_end(db_pool):
+    """A window from before the cap existed has no end: the sweep gives it
+    `first_seen_at + OUTAGE_MAX`. And a hub row whose problem is no longer
+    live — merged, closed, or resolved while the release failed — gets its
+    tail instead of holding its services back for ever."""
+    outage = await ingest_event(
+        db_pool,
+        event_from_alert(_am("ClusterOutage", labels={"aegis_class": "outage"}), occurred_at=NOW),
+        now=NOW,
+    )
+    # What #630 wrote: the same row, open-ended.
+    await db_pool.execute(
+        "UPDATE service_state SET until_at = NULL WHERE subject = '*' AND subject_kind = '*'"
+    )
+    gone = str(uuid.uuid4())
+    svc = f"svc_{uuid.uuid4().hex[:8]}"
+    await db_pool.execute(
+        "INSERT INTO service_state (subject, subject_kind, state, until_at, set_by, note) "
+        "VALUES ($1, 'service', $2, NULL, $3, '')",
+        svc,
+        OUTAGE_STATE,
+        f"hub:{gone}",
+    )
+    t1 = NOW + timedelta(minutes=5)
+    await promote_expired_suppressions(db_pool, now=t1)
+    assert (await _window(db_pool))["until_at"] == NOW + OUTAGE_MAX
+    orphan = await db_pool.fetchval(
+        "SELECT until_at FROM service_state WHERE subject = $1 AND subject_kind = 'service'", svc
+    )
+    assert orphan == t1 + OUTAGE_TAIL
+    # A live problem's window is left alone by the same sweep.
+    assert (await get_problem(db_pool, outage.problem_id))["status"] == "open"
+    await db_pool.execute("DELETE FROM service_state WHERE subject = $1", svc)

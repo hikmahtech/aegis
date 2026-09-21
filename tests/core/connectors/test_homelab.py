@@ -93,3 +93,39 @@ async def test_list_nodes_failure_retryable(monkeypatch):
     env = await conn.list_nodes()
     assert env["ok"] is False
     assert env["retryable"] is True
+
+
+@pytest.mark.asyncio
+async def test_node_ps_asks_the_managers_about_one_node(monkeypatch):
+    """#633: the heartbeat asks which tasks the swarm placed on a node that
+    went down, in the JSON shape `docker node ps` prints."""
+    conn = HomelabConnector(docker_context="swarm")
+    seen: list[tuple] = []
+
+    async def fake_docker(*args, timeout=30):
+        seen.append(args)
+        rows = [
+            {"ID": "t1", "Name": "postgres_postgres.1", "Node": "lam", "DesiredState": "Shutdown",
+             "CurrentState": "Running 3 hours ago"},
+            {"ID": "t2", "Name": "promtail_promtail.x9z", "Node": "lam", "DesiredState": "Shutdown",
+             "CurrentState": "Running 3 hours ago"},
+        ]
+        return (0, "\n".join(json.dumps(r) for r in rows) + "\nnot json\n", "")
+
+    monkeypatch.setattr(conn, "_docker", fake_docker)
+    env = await conn.node_ps("lam")
+    assert seen == [("node", "ps", "lam", "--format", "{{json .}}")]
+    assert env["ok"] is True
+    assert env["data"][0] == {
+        "name": "postgres_postgres.1",
+        "current_state": "Running 3 hours ago",
+        "desired_state": "Shutdown",
+    }
+    assert len(env["data"]) == 2
+
+    async def failing(*args, timeout=30):
+        return (1, "", "node lam not found")
+
+    monkeypatch.setattr(conn, "_docker", failing)
+    env = await conn.node_ps("lam")
+    assert env["ok"] is False and env["retryable"] is True

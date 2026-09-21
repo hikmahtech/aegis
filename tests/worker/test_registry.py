@@ -442,9 +442,12 @@ def test_books_write_flow_is_gated_on_money_hygiene():
         # and `promoted_investigations` on the existing HubActivities, the
         # decision-card retirement and the investigation a window held back.
         # Unflagged, so all three rows move.
-        (True, True, 51, 252),
+        # Then +1 activity and no flow from #633: `node_services` on
+        # HomelabActivities, which lists what a node that went down carried.
+        # HomelabActivities is homelab-flagged, so only the homelab rows move.
+        (True, True, 51, 253),
         (False, False, 40, 217),
-        (True, False, 44, 234),
+        (True, False, 44, 235),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):

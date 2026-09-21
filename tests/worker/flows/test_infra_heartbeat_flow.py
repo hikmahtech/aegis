@@ -57,6 +57,8 @@ async def _ingest(alert: dict, resolved: bool = False) -> dict:
         _calls["resolved"].append(alert["fingerprint"])
         return {"problem_id": "prob-r", "action": "resolved", "investigate": False}
     _calls.setdefault("ingested", []).append(alert["fingerprint"])
+    _calls.setdefault("ingested_alerts", []).append(alert)
+    _calls.setdefault("order", []).append(f"ingest:{alert['fingerprint']}")
     return {
         "problem_id": f"prob-{alert['fingerprint']}",
         "action": "created",
@@ -96,6 +98,19 @@ async def _probe_ingress(url: str, expect_status: int = 0) -> dict:
     return _state.get("probe") or {"url": url, "ok": True, "status": 200, "ms": 5, "error": ""}
 
 
+@activity.defn(name="node_services")
+async def _node_services(node: str) -> list[str]:
+    """`docker node ps` for a node that went down (#633). What each node
+    carried is `_state["placement"]`; an Exception there is a failed call."""
+    _calls.setdefault("node_services", []).append(node)
+    # Recorded in the same list as the hub ingests, so a test can read the order.
+    _calls.setdefault("order", []).append(f"node_services:{node}")
+    placement = _state.get("placement") or {}
+    if isinstance(placement.get(node), Exception):
+        raise placement[node]
+    return list(placement.get(node) or [])
+
+
 @activity.defn(name="clear_converged_deploys")
 async def _clear_deploys(stuck: list[str]) -> dict:
     _calls.setdefault("clear_deploys", []).append(stuck)
@@ -121,6 +136,7 @@ _ACTS = [
     _quiet_notify,
     _clear_deploys,
     _probe_ingress,
+    _node_services,
 ]
 
 

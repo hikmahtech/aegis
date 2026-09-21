@@ -28,6 +28,35 @@ logger = structlog.get_logger()
 # 2-minute heartbeat tick rather than a timeout on the activity itself.
 _INGRESS_TIMEOUT_S = 10.0
 
+# The task states that mean "this task is on the node", as `docker node ps`
+# prints them (`Running 2 hours ago`). A task on a node that goes down keeps
+# its last state: the node cannot report a change, so `Running` stays.
+_LIVE_TASK_STATES = frozenset({"assigned", "accepted", "preparing", "ready", "starting", "running"})
+
+
+def services_on_node(tasks: list[dict]) -> list[str]:
+    """The replicated services with a live task among ``tasks`` (from
+    `HomelabConnector.node_ps`), sorted and unique (#633).
+
+    A replicated task is named `<service>.<slot>`; a global one
+    `<service>.<node id>`, and those are left out: a global service runs on
+    every node, so one node down does not explain a fault on the others, and
+    the swarm stops counting the down node's task as desired anyway. History
+    rows (`Shutdown`, `Failed`, `Complete`, `Rejected`, `Orphaned`) are left
+    out too: they are not on the node now."""
+    out: set[str] = set()
+    for t in tasks:
+        state = str(t.get("current_state") or "").strip().split(" ", 1)[0].lower()
+        if state not in _LIVE_TASK_STATES:
+            continue
+        # The table format indents a task's history as ` \_ name`; the JSON
+        # format does not, but a stray prefix must not become a service name.
+        name = str(t.get("name") or "").strip().lstrip("\\_ ")
+        service, _, slot = name.rpartition(".")
+        if service and slot.isdigit():
+            out.add(service)
+    return sorted(out)
+
 
 def _format_card(title: str, body: str) -> str:
     """Render a homelab notification as a light-HTML chat card.
@@ -518,6 +547,21 @@ class HomelabActivities:
             and (s.get("replicas_actual") or 0) < (s.get("replicas_desired") or 0)
         )
         return {"ok": True, "nodes": nodes, "stuck": stuck, "error": ""}
+
+    @activity.defn
+    async def node_services(self, node: str) -> list[str]:
+        """The replicated services that had a task on ``node`` when it went
+        down (#633): pinned there, or last running there. One `docker node ps`,
+        asked only on the tick the node goes down. The heartbeat puts them on
+        the node's NodeDown, and the hub holds back their problems while it is
+        down. Raises on a failed call, so the retry policy applies; the flow
+        raises the NodeDown without them if it still fails."""
+        if not self.homelab:
+            return []
+        env = await self.homelab.node_ps(node)
+        if not env.get("ok"):
+            raise RuntimeError(f"node_ps {node}: {str(env.get('error'))[:200]}")
+        return services_on_node(env.get("data") or [])
 
     @activity.defn
     async def read_heartbeat_state(self) -> dict:

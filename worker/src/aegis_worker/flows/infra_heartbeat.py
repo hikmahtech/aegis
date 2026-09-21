@@ -13,8 +13,13 @@ Emits mostly on state transitions, never on unchanged steady state:
 - the ingress stopped answering from outside → IngressUnreachable alert (#492)
 - the ingress answers again                  → its resolved event
 - `outage_min_nodes` or more nodes not ready → ClusterOutage alert (#630),
-  class `outage`: the hub holds back every other infra problem while it lasts
+  class `outage`: the hub holds back every other infra problem while it lasts.
+  Only nodes that went not ready in the last `outage_recent_hours` count
+  (#633): a node off for days does not make the next failure an outage
 - fewer than that again                      → its resolved event
+
+A NodeDown carries the replicated services that had a task on the node
+(`services`, #633), and the hub holds back their problems while it is down.
 
 Recovery is `_resolve()` → `HubActivities.ingest_alert(resolved=True)`: the
 hub closes the problem and the projector closes its task. The audit-log rows
@@ -64,6 +69,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 
 from temporalio import workflow
 
@@ -91,6 +97,20 @@ OUTAGE_ALERTNAME = "ClusterOutage"
 OUTAGE_CLASS = "outage"
 # #630: count the nodes that are not ready, and raise one outage problem.
 PATCH_CLUSTER_OUTAGE = "heartbeat-cluster-outage"
+# #633: a NodeDown names the services that had a task on the node.
+PATCH_NODE_SERVICES = "heartbeat-node-services"
+# #633: only a node that went not ready recently counts toward an outage.
+PATCH_OUTAGE_RECENT = "heartbeat-outage-recent-nodes"
+
+
+def _since(value: object, default: datetime) -> datetime:
+    """A stored not-ready-since stamp, or ``default`` when it is missing or
+    unreadable (which then counts as "just now")."""
+    try:
+        ts = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return default
+    return ts if ts.tzinfo is not None else ts.replace(tzinfo=UTC)
 
 
 def build_heartbeat_alert(
@@ -103,6 +123,7 @@ def build_heartbeat_alert(
     escalate: bool,
     service_name: str = "",
     aegis_class: str = "",
+    services: list[str] | None = None,
 ) -> dict:
     labels: dict = {"alertname": alertname}
     if infra_cluster:
@@ -123,6 +144,9 @@ def build_heartbeat_alert(
     }
     if service_name:
         alert["service"] = service_name
+    if services:
+        # A NodeDown's services (#633): the hub holds back their problems.
+        alert["services"] = list(services)
     return alert
 
 
@@ -165,6 +189,15 @@ class InfraHeartbeatConfig:
     # nodes do not count. 0 disables the detector. Lives in activities.config
     # (`outage_min_nodes`).
     outage_min_nodes: int = 2
+    # Only a node that went not ready within this many hours counts toward
+    # `outage_min_nodes` (#633). noon does not power on by itself and can stay
+    # off for days; counted, it made one more failure look like a cluster
+    # outage, and the outage window then held back every unrelated fault for
+    # as long as both were down. A node down longer is its own NodeDown
+    # problem, which still holds back its own services. 0 counts every node
+    # however long it has been down. Lives in activities.config
+    # (`outage_recent_hours`).
+    outage_recent_hours: int = 6
 
 
 @workflow.defn
@@ -465,21 +498,44 @@ class InfraHeartbeatFlow:
         # it keeps the last answer rather than ending an outage.
         outage = bool(prior.get("outage"))
         nodes_not_ready: list[str] = []
+        counted: list[str] = []
+        # When each node was first seen not ready (#633). Kept in the state
+        # row; a node with no stamp is stamped now, so a node already down
+        # when this shipped counts as recent for `outage_recent_hours`.
+        not_ready_since: dict = dict(prior.get("not_ready_since") or {})
         if workflow.patched(PATCH_CLUSTER_OUTAGE) and cur_nodes:
             nodes_not_ready = sorted(
                 name for name, status in cur_nodes.items() if status != "Ready" and name not in quiet
             )
-            outage_now = config.outage_min_nodes > 0 and len(nodes_not_ready) >= config.outage_min_nodes
+            counted = nodes_not_ready
+            if workflow.patched(PATCH_OUTAGE_RECENT):
+                now = workflow.now()
+                not_ready_since = {
+                    name: _since(not_ready_since.get(name), now).isoformat()
+                    for name, status in sorted(cur_nodes.items())
+                    if status != "Ready"
+                }
+                if config.outage_recent_hours > 0:
+                    cutoff = now - timedelta(hours=config.outage_recent_hours)
+                    counted = [n for n in nodes_not_ready if _since(not_ready_since[n], now) >= cutoff]
+            outage_now = config.outage_min_nodes > 0 and len(counted) >= config.outage_min_nodes
             if outage_now and not outage:
+                older = [n for n in nodes_not_ready if n not in counted]
                 alert = build_heartbeat_alert(
                     OUTAGE_ALERTNAME,
                     "",
                     cluster,
-                    f"Cluster outage: {len(nodes_not_ready)} nodes not ready",
-                    f"Heartbeat poll saw {len(nodes_not_ready)} of {len(cur_nodes)} swarm nodes "
-                    f"not ready at once: {', '.join(nodes_not_ready)}. Infra problems raised "
-                    "while this lasts are recorded without a task or a card; whatever is still "
-                    "broken when it ends gets them then.",
+                    f"Cluster outage: {len(counted)} nodes not ready",
+                    f"Heartbeat poll saw {len(counted)} of {len(cur_nodes)} swarm nodes "
+                    f"not ready at once: {', '.join(counted)}. "
+                    + (
+                        f"Not counted, not ready for over {config.outage_recent_hours}h: "
+                        f"{', '.join(older)}. "
+                        if older
+                        else ""
+                    )
+                    + "Infra problems raised while this lasts are recorded without a task or a "
+                    "card; whatever is still broken when it ends gets them then.",
                     escalate=True,
                     aegis_class=OUTAGE_CLASS,
                 )
@@ -499,13 +555,35 @@ class InfraHeartbeatFlow:
                 )
                 quiet_notified += 1
                 continue
+            # The services it explains (#633). Asked here, so the NodeDown is
+            # ingested with them before this tick's service alerts below.
+            services: list[str] = []
+            if workflow.patched(PATCH_NODE_SERVICES):
+                try:
+                    services = await workflow.execute_activity_method(
+                        HomelabActivities.node_services,
+                        args=[node],
+                        start_to_close_timeout=TIMEOUT_STANDARD,
+                        retry_policy=FAST,
+                    )
+                except Exception as exc:  # noqa: BLE001 — the NodeDown matters more
+                    workflow.logger.warning(
+                        "heartbeat_node_services_failed node=%s err=%s", node, error_text(exc)
+                    )
+            description = f"Heartbeat poll saw node {node} transition to Down."
+            if services:
+                description += (
+                    f" {len(services)} services had a task there: {', '.join(services)}. "
+                    "Their problems are recorded, not raised, while it is down."
+                )
             alert = build_heartbeat_alert(
                 "NodeDown",
                 node,
                 cluster,
                 f"Swarm node {node} down",
-                f"Heartbeat poll saw node {node} transition to Down.",
+                description,
                 escalate=True,
+                services=services,
             )
             if await self._spawn(alert):
                 spawned += 1
@@ -582,6 +660,7 @@ class InfraHeartbeatFlow:
                     "ingress_failing": ingress_failing,
                     "ingress_fails": ingress_fails,
                     "outage": outage,
+                    "not_ready_since": not_ready_since,
                 }
             ],
             start_to_close_timeout=TIMEOUT_FAST,
@@ -607,4 +686,5 @@ class InfraHeartbeatFlow:
             "deploys_cleared": deploys_cleared,
             "outage": outage,
             "nodes_not_ready": len(nodes_not_ready),
+            "nodes_counted": len(counted),
         }

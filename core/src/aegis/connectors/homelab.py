@@ -131,6 +131,33 @@ class HomelabConnector:
             )
         return envelope(True, data=tasks)
 
+    async def node_ps(self, node: str) -> dict:
+        """Return the tasks the swarm placed on ``node``, history included.
+        Shape per item: {name, current_state, desired_state}. `name` is
+        `<service>.<slot>` for a replicated task and `<service>.<node id>` for
+        a global one. The managers answer it, so it works while the node is
+        down: a task it was running then still reads `Running …`."""
+        rc, out, err = await self._docker("node", "ps", node, "--format", "{{json .}}")
+        if rc != 0:
+            return envelope(False, error=f"docker node ps failed: {err[:200]}", retryable=True)
+        tasks = []
+        for line in out.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                t = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            tasks.append(
+                {
+                    "name": t.get("Name", ""),
+                    "current_state": t.get("CurrentState", ""),
+                    "desired_state": t.get("DesiredState", ""),
+                }
+            )
+        return envelope(True, data=tasks)
+
     async def list_nodes(self) -> dict:
         """Return swarm nodes. Shape per item:
         {hostname, status, availability, manager}. status is Ready|Down."""

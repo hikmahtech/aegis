@@ -129,7 +129,8 @@ QUESTION_CLASS = "question"
 # counting nodes that are not ready. It has no subject, so both producers land
 # on the one key `outage::`. While it is live the hub keeps a `service_state`
 # window (`*`/`*`, state `outage`) that records infra problems without raising
-# them; see `_sync_outage_window`.
+# them; see `_open_outage_window`. A live `nodedown` holds back its own
+# services the same way, one row per service (`_hold_services`, #633).
 OUTAGE_CLASS = "outage"
 # The `service_state.state` of that window.
 OUTAGE_STATE = "outage"
@@ -148,6 +149,14 @@ OUTAGE_SOURCES = frozenset(
 # A constant for the same reason as `REOPEN_WINDOW`: it describes what the end
 # of an outage looks like, not an operator preference.
 OUTAGE_TAIL = timedelta(minutes=10)
+# The longest the cluster-wide window stays up (#633), counted from when the
+# outage began, or began again after it had resolved. A later occurrence never
+# moves it. noon does not power on by itself, and wow was once off for five
+# days: a window as long as the outage held back every unrelated fault on the
+# healthy nodes for all that time. Once it passes, the sweep promotes what is
+# still broken while the outage problem stays open. A node that is still down
+# keeps holding back its own services (`_hold_services`), which is not capped.
+OUTAGE_MAX = timedelta(hours=6)
 SEVERITIES = frozenset({"critical", "error", "warning", "info"})
 # Problem statuses. `suppressed` = seen while its subject was deploying or in
 # maintenance, or during a cluster outage (see `service_state`); it is live,
@@ -690,18 +699,35 @@ async def ingest_event(
                 occurred_at=occurred_at,
             )
         if d.action == "resolve":
-            # A resolved problem's decision cards retire with it (#629).
+            # A resolved problem's decision cards retire with it (#629), and
+            # the windows it kept start their tail (#630, #633).
             await _retire_cards_quietly(conn, problem_id, now)
+            await _release_holds(conn, problem_id, now)
         stored_class = (
             _slug(event.klass) or "manual"
             if d.action in {"create", "rollover"}
             else str(current.get("class") or "")
         )
-        if stored_class == OUTAGE_CLASS:
-            if d.action == "resolve":
-                await _sync_outage_window(conn, live=False, problem_id=problem_id, now=now)
-            elif event.kind == "occurrence":
-                await _sync_outage_window(conn, live=True, problem_id=problem_id, now=now)
+        if event.kind == "occurrence" and stored_class == OUTAGE_CLASS:
+            await _open_outage_window(
+                conn,
+                problem_id=problem_id,
+                now=now,
+                # A new stretch of the outage starts its own window; a repeat
+                # occurrence never moves the end of the one it has.
+                began=occurred_at if d.action in {"create", "rollover", "reopen"} else None,
+            )
+        elif event.kind == "occurrence" and stored_class in _NODE_CLASSES:
+            # The heartbeat names the services that had a task on the node.
+            services = payload.get("services")
+            if isinstance(services, list) and services:
+                await _hold_services(
+                    conn,
+                    problem_id=problem_id,
+                    node=subject_slug,
+                    services=services,
+                    now=now,
+                )
 
     action = {
         "create": "created",
@@ -808,52 +834,202 @@ async def _retire_cards_quietly(conn: asyncpg.Connection, problem_id: str, now: 
         logger.info("hub_cards_retired", problem_id=problem_id, count=len(retired), reason="resolved")
 
 
-async def _sync_outage_window(
-    conn: asyncpg.Connection, *, live: bool, problem_id: str, now: datetime
+# The `service_state.set_by` of a row a live problem keeps (#630, #633). The
+# hub's own rows are found by it, so each problem ends exactly the rows it set.
+def _hold_owner(problem_id: str) -> str:
+    return f"hub:{problem_id}"
+
+
+# The guard every hold write shares: a hub row takes over an existing row only
+# when that row has expired, or is another hub row. An operator's window that
+# is still in force — a deploy, a planned power cut — is never overwritten,
+# and so never later shortened by the hub ending its own. A statement that
+# uses it must pass `OUTAGE_STATE` as `$1` and now as `$4`.
+_TAKE_OVER = (
+    "(service_state.until_at IS NOT NULL AND service_state.until_at <= $4) "
+    "OR (service_state.state = $1 AND service_state.set_by LIKE 'hub:%')"
+)
+
+
+async def _open_outage_window(
+    conn: asyncpg.Connection, *, problem_id: str, now: datetime, began: datetime | None
 ) -> None:
-    """Open or close the window a live outage problem keeps (#630).
+    """Open the window a live outage problem keeps (#630): the `*`/`*`
+    `service_state` row, state `outage`, ending `OUTAGE_MAX` after the outage
+    began (#633).
 
-    Open: the `*`/`*` `service_state` row, state `outage`, with no end. It
-    takes the place of an operator's row on that key only when that row has
-    already expired: a planned maintenance window already suppresses
-    everything, and the hub must not overwrite it and later delete it.
+    ``began`` is when this stretch of the outage started: its first
+    occurrence, or the occurrence that reopened it after it had resolved. A
+    reopen keeps `first_seen_at`, so counting from that alone would give a
+    second power cut on the same day no window at all. ``None`` is a repeat
+    occurrence of a live outage, which never moves the end of a window this
+    problem already holds; if it holds none, one opens that ends
+    `OUTAGE_MAX` after `first_seen_at`.
 
-    Close: the window gets an end `OUTAGE_TAIL` from now instead of going at
-    once, and only if it is still the hub's. Once that passes,
-    `promote_expired_suppressions` opens whatever is still broken, and the
-    sweep gives it its task and its investigation.
-
-    Savepoint, fail open: the outage event is recorded whatever happens here.
-    """
+    Once the end passes, `promote_expired_suppressions` opens what is still
+    broken while the outage problem stays open. Savepoint, fail open: the
+    outage event is recorded whatever happens here."""
+    # A new stretch replaces this problem's own window (a tail left by the
+    # resolve it came back from); a repeat occurrence leaves it alone.
+    restart = began is not None
     try:
         async with conn.transaction():
-            if live:
-                await conn.execute(
-                    "INSERT INTO service_state (subject, subject_kind, state, until_at, set_by, "
-                    "note, updated_at) VALUES ('*', '*', $1, NULL, $2, $3, $4) "
-                    "ON CONFLICT (subject, subject_kind) DO UPDATE SET state = EXCLUDED.state, "
-                    "until_at = NULL, set_by = EXCLUDED.set_by, note = EXCLUDED.note, "
-                    "updated_at = EXCLUDED.updated_at "
-                    "WHERE service_state.state = $1 "
-                    "   OR (service_state.until_at IS NOT NULL AND service_state.until_at <= $4)",
-                    OUTAGE_STATE,
-                    f"hub:{problem_id}",
-                    "Cluster outage: infra problems are recorded, not raised, until it ends.",
-                    now,
+            if began is None:
+                began = await conn.fetchval(
+                    "SELECT first_seen_at FROM problems WHERE id = $1::uuid", problem_id
                 )
-            else:
-                await conn.execute(
-                    "UPDATE service_state SET until_at = $2, updated_at = $3 "
-                    "WHERE subject = '*' AND subject_kind = '*' AND state = $1 "
-                    "  AND (until_at IS NULL OR until_at > $2)",
-                    OUTAGE_STATE,
-                    now + OUTAGE_TAIL,
-                    now,
-                )
+            end = _aware(began, now) + OUTAGE_MAX
+            if end <= now:
+                logger.info("hub_outage_window_capped", problem_id=problem_id, until=end.isoformat())
+                return
+            await conn.execute(
+                "INSERT INTO service_state (subject, subject_kind, state, until_at, set_by, "
+                "note, updated_at) VALUES ('*', '*', $1, $5, $2, $3, $4) "
+                "ON CONFLICT (subject, subject_kind) DO UPDATE SET state = EXCLUDED.state, "
+                "until_at = EXCLUDED.until_at, set_by = EXCLUDED.set_by, note = EXCLUDED.note, "
+                "updated_at = EXCLUDED.updated_at "
+                f"WHERE ({_TAKE_OVER}) AND ($6 OR service_state.set_by <> EXCLUDED.set_by)",
+                OUTAGE_STATE,
+                _hold_owner(problem_id),
+                "Cluster outage: infra problems are recorded, not raised, until it ends "
+                f"or for {int(OUTAGE_MAX.total_seconds() // 3600)} hours at most.",
+                now,
+                end,
+                restart,
+            )
     except Exception as exc:  # noqa: BLE001 — the outage event is recorded regardless
-        logger.warning("hub_outage_window_failed", live=live, error=error_text(exc))
+        logger.warning("hub_outage_window_failed", problem_id=problem_id, error=error_text(exc))
         return
-    logger.info("hub_outage_window", live=live, problem_id=problem_id)
+    logger.info("hub_outage_window", problem_id=problem_id)
+
+
+async def _hold_services(
+    conn: asyncpg.Connection,
+    *,
+    problem_id: str,
+    node: str,
+    services: list[str],
+    now: datetime,
+) -> None:
+    """Hold back the services a node that is down explains (#633).
+
+    One `service_state` row per service that had a task on the node when it
+    went down, state `outage`, with no end: `(<service>, service)`, set by
+    this problem. `_active_suppression` matches it exactly, so a
+    `DockerServiceDown`, `ServiceDownProlonged` or crash-loop problem for one
+    of them — from alertmanager or the heartbeat, both keyed on the swarm
+    service name — is recorded as `suppressed`, and a service on another node
+    is not held at all. lam alone carries about 30 pinned services.
+
+    A row is taken over only as `_TAKE_OVER` allows. A service another live
+    node problem already holds (its row has no end) stays with that one.
+
+    Not capped like the cluster window: a node that is still down still
+    explains its own services. The rows end when the problem resolves
+    (`_release_holds`). Savepoint, fail open."""
+    subjects = sorted({s for s in (_slug(str(x)) for x in services) if s})
+    if not subjects:
+        return
+    try:
+        async with conn.transaction():
+            await conn.execute(
+                "INSERT INTO service_state (subject, subject_kind, state, until_at, set_by, "
+                "note, updated_at) "
+                "SELECT s, 'service', $1, NULL, $2, $3, $4 FROM unnest($5::text[]) AS s "
+                "ON CONFLICT (subject, subject_kind) DO UPDATE SET state = EXCLUDED.state, "
+                "until_at = NULL, set_by = EXCLUDED.set_by, note = EXCLUDED.note, "
+                "updated_at = EXCLUDED.updated_at "
+                f"WHERE ({_TAKE_OVER}) AND service_state.until_at IS NOT NULL",
+                OUTAGE_STATE,
+                _hold_owner(problem_id),
+                f"Node {node or '?'} is down: problems on its services are recorded, "
+                "not raised, until it is back.",
+                now,
+                subjects,
+            )
+    except Exception as exc:  # noqa: BLE001 — the node event is recorded regardless
+        logger.warning("hub_node_hold_failed", problem_id=problem_id, error=error_text(exc))
+        return
+    logger.info("hub_node_hold", problem_id=problem_id, node=node, services=len(subjects))
+
+
+async def _release_holds(conn: asyncpg.Connection, problem_id: str, now: datetime) -> None:
+    """End the rows a resolving problem set (#630, #633): each gets an end
+    `OUTAGE_TAIL` from now instead of going at once, and none is lengthened.
+    Services on the returning nodes take a few minutes to converge; once the
+    tail passes, `promote_expired_suppressions` opens whatever is still broken
+    and the sweep gives it its task and its investigation.
+
+    Only the rows this problem set: an operator's window, or a row another
+    live problem took over, is left as it is. Savepoint, fail open."""
+    try:
+        async with conn.transaction():
+            await conn.execute(
+                "UPDATE service_state SET until_at = $3, updated_at = $4 "
+                "WHERE set_by = $1 AND state = $2 AND (until_at IS NULL OR until_at > $3)",
+                _hold_owner(problem_id),
+                OUTAGE_STATE,
+                now + OUTAGE_TAIL,
+                now,
+            )
+    except Exception as exc:  # noqa: BLE001 — the resolve is recorded regardless
+        logger.warning("hub_release_holds_failed", problem_id=problem_id, error=error_text(exc))
+
+
+async def _resume_holds(conn: asyncpg.Connection, problem_id: str, now: datetime) -> None:
+    """A node problem reopened by hand holds its services again: the rows it
+    set, still its own, lose the end `_release_holds` gave them. Savepoint,
+    fail open."""
+    try:
+        async with conn.transaction():
+            await conn.execute(
+                "UPDATE service_state SET until_at = NULL, updated_at = $3 "
+                "WHERE set_by = $1 AND state = $2 AND subject <> '*'",
+                _hold_owner(problem_id),
+                OUTAGE_STATE,
+                now,
+            )
+    except Exception as exc:  # noqa: BLE001 — the reopen is recorded regardless
+        logger.warning("hub_resume_holds_failed", problem_id=problem_id, error=error_text(exc))
+
+
+async def _reap_holds(conn: asyncpg.Connection, now: datetime) -> None:
+    """The sweep's safety net for the hub's own rows, run before promotion.
+
+    * A row whose problem is no longer live gets its tail. A resolve ends its
+      rows in the same transaction, but a problem can also leave by a merge,
+      a close, or a resolve whose release failed, and an open-ended row
+      nobody ends would hold its services back for ever.
+    * A cluster window from before `OUTAGE_MAX` existed has no end: it gets
+      the one it would have had, `first_seen_at + OUTAGE_MAX`.
+
+    Savepoint, fail open: promotion runs either way."""
+    try:
+        async with conn.transaction():
+            await conn.execute(
+                "UPDATE service_state s SET until_at = $2, updated_at = $3 "
+                "WHERE s.state = $1 AND s.set_by LIKE 'hub:%' "
+                "  AND (s.until_at IS NULL OR s.until_at > $2) "
+                "  AND NOT EXISTS (SELECT 1 FROM problems p WHERE 'hub:' || p.id::text = s.set_by "
+                "                  AND p.closed_at IS NULL AND p.status = ANY($4::text[]))",
+                OUTAGE_STATE,
+                now + OUTAGE_TAIL,
+                now,
+                sorted(LIVE_STATUSES),
+            )
+            await conn.execute(
+                "UPDATE service_state s SET until_at = p.first_seen_at + $2::interval, "
+                "updated_at = $3 FROM problems p "
+                "WHERE s.subject = '*' AND s.subject_kind = '*' AND s.state = $1 "
+                "  AND s.until_at IS NULL AND s.set_by = 'hub:' || p.id::text "
+                "  AND p.class = $4",
+                OUTAGE_STATE,
+                OUTAGE_MAX,
+                now,
+                OUTAGE_CLASS,
+            )
+    except Exception as exc:  # noqa: BLE001 — promotion matters more
+        logger.warning("hub_reap_holds_failed", error=error_text(exc))
 
 
 async def set_service_state(
@@ -992,10 +1168,12 @@ async def promote_expired_suppressions(
     pool: asyncpg.Pool, *, now: datetime | None = None
 ) -> list[str]:
     """Every `suppressed` problem whose window has passed becomes `open`: the
-    deploy or maintenance did not make it go away. Returns the promoted ids."""
+    deploy, maintenance or outage did not make it go away. Returns the
+    promoted ids. The hub's own windows are tidied first (`_reap_holds`)."""
     now = now or _utcnow()
     promoted: list[str] = []
     async with pool.acquire() as conn, conn.transaction():
+        await _reap_holds(conn, now)
         # The source of the first occurrence, because an `outage` window holds
         # only some sources back (`_active_suppression`), so "is its window
         # still in force" depends on who raised it.
@@ -1120,12 +1298,16 @@ async def set_status(
             occurred_at=now,
         )
         if status == "resolved":
-            # Every way a problem resolves retires its cards (#629): this is
-            # the Problems page, a fix that held, a completed task, and an
-            # investigation's own verdict.
+            # Every way a problem resolves retires its cards (#629) and ends
+            # the windows it kept (#630, #633): this is the Problems page, a
+            # fix that held, a completed task, and an investigation's own
+            # verdict.
             await _retire_cards_quietly(conn, problem_id, now)
-        if row["class"] == OUTAGE_CLASS and (status == "resolved" or reopening):
-            await _sync_outage_window(conn, live=reopening, problem_id=problem_id, now=now)
+            await _release_holds(conn, problem_id, now)
+        elif reopening and row["class"] == OUTAGE_CLASS:
+            await _open_outage_window(conn, problem_id=problem_id, now=now, began=now)
+        elif reopening and row["class"] in _NODE_CLASSES:
+            await _resume_holds(conn, problem_id, now)
     logger.info("hub_status_set", problem_id=problem_id, status=status, reason=reason[:80])
     return True
 
@@ -1219,8 +1401,17 @@ def event_from_alert(
                 subject = m.group(2).strip()
                 subject_kind = "node" if klass.lower() in _NODE_CLASSES else "service"
     if not subject:
-        node = str(labels.get("node") or labels.get("nodename") or "").strip()
-        if node and (klass.lower() in _NODE_CLASSES or not alert.get("service")):
+        # `hostname` is what Prometheus' node rules carry (#633): the swarm
+        # exporter's `SwarmNodeNotReady` (with `aegis_class: NodeDown`) and
+        # node-exporter's `NodeDown`. It is the `docker node ls` hostname, the
+        # heartbeat's own NodeDown subject, so all three meet on one
+        # `nodedown:node:<host>` problem. Another class keeps its old key: a
+        # CPU or disk alert has an instance, and re-keying it would split its
+        # live problem in two.
+        node = str(
+            labels.get("node") or labels.get("nodename") or labels.get("hostname") or ""
+        ).strip()
+        if node and (_slug(klass) in _NODE_CLASSES or not alert.get("service")):
             subject, subject_kind = node, "node"
         else:
             subject = str(alert.get("service") or "").strip()
@@ -1255,6 +1446,17 @@ def event_from_alert(
     external_id = f"{fingerprint or _slug(str(alert.get('title') or 'alert'))}@{occurrence_key or stamp}"
     if resolved:
         external_id += "@resolved"
+    payload: dict[str, Any] = {
+        "fingerprint": fingerprint,
+        "labels": labels,
+        "description": str(alert.get("description") or "")[:2000],
+    }
+    services = alert.get("services")
+    if isinstance(services, list) and services:
+        # The swarm services that had a task on a node that went down: the
+        # heartbeat's NodeDown carries them, and the hub holds them back
+        # while the node is down (`_hold_services`, #633).
+        payload["services"] = sorted({str(s).strip() for s in services if str(s).strip()})
     return Event(
         source=source,
         external_id=external_id,
@@ -1264,11 +1466,7 @@ def event_from_alert(
         subject_kind=subject_kind,
         klass=klass,
         severity=str(alert.get("severity") or "warning"),
-        payload={
-            "fingerprint": fingerprint,
-            "labels": labels,
-            "description": str(alert.get("description") or "")[:2000],
-        },
+        payload=payload,
         occurred_at=occurred_at,
     )
 
