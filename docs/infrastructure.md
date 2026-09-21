@@ -2233,9 +2233,11 @@ capability's holder.
 
 Where the notes go and what an entry looks like is the **vault layout**, a
 settings row (`vault_layout`) edited on the admin **Vault** page. The shipped
-defaults are one vault's conventions (the ones the lane was written against),
-so a deployment with no row behaves exactly as before. The paths below are
-those defaults.
+defaults are one vault's conventions (the ones the lane was written against)
+except the tag, which was `#raphael` and is now `#aegis/{agent}`, so a
+deployment with no row behaves as before apart from the tag on new blocks —
+old blocks keep theirs and still read, because every reader finds a block by
+its marker. The paths below are those defaults.
 
 - **Reads:** `NotesSyncFlow` (`notes-sync-hourly`, minute :19) pulls the vault
   and indexes every changed `.md` note as `source_type='note'`, skipping the

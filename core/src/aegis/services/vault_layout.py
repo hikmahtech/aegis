@@ -2,9 +2,12 @@
 
 DB-owned, so a fork ships nobody's folder names. Stored in the ``settings``
 table under ``vault_layout``; the code defaults are one particular vault's
-conventions (the ones AEGIS was first written against), so a deployment with
-no row behaves exactly as before. Edited on the admin **Vault** page through
-``GET/PUT /api/admin/notes/layout`` (``routes/notes_admin.py``).
+conventions (the ones AEGIS was first written against) except the tag, which
+was ``#raphael`` and is now ``#aegis/{agent}``, so a deployment with no row
+behaves as before apart from the tag on new blocks — old blocks keep theirs
+and still read, because every reader finds a block by its marker. Edited on the
+admin **Vault** page through ``GET/PUT /api/admin/notes/layout``
+(``routes/notes_admin.py``).
 
 What is configurable here: the agent's own folder, the journal's folders, file
 names (moment.js formats, as Obsidian's periodic-notes settings use), templates,
