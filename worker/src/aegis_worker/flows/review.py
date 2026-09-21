@@ -9,13 +9,17 @@ See docs/superpowers/specs/2026-05-20-gtd-todoist-phase5-reviews-design.md.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date, timedelta
 
 from temporalio import workflow
 from temporalio.exceptions import ApplicationError
 
 with workflow.unsafe.imports_passed_through():
     from aegis.errors import error_text, logged_failure
+    from aegis.services.notes_write import NOTES_WRITE_TIMEOUT_S
+    from aegis.services.vault_layout import week_bounds
 
+    from aegis_worker.activities.daylog import DayLogActivities
     from aegis_worker.activities.delivery import DeliveryActivities
     from aegis_worker.activities.review import (
         ReviewActivities,
@@ -26,7 +30,15 @@ with workflow.unsafe.imports_passed_through():
         format_weekly_preview,
     )
     from aegis_worker.flows.interaction import InteractionFlow, InteractionFlowInput
-    from aegis_worker.shared.retry import NO_RETRY, TIMEOUT_FAST, TIMEOUT_LLM
+    from aegis_worker.shared.retry import NO_RETRY, RETRY_ONCE, TIMEOUT_FAST, TIMEOUT_LLM
+
+_JOURNAL_TIMEOUT = timedelta(seconds=NOTES_WRITE_TIMEOUT_S)
+
+# Live patch. The weekly review takes minutes and runs once a week, so a
+# deploy can land mid-run; a run already in flight has none of the vault step
+# in its history, so `patched` answers False on its replay and it finishes as
+# recorded, reporting `skipped`. The next Sunday takes the step.
+PATCH_FILE_IN_VAULT = "weekly-review-file-in-vault"
 
 
 @dataclass
@@ -176,11 +188,57 @@ async def _spawn_decision_card(
 
 @workflow.defn(name="WeeklyReviewFlow")
 class WeeklyReviewFlow:
+    async def _file_in_vault(self, agent_id: str, narrative: str) -> str:
+        """File the review in the vault's note for the week it covers, and say
+        what happened: written / exists / not_configured / disabled / error.
+
+        Best-effort by design — the user already has the review in Slack, so a
+        vault problem is reported, never raised. The week is the one the run's
+        LOCAL date sits in (the daylog's own clock and week-rule activities), so
+        the block lands in the same note the daylog's weekly rollup writes."""
+        try:
+            clock = await workflow.execute_activity_method(
+                DayLogActivities.daylog_local_day,
+                args=[workflow.now().isoformat()],
+                start_to_close_timeout=TIMEOUT_FAST,
+                retry_policy=RETRY_ONCE,
+            )
+            rule = await workflow.execute_activity_method(
+                DayLogActivities.vault_week_rule,
+                start_to_close_timeout=TIMEOUT_FAST,
+                retry_policy=RETRY_ONCE,
+            )
+            start, _end, label = week_bounds(
+                date.fromisoformat(str((clock or {}).get("date") or "")),
+                str((rule or {}).get("week_start") or "monday"),
+                str((rule or {}).get("week_numbering") or "iso"),
+            )
+            res = await workflow.execute_activity(
+                "notes_journal_write",
+                {
+                    "kind": "weekly",
+                    "day": start.isoformat(),
+                    "label": label,
+                    "text": narrative,
+                    "agent_id": agent_id,
+                    "slot": "review",
+                },
+                start_to_close_timeout=_JOURNAL_TIMEOUT,
+                retry_policy=RETRY_ONCE,
+            )
+            return str((res or {}).get("status") or "error")
+        except Exception as exc:  # noqa: BLE001 — the review is already sent
+            workflow.logger.warning("weekly_review_vault_failed err=%s", error_text(exc))
+            return "error"
+
     @workflow.run
     async def run(self, config: WeeklyReviewConfig) -> dict:
         workflow.logger.info("weekly_review_flow_starting")
         step = "gather_weekly_state"
         spawned = 0
+        # `skipped` is what a run in flight across the deploy reports: the step
+        # is not in its history, so it never runs (`PATCH_FILE_IN_VAULT`).
+        vault = "skipped"
         try:
             snapshot = await workflow.execute_activity_method(
                 ReviewActivities.gather_weekly_state,
@@ -255,6 +313,9 @@ class WeeklyReviewFlow:
                     start_to_close_timeout=TIMEOUT_FAST,
                     retry_policy=NO_RETRY,
                 )
+            step = "file_review_in_vault"
+            if workflow.patched(PATCH_FILE_IN_VAULT):
+                vault = await self._file_in_vault(config.agent_id, narrative)
             step = "spawn_decisions"
             for i, decision in enumerate(decisions):
                 if await _spawn_decision_card(
@@ -275,4 +336,9 @@ class WeeklyReviewFlow:
                 f"weekly_review_failed at step={step}: {exc!r}",
                 non_retryable=True,
             ) from exc
-        return {"kind": "weekly", "counts": snapshot, "decisions": spawned}
+        return {
+            "kind": "weekly",
+            "counts": snapshot,
+            "decisions": spawned,
+            "vault": vault,
+        }
