@@ -438,9 +438,13 @@ def test_books_write_flow_is_gated_on_money_hygiene():
         # on CaptureActivities and `upsert_resources_batch` on
         # InventoryActivities, neither of which any flow ever called. Both
         # classes are unflagged, so all three rows move by -2.
-        (True, True, 51, 250),
-        (False, False, 40, 215),
-        (True, False, 44, 232),
+        # Then +2 activities and NO new flow from #629/#630: `retire_cards`
+        # and `promoted_investigations` on the existing HubActivities, the
+        # decision-card retirement and the investigation a window held back.
+        # Unflagged, so all three rows move.
+        (True, True, 51, 252),
+        (False, False, 40, 217),
+        (True, False, 44, 234),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):

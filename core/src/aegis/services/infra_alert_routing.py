@@ -60,6 +60,9 @@ DEFAULT_INFRA_ALERTNAMES: frozenset[str] = frozenset(
         "dockerservicedown",
         "servicedownprolonged",
         "heartbeatcollectfailed",
+        # Several nodes down at once (#630): the heartbeat raises it, and a
+        # Prometheus rule of the same name can too. Its problem is `outage`.
+        "clusteroutage",
         # The way in to AEGIS stopped answering from outside (#492). Infra by
         # definition: it is the proxy or the route, never application code.
         "ingressunreachable",

@@ -182,6 +182,8 @@ async def main():
         # The grouping judge reads a dozen alert titles and answers yes or no;
         # the balanced tier is sized for exactly that.
         model=model_balanced,
+        # Signals a retired decision card's waiting flow so its run ends (#629).
+        temporal_client=client,
     )
     alert_governance_act = AlertGovernanceActivities(
         db_pool=deps.pool,

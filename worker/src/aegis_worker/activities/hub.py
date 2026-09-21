@@ -14,14 +14,16 @@ start a child workflow.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import asyncpg
 import httpx
 from aegis.errors import error_text, logged_failure
-from aegis.services import hub, hub_fix, hub_group, hub_project, hub_watch
+from aegis.services import hub, hub_cards, hub_fix, hub_group, hub_project, hub_watch
 from temporalio import activity
+from temporalio.service import RPCError, RPCStatusCode
 
 from aegis_worker.activities.delivery import safe_send_message
 
@@ -34,6 +36,9 @@ _GROUP_PROMPT_CAP = 12
 # minutes and a monitoring stack that cannot answer in this long is one the
 # reconciliation must decline to act on anyway.
 _ALERTMANAGER_TIMEOUT_S = 8.0
+# The producers that start an investigation for a problem they raise, so a
+# problem of theirs a window held back gets one when the window ends (#630).
+_INVESTIGATED_ON_PROMOTE = frozenset({"alertmanager", "heartbeat"})
 
 
 def _uptime_since(raw: str, now: datetime) -> timedelta | None:
@@ -64,6 +69,7 @@ class HubActivities:
         llm_client: Any = None,
         model: str = "",
         delivery: Any = None,
+        temporal_client: Any = None,
     ) -> None:
         self.db_pool = db_pool
         # Only the grouping judge needs a model. Everything else here is SQL,
@@ -72,6 +78,10 @@ class HubActivities:
         self.llm_client = llm_client
         self.model = model
         self.delivery = delivery
+        # Only `retire_cards` needs it: it signals a retired card's waiting
+        # `InteractionFlow`, which may belong to any run. Without one the card
+        # is still retired and edited, and its run waits out its own timeout.
+        self.temporal_client = temporal_client
 
     async def _infra_agent(self) -> str:
         """The `infra` holder, who judges and announces a group — never an
@@ -508,6 +518,150 @@ class HubActivities:
             return {"promoted": 0, "problem_ids": []}
         ids = await hub.promote_expired_suppressions(self.db_pool)
         return {"promoted": len(ids), "problem_ids": ids}
+
+    @activity.defn
+    async def promoted_investigations(self, problem_ids: list[str]) -> list[dict]:
+        """The alert to investigate each just-promoted problem with (#630).
+
+        A window held these problems back, so they got no investigation when
+        they appeared, and nothing else will start one: alertmanager re-sends
+        a firing alert under the same occurrence id, and the heartbeat emits
+        only on a change. Only the producers that start an investigation for a
+        new problem qualify (alertmanager and the heartbeat), and only a
+        problem still `open` — one that resolved during the window needs
+        nothing. The alert is rebuilt from the problem and its last
+        occurrence, and carries `problem_id`, so the flow skips ingest."""
+        if self.db_pool is None or not problem_ids:
+            return []
+        rows = await self.db_pool.fetch(
+            "SELECT p.id::text AS id, p.title, p.severity, p.subject, p.subject_kind, "
+            "       p.status, p.todoist_task_id, "
+            "  (SELECT e.source FROM problem_events e WHERE e.problem_id = p.id "
+            "     AND e.kind = 'occurrence' ORDER BY e.id LIMIT 1) AS source, "
+            "  (SELECT e.payload FROM problem_events e WHERE e.problem_id = p.id "
+            "     AND e.kind = 'occurrence' ORDER BY e.id DESC LIMIT 1) AS payload "
+            "FROM problems p WHERE p.id = ANY($1::uuid[]) ORDER BY p.first_seen_at",
+            list(problem_ids),
+        )
+        out: list[dict] = []
+        for r in rows:
+            if r["status"] != "open" or r["source"] not in _INVESTIGATED_ON_PROMOTE:
+                continue
+            payload = r["payload"] if isinstance(r["payload"], dict) else {}
+            labels = payload.get("labels") if isinstance(payload.get("labels"), dict) else {}
+            service = r["subject"] if r["subject_kind"] == "service" else ""
+            out.append(
+                {
+                    "title": r["title"],
+                    "fingerprint": str(payload.get("fingerprint") or ""),
+                    "severity": r["severity"],
+                    # The spelling the producers use; `hub.event_from_alert`
+                    # maps it back to `heartbeat`.
+                    "source": "aegis-heartbeat" if r["source"] == "heartbeat" else r["source"],
+                    "service": service,
+                    "description": str(payload.get("description") or ""),
+                    "labels": labels,
+                    "escalate": False,
+                    "problem_id": r["id"],
+                    "todoist_task_id": r["todoist_task_id"],
+                }
+            )
+        return out
+
+    @activity.defn
+    async def retire_cards(self, inp: dict) -> dict:
+        """Retire stale decision cards and finish the ones already retired
+        (#629, `aegis.services.hub_cards`).
+
+        `inp` may name a `problem_id` and a `reason`: the investigation flow
+        passes `superseded` for the problem it is about to post a newer card
+        for, with `exclude_run` set to its own run. Every card retired so far
+        — here, or by a resolve inside the hub — is then finished: its Slack
+        message edited to say why, and its waiting `InteractionFlow` signalled
+        so the old run ends now. The sweep calls it with no problem, which
+        finishes every retired card still waiting.
+
+        Safe to retry: retiring only moves `pending` rows, and a finished card
+        is not touched again."""
+        if self.db_pool is None:
+            return {"retired": 0, "finished": 0, "waiting": 0}
+        problem_id = str(inp.get("problem_id") or "")
+        reason = str(inp.get("reason") or "")
+        retired: list[dict] = []
+        if problem_id and reason:
+            retired = await hub_cards.retire(
+                self.db_pool,
+                problem_id,
+                reason=reason,
+                exclude_run=str(inp.get("exclude_run") or ""),
+            )
+        rows = await hub_cards.unfinished(self.db_pool, problem_id=problem_id)
+        finished = 0
+        for row in rows:
+            why = row["reason"] if row["reason"] in hub_cards.REASONS else hub_cards.SUPERSEDED
+            edited = await self._edit_retired_card(row, why)
+            signalled = await self._end_card_flow(row, why)
+            if await hub_cards.finish(self.db_pool, row["id"], edited=edited, signalled=signalled):
+                finished += 1
+        if retired or rows:
+            activity.logger.info(
+                "hub_cards_retire problem=%s retired=%d finished=%d",
+                problem_id or "*",
+                len(retired),
+                finished,
+            )
+        return {"retired": len(retired), "finished": finished, "waiting": len(rows) - finished}
+
+    async def _edit_retired_card(self, row: dict, reason: str) -> bool:
+        ref = row.get("delivery_ref")
+        if isinstance(ref, str):
+            try:
+                ref = json.loads(ref)
+            except ValueError:
+                ref = None
+        if self.delivery is None:
+            return not (isinstance(ref, dict) and ref.get("adapter") == "slack")
+        try:
+            result = await self.delivery.edit_card(
+                ref if isinstance(ref, dict) else None,
+                hub_cards.edit_text(reason, str(row.get("prompt") or "")),
+            )
+        except Exception as exc:  # noqa: BLE001 — the next sweep tries again
+            activity.logger.warning("hub_card_edit_failed id=%s err=%s", row["id"], error_text(exc))
+            return False
+        ok = isinstance(result, dict) and bool(result.get("ok"))
+        if not ok:
+            activity.logger.warning(
+                "hub_card_edit_failed id=%s err=%s", row["id"], str((result or {}).get("error"))[:200]
+            )
+        return ok
+
+    async def _end_card_flow(self, row: dict, reason: str) -> bool:
+        """Signal the card's `InteractionFlow` with the answer that ends its
+        run. A problem retired as resolved that has come back since is told
+        `superseded` instead: `self_resolved` would make the old run record
+        the problem resolved again while it is live."""
+        if self.temporal_client is None:
+            return False
+        if reason == hub_cards.RESOLVED and row.get("problem_id"):
+            try:
+                p = await hub.get_problem(self.db_pool, row["problem_id"])
+            except Exception:  # noqa: BLE001 — unknown reads as "still resolved"
+                p = None
+            if p is not None and p["status"] not in {"resolved", "closed"}:
+                reason = hub_cards.SUPERSEDED
+        try:
+            handle = self.temporal_client.get_workflow_handle(row["flow_run_id"])
+            await handle.signal("submit_response", hub_cards.answer(reason))
+        except RPCError as exc:
+            if exc.status == RPCStatusCode.NOT_FOUND:
+                return True  # its run is already over: nothing waits on the card
+            activity.logger.warning("hub_card_signal_failed id=%s err=%s", row["id"], error_text(exc))
+            return False
+        except Exception as exc:  # noqa: BLE001 — the next sweep tries again
+            activity.logger.warning("hub_card_signal_failed id=%s err=%s", row["id"], error_text(exc))
+            return False
+        return True
 
     @activity.defn
     async def reconcile_completed_tasks(self) -> dict:

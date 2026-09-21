@@ -343,6 +343,23 @@ async def test_on_action_unknown_terminal_status_also_expires_card():
     assert "cancelled" in ekw["text"]
 
 
+async def test_on_action_on_a_retired_card_says_why_it_is_dead():
+    """#629: a card the hub retired (a newer card replaced it, or its problem
+    resolved) is refused by core with status `retired`. A tap that beats the
+    worker's own edit, or lands on an escalating card's reminder copy, must
+    say that — not claim the card timed out."""
+    inbound, core, adapter = _inbound()
+    core.resolve_interaction.return_value = {"status": "retired", "already_resolved": True}
+
+    await inbound.on_action(value="interaction:i7:run_fix", channel_id="CSEBAS", message_ts="8.8")
+
+    assert core.resolve_interaction.await_count == 1
+    adapter.edit_card.assert_awaited_once()
+    text = adapter.edit_card.await_args.kwargs["text"]
+    assert text.startswith("⏭ Retired")
+    assert "Nothing was done" in text and "Expired" not in text
+
+
 async def test_on_action_409_conflict_no_retry_posts_stale_feedback():
     """(b) a 409 base-drift conflict is a deterministic 4xx — retrying it
     can never succeed, so resolve is attempted exactly once. Feedback goes

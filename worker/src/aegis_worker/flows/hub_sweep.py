@@ -2,10 +2,13 @@
 
 Five things, in order:
 
-1. Open every `suppressed` problem whose deploy or maintenance window has
-   passed without a `resolved` event. The heartbeat only emits on transitions,
-   so a service that broke during a deploy and stayed broken would otherwise
-   surface only at the 24h re-investigation.
+1. Open every `suppressed` problem whose deploy, maintenance or outage
+   window has passed without a `resolved` event. The heartbeat only emits on
+   transitions, so a service that broke during a deploy and stayed broken
+   would otherwise surface only at the 24h re-investigation. One raised by
+   alertmanager or the heartbeat also gets the investigation the window held
+   back (#630): a cluster outage that ends leaves one card for each thing
+   still broken, instead of forty for everything that went down with it.
 2. Read completed tasks back: a live problem whose Todoist task a person
    completed resolves, and a task the hub closed before the problem came
    back is reopened. Nothing else reads a completion back, so without this
@@ -14,8 +17,11 @@ Five things, in order:
    PR merged — resolves once its alert has stayed clear for
    `fix_verify_hours`, and goes back to `open` when the alert comes back
    later than `fix_grace_hours` after the merge (`hub_fix.verify_fixes`).
-4. Project: bring each problem's Todoist task up to date with its events, and
-   create the task for anything promoted a moment ago.
+4. Retire decision cards (#629): a resolve anywhere in the hub already moved
+   its problem's pending cards out of `pending`; here each one's Slack message
+   is edited to say so and its waiting run is ended.
+   Then project: bring each problem's Todoist task up to date with its
+   events, and create the task for anything promoted a moment ago.
 5. Group: when several live problems share a class and a kind of subject, ask
    the model whether they are one condition, and fold them into a single
    problem when they are. Six posts wedged in one Postiz queue were six
@@ -34,9 +40,10 @@ from dataclasses import dataclass
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
-    from aegis.errors import logged_failure
+    from aegis.errors import error_text, logged_failure
 
     from aegis_worker.activities.hub import HubActivities
+    from aegis_worker.flows.alert_investigation import AlertInvestigationFlow
     from aegis_worker.shared.retry import (
         FAST,
         NO_RETRY,
@@ -62,6 +69,14 @@ PATCH_COMPLETED_TASKS = "hub-sweep-completed-tasks"
 PATCH_FIX_VERIFICATION = "hub-sweep-fix-verification"
 PATCH_ALERTMANAGER_RECONCILE = "hub-sweep-alertmanager-reconcile"
 
+# Live patches. A sweep in flight across the deploy has none of these steps in
+# its history, so `patched` answers False on its replay and it finishes as
+# recorded; the next tick takes them.
+# #630: a promoted problem gets the investigation its window held back.
+PATCH_PROMOTE_INVESTIGATES = "hub-sweep-promote-investigates"
+# #629: finish retired decision cards (edit the message, end the waiting run).
+PATCH_RETIRE_CARDS = "hub-sweep-retire-cards"
+
 @dataclass
 class HubSweepConfig:
     agent_id: str = "pandoras-actor"
@@ -85,6 +100,37 @@ class HubSweepConfig:
 
 @workflow.defn
 class HubSweepFlow:
+    async def _investigate_promoted(self, problem_ids: list[str]) -> int:
+        """Start an investigation for each promoted problem that should have
+        one. Returns how many started."""
+        alerts: list[dict] = []
+        with logged_failure("hub_sweep_promoted_lookup_failed", logger=workflow.logger):
+            alerts = await workflow.execute_activity_method(
+                HubActivities.promoted_investigations,
+                args=[problem_ids],
+                start_to_close_timeout=TIMEOUT_FAST,
+                retry_policy=FAST,
+            )
+        started = 0
+        stamp = workflow.now().strftime("%Y%m%d%H%M%S")
+        for alert in alerts:
+            # `investigate-<problem>-…`, the shape every hub investigation has,
+            # so clarify and the card retirement both recognise it.
+            child_id = f"investigate-{alert['problem_id']}-pr{stamp}"
+            try:
+                await workflow.start_child_workflow(
+                    AlertInvestigationFlow.run,
+                    alert,
+                    id=child_id,
+                    parent_close_policy=workflow.ParentClosePolicy.ABANDON,
+                )
+                started += 1
+            except Exception as exc:  # noqa: BLE001 — already started is benign
+                workflow.logger.warning(
+                    "hub_sweep_promote_spawn_skipped id=%s err=%s", child_id, error_text(exc)
+                )
+        return started
+
     @workflow.run
     async def run(self, config: HubSweepConfig) -> dict:
         promoted = await workflow.execute_activity_method(
@@ -92,6 +138,14 @@ class HubSweepFlow:
             start_to_close_timeout=TIMEOUT_FAST,
             retry_policy=FAST,
         )
+        # A promoted problem never had its investigation: the window held it
+        # back, and nothing else will start one (#630). Started ABANDONED, as
+        # the heartbeat starts its own: an investigation waits on a person and
+        # must outlive this tick. A failure here is logged, never raised —
+        # the problem is open and gets its task in this tick either way.
+        investigated = 0
+        if workflow.patched(PATCH_PROMOTE_INVESTIGATES) and promoted.get("problem_ids"):
+            investigated = await self._investigate_promoted(list(promoted["problem_ids"]))
         # Then read completions back: a task a person ticked off resolves its
         # problem, before projection, so the resolve reaches the task in this
         # tick. FAST retries are safe — nothing is touched twice.
@@ -134,6 +188,19 @@ class HubSweepFlow:
                 reconciled = await workflow.execute_activity_method(
                     HubActivities.reconcile_alertmanager,
                     args=[config.alertmanager_url, config.alertmanager_min_uptime_seconds],
+                    start_to_close_timeout=TIMEOUT_STANDARD,
+                    retry_policy=FAST,
+                )
+        # Then finish the decision cards a resolve retired (#629) — this tick's
+        # included, which is why it comes after every step that resolves. The
+        # hub already refuses their buttons; this edits each Slack message to
+        # say why and ends the run still waiting on it.
+        cards: dict = {}
+        if workflow.patched(PATCH_RETIRE_CARDS):
+            with logged_failure("hub_sweep_retire_cards_failed", logger=workflow.logger):
+                cards = await workflow.execute_activity_method(
+                    HubActivities.retire_cards,
+                    args=[{}],
                     start_to_close_timeout=TIMEOUT_STANDARD,
                     retry_policy=FAST,
                 )
@@ -182,6 +249,8 @@ class HubSweepFlow:
 
         return {
             "promoted": int(promoted.get("promoted") or 0),
+            "promoted_investigated": investigated,
+            "cards_finished": int(cards.get("finished") or 0),
             "task_completed": int(completed.get("resolved") or 0),
             "task_reopened": int(completed.get("tasks_reopened") or 0),
             "fix_resolved": int(verified.get("resolved") or 0),

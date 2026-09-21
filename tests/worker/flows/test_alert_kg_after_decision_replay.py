@@ -67,6 +67,8 @@ SCENARIOS = [
     "open_all_prs_none_opened",
     "discard",
     "self_resolved",
+    # A newer card retired this one (#629).
+    "superseded",
     "run_fix",
     "expired",
     "jira",

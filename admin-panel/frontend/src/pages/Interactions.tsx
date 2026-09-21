@@ -122,6 +122,7 @@ export default function Interactions() {
           <option value="pending">Pending</option>
           <option value="resolved">Resolved</option>
           <option value="archived">Archived</option>
+          <option value="retired">Retired</option>
           <option value="">All</option>
         </select>
         <input

@@ -47,6 +47,9 @@ class _State:
     card_status: str = "resolved"
     pr_url: str = "https://github.com/acme/shop/pull/7"
     staged: list[Any] = field(default_factory=list)
+    # Each `retire_cards` call, with how many cards and records had gone out
+    # when it came (#629).
+    retires: list[dict] = field(default_factory=list)
 
 
 S = _State()
@@ -282,7 +285,16 @@ async def stub_create_github_pr(inp: Any) -> dict:
     return {"pr_url": S.pr_url, "status": "opened", "error": ""}
 
 
+@activity.defn(name="retire_cards")
+async def stub_retire_cards(inp: dict) -> dict:
+    S.retires.append(
+        {**inp, "cards_before": len(S.cards), "records_before": len(S.records)}
+    )
+    return {"retired": 1, "finished": 1, "waiting": 0}
+
+
 STUBS = [
+    stub_retire_cards,
     stub_resolve_agents,
     stub_routing,
     stub_ingest_alert,

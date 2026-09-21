@@ -601,6 +601,9 @@ FLOWS: tuple[FlowSpec, ...] = (
             fail_threshold=_int(act["config"], "fail_threshold", 3),
             quiet_nodes=[str(n) for n in (act["config"].get("quiet_nodes") or [])],
             restuck_hours=_int(act["config"], "restuck_hours", 24),
+            outage_min_nodes=_int(
+                act["config"], "outage_min_nodes", InfraHeartbeatConfig.outage_min_nodes
+            ),
             ingress_url=str(act["config"].get("ingress_url") or "").strip(),
             ingress_fail_threshold=_int(
                 act["config"],
