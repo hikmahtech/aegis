@@ -43,8 +43,9 @@ with workflow.unsafe.imports_passed_through():
 @dataclass
 class SocialMetricsConfig:
     agent_id: str
-    #: Backward half of the Postiz `GET /posts` window, and the recency bound on
-    #: which outbox rows are refreshed.
+    #: How long a PUBLISHED row keeps refreshing (its analytics), and the least
+    #: the Postiz `GET /posts` window reaches back. A row Postiz has not yet
+    #: published refreshes whatever its age (#623).
     window_days: int = 14
     #: Forward half of that window. Was hardcoded at 1 day, which made every
     #: post scheduled further out than tomorrow read as `state: "unknown"`.
