@@ -10,14 +10,15 @@ import pytest
 from aegis_worker.activities.review import format_key_dates, format_meeting_week
 from aegis_worker.flows.interaction import InteractionFlow
 from aegis_worker.flows.review import (
+    PATCH_FILE_IN_VAULT,
     DailyReviewConfig,
     DailyReviewFlow,
     WeeklyReviewConfig,
     WeeklyReviewFlow,
 )
-from temporalio import activity
+from temporalio import activity, workflow
 from temporalio.testing import WorkflowEnvironment
-from temporalio.worker import Worker
+from temporalio.worker import Replayer, Worker
 
 
 @asynccontextmanager
@@ -160,6 +161,7 @@ async def test_daily_review_flow_sends_digest_and_logs() -> None:
 async def test_weekly_review_flow_sends_digest_and_logs() -> None:
     sent: list[str] = []
     logs: list[dict] = []
+    vault_seen: list[dict] = []
 
     @activity.defn(name="gather_weekly_state")
     async def gather_weekly_state():
@@ -220,6 +222,7 @@ async def test_weekly_review_flow_sends_digest_and_logs() -> None:
             apply_dec,
             check_key_dates,
             stub_gather_meeting_week,
+            *_vault_stubs(vault_seen),
         ],
     ) as client:
         result = await client.execute_workflow(
@@ -234,6 +237,7 @@ async def test_weekly_review_flow_sends_digest_and_logs() -> None:
         assert "Weekly review" in sent[0]
         assert logs[0]["kind"] == "weekly"
         assert result["decisions"] == 0
+        assert result["vault"] == "written"
         # Nothing upcoming ⇒ no people block bolted onto the narrative.
         assert "Coming up" not in sent[0]
 
@@ -437,6 +441,143 @@ def _weekly_stubs(sent: list[str], key_dates: list[dict] | None, *, fail: bool =
     ]
 
 
+def _vault_stubs(seen: list[dict], status: str = "written", *, boom: bool = False):
+    """The three activities the weekly review's vault step calls. `seen` records
+    the entry the flow built, which is where the week is proved."""
+
+    @activity.defn(name="daylog_local_day")
+    async def daylog_local_day(now_iso: str) -> dict:
+        # A fixed Sunday, so the week the flow derives is not the wall clock's.
+        return {"timezone": "Asia/Kolkata", "date": "2026-09-20"}
+
+    @activity.defn(name="vault_week_rule")
+    async def vault_week_rule() -> dict:
+        return {"week_start": "monday", "week_numbering": "iso"}
+
+    @activity.defn(name="notes_journal_write")
+    async def notes_journal_write(entry: dict) -> dict:
+        seen.append(entry)
+        if boom:
+            raise RuntimeError("the vault push was rejected")
+        return {"status": status, "path": "journal/2026/09. Sep/W38 Sep 26.md"}
+
+    return [daylog_local_day, vault_week_rule, notes_journal_write]
+
+
+@pytest.mark.asyncio
+async def test_weekly_review_files_the_week_that_is_ending_in_the_vault() -> None:
+    sent: list[str] = []
+    seen: list[dict] = []
+    async with (
+        await WorkflowEnvironment.start_time_skipping() as env,
+        Worker(
+            env.client,
+            task_queue="aegis-review-vault-test",
+            workflows=[WeeklyReviewFlow, InteractionFlow],
+            activities=[*_weekly_stubs(sent, None), *_vault_stubs(seen)],
+        ),
+    ):
+        result = await env.client.execute_workflow(
+            WeeklyReviewFlow.run,
+            WeeklyReviewConfig(),
+            id=f"weekly-vault-{uuid.uuid4()}",
+            task_queue="aegis-review-vault-test",
+        )
+    assert result["vault"] == "written"
+    assert len(sent) == 1 and seen == [
+        {
+            "kind": "weekly",
+            "day": "2026-09-14",
+            "label": "2026-W38",
+            "text": sent[0],
+            "agent_id": WeeklyReviewConfig().agent_id,
+            "slot": "review",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["exists", "not_configured", "disabled"])
+async def test_weekly_review_says_what_the_vault_did(status: str) -> None:
+    sent: list[str] = []
+    seen: list[dict] = []
+    async with (
+        await WorkflowEnvironment.start_time_skipping() as env,
+        Worker(
+            env.client,
+            task_queue=f"aegis-review-vault-{status}",
+            workflows=[WeeklyReviewFlow, InteractionFlow],
+            activities=[*_weekly_stubs(sent, None), *_vault_stubs(seen, status)],
+        ),
+    ):
+        result = await env.client.execute_workflow(
+            WeeklyReviewFlow.run,
+            WeeklyReviewConfig(),
+            id=f"weekly-vault-{status}-{uuid.uuid4()}",
+            task_queue=f"aegis-review-vault-{status}",
+        )
+    assert result["vault"] == status
+    assert len(sent) == 1, "the review ships whatever the vault says"
+
+
+@pytest.mark.asyncio
+async def test_weekly_review_ships_when_the_vault_write_fails() -> None:
+    sent: list[str] = []
+    seen: list[dict] = []
+    async with (
+        await WorkflowEnvironment.start_time_skipping() as env,
+        Worker(
+            env.client,
+            task_queue="aegis-review-vault-error",
+            workflows=[WeeklyReviewFlow, InteractionFlow],
+            activities=[*_weekly_stubs(sent, None), *_vault_stubs(seen, boom=True)],
+        ),
+    ):
+        result = await env.client.execute_workflow(
+            WeeklyReviewFlow.run,
+            WeeklyReviewConfig(),
+            id=f"weekly-vault-error-{uuid.uuid4()}",
+            task_queue="aegis-review-vault-error",
+        )
+    assert result["vault"] == "error" and result["kind"] == "weekly"
+    assert len(sent) == 1, "a vault error must not cost the user their review"
+
+
+@pytest.mark.asyncio
+async def test_a_weekly_review_in_flight_across_the_deploy_replays(monkeypatch) -> None:
+    """The review runs once a week and takes minutes, so a deploy can land
+    mid-run. The vault step is behind `workflow.patched`: a run whose history
+    has no marker skips it, says `skipped`, and still replays on the new code."""
+    real = workflow.patched
+    monkeypatch.setattr(
+        workflow, "patched", lambda pid: False if pid == PATCH_FILE_IN_VAULT else real(pid)
+    )
+    sent: list[str] = []
+    seen: list[dict] = []
+    async with (
+        await WorkflowEnvironment.start_time_skipping() as env,
+        Worker(
+            env.client,
+            task_queue="aegis-review-vault-replay",
+            workflows=[WeeklyReviewFlow, InteractionFlow],
+            activities=[*_weekly_stubs(sent, None), *_vault_stubs(seen)],
+        ) as worker,
+    ):
+        handle = await env.client.start_workflow(
+            WeeklyReviewFlow.run,
+            WeeklyReviewConfig(),
+            id=f"weekly-vault-replay-{uuid.uuid4()}",
+            task_queue=worker.task_queue,
+        )
+        result = await handle.result()
+        history = await handle.fetch_history()
+    monkeypatch.undo()
+    # The premise: this run really is the code from before the vault step.
+    assert seen == [] and result["vault"] == "skipped"
+    assert len(sent) == 1, "the review still ships"
+    await Replayer(workflows=[WeeklyReviewFlow]).replay_workflow(history)
+
+
 @pytest.mark.asyncio
 async def test_weekly_review_appends_upcoming_key_dates() -> None:
     sent: list[str] = []
@@ -456,7 +597,7 @@ async def test_weekly_review_appends_upcoming_key_dates() -> None:
             env.client,
             task_queue="aegis-review-keydates-test",
             workflows=[WeeklyReviewFlow, InteractionFlow],
-            activities=_weekly_stubs(sent, hits),
+            activities=[*_weekly_stubs(sent, hits), *_vault_stubs([])],
         ),
     ):
         await env.client.execute_workflow(
@@ -489,7 +630,7 @@ async def test_weekly_review_appends_meeting_block_when_present() -> None:
                 env.client,
                 task_queue="aegis-review-meetingweek-test",
                 workflows=[WeeklyReviewFlow, InteractionFlow],
-                activities=_weekly_stubs(sent, None),
+                activities=[*_weekly_stubs(sent, None), *_vault_stubs([])],
             ),
         ):
             await env.client.execute_workflow(
@@ -518,7 +659,7 @@ async def test_weekly_review_ships_when_key_dates_lookup_fails() -> None:
             env.client,
             task_queue="aegis-review-keydates-fail",
             workflows=[WeeklyReviewFlow, InteractionFlow],
-            activities=_weekly_stubs(sent, None, fail=True),
+            activities=[*_weekly_stubs(sent, None, fail=True), *_vault_stubs([])],
         ),
     ):
         result = await env.client.execute_workflow(
@@ -549,7 +690,7 @@ async def test_weekly_review_ships_when_the_meeting_formatter_raises() -> None:
                 env.client,
                 task_queue="aegis-review-meetingfmt-fail",
                 workflows=[WeeklyReviewFlow, InteractionFlow],
-                activities=_weekly_stubs(sent, None),
+                activities=[*_weekly_stubs(sent, None), *_vault_stubs([])],
             ),
         ):
             result = await env.client.execute_workflow(
@@ -638,7 +779,7 @@ async def test_weekly_review_ships_when_the_key_dates_formatter_raises(monkeypat
             env.client,
             task_queue="aegis-review-keydatesfmt-fail",
             workflows=[WeeklyReviewFlow, InteractionFlow],
-            activities=_weekly_stubs(sent, hits),
+            activities=[*_weekly_stubs(sent, hits), *_vault_stubs([])],
         ),
     ):
         result = await env.client.execute_workflow(

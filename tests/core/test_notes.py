@@ -241,6 +241,37 @@ def _journal_append(day: date, body: str = "Raphael's day.") -> notes.Append:
     return notes.journal_append("daily", day, day.isoformat(), body, datetime(2026, 9, 12, 21, 0))
 
 
+def test_a_slot_keys_the_block_on_itself_not_on_the_day_log():
+    assert notes.journal_key("weekly", "2026-W38") == "daylog:weekly:2026-W38"
+    assert notes.journal_key("weekly", "2026-W38", "review") == "review:2026-W38"
+    assert notes.journal_key("daily", "2026-09-20", "selfreport") == "selfreport:2026-09-20"
+
+
+def test_the_weekly_review_and_the_rollup_are_two_blocks_in_one_note():
+    when = datetime(2026, 9, 20, 9, 0)
+    note = "# W38 Sep 26\n## Review\n- the user wrote this\n"
+    review = notes.journal_append(
+        "weekly", date(2026, 9, 14), "2026-W38", "The week went well.", when, slot="review"
+    )
+    rollup = notes.journal_append("weekly", date(2026, 9, 14), "2026-W38", "Seven days.", when)
+    text = notes.append_text(notes.append_text(note, review), rollup)
+
+    assert "- #aegis weekly review %% aegis:review:2026-W38 %%" in text
+    # The rollup's reader still finds its own block, and does not read the review as it.
+    mine, _rest = notes.split_section(text, notes.journal_key("weekly", "2026-W38"))
+    assert mine == "Seven days."
+    theirs, _ = notes.split_section(text, "review:2026-W38")
+    assert theirs == "The week went well."
+    # Both sit in the Review section, after what was already there.
+    assert (
+        text.index("the user wrote this")
+        < text.index("weekly review")
+        < text.index("week in review")
+    )
+    # A second run writes nothing.
+    assert notes.append_text(text, review) is None
+
+
 @needs_git
 def test_a_new_journal_note_is_rendered_from_the_template_and_pushed(vault):
     res = notes.write_sync(vault["cfg"], [_journal_append(date(2026, 9, 13))], "journal")

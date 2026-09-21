@@ -13,7 +13,7 @@ from aegis.services.knowledge import _content_id_for
 from aegis_worker.activities.notes import INDEX_STATE_KEY, NotesActivities
 from temporalio.testing import ActivityEnvironment
 
-from tests.notes_vault import CIPHER, device_commit, make_vault, needs_git, remote_file
+from tests.notes_vault import CIPHER, device_commit, git, make_vault, needs_git, remote_file
 
 
 class _KS:
@@ -80,6 +80,30 @@ async def test_a_weekly_rollup_goes_to_the_vaults_weekly_note(vault):
     entry = {"kind": "weekly", "day": "2026-09-07", "label": "2026-W37", "text": "A week."}
     out = await ActivityEnvironment().run(acts.notes_journal_write, entry)
     assert out == {"status": "written", "path": "journal/2026/09. Sep/W37 Sep 26.md"}
+
+
+@needs_git
+async def test_a_review_block_goes_to_the_weekly_note_once(vault):
+    acts = NotesActivities(settings=vault["settings"])
+    entry = {
+        "kind": "weekly",
+        "day": "2026-09-14",
+        "label": "2026-W38",
+        "text": "Weekly review — five stale next actions.",
+        "slot": "review",
+    }
+    first = await ActivityEnvironment().run(acts.notes_journal_write, entry)
+    second = await ActivityEnvironment().run(acts.notes_journal_write, entry)
+    path = "journal/2026/09. Sep/W38 Sep 26.md"
+    assert first == {"status": "written", "path": path}
+    assert second == {"status": "exists", "path": path}
+    text = remote_file(vault, path)
+    assert notes.marker("review:2026-W38") in text
+    assert "weekly review" in text
+    assert text.count("five stale next actions") == 1
+    # The rollup's own marker is not in the note: the review did not take its place.
+    assert notes.marker(notes.journal_key("weekly", "2026-W38")) not in text
+    assert git("log", "-1", "--format=%s", cwd=vault["remote"]).strip().endswith("review 2026-W38")
 
 
 async def test_journal_write_when_the_vault_is_off():

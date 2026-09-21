@@ -37,6 +37,7 @@ const LANGUAGE_HELP: Record<string, string> = {
   rollup_header: 'First line of a rollup written without a model: {period}, {label}, {n}.',
   journal_title: 'How a journal note is titled inside a rollup. {day}.',
   also_in_note: 'Introduces what else the note held, after the agent\'s own block.',
+  review_label: 'The label on the weekly review block, filed in the week\'s note.',
 };
 
 function today(): string {

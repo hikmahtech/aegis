@@ -147,7 +147,8 @@ class NotesActivities:
 
         `entry`: `kind` (daily / weekly / monthly), `day` (the day; the
         week's first day; the month's first day), `label` (the daylog's own
-        label), `text` and, optionally, `agent_id` (the flow's owner).
+        label), `text` and, optionally, `agent_id` (the flow's owner) and
+        `slot` (what the block is, when it is not the day log — `review`).
         """
         cfg = self._cfg()
         if not cfg.configured:
@@ -155,6 +156,7 @@ class NotesActivities:
         layout = await self._layout()
         owner = await self._owner_id(str(entry.get("agent_id") or ""))
         author = await self._author(owner)
+        slot = str(entry.get("slot") or "")
         try:
             ap = notes.journal_append(
                 str(entry["kind"]),
@@ -164,9 +166,13 @@ class NotesActivities:
                 await user_now(self.db_pool),
                 layout,
                 agent=owner,
+                slot=slot,
             )
             res = await notes.write(
-                cfg, [ap], f"{author.prefix}: journal {entry['label']}", author=author
+                cfg,
+                [ap],
+                f"{author.prefix}: {slot or 'journal'} {entry['label']}",
+                author=author,
             )
         except notes.NotesDisabled:
             return {"status": "not_configured"}

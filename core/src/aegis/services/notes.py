@@ -1101,9 +1101,15 @@ def vault_changes_sync(
 # ------------------------------------------------------ what writes what
 
 
-def journal_key(kind: str, label: str) -> str:
+def journal_key(kind: str, label: str, slot: str = "") -> str:
     """The marker the daylog and the backfill share, so a backfilled day and a
-    live one are the same write and never appear twice."""
+    live one are the same write and never appear twice.
+
+    A `slot` names something else filed in the same note — the weekly review, a
+    self-report, the week's dues — and keys it on its own name, so it can never
+    collide with the daylog's block in that note."""
+    if slot:
+        return f"{slot}:{label}"
     return f"daylog:{label}" if kind == "daily" else f"daylog:{kind}:{label}"
 
 
@@ -1115,6 +1121,7 @@ def journal_append(
     now: datetime,
     layout: Layout = DEFAULT_LAYOUT,
     agent: str = "",
+    slot: str = "",
 ) -> Append:
     """The daylog's entry for one day, week or month.
 
@@ -1122,6 +1129,9 @@ def journal_append(
     day    the day; the week's first day; the month's first day
     label  the daylog's own label: `2026-09-12`, `2026-W37`, `2026-09`
     agent  the agent the entry is written by; its id fills the tag's `{agent}`
+    slot   what the block is, when it is not the day log: `review` files the
+           weekly review under `review:<label>`, labelled by the layout's
+           wording for that slot. Empty is the day log.
 
     Raises `JournalKindDisabled` when the layout has the kind switched off.
     """
@@ -1141,7 +1151,7 @@ def journal_append(
     )
     return Append(
         rel=rel,
-        key=journal_key(kind, label),
+        key=journal_key(kind, label, slot),
         body=body,
         template=kind,
         when=when,
@@ -1149,7 +1159,7 @@ def journal_append(
         alt_rel=alt,
         also_rels=also,
         section=k.sections,
-        label=k.label,
+        label=layout.label_for(slot, kind),
         agent=agent,
         layout=layout,
     )

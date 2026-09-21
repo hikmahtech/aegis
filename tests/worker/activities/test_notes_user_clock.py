@@ -40,9 +40,11 @@ async def test_the_journal_write_uses_the_users_clock(user_zone, tmp_path, monke
     seen: dict = {}
     real = notes.journal_append
 
-    def spy(kind, day, label, body, now, layout=None, agent=""):
+    # Everything but `now` is passed straight through, so a new argument on
+    # `journal_append` cannot break the one thing this test watches.
+    def spy(kind, day, label, body, now, *args, **kwargs):
         seen["now"] = now
-        return real(kind, day, label, body, now, layout, agent)
+        return real(kind, day, label, body, now, *args, **kwargs)
 
     monkeypatch.setattr(notes, "journal_append", spy)
     acts = NotesActivities(settings=vault["settings"], db_pool=user_zone)
