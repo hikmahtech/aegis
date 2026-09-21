@@ -1411,6 +1411,15 @@ async def _gather_knowledge_context(
         return (None, [])
 
 
+# How much of a thread the model sees (#638). Conversation turns and the
+# dispatches the user was shown in that thread are capped on their own, so a
+# burst of notices cannot crowd out the conversation, and a dispatch counts as
+# context only while it is recent.
+_HISTORY_TURNS = 20
+_HISTORY_DISPATCHES = 10
+_HISTORY_DISPATCH_HOURS = 24
+
+
 async def send_message(
     pool: asyncpg.Pool,
     llm_client: Any,
@@ -1471,18 +1480,41 @@ async def send_message(
     # accepts system/user/assistant/tool, so the synthetic prefix is the
     # mechanism that surfaces dispatches as assistant turns without
     # losing the "the user actually saw this" signal.
+    #
+    # Turns and dispatches are capped SEPARATELY (#638). An agent's channel
+    # carries far more notices than conversation — 16 PR/alert posts against
+    # 8 turns in one evening — so one shared LIMIT would let a busy hour of
+    # notices push the user's own last words out of the window. Dispatches
+    # are also bounded in time: a notice from last week is not context for
+    # "this is merged" tonight, while the conversation's last turns are.
     history_rows = await pool.fetch(
-        "SELECT role, content FROM chat_history "
-        "WHERE agent_id = $1 AND thread_id = $2 "
-        "ORDER BY created_at DESC LIMIT 20",
+        "SELECT role, content FROM ("
+        "  (SELECT role, content, created_at FROM chat_history"
+        "    WHERE agent_id = $1 AND thread_id = $2 AND role <> 'dispatch'"
+        "    ORDER BY created_at DESC LIMIT $3)"
+        "  UNION ALL"
+        "  (SELECT role, content, created_at FROM chat_history"
+        "    WHERE agent_id = $1 AND thread_id = $2 AND role = 'dispatch'"
+        "      AND created_at > now() - make_interval(hours => $5)"
+        "    ORDER BY created_at DESC LIMIT $4)"
+        ") h ORDER BY created_at DESC",
         agent_id,
         thread_id,
+        _HISTORY_TURNS,
+        _HISTORY_DISPATCHES,
+        _HISTORY_DISPATCH_HOURS,
     )
+    # An async reply reaches the user through comms, which logs it as a
+    # dispatch too — the same text as the assistant row send_message already
+    # saved. Show it once.
+    assistant_texts = {(r["content"] or "") for r in history_rows if r["role"] == "assistant"}
     history: list[dict[str, Any]] = []
     for r in reversed(history_rows):
         role = r["role"]
         content = r["content"] or ""
         if role == "dispatch":
+            if content in assistant_texts:
+                continue
             history.append(
                 {
                     "role": "assistant",

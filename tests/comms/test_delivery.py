@@ -65,6 +65,78 @@ async def test_log_dispatch_forwards_neutral_delivery_ref(monkeypatch):
     assert body["agent_id"] == "sebas"
     assert body["content"] == "hello"
     assert body["kind"] == "deliver"
+    # #638: the dispatch is filed under the thread the inbound handler uses for
+    # this channel and agent, so the chat loader can find it when the user
+    # replies. Before this it went under `system` and was never seen.
+    from aegis_comms.adapters.slack import slack_thread_id
+
+    assert body["thread_id"] == slack_thread_id("CSEBAS", "sebas") == "slack-CSEBAS-sebas"
+
+
+def _capture_dispatch(monkeypatch):
+    import aegis_comms.__main__ as bot_main
+
+    captured: dict = {}
+
+    class _FakeResp:
+        status_code = 200
+
+    class _FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, json=None, headers=None, auth=None):
+            captured["json"] = json
+            return _FakeResp()
+
+    monkeypatch.setattr(bot_main.httpx, "AsyncClient", _FakeClient)
+    return captured
+
+
+async def test_log_dispatch_system_event_stays_threadless(monkeypatch):
+    """A system event is posted as AEGIS, not as an agent, so it has no
+    conversation to join: thread_id is None and core files it under `system`."""
+    import aegis_comms.__main__ as bot_main
+    from aegis_comms.config import CommsSettings
+
+    settings = CommsSettings(_env_file=None, core_url="http://core.test", api_key="k", admin_username="")
+    captured = _capture_dispatch(monkeypatch)
+    await bot_main._log_dispatch(
+        settings,
+        agent_id="system",
+        content="worker restarted",
+        send_result={
+            "ok": True,
+            "delivery_ref": {"adapter": "slack", "channel": "CGENERAL", "ts": "1.1"},
+        },
+        kind="system_event",
+    )
+    assert captured["json"]["thread_id"] is None
+
+
+async def test_log_dispatch_without_channel_stays_threadless(monkeypatch):
+    """No channel in the ref (a non-Slack adapter, or a failed ref) means no
+    thread can be named; the row must still be logged, threadless."""
+    import aegis_comms.__main__ as bot_main
+    from aegis_comms.config import CommsSettings
+
+    settings = CommsSettings(_env_file=None, core_url="http://core.test", api_key="k", admin_username="")
+    captured = _capture_dispatch(monkeypatch)
+    await bot_main._log_dispatch(
+        settings,
+        agent_id="sebas",
+        content="hello",
+        send_result={"ok": True, "delivery_ref": {"adapter": "slack"}},
+        kind="deliver",
+    )
+    assert captured["json"]["thread_id"] is None
+    assert captured["json"]["content"] == "hello"
 
 
 def _thread_app(monkeypatch):

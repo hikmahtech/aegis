@@ -44,6 +44,18 @@ _DEFAULT_ICON = ":robot_face:"
 _DEFAULT_AGENT_TTL_S = 60.0
 
 
+def slack_thread_id(channel_id: str, agent_id: str) -> str:
+    """The chat_history thread id for a conversation with `agent_id` in `channel_id`.
+
+    The ONE definition. The inbound handler files the user's turns under it, and
+    `_log_dispatch` files every outbound message under the same id, so the chat
+    loader finds what the user was shown in the thread they reply in (#638).
+    Before that, dispatches were logged under `system` and the model never saw
+    the card or PR notice the user was answering.
+    """
+    return f"slack-{channel_id}-{agent_id}"
+
+
 def _split_message(text: str, limit: int = _SLACK_MAX_CHARS) -> list[str]:
     """Split on line boundaries where possible; hard-cut overlong lines."""
     if len(text) <= limit:

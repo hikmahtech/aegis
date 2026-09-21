@@ -404,3 +404,10 @@ same pipeline, add a content route with `alert_overrides`, e.g.
   flagged by the same flow.
 - Slack tokens/channel mapping are on the admin **Slack** page; per-agent channels
   come from `agents.slack_channel_id` (falls back to resolving `#aegis-<short>`).
+- "The agent does not know what it just posted": every outbound Slack message is
+  logged to `chat_history` as a `dispatch` row under the thread the user replies in,
+  `slack-<channel>-<agent>` (#638), and `send_message` folds the last 24 hours of them
+  into the model's context as `[Sent to you in chat]`. If the agent asks "which PR?"
+  two minutes after posting one, check that the new rows carry that thread id and not
+  `system`:
+  `SELECT thread_id, count(*) FROM chat_history WHERE role='dispatch' AND created_at > now() - interval '1 day' GROUP BY 1;`
