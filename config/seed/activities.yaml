@@ -590,6 +590,10 @@ activities:
     # config.restuck_hours: hours a service must sit confirmed-stuck before it
     # is re-investigated as ServiceDownProlonged, and the minimum gap between
     # two such re-investigations of the same service (default 24; 0 disables).
+    # config.outage_min_nodes: how many nodes not ready at once make a cluster
+    # outage (#630). One `outage` problem is raised and the hub holds back the
+    # other infra problems until it ends (default 2; quiet_nodes do not count;
+    # 0 disables).
     config: {}
     active: true
 

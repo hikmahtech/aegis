@@ -212,6 +212,13 @@ class DeleteRequest(BaseModel):
     delivery_ref: dict
 
 
+class EditRequest(BaseModel):
+    """Rewrite a posted card with its buttons removed (a retired card, #629)."""
+
+    delivery_ref: dict
+    text: str
+
+
 def create_delivery_app(adapter: SlackAdapter, settings: CommsSettings) -> FastAPI:
     """Create FastAPI app for delivery endpoint + health.
 
@@ -450,6 +457,19 @@ def create_delivery_app(adapter: SlackAdapter, settings: CommsSettings) -> FastA
             logger.warning("delete_dispatch_error", error=error_text(exc))
             ok = False
         return {"ok": bool(ok)}
+
+    @router.post("/api/comms/edit", dependencies=[Depends(require_api_key)])
+    async def edit_dispatch(req: EditRequest) -> dict[str, Any]:
+        """Rewrite a card the worker retired: new text, no buttons. Edited, not
+        deleted, so what the card proposed stays in the channel's history."""
+        try:
+            ref = DeliveryRef.from_dict(req.delivery_ref)
+            await adapter.edit_card(ref=ref, text=req.text)
+            ok = True
+        except Exception as exc:
+            logger.warning("edit_dispatch_error", error=error_text(exc))
+            ok = False
+        return {"ok": ok}
 
     app.include_router(router)
     return app

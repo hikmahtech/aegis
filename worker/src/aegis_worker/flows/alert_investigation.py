@@ -101,6 +101,12 @@ _PATCH_RESTART_ONCE = "auto-restart-once-per-window"
 # #502: the verdict goes to the knowledge store once the operator has decided.
 _PATCH_KG_AFTER_DECISION = "kg-verdict-after-decision"
 
+# #629: a run about to post its Gate-2 card first retires the problem's older
+# pending cards. Live, not retired: a run waiting on its card when this
+# shipped has no retire call in its history before the card, so `patched`
+# answers False on its replay and it goes on exactly as recorded.
+_PATCH_RETIRE_OLD_CARDS = "retire-superseded-cards"
+
 
 def _safe_workflow_id_segment(text: str, max_len: int = 60) -> str:
     """Replace characters illegal in Temporal workflow IDs with dashes."""
@@ -1395,6 +1401,26 @@ class AlertInvestigationFlow:
                 f"gate2-{_safe_workflow_id_segment(alert.get('fingerprint') or '')}"
                 f"-{workflow.info().workflow_id}"
             )
+            # One live card per problem (#629). The older runs' cards are
+            # retired before this one goes out: each is refused if pressed,
+            # edited in Slack to say it was replaced, and its waiting run is
+            # told `superseded` and ends without acting. Best-effort: a card
+            # that could not be retired is the old behaviour, not a reason to
+            # withhold this one.
+            if workflow.patched(_PATCH_RETIRE_OLD_CARDS) and problem_id:
+                with logged_failure("alert_retire_old_cards_failed", logger=workflow.logger):
+                    await workflow.execute_activity_method(
+                        HubActivities.retire_cards,
+                        args=[
+                            {
+                                "problem_id": problem_id,
+                                "reason": "superseded",
+                                "exclude_run": workflow.info().workflow_id,
+                            }
+                        ],
+                        start_to_close_timeout=TIMEOUT_STANDARD,
+                        retry_policy=FAST,
+                    )
             await self._record(
                 problem_id,
                 "waiting_human",
@@ -1451,10 +1477,19 @@ class AlertInvestigationFlow:
                         )
                         continue
                     if recheck.get("resolved"):
-                        await handle.signal(
-                            InteractionFlow.submit_response,
-                            {"value": "self_resolved", "note": "auto-closed: alert resolved"},
-                        )
+                        # The hub may have retired the card and ended it a
+                        # moment ago (#629), so the child can already be
+                        # closed. A signal to it then fails, and that is fine:
+                        # its answer is waiting in `gate_task`.
+                        try:
+                            await handle.signal(
+                                InteractionFlow.submit_response,
+                                {"value": "self_resolved", "note": "auto-closed: alert resolved"},
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            workflow.logger.info(
+                                "alert_gate2_signal_skipped err=%s", error_text(exc)
+                            )
                         g2 = await gate_task
                         break
             # Mirror Gate-1's archived-treatment: a 48h-ignored Gate-2 means
@@ -1478,6 +1513,17 @@ class AlertInvestigationFlow:
                     "todoist_task_id": track_task_id,
                 }
             v2 = ((g2.response or {}).get("value") or "").strip()
+            if v2 == "superseded":
+                # A newer investigation of the same problem posted its own card
+                # and retired this one (#629). That run owns the problem now,
+                # so this one ends as it is: no note, no status, no verdict.
+                workflow.logger.info("alert_gate2_superseded problem_id=%s", problem_id)
+                return {
+                    "status": "gate2_superseded",
+                    "task_id": None,
+                    "problem_id": problem_id,
+                    "todoist_task_id": track_task_id,
+                }
             if v2 == "self_resolved":
                 # The self-resolve race auto-closed the card because the alert
                 # recovered while we awaited the human. Log for dedup and short

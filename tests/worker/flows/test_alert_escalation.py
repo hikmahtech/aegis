@@ -247,6 +247,7 @@ _HUB: dict = {
     "status": [],
     "record": [],
     "mute": [],
+    "retire": [],
     "resolved": False,
     "investigate": True,
     "delay": 0,
@@ -300,8 +301,14 @@ async def stub_verification_delay(alert: dict) -> dict:
     return {"delay_seconds": _HUB["delay"]}
 
 
+@activity.defn(name="retire_cards")
+async def stub_retire_cards(inp: dict) -> dict:
+    _HUB["retire"].append(inp)
+    return {"retired": 0, "finished": 0, "waiting": 0}
+
+
 def _hub_reset() -> None:
-    for key in ("ingest", "status", "record", "mute"):
+    for key in ("ingest", "status", "record", "mute", "retire"):
         _HUB[key].clear()
     _HUB["resolved"] = False
     _HUB["investigate"] = True
@@ -310,6 +317,7 @@ def _hub_reset() -> None:
 
 
 ALL_STUBS = [
+    stub_retire_cards,
     stub_ingest_alert,
     stub_problem_status,
     stub_record_investigation,
@@ -529,6 +537,53 @@ async def test_gate2_recheck_exception_does_not_kill_gate():
 
     assert result["status"] != "gate2_discarded"
     assert _HUB["status"], "recheck must have been attempted at least once"
+
+
+@pytest.mark.asyncio
+async def test_a_retired_escalating_card_ends_its_run_without_acting():
+    """#629: a newer run retired this escalating card. The hub signals the
+    card `superseded` (what `HubActivities.retire_cards` sends), the waiting
+    race loop takes it like any answer, and the run ends there — no note, no
+    mute, no fix, no final record, no verdict ping.
+
+    Falsifiable: without the `superseded` branch the run falls through to the
+    verdict comment and the chat ping, and `notes` grows."""
+    _reset()
+
+    async with (
+        await WorkflowEnvironment.start_time_skipping() as env,
+        Worker(
+            env.client,
+            task_queue="tq-esc",
+            workflows=[AlertInvestigationFlow, InteractionFlow],
+            activities=ALL_STUBS,
+        ),
+    ):
+        wf_id = "esc-superseded-test"
+        handle = await env.client.start_workflow(
+            AlertInvestigationFlow.run, _esc_alert(), id=wf_id, task_queue="tq-esc"
+        )
+        await _wait_for_gate2(lambda: env.sleep(1))
+        # The run retired the older cards of its own problem before posting.
+        assert _HUB["retire"] == [
+            {"problem_id": "prob-1", "reason": "superseded", "exclude_run": wf_id}
+        ]
+        notes_before = len(_calls.get("notes", []))
+        messages_before = len(_calls.get("messages", []))
+        records_before = len(_HUB["record"])
+
+        gate2 = env.client.get_workflow_handle(f"gate2-{_SAFE_FINGERPRINT}-{wf_id}")
+        await gate2.signal(
+            InteractionFlow.submit_response,
+            {"value": "superseded", "note": "auto-closed: newer card"},
+        )
+        result = await asyncio.wait_for(handle.result(), timeout=15.0)
+
+    assert result["status"] == "gate2_superseded"
+    assert len(_calls.get("notes", [])) == notes_before
+    assert len(_calls.get("messages", [])) == messages_before
+    assert len(_HUB["record"]) == records_before
+    assert _HUB["mute"] == []
 
 
 # ---------------------------------------------------------------------------

@@ -1,4 +1,4 @@
-"""Tests for the /api/comms/delete endpoint."""
+"""Tests for the /api/comms/delete and /api/comms/edit endpoints."""
 from __future__ import annotations
 
 from unittest.mock import AsyncMock
@@ -64,6 +64,47 @@ async def test_delete_endpoint_requires_auth(app):
         resp = await client.post(
             "/api/comms/delete",
             json={"delivery_ref": {"adapter": "slack", "channel": "C1", "ts": "2.0"}},
+            headers={"X-API-Key": "wrong-key"},
+        )
+    assert resp.status_code == 401
+
+
+async def test_edit_endpoint_rewrites_the_card_without_deleting_it(app, fake_adapter):
+    """#629: a retired card is edited — new text, buttons gone — never deleted."""
+    fake_adapter.edit_card = AsyncMock(return_value=None)
+    transport = ASGITransport(app=app)
+    ref = {"adapter": "slack", "channel": "C100123", "ts": "4242.0"}
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/api/comms/edit",
+            json={"delivery_ref": ref, "text": "⏭ Replaced by a newer card."},
+            headers={"X-API-Key": "test-key"},
+        )
+    assert resp.status_code == 200 and resp.json() == {"ok": True}
+    kw = fake_adapter.edit_card.await_args.kwargs
+    assert kw["ref"].data == {"channel": "C100123", "ts": "4242.0"}
+    assert kw["text"] == "⏭ Replaced by a newer card."
+    fake_adapter.delete_message.assert_not_awaited()
+
+
+async def test_edit_endpoint_reports_a_failed_edit(app, fake_adapter):
+    fake_adapter.edit_card = AsyncMock(side_effect=Exception("message_not_found"))
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/api/comms/edit",
+            json={"delivery_ref": {"adapter": "slack", "channel": "C1", "ts": "2.0"}, "text": "x"},
+            headers={"X-API-Key": "test-key"},
+        )
+    assert resp.json() == {"ok": False}
+
+
+async def test_edit_endpoint_requires_auth(app):
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/api/comms/edit",
+            json={"delivery_ref": {"adapter": "slack", "channel": "C1", "ts": "2.0"}, "text": "x"},
             headers={"X-API-Key": "wrong-key"},
         )
     assert resp.status_code == 401

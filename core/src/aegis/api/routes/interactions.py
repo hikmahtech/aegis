@@ -179,7 +179,7 @@ async def get_interaction(interaction_id: UUID, request: Request):
 async def list_interactions(
     request: Request,
     agent_id: str | None = None,
-    status: Literal["pending", "resolved", "archived"] | None = None,
+    status: Literal["pending", "resolved", "archived", "retired"] | None = None,
     origin: str | None = None,
     limit: int = 50,
 ):

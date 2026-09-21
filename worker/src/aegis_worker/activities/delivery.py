@@ -235,6 +235,24 @@ class DeliveryActivities:
         resp = await client.post("/api/deliver/card", json=body)
         return resp.json()
 
+    async def edit_card(self, delivery_ref: dict | None, text: str) -> dict:
+        """Rewrite a card that was already posted, with its buttons removed
+        (comms `/api/comms/edit`). Edited, never deleted: what the card
+        offered stays readable under the new first line.
+
+        Not an activity. `HubActivities.retire_cards` calls it directly, the
+        way `apply_group` uses `send_message`. A card with no Slack message
+        behind it (the web channel keeps cards in the admin inbox) has nothing
+        to edit and reports ok."""
+        ref = dict(delivery_ref or {})
+        if ref.get("adapter") != "slack" or not ref.get("ts"):
+            return {"ok": True, "skipped": "no_message"}
+        if not self.comms_url:
+            return {"ok": False, "error": "comms_url not configured"}
+        client = self._ensure_client()
+        resp = await client.post("/api/comms/edit", json={"delivery_ref": ref, "text": text})
+        return resp.json()
+
     async def close(self) -> None:
         """Close the pooled HTTP client (best-effort; process exit covers it)."""
         if self._client and not self._client.is_closed:

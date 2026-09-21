@@ -12,6 +12,9 @@ Emits mostly on state transitions, never on unchanged steady state:
 - collect recovered                          → its resolved event
 - the ingress stopped answering from outside → IngressUnreachable alert (#492)
 - the ingress answers again                  → its resolved event
+- `outage_min_nodes` or more nodes not ready → ClusterOutage alert (#630),
+  class `outage`: the hub holds back every other infra problem while it lasts
+- fewer than that again                      → its resolved event
 
 Recovery is `_resolve()` → `HubActivities.ingest_alert(resolved=True)`: the
 hub closes the problem and the projector closes its task. The audit-log rows
@@ -81,6 +84,15 @@ def _hb_fingerprint(alertname: str, subject: str) -> str:
     return f"aegis-heartbeat:{alertname}:{subject}"
 
 
+# The alertname the heartbeat raises an outage under, and the hub class it
+# carries (`aegis_class`) — the same pair the Prometheus `ClusterOutage` rule
+# uses, so both land on the one `outage` problem.
+OUTAGE_ALERTNAME = "ClusterOutage"
+OUTAGE_CLASS = "outage"
+# #630: count the nodes that are not ready, and raise one outage problem.
+PATCH_CLUSTER_OUTAGE = "heartbeat-cluster-outage"
+
+
 def build_heartbeat_alert(
     alertname: str,
     subject: str,
@@ -90,12 +102,16 @@ def build_heartbeat_alert(
     *,
     escalate: bool,
     service_name: str = "",
+    aegis_class: str = "",
 ) -> dict:
     labels: dict = {"alertname": alertname}
     if infra_cluster:
         labels["cluster"] = infra_cluster
     if service_name:
         labels["service_name"] = service_name
+    if aegis_class:
+        # The hub class, read before the alertname (`hub.event_from_alert`).
+        labels["aegis_class"] = aegis_class
     alert: dict = {
         "title": title,
         "description": description,
@@ -142,6 +158,13 @@ class InfraHeartbeatConfig:
     # "this has been broken all day and nothing fixed it". 0 disables the path.
     # Lives in activities.config so schedule_sync propagates edits live.
     restuck_hours: int = 24
+    # How many swarm nodes must be not ready at once for the tick to call it a
+    # cluster outage (#630). One node down is that node's problem; two or more
+    # at once is usually one cause (a power domain, the switch), and the hub
+    # then holds back the dozens of problems it would otherwise raise. Quiet
+    # nodes do not count. 0 disables the detector. Lives in activities.config
+    # (`outage_min_nodes`).
+    outage_min_nodes: int = 2
 
 
 @workflow.defn
@@ -162,10 +185,17 @@ class InfraHeartbeatFlow:
             )
             return {"problem_id": None, "investigate": False, "action": "error"}
 
-    async def _resolve(self, alertname: str, subject: str, cluster: str, service_name: str = "") -> None:
+    async def _resolve(
+        self,
+        alertname: str,
+        subject: str,
+        cluster: str,
+        service_name: str = "",
+        aegis_class: str = "",
+    ) -> None:
         alert = build_heartbeat_alert(
             alertname, subject, cluster, f"{alertname} resolved: {subject}", "", escalate=False,
-            service_name=service_name,
+            service_name=service_name, aegis_class=aegis_class,
         )
         await self._ingest(alert, resolved=True)
 
@@ -426,6 +456,39 @@ class InfraHeartbeatFlow:
 
         quiet = set(config.quiet_nodes or [])
         quiet_notified = 0
+
+        # ── Cluster outage (#630) ──
+        # Before the node and service alerts below, so the ones this very tick
+        # raises already land inside the outage window and are held back. On
+        # transitions only, like a node: the problem lives on the hub.
+        # An empty listing is a collection anomaly (see nodes_vanished), so
+        # it keeps the last answer rather than ending an outage.
+        outage = bool(prior.get("outage"))
+        nodes_not_ready: list[str] = []
+        if workflow.patched(PATCH_CLUSTER_OUTAGE) and cur_nodes:
+            nodes_not_ready = sorted(
+                name for name, status in cur_nodes.items() if status != "Ready" and name not in quiet
+            )
+            outage_now = config.outage_min_nodes > 0 and len(nodes_not_ready) >= config.outage_min_nodes
+            if outage_now and not outage:
+                alert = build_heartbeat_alert(
+                    OUTAGE_ALERTNAME,
+                    "",
+                    cluster,
+                    f"Cluster outage: {len(nodes_not_ready)} nodes not ready",
+                    f"Heartbeat poll saw {len(nodes_not_ready)} of {len(cur_nodes)} swarm nodes "
+                    f"not ready at once: {', '.join(nodes_not_ready)}. Infra problems raised "
+                    "while this lasts are recorded without a task or a card; whatever is still "
+                    "broken when it ends gets them then.",
+                    escalate=True,
+                    aegis_class=OUTAGE_CLASS,
+                )
+                if await self._spawn(alert):
+                    spawned += 1
+            elif outage and not outage_now:
+                await self._resolve(OUTAGE_ALERTNAME, "", cluster, aegis_class=OUTAGE_CLASS)
+            outage = outage_now
+
         for node in nodes_down:
             if node in quiet:
                 await workflow.execute_activity_method(
@@ -518,6 +581,7 @@ class InfraHeartbeatFlow:
                     # here is a key the canary forgets every two minutes.
                     "ingress_failing": ingress_failing,
                     "ingress_fails": ingress_fails,
+                    "outage": outage,
                 }
             ],
             start_to_close_timeout=TIMEOUT_FAST,
@@ -541,4 +605,6 @@ class InfraHeartbeatFlow:
             "services_reinvestigated": reinvestigated,
             "services_recovered": len(recovered_services),
             "deploys_cleared": deploys_cleared,
+            "outage": outage,
+            "nodes_not_ready": len(nodes_not_ready),
         }

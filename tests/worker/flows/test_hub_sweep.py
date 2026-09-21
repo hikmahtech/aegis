@@ -99,13 +99,39 @@ async def _apply(candidate: dict, verdict: dict) -> dict:
     }
 
 
+@activity.defn(name="promoted_investigations")
+async def _no_promoted_investigations(problem_ids: list[str]) -> list[dict]:
+    _calls.append("promoted_investigations")
+    return []
+
+
+_retire_inputs: list[dict] = []
+
+
+@activity.defn(name="retire_cards")
+async def _retire_cards(inp: dict) -> dict:
+    _calls.append("retire_cards")
+    _retire_inputs.append(inp)
+    return {"retired": 0, "finished": 1, "waiting": 0}
+
+
+def _name(fn) -> str:
+    return activity._Definition.must_from_callable(fn).name
+
+
 async def _run(
     activities: list,
     workflows: tuple = (HubSweepFlow,),
     flow=HubSweepFlow,
     config: HubSweepConfig | None = None,
 ):
-    """Run one sweep; returns `(result, history)`."""
+    """Run one sweep; returns `(result, history)`. The two #629/#630 steps get
+    a quiet stub unless the test brings its own."""
+    given = {_name(a) for a in activities}
+    activities = [
+        *activities,
+        *(d for d in (_no_promoted_investigations, _retire_cards) if _name(d) not in given),
+    ]
     async with (
         await WorkflowEnvironment.start_time_skipping() as env,
         Worker(
@@ -134,6 +160,9 @@ async def test_sweep_promotes_then_projects_and_reports():
     )
     assert out == {
         "promoted": 2,
+        # The stub finds nothing a producer would have investigated (#630).
+        "promoted_investigated": 0,
+        "cards_finished": 1,
         "task_completed": 1,
         "task_reopened": 1,
         "fix_resolved": 1,
@@ -156,7 +185,19 @@ async def test_sweep_promotes_then_projects_and_reports():
     # tick; completed tasks and merged fixes next, so what they resolve or
     # reopen is projected in the same tick too; grouping last, on problems
     # that already have their tasks.
-    assert _calls == ["promote", "reconcile", "verify", "project", "find"]
+    # The promoted problems are offered for investigation at once (#630), and
+    # retired cards are finished after every step that can resolve and before
+    # projection (#629).
+    assert _calls == [
+        "promote",
+        "promoted_investigations",
+        "reconcile",
+        "verify",
+        "retire_cards",
+        "project",
+        "find",
+    ]
+    assert _retire_inputs[-1] == {}
     # The generic defaults when the hub sweep row sets nothing.
     assert _verify_args == [(24.0, 1.0)]
 
@@ -198,7 +239,9 @@ async def test_sweep_groups_a_cluster_the_judge_agrees_on():
     assert out["grouped"] == 1
     assert out["folded"] == 2
     assert out["group_candidates"] == 1
-    assert _calls == ["promote", "reconcile", "verify", "project", "find", "judge", "apply"]
+    assert [c for c in _calls if c not in {"promoted_investigations", "retire_cards"}] == [
+        "promote", "reconcile", "verify", "project", "find", "judge", "apply"
+    ]
 
 
 @pytest.mark.asyncio
@@ -302,3 +345,51 @@ async def test_the_sweep_does_not_ask_an_alertmanager_it_has_no_address_for():
     )
     assert out["alertmanager_resolved"] == 0
     assert not [c for c in _calls if c.startswith("reconcile_alertmanager")]
+
+
+@activity.defn(name="promoted_investigations")
+async def _one_promoted_investigation(problem_ids: list[str]) -> list[dict]:
+    _calls.append("promoted_investigations")
+    return [
+        {
+            "title": "Service shop_web down",
+            "fingerprint": "aegis-heartbeat:DockerServiceDown:shop_web",
+            "severity": "critical",
+            "source": "aegis-heartbeat",
+            "service": "shop_web",
+            "description": "",
+            "labels": {"alertname": "DockerServiceDown", "service_name": "shop_web"},
+            "escalate": False,
+            "problem_id": problem_ids[0],
+            "todoist_task_id": None,
+        }
+    ]
+
+
+@workflow.defn(name="AlertInvestigationFlow", sandboxed=False)
+class _NoInvestigation:
+    @workflow.run
+    async def run(self, alert: dict) -> dict:
+        return {"status": "stub"}
+
+
+@pytest.mark.asyncio
+async def test_a_promoted_problem_gets_the_investigation_its_window_held_back():
+    """#630: once an outage (or any window) ends, what is still broken gets a
+    card as well as a task. The sweep starts the investigation itself, as an
+    abandoned child named like every hub investigation."""
+    _calls.clear()
+    out, history = await _run(
+        [_promote, _one_promoted_investigation, _reconcile, _verify, _project, _finder([])],
+        workflows=(HubSweepFlow, _NoInvestigation),
+    )
+    assert out["promoted_investigated"] == 1
+    started = [
+        e.start_child_workflow_execution_initiated_event_attributes
+        for e in history.events
+        if e.HasField("start_child_workflow_execution_initiated_event_attributes")
+    ]
+    assert len(started) == 1
+    assert started[0].workflow_type.name == "AlertInvestigationFlow"
+    assert started[0].workflow_id.startswith("investigate-a-pr")
+    await Replayer(workflows=[HubSweepFlow]).replay_workflow(history)

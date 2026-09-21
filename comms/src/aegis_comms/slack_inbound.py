@@ -1034,10 +1034,17 @@ class SlackInbound:
                 interaction_id=interaction_id,
                 status=status,
             )
-            await self._adapter.edit_card(
-                ref=ref,
-                text=f"⏰ Expired — this card timed out before a response ({status})",
-            )
+            if status == "retired":
+                # A newer card replaced it or its problem resolved (#629). The
+                # worker edits the card itself; this covers a tap that beat it,
+                # and the reminder copies of an escalating card.
+                text = (
+                    "⏭ Retired — a newer card replaced this one, or the problem "
+                    "resolved on its own. Nothing was done."
+                )
+            else:
+                text = f"⏰ Expired — this card timed out before a response ({status})"
+            await self._adapter.edit_card(ref=ref, text=text)
             return
 
         status_code = error_sink.get("status_code")
