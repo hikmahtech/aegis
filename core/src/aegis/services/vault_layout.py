@@ -2,9 +2,12 @@
 
 DB-owned, so a fork ships nobody's folder names. Stored in the ``settings``
 table under ``vault_layout``; the code defaults are one particular vault's
-conventions (the ones AEGIS was first written against), so a deployment with
-no row behaves exactly as before. Edited on the admin **Vault** page through
-``GET/PUT /api/admin/notes/layout`` (``routes/notes_admin.py``).
+conventions (the ones AEGIS was first written against) except the tag, which
+was ``#raphael`` and is now ``#aegis/{agent}``, so a deployment with no row
+behaves as before apart from the tag on new blocks — old blocks keep theirs
+and still read, because every reader finds a block by its marker. Edited on the
+admin **Vault** page through ``GET/PUT /api/admin/notes/layout``
+(``routes/notes_admin.py``).
 
 What is configurable here: the agent's own folder, the journal's folders, file
 names (moment.js formats, as Obsidian's periodic-notes settings use), templates,
@@ -93,6 +96,21 @@ DEFAULT_LANGUAGE: dict[str, str] = {
     "also_in_note": "Also in the note:",
 }
 
+# ------------------------------------------------------------------ the agent
+
+# The one placeholder `entry.tag` takes: the id of the agent whose block it is.
+# `#aegis/{agent}` is a nested Obsidian tag, so `#aegis` finds or hides
+# everything AEGIS wrote, whoever keeps the journal next year.
+AGENT_PLACEHOLDER = "{agent}"
+
+
+def agent_slug(agent_id: str | None) -> str:
+    """An agent id as a tag or an address may carry it: lower case, letters,
+    digits, `.`, `_` and `-`. `notes.author_for` uses this same one, so the
+    tag on a block and the author of its commit cannot disagree."""
+    return re.sub(r"[^a-z0-9._-]+", "-", (agent_id or "").strip().lower()).strip("-")
+
+
 # ------------------------------------------------------------------ defaults
 
 DEFAULTS: dict[str, Any] = {
@@ -103,7 +121,7 @@ DEFAULTS: dict[str, Any] = {
     "week_numbering": "iso",
     "date_heading_format": "YYYY-MM-DD",
     "index_skip_prefixes": [".obsidian/", "_templates/", "backups/", "_attachments/", ".trash/"],
-    "entry": {"tag": "#raphael", "indent": "tab", "max_outline_depth": 4},
+    "entry": {"tag": "#aegis/{agent}", "indent": "tab", "max_outline_depth": 4},
     "new_note": {"drop_open_tasks": True, "drop_empty_bullets_in_section": True},
     "section_ends_at_rule_or_fence": True,
     "language": dict(DEFAULT_LANGUAGE),
@@ -344,7 +362,7 @@ class Layout:
     week_numbering: str = "iso"
     date_heading_format: str = "YYYY-MM-DD"
     index_skip_prefixes: tuple[str, ...] = tuple(DEFAULTS["index_skip_prefixes"])
-    entry_tag: str = "#raphael"
+    entry_tag: str = "#aegis/{agent}"
     entry_indent: str = "tab"
     max_outline_depth: int = 4
     drop_open_tasks: bool = True
@@ -371,6 +389,19 @@ class Layout:
     def indent_width(self) -> int:
         """Spaces per outline level when reading a block back; a tab is one level."""
         return 4 if self.entry_indent == "four_spaces" else 2
+
+    def tag_for(self, agent: str = "") -> str:
+        """`entry_tag` with `{agent}` filled in from the agent writing the
+        block. With no agent the placeholder and the `/` before it drop, so
+        `#aegis/{agent}` is `#aegis` — a real tag, not a literal brace in the
+        user's note. A tag without the placeholder is returned as it is."""
+        if AGENT_PLACEHOLDER not in self.entry_tag:
+            return self.entry_tag
+        aid = agent_slug(agent)
+        if aid:
+            return self.entry_tag.replace(AGENT_PLACEHOLDER, aid)
+        bare = self.entry_tag.replace(AGENT_PLACEHOLDER, "").rstrip("/")
+        return "" if bare == "#" else bare
 
     @property
     def words(self) -> dict[str, str]:

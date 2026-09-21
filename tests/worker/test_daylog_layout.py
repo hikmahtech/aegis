@@ -2,7 +2,7 @@
 
 The day is bounded in `user_timezone`, the deterministic entry's wording and
 the rollup's week rule come from the `vault_layout` row, and a run with no
-agent resolves the `research` holder instead of naming one.
+agent resolves the `gtd` holder instead of naming one.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 import pytest_asyncio
+from aegis.services import notes
 from aegis.services import vault_layout as vl
 from aegis_worker.activities.daylog import (
     DayLogActivities,
@@ -219,14 +220,14 @@ async def test_vault_week_rule_reads_the_row(clean_db):
 
 
 @pytest.mark.asyncio
-async def test_a_run_with_no_agent_is_owned_by_the_research_holder(clean_db):
-    """`DayLogConfig()` names nobody; the flow resolves the `research`
-    capability's holder and the LLM ledger / journal entry carry that id."""
+async def test_a_run_with_no_agent_is_owned_by_the_gtd_holder(clean_db):
+    """`DayLogConfig()` names nobody; the journal belongs to the `gtd`
+    capability's holder, and the LLM ledger / journal entry carry that id."""
     from aegis_worker.activities.agent_registry import AgentRegistryActivities
     from temporalio import activity
 
     holder = await clean_db.fetchval(
-        "SELECT id FROM agents WHERE active AND capabilities @> '[\"research\"]'::jsonb "
+        "SELECT id FROM agents WHERE active AND capabilities @> '[\"gtd\"]'::jsonb "
         "ORDER BY id LIMIT 1"
     )
     assert holder
@@ -249,3 +250,24 @@ async def test_a_run_with_no_agent_is_owned_by_the_research_holder(clean_db):
         )
     assert result["status"] == "journaled"
     assert seen[0]["agent_id"] == holder
+
+
+def test_a_week_spanning_the_owner_move_reads_every_day():
+    """Spec §19, "the owner move": the days before the handover carry
+    `#raphael` and the days after `#aegis/sebas`, and the rollup reads seven
+    entries — every reader finds a block by its marker, never by its tag."""
+    days = [f"2026-09-{d:02d}" for d in range(14, 21)]
+    tags = ["#raphael"] * 4 + ["#aegis/sebas"] * 3
+    notes_text = [
+        f"# {day}\n## Journal\n- the user wrote this\n"
+        f"- {tag} day log {notes.marker(notes.journal_key('daily', day))}\n\t- Day {day}.\n"
+        for day, tag in zip(days, tags, strict=True)
+    ]
+    read = [
+        DayLogActivities._journal_entry(day, text)
+        for day, text in zip(days, notes_text, strict=True)
+    ]
+
+    assert len(read) == 7
+    assert all(f"Day {day}." in entry for day, entry in zip(days, read, strict=True))
+    assert all("the user wrote this" in entry for entry in read)

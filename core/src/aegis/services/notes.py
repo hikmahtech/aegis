@@ -81,6 +81,10 @@ DAILY_FORMAT = DEFAULT_LAYOUT.daily.format
 WEEKLY_FORMAT = DEFAULT_LAYOUT.weekly.format
 MONTHLY_FORMAT = DEFAULT_LAYOUT.monthly.format
 
+# Whose journal it is: the holder of this capability keeps it, and a run or a
+# write that names no agent is his. Never a literal agent id (#36).
+JOURNAL_OWNER_TAG = "gtd"
+
 _LOCK_NAME = ".aegis.lock"
 
 # meld-encrypt 1.6.2 (the vault's version) writes `%%🔐<ciphertext> 🔐%%`, and
@@ -155,7 +159,7 @@ class NotesConfig:
 def author_for(agent_id: str | None, name: str | None = None) -> Author:
     """The `Author` for an agent: its display name, `<id>@aegis.local`, and the
     id as the commit prefix."""
-    aid = re.sub(r"[^a-z0-9._-]+", "-", (agent_id or "").strip().lower()).strip("-")
+    aid = vl.agent_slug(agent_id)
     if not aid:
         return DEFAULT_AUTHOR
     return Author(name=(name or "").strip() or aid, email=f"{aid}@aegis.local", prefix=aid)
@@ -388,6 +392,7 @@ class Append:
               such section of the note, at any heading level, instead of
               appending at the end
     label     the block's title after the tag (`day log`)
+    agent     the agent writing the block; its id fills the layout's `{agent}`
     layout    the vault layout the append was built for: the gate, the
               template, the block's tag and indent all follow it
     """
@@ -404,6 +409,7 @@ class Append:
     also_rels: tuple[str, ...] = ()
     section: tuple[str, ...] = ()
     label: str = ""
+    agent: str = ""
     layout: Layout = DEFAULT_LAYOUT
 
 
@@ -527,11 +533,13 @@ def body_outline(body: str, max_depth: int = MAX_OUTLINE_DEPTH) -> list[tuple[in
     return nodes
 
 
-def journal_block(key: str, label: str, body: str, layout: Layout = DEFAULT_LAYOUT) -> str:
+def journal_block(
+    key: str, label: str, body: str, layout: Layout = DEFAULT_LAYOUT, agent: str = ""
+) -> str:
     """The agent's entry in the user's own bullet style (they write `- `
     bullets under the section, with obsidian-outliner)::
 
-        - #raphael day log %% aegis:<key> %%
+        - #aegis/sebas day log %% aegis:<key> %%
         <TAB>- <first paragraph, as one line>
         <TAB>- Completed:
         <TAB><TAB>- <an item under that label>
@@ -540,7 +548,7 @@ def journal_block(key: str, label: str, body: str, layout: Layout = DEFAULT_LAYO
     body is laid out by :func:`body_outline`. The marker is an Obsidian
     comment, so reading view shows the tag, the label and the outline."""
     title = " ".join(
-        p for p in (layout.entry_tag, clean_body(label).replace("\n", " ")) if p
+        p for p in (layout.tag_for(agent), clean_body(label).replace("\n", " ")) if p
     )
     head = f"- {title} {marker(key)}" if title else f"- {marker(key)}"
     rows = [head] + [
@@ -628,7 +636,7 @@ def append_text(existing: str | None, ap: Append, new_note: str = "") -> str | N
         return insert_block(
             base,
             ap.section,
-            journal_block(ap.key, ap.label, ap.body, ap.layout),
+            journal_block(ap.key, ap.label, ap.body, ap.layout, ap.agent),
             ap.layout.section_ends_at_rule_or_fence,
         )
     if base and not base.endswith("\n"):
@@ -1106,12 +1114,14 @@ def journal_append(
     body: str,
     now: datetime,
     layout: Layout = DEFAULT_LAYOUT,
+    agent: str = "",
 ) -> Append:
     """The daylog's entry for one day, week or month.
 
     kind   `daily` / `weekly` / `monthly`
     day    the day; the week's first day; the month's first day
     label  the daylog's own label: `2026-09-12`, `2026-W37`, `2026-09`
+    agent  the agent the entry is written by; its id fills the tag's `{agent}`
 
     Raises `JournalKindDisabled` when the layout has the kind switched off.
     """
@@ -1140,6 +1150,7 @@ def journal_append(
         also_rels=also,
         section=k.sections,
         label=k.label,
+        agent=agent,
         layout=layout,
     )
 

@@ -2221,19 +2221,23 @@ done: those are single broad words (`ai`, `world`, `tech`, `macro`), and as
 whole-word terms they would cross the threshold on every scan and raise a task
 each round — the noise #513 removed.
 
-## The vault (Raphael)
+## The vault
 
-The user's Obsidian vault (`you/your-vault`) is the research agent's record;
-the knowledge store is only its index (#514, spec
-`docs/superpowers/specs/2026-09-12-raphael-notes-design.md`). "Raphael" below
-is the example agent that holds the `research` capability; nothing in the
-lane names it — a run with no agent resolves that capability's holder.
+The user's Obsidian vault (`you/your-vault`) is the record; the knowledge store
+is only its index (#514, spec
+`docs/superpowers/specs/2026-09-12-raphael-notes-design.md`). The journal
+belongs to the holder of the `gtd` capability and the research answers to the
+holder of `research` — "Sebas" and "Raphael" below are the example agents that
+hold them. Nothing in the lane names either: a run with no agent resolves the
+capability's holder.
 
 Where the notes go and what an entry looks like is the **vault layout**, a
 settings row (`vault_layout`) edited on the admin **Vault** page. The shipped
-defaults are one vault's conventions (the ones the lane was written against),
-so a deployment with no row behaves exactly as before. The paths below are
-those defaults.
+defaults are one vault's conventions (the ones the lane was written against)
+except the tag, which was `#raphael` and is now `#aegis/{agent}`, so a
+deployment with no row behaves as before apart from the tag on new blocks —
+old blocks keep theirs and still read, because every reader finds a block by
+its marker. The paths below are those defaults.
 
 - **Reads:** `NotesSyncFlow` (`notes-sync-hourly`, minute :19) pulls the vault
   and indexes every changed `.md` note as `source_type='note'`, skipping the
@@ -2253,7 +2257,7 @@ those defaults.
   or moved (`is_one_insertion` refuses anything else). Each block carries a
   hidden `%% aegis:<key> %%` marker, so a re-run adds nothing twice. A commit
   is authored by the owning agent under its `agents.name`
-  (`<id>@aegis.local`), with the id as the message prefix (`raphael: journal
+  (`<id>@aegis.local`), with the id as the message prefix (`sebas: journal
   2026-09-12`); with no agent it is `AEGIS <aegis@aegis.local>`.
 - **The journal:** notes are filed as the layout says. With the defaults the
   nightly daylog writes to `journal/<YYYY>/<NN. Mon>/DD MMM YY.md`, the weekly
@@ -2262,16 +2266,16 @@ those defaults.
   folder's own note, `journal/<YYYY>/<NN. Mon>/<NN. Mon>.md`. If the user
   already has the day's or week's note open in the layout's `live_folder`
   (`journal/`, where periodic-notes creates it), the agent writes into that
-  one instead. The entry is a `- #raphael day log` bullet (`week in review`,
-  `month in review`; the tag and labels are the layout's) with the text as an
-  indented outline under it (the layout's indent — a tab by default): one
-  bullet per prose paragraph, and in the daylog's fallback format each
-  `Label:` line with its items nested under it. It is placed at the end of
-  the note's own section — the layout's `sections` for the kind: `Journal`
-  for a day, `Review` for a week or a month (an older month note's `Month
-  Review`) — found by its heading text at any level. The section ends at the
-  next heading and, unless the layout says otherwise, a `---` line or a code
-  fence, so the month note's folder card stays last. A note without the
+  one instead. The entry is a `- #aegis/sebas day log` bullet (`week in
+  review`, `month in review`; the tag and labels are the layout's) with the
+  text as an indented outline under it (the layout's indent — a tab by
+  default): one bullet per prose paragraph, and in the daylog's fallback
+  format each `Label:` line with its items nested under it. It is placed at
+  the end of the note's own section — the layout's `sections` for the kind:
+  `Journal` for a day, `Review` for a week or a month (an older month note's
+  `Month Review`) — found by its heading text at any level. The section ends
+  at the next heading and, unless the layout says otherwise, a `---` line or a
+  code fence, so the month note's folder card stays last. A note without the
   section gets `## <first section>` and the block at its end. A new note is
   rendered from the layout's template for the kind, without its open
   checkboxes and without the empty `- ` placeholder in that section (both
@@ -2317,7 +2321,7 @@ the same code that writes the notes; the page shows that preview live.
 | `week_numbering` | `iso` | `iso` (week 1 holds January 4th) or `locale_us` (week 1 holds January 1st): what `ww` renders and the rollup's `YYYY-Www` label. |
 | `date_heading_format` | `YYYY-MM-DD` | The heading a dated section gets. |
 | `index_skip_prefixes` | `.obsidian/`, `_templates/`, `backups/`, `_attachments/`, `.trash/` | Path prefixes the index leaves out. |
-| `entry.tag` | `#raphael` | The tag on the agent's bullet; empty for none. |
+| `entry.tag` | `#aegis/{agent}` | The tag on the agent's bullet; `{agent}` becomes the id of the agent that wrote the block, and with no agent it drops (`#aegis`). Empty for no tag. |
 | `entry.indent` | `tab` | `tab`, `two_spaces` or `four_spaces`: the outline's indent (the rollup reads it back with the same). |
 | `entry.max_outline_depth` | `4` | How deep the outline may nest. |
 | `new_note.drop_open_tasks` | `true` | A note the agent creates loses the template's unticked checkboxes. |

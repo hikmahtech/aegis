@@ -40,9 +40,9 @@ async def test_the_journal_write_uses_the_users_clock(user_zone, tmp_path, monke
     seen: dict = {}
     real = notes.journal_append
 
-    def spy(kind, day, label, body, now, layout=None):
+    def spy(kind, day, label, body, now, layout=None, agent=""):
         seen["now"] = now
-        return real(kind, day, label, body, now, layout)
+        return real(kind, day, label, body, now, layout, agent)
 
     monkeypatch.setattr(notes, "journal_append", spy)
     acts = NotesActivities(settings=vault["settings"], db_pool=user_zone)

@@ -23,7 +23,7 @@ def test_the_defaults_are_todays_layout():
     assert lay == vl.layout_from({}) == vl.layout_from(None) == vl.layout_from("junk")
     assert vl.layout_to_dict(lay) == vl.merge({})
     assert lay.agent_dir == "raphael" and lay.questions_dir == "raphael/questions"
-    assert lay.entry_tag == "#raphael" and lay.indent_text == "\t"
+    assert lay.entry_tag == "#aegis/{agent}" and lay.indent_text == "\t"
     assert lay.note_path("daily", date(2023, 10, 24)) == "journal/2023/10. Oct/24 Oct 23.md"
     assert lay.note_path("weekly", date(2023, 10, 5)) == "journal/2023/10. Oct/W40 Oct 23.md"
     assert lay.note_path("monthly", date(2023, 8, 1)) == "journal/2023/08. Aug/08. Aug.md"

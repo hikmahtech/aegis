@@ -56,7 +56,7 @@ def test_a_new_journal_note_carries_no_open_tasks(tmp_path):
     assert "[ ]" not in text
     assert "### Todo" in text
     assert "- [x] a box the template ships ticked" in text
-    assert "- #raphael day log" in text and "Raphael's day." in text
+    assert "- #aegis day log" in text and "Raphael's day." in text
 
 
 @needs_git

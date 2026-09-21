@@ -127,9 +127,9 @@ def test_a_section_may_run_past_rules_and_fences_when_the_layout_says_so():
     lay = vl.layout_from({"section_ends_at_rule_or_fence": False})
     existing = "## Journal\n- mine\n---\n- still the journal\n## Next\n"
     out = notes.append_text(existing, _daily(date(2026, 9, 12), layout=lay))
-    assert out.index("- still the journal") < out.index("- #raphael") < out.index("## Next")
+    assert out.index("- still the journal") < out.index("- #aegis") < out.index("## Next")
     strict = notes.append_text(existing, _daily(date(2026, 9, 12), layout=vl.DEFAULT_LAYOUT))
-    assert strict.index("- #raphael") < strict.index("---")
+    assert strict.index("- #aegis") < strict.index("---")
 
 
 def test_a_new_note_keeps_its_open_tasks_when_the_layout_says_so(tmp_path):

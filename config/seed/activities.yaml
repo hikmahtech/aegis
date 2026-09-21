@@ -245,7 +245,7 @@ activities:
     config: {}
     active: true
 
-  # Raphael — nightly episodic diary (A8). One dated entry per day so
+  # Sebas — nightly episodic diary (A8). One dated entry per day so
   # retrieval has a timeline, not just topics. The run logs the LAST COMPLETE
   # DAY on your clock (`user_timezone`, Vault page) and bounds it there, so
   # the cron can fire at any time after midnight in that timezone, east or
@@ -253,12 +253,12 @@ activities:
   # UTC+5:30 user; set yours on /admin/flows (crons are DB-owned).
   - slug: daylog-nightly
     workflow_type: DayLogFlow
-    agent_id: raphael
+    agent_id: sebas
     schedule_cron: "0 19 * * *"
     config: {}
     active: true
 
-  # Raphael — weekly rollup (A9), same flow class with mode=weekly. Sunday
+  # Sebas — weekly rollup (A9), same flow class with mode=weekly. Sunday
   # 20:20 UTC: after the nightly entry for that same Sunday lands (the seed's
   # 19:00), so the week it summarises — the vault layout's week, ISO Mon-Sun
   # by default, anchored on the last complete local day like the nightly —
@@ -269,13 +269,13 @@ activities:
   # is the next busiest.
   - slug: daylog-weekly
     workflow_type: DayLogFlow
-    agent_id: raphael
+    agent_id: sebas
     schedule_cron: "20 20 * * 0"
     config:
       mode: weekly
     active: true
 
-  # Raphael — monthly rollup (A9), mode=monthly. Cron has no last-day-of-month
+  # Sebas — monthly rollup (A9), mode=monthly. Cron has no last-day-of-month
   # operator, so this fires on days 28-31 and DayLogFlow's own guard drops
   # every run except the real month end (correct for February, 30- and
   # 31-day months alike). 21:20 UTC on that day, i.e. after both the seed's
@@ -284,7 +284,7 @@ activities:
   # midnight and after the nightly if you move the crons to your own zone.
   - slug: daylog-monthly
     workflow_type: DayLogFlow
-    agent_id: raphael
+    agent_id: sebas
     schedule_cron: "20 21 28-31 * *"
     config:
       mode: monthly
@@ -408,7 +408,7 @@ activities:
     config: {max_files: 300, index_max_chars: 100000}
     active: true
 
-  # Raphael — the journal backfill (#514), weekly: the daylog's knowledge rows
+  # Sebas — the journal backfill (#514), weekly: the daylog's knowledge rows
   # into the vault journal, newest first. The daylog files a row only when its
   # vault write fails, so this is what puts such a day in the journal; a week
   # with nothing missing writes nothing (every write is marker-idempotent).
@@ -421,7 +421,7 @@ activities:
   # no other row. NOTE: `config` is DB-owned — tune it on /admin/flows.
   - slug: notes-backfill-weekly
     workflow_type: NotesBackfillFlow
-    agent_id: raphael
+    agent_id: sebas
     schedule_cron: "47 4 * * 0"
     config: {limit: 1000, since_days: 14, batch: 50}
     active: true

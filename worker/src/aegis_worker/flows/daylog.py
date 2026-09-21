@@ -33,8 +33,7 @@ rollup covers is the vault layout's week (`vault_week_rule`), so the rollup's
 label and the weekly note's name are the same week.
 
 The flow belongs to the agent the activities row names; started by hand with
-no agent, it resolves the holder of the `research` capability, never a
-literal id.
+no agent, it resolves the holder of the `gtd` capability, never a literal id.
 """
 
 from __future__ import annotations
@@ -46,6 +45,7 @@ from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
     from aegis.errors import error_text
+    from aegis.services.notes import JOURNAL_OWNER_TAG
     from aegis.services.notes_write import NOTES_WRITE_TIMEOUT_S
     from aegis.services.vault_layout import week_bounds
 
@@ -62,7 +62,6 @@ with workflow.unsafe.imports_passed_through():
 
 _JOURNAL_TIMEOUT = timedelta(seconds=NOTES_WRITE_TIMEOUT_S)
 _JOURNALED = ("written", "exists")
-_OWNER_TAG = "research"
 
 
 @dataclass
@@ -265,21 +264,22 @@ class DayLogFlow:
 
     async def _owner(self) -> str:
         """The agent a run with no `agent_id` belongs to: the holder of the
-        `research` capability. Empty, with a warning, when nobody holds it —
-        the day is still logged, under AEGIS's own name."""
+        `gtd` capability, which is whose journal this is. Empty, with a
+        warning, when nobody holds it — the day is still logged, under AEGIS's
+        own name."""
         try:
             resolved = await workflow.execute_activity_method(
                 AgentRegistryActivities.resolve_agents,
-                args=[[_OWNER_TAG]],
+                args=[[JOURNAL_OWNER_TAG]],
                 start_to_close_timeout=TIMEOUT_FAST,
                 retry_policy=NO_RETRY,
             )
         except Exception as exc:  # noqa: BLE001 — the owner is a nicety
             workflow.logger.warning("daylog_owner_resolve_failed err=%s", error_text(exc))
             return ""
-        owner = str((resolved or {}).get(_OWNER_TAG) or "")
+        owner = str((resolved or {}).get(JOURNAL_OWNER_TAG) or "")
         if not owner:
-            workflow.logger.warning("daylog_owner_unresolved tag=%s", _OWNER_TAG)
+            workflow.logger.warning("daylog_owner_unresolved tag=%s", JOURNAL_OWNER_TAG)
         return owner
 
     async def _journal(

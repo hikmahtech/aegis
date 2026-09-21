@@ -23,6 +23,7 @@ from aegis.api.auth import verify_auth
 from aegis.api.settings_routes import settings_row_routes
 from aegis.services import notes
 from aegis.services import vault_layout as vl
+from aegis.services.agents import resolve_tag
 
 router = APIRouter(
     prefix="/api/admin/notes",
@@ -57,7 +58,7 @@ async def preview_layout_route(
 ) -> dict[str, Any]:
     """What the SAVED layout renders for `date` (today by default)."""
     layout = await vl.get_layout(request.app.state.db_pool)
-    return _preview(layout, date)
+    return _preview(layout, date, await _journal_owner(request))
 
 
 @router.post("/layout/preview")
@@ -68,10 +69,24 @@ async def preview_candidate_route(request: Request, body: dict[str, Any]) -> dic
         merged = vl.validate(body.get("layout") if isinstance(body, dict) else None)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return _preview(vl.layout_from(merged), body.get("date") if isinstance(body, dict) else None)
+    return _preview(
+        vl.layout_from(merged),
+        body.get("date") if isinstance(body, dict) else None,
+        await _journal_owner(request),
+    )
 
 
-def _preview(layout: vl.Layout, when: str | None) -> dict[str, Any]:
+async def _journal_owner(request: Request) -> str:
+    """Whose block the sample shows: the journal's owner, so the preview's tag
+    is the one the nightly run will write. Never raises — an unresolved tag
+    previews with no agent rather than failing the page."""
+    try:
+        return await resolve_tag(request.app.state.db_pool, notes.JOURNAL_OWNER_TAG) or ""
+    except Exception:  # noqa: BLE001 — a preview must not 500 on a lookup
+        return ""
+
+
+def _preview(layout: vl.Layout, when: str | None, agent: str = "") -> dict[str, Any]:
     try:
         d = date.fromisoformat(when) if when else datetime.now().date()
     except ValueError as exc:
@@ -83,6 +98,7 @@ def _preview(layout: vl.Layout, when: str | None) -> dict[str, Any]:
         "The first paragraph of the day, as one line.\n\nA second paragraph.\n\n"
         f"{layout.word('tasks')}\n  - an item under that label",
         layout,
+        agent,
     )
     return out
 
