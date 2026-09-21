@@ -469,3 +469,23 @@ async def test_channels_seed_does_not_prune_operator_rows(db_pool):
         assert survives == 1, "seed loader must never delete rows missing from the yaml"
     finally:
         await db_pool.execute("DELETE FROM channels WHERE identifier = $1", operator_identifier)
+
+
+def test_the_journal_rows_belong_to_the_gtd_holder():
+    """The journal moved from the research agent to the GTD one (spec
+    2026-09-22 §1). Read through the capability, not the id, so renaming the
+    example agent in a fork does not need this test edited. The index row
+    stays where it was: an index has no author."""
+    import yaml
+
+    activities = yaml.safe_load((SEED_DIR / "activities.yaml").read_text())["activities"]
+    agents = yaml.safe_load((SEED_DIR / "agents.yaml").read_text())["agents"]
+    holds = {
+        tag: {a["id"] for a in agents if tag in (a.get("capabilities") or [])}
+        for tag in ("gtd", "research")
+    }
+    by_slug = {r["slug"]: r for r in activities}
+
+    for slug in ("daylog-nightly", "daylog-weekly", "daylog-monthly", "notes-backfill-weekly"):
+        assert by_slug[slug]["agent_id"] in holds["gtd"], slug
+    assert by_slug["notes-sync-hourly"]["agent_id"] in holds["research"]
