@@ -93,6 +93,21 @@ DEFAULT_LANGUAGE: dict[str, str] = {
     "also_in_note": "Also in the note:",
 }
 
+# ------------------------------------------------------------------ the agent
+
+# The one placeholder `entry.tag` takes: the id of the agent whose block it is.
+# `#aegis/{agent}` is a nested Obsidian tag, so `#aegis` finds or hides
+# everything AEGIS wrote, whoever keeps the journal next year.
+AGENT_PLACEHOLDER = "{agent}"
+
+
+def agent_slug(agent_id: str | None) -> str:
+    """An agent id as a tag or an address may carry it: lower case, letters,
+    digits, `.`, `_` and `-`. `notes.author_for` uses this same one, so the
+    tag on a block and the author of its commit cannot disagree."""
+    return re.sub(r"[^a-z0-9._-]+", "-", (agent_id or "").strip().lower()).strip("-")
+
+
 # ------------------------------------------------------------------ defaults
 
 DEFAULTS: dict[str, Any] = {
@@ -371,6 +386,19 @@ class Layout:
     def indent_width(self) -> int:
         """Spaces per outline level when reading a block back; a tab is one level."""
         return 4 if self.entry_indent == "four_spaces" else 2
+
+    def tag_for(self, agent: str = "") -> str:
+        """`entry_tag` with `{agent}` filled in from the agent writing the
+        block. With no agent the placeholder and the `/` before it drop, so
+        `#aegis/{agent}` is `#aegis` — a real tag, not a literal brace in the
+        user's note. A tag without the placeholder is returned as it is."""
+        if AGENT_PLACEHOLDER not in self.entry_tag:
+            return self.entry_tag
+        aid = agent_slug(agent)
+        if aid:
+            return self.entry_tag.replace(AGENT_PLACEHOLDER, aid)
+        bare = self.entry_tag.replace(AGENT_PLACEHOLDER, "").rstrip("/")
+        return "" if bare == "#" else bare
 
     @property
     def words(self) -> dict[str, str]:
