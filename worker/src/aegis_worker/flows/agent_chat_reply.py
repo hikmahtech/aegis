@@ -65,6 +65,20 @@ class AgentChatReplyInput:
     synthetic_user_message: str
     thread_id: str
     task_id: str | None = None
+    # Where the reply goes (`{"channel"}`, plus `"ts"` inside a thread): the
+    # channel and thread the question was asked in. None ⇒ the agent's own
+    # channel, as before — so a question to Pandora asked in Maou's channel
+    # used to be answered in Pandora's.
+    reply_ref: dict | None = None
+
+
+def _delivery_args(inp: AgentChatReplyInput, text: str) -> list:
+    """`send_message` args: the agent's channel as before, or the channel and
+    thread the question came from. `send_message`'s `thread_ref` is exactly
+    that shape — a `{"channel"}` with no `ts` posts top-level there."""
+    if not inp.reply_ref or not inp.reply_ref.get("channel"):
+        return [inp.target_agent, text]
+    return [inp.target_agent, text, 0, dict(inp.reply_ref)]
 
 
 @workflow.defn(name="AgentChatReplyFlow")
@@ -124,10 +138,9 @@ class AgentChatReplyFlow:
                 try:
                     await workflow.execute_activity_method(
                         DeliveryActivities.send_message,
-                        args=[
-                            inp.target_agent,
-                            f"I couldn't answer that one: {err_msg[:200]}",
-                        ],
+                        args=_delivery_args(
+                            inp, f"I couldn't answer that one: {err_msg[:200]}"
+                        ),
                         start_to_close_timeout=TIMEOUT_FAST,
                         retry_policy=STANDARD,
                     )
@@ -166,7 +179,7 @@ class AgentChatReplyFlow:
         try:
             tg = await workflow.execute_activity_method(
                 DeliveryActivities.send_message,
-                args=[inp.target_agent, reply_text],
+                args=_delivery_args(inp, reply_text),
                 start_to_close_timeout=TIMEOUT_FAST,
                 retry_policy=STANDARD,
             )

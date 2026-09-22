@@ -309,6 +309,10 @@ class AgentReplyTriggerRequest(BaseModel):
     message: str
     thread_id: str
     reply_chat_id: int
+    # Where the answer goes: `{"channel"}` for the channel the question was
+    # asked in, plus `"ts"` (the thread root) when it was asked in a thread.
+    # None keeps the old behaviour, the agent's own channel.
+    reply_ref: dict[str, str] | None = None
 
 
 @router.post("/agent-reply/trigger")
@@ -358,6 +362,7 @@ async def post_agent_reply_trigger(
             "thread_id": body.thread_id,
             "task_id": None,
             "reply_chat_id": body.reply_chat_id,
+            "reply_ref": body.reply_ref,
         },
         id=workflow_id,
         task_queue="aegis-main",

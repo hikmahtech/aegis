@@ -481,15 +481,28 @@ class SlackCoreClient:
         return {"agent_id": "", "method": "default"}
 
     async def agent_reply_trigger(
-        self, *, target_agent: str, message: str, thread_id: str, reply_chat_id: int
+        self,
+        *,
+        target_agent: str,
+        message: str,
+        thread_id: str,
+        reply_chat_id: int,
+        reply_ref: dict | None = None,
     ) -> dict | None:
-        """POST /api/chat/agent-reply/trigger — spawn AgentChatReplyFlow (async)."""
+        """POST /api/chat/agent-reply/trigger — spawn AgentChatReplyFlow (async).
+
+        `reply_ref` is where the answer goes: `{"channel"}` for the channel the
+        question was asked in, plus `"ts"` when it was asked inside a thread.
+        Omitted from the body when None, so an older core sees the request it
+        always did."""
         payload = {
             "target_agent": target_agent,
             "message": message,
             "thread_id": thread_id,
             "reply_chat_id": reply_chat_id,
         }
+        if reply_ref:
+            payload["reply_ref"] = reply_ref
         return await self._post("/api/chat/agent-reply/trigger", payload, timeout=15)
 
     async def capture(
@@ -704,7 +717,13 @@ class SlackInbound:
         self._sticky[channel_id] = (agent_id, now)
 
     async def _sync_chat(
-        self, *, agent_id: str, clean_text: str, thread_id: str, channel_id: str
+        self,
+        *,
+        agent_id: str,
+        clean_text: str,
+        thread_id: str,
+        channel_id: str,
+        reply_thread: str = "",
     ) -> str:
         """Sync chat: POST /api/chat → post reply → attach delivery-ref.
 
@@ -713,6 +732,8 @@ class SlackInbound:
 
         `agent_id` may be "": core's front door then picks the agent and its
         answer names it (#579). Returns the agent that answered ("" if none).
+        `reply_thread` is the root of the thread the question was asked in,
+        "" for a top-level question.
         """
         result = await self._core.chat(
             agent_id=agent_id,
@@ -724,7 +745,7 @@ class SlackInbound:
         assistant_message_id = result.get("assistant_message_id")
         answered_by = result.get("agent_id") or agent_id
 
-        send_result = await self._reply(answered_by, channel_id, reply_text)
+        send_result = await self._reply(answered_by, channel_id, reply_text, reply_thread)
 
         if assistant_message_id and send_result.ok and send_result.ref is not None:
             await self._core.attach_delivery_ref(
@@ -784,7 +805,9 @@ class SlackInbound:
             await self._ingest_self_signal(channel_id=channel_id, ts=ts, text=text)
             return
 
-        await self._route_and_dispatch(channel_id=channel_id, text=text)
+        await self._route_and_dispatch(
+            channel_id=channel_id, text=text, ts=ts, thread_ts=thread_ts
+        )
 
     # --- task threads (a task's coding session, one Slack thread) ------------
 
@@ -947,14 +970,33 @@ class SlackInbound:
         else:
             logger.warning("slack_self_signal_ingest_failed", channel=channel_id, ts=ts)
 
-    async def _route_and_dispatch(self, *, channel_id: str, text: str) -> None:
+    async def _route_and_dispatch(
+        self, *, channel_id: str, text: str, ts: str = "", thread_ts: str = ""
+    ) -> None:
         """Route an inbound message body and dispatch it (sync chat vs async).
 
         Shared post-routing core for both typed messages (`on_message`) and
         transcribed voice notes (`on_file` audio branch) so a voice note behaves
         exactly like a typed message: @mention parsing, sticky-agent, and the
         sync/async split all apply identically.
+
+        Two things every agent now does alike (2026-09-22):
+
+        * **The message is acknowledged at once**, with a :eyes: reaction on
+          it (`ts`). Only async agents used to say anything before the answer
+          ("Routing to @pandora…"), so a sync agent's 13-second tool loop read
+          as no reply at all. The async text is kept only for when the
+          reaction cannot be added (no `reactions:write` scope yet): an async
+          answer can be minutes away, and silence for that long is worse.
+        * **The answer goes where the question was asked.** A message inside
+          a thread (`thread_ts` set and not its own `ts`) is answered in that
+          thread; a top-level one in the channel. The sync reply used to go to
+          the channel whatever the thread, and the async one to the agent's
+          own channel whatever the channel.
         """
+        acked = await self._acknowledge(channel_id, ts)
+        # A thread ROOT has thread_ts == ts: that is a top-level message.
+        reply_thread = thread_ts if thread_ts and thread_ts != ts else ""
         cfg = await self._routing_config()
         mode, agent_id, clean_text = route_message(
             channel_id,
@@ -986,16 +1028,23 @@ class SlackInbound:
         thread_id = slack_thread_id(channel_id, agent_id)
 
         if mode == "async":
+            reply_ref = {"channel": channel_id}
+            if reply_thread:
+                reply_ref["ts"] = reply_thread
             triggered = await self._core.agent_reply_trigger(
                 target_agent=agent_id,
                 message=clean_text,
                 thread_id=thread_id,
                 reply_chat_id=0,
+                reply_ref=reply_ref,
             )
             if triggered is not None:
-                # Short ack so the user knows it's queued; pandora's kimi
-                # tools can legitimately run minutes.
-                await self._reply(agent_id, channel_id, f"🤖 Routing to @{agent_id}…")
+                if not acked:
+                    # No reaction to say it arrived, and pandora's kimi tools
+                    # can legitimately run minutes: say it in words.
+                    await self._reply(
+                        agent_id, channel_id, f"🤖 Routing to @{agent_id}…", reply_thread
+                    )
                 return
             # Trigger failed (non-2xx or transport error) — fall back to sync
             # so the user still gets a reply rather than silence.
@@ -1011,6 +1060,7 @@ class SlackInbound:
             clean_text=clean_text,
             thread_id=thread_id,
             channel_id=channel_id,
+            reply_thread=reply_thread,
         )
         if answered_by and not agent_id:
             # Core picked the agent: it is now this conversation's.
@@ -1448,15 +1498,28 @@ class SlackInbound:
         message = f"{transcript}\n\n{caption}" if caption else transcript
         await self._route_and_dispatch(channel_id=channel_id, text=message)
 
-    async def _reply(self, agent_id: str, channel_id: str, text: str):
-        """Say `text` in `channel_id` as `agent_id`.
+    async def _reply(self, agent_id: str, channel_id: str, text: str, thread_ts: str = ""):
+        """Say `text` in `channel_id` as `agent_id`, inside the thread rooted
+        at `thread_ts` when one is given.
 
         Every reply this handler sends goes out this way. The adapter's result
         is returned for the one caller that attaches a delivery ref to it.
         """
-        return await self._adapter.send_message(
-            agent_id=agent_id, text=text, target={"channel": channel_id}
-        )
+        target = {"channel": channel_id}
+        if thread_ts:
+            target["thread_ts"] = thread_ts
+        return await self._adapter.send_message(agent_id=agent_id, text=text, target=target)
+
+    async def _acknowledge(self, channel_id: str, ts: str) -> bool:
+        """React :eyes: on the message the moment it arrives, for every agent.
+        False when there is no message to react to or Slack refused (e.g. the
+        app has not been granted `reactions:write`); never raises."""
+        if not ts:
+            return False
+        add = getattr(self._adapter, "add_reaction", None)
+        if add is None:
+            return False
+        return bool(await add(channel=channel_id, ts=ts, name="eyes"))
 
     async def _download_private_file(self, url: str | None) -> bytes | None:
         """Download a Slack private file via the bot-token bearer auth."""

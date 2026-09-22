@@ -37,6 +37,10 @@ oauth_config:
       - im:read
       - users:read
       - reactions:read
+      # The :eyes: acknowledgement on every message routed to an agent. Without
+      # it the reaction fails with missing_scope and async agents fall back to
+      # the "Routing to @agent" text; sync agents stay silent until they answer.
+      - reactions:write
 settings:
   event_subscriptions:
     bot_events:

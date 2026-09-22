@@ -72,6 +72,33 @@ async def test_agent_reply_trigger_creates_no_task(app, auth_headers, monkeypatc
     assert payload["reply_chat_id"] == 12345
     assert payload["thread_id"] == "chat-12345-pandoras-actor"
     assert call.kwargs["task_queue"] == "aegis-main"
+    # No reply target sent: the flow answers in the agent's own channel.
+    assert payload["reply_ref"] is None
+
+
+async def test_agent_reply_trigger_forwards_where_the_answer_goes(app, auth_headers):
+    """The channel and thread the question came from reach the flow, so the
+    answer lands there instead of in the agent's own channel."""
+    fake_temporal = MagicMock()
+    fake_temporal.start_workflow = AsyncMock(return_value=MagicMock())
+    app.state.temporal_client = fake_temporal
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/api/chat/agent-reply/trigger",
+            headers=auth_headers,
+            json={
+                "target_agent": "pandoras-actor",
+                "message": "and now?",
+                "thread_id": "slack-CMAOU-pandoras-actor",
+                "reply_chat_id": 0,
+                "reply_ref": {"channel": "CMAOU", "ts": "8.0"},
+            },
+        )
+
+    assert resp.status_code == 200, resp.text
+    payload = fake_temporal.start_workflow.call_args.args[1]
+    assert payload["reply_ref"] == {"channel": "CMAOU", "ts": "8.0"}
 
 
 async def test_agent_reply_trigger_repeat_asks_stay_taskless(app, auth_headers, monkeypatch):

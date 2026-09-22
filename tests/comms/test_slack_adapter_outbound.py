@@ -92,6 +92,35 @@ async def test_send_message_slack_error_returns_not_ok(monkeypatch):
     assert r.error
 
 
+async def test_add_reaction_reacts_on_the_message(monkeypatch):
+    a = _adapter(monkeypatch)
+    assert await a.add_reaction(channel="C1", ts="3.4", name="eyes") is True
+    assert a._client.reactions_add.await_args.kwargs == {
+        "channel": "C1", "timestamp": "3.4", "name": "eyes"
+    }
+
+
+async def test_add_reaction_never_raises_and_says_whether_it_worked(monkeypatch):
+    """An acknowledgement must not cost the message it acknowledges. Without
+    `reactions:write` Slack answers missing_scope: that is a False, not a
+    crash, so async agents can fall back to their routing text."""
+    a = _adapter(monkeypatch)
+    a._client.reactions_add.side_effect = SlackApiError(
+        "no", response={"ok": False, "error": "missing_scope"}
+    )
+    assert await a.add_reaction(channel="C1", ts="3.4", name="eyes") is False
+
+    a._client.reactions_add.side_effect = SlackApiError(
+        "dup", response={"ok": False, "error": "already_reacted"}
+    )
+    assert await a.add_reaction(channel="C1", ts="3.4", name="eyes") is True
+
+    a._client.reactions_add.side_effect = RuntimeError("socket closed")
+    assert await a.add_reaction(channel="C1", ts="3.4", name="eyes") is False
+
+    assert await a.add_reaction(channel="C1", ts="", name="eyes") is False
+
+
 async def test_send_card_passes_blocks_with_callback_value(monkeypatch):
     a = _adapter(monkeypatch)
     spec = CardSpec("i1", "sebas", "approval", "ok?", None)
