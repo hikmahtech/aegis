@@ -157,8 +157,8 @@ async def record_pr_closed(
     """A pull request closed. For every live problem an investigation opened
     it for: write the close on the timeline and move the problem to
     :func:`fix_status`. Returns one row per problem: ``problem_id``, ``state``
-    (merged | closed), ``status`` (where the problem is now meant to be) and
-    ``moved``.
+    (merged | closed), ``status`` (where the problem is now meant to be),
+    ``moved``, and ``text``, the note written on its timeline.
 
     ``at`` is GitHub's `merged_at` / `closed_at`. It is in the event's id, so
     a retried or redelivered close is written once; a PR closed, reopened and
@@ -200,7 +200,9 @@ async def record_pr_closed(
         moved = was != "resolved" and await set_status(
             pool, problem_id, status, reason=text[:300], now=now
         )
-        out.append({"problem_id": problem_id, "state": state, "status": status, "moved": moved})
+        out.append(
+            {"problem_id": problem_id, "state": state, "status": status, "moved": moved, "text": text}
+        )
         logger.info(
             "hub_fix_pr_closed", problem_id=problem_id, state=state, status=status, moved=moved
         )

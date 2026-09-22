@@ -42,6 +42,7 @@ Core and the worker both import this module (the worker already imports
 from __future__ import annotations
 
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -454,6 +455,59 @@ async def get_problem(pool: asyncpg.Pool, problem_id: str) -> dict[str, Any] | N
         problem_id,
     )
     return dict(row) if row else None
+
+
+async def claim_investigation(
+    pool: asyncpg.Pool,
+    problem_id: str,
+    run_id: str,
+    *,
+    is_running: Callable[[str], Awaitable[bool]],
+) -> dict[str, Any]:
+    """Make ``run_id`` the one investigation of a problem (#639).
+
+    Returns ``{"claimed": True, "holder": run_id}`` when the problem had no
+    holder, already had this one, or had one ``is_running`` says has ended.
+    Returns ``{"claimed": False, "holder": <other run>}`` while another run is
+    still going: the caller stands down and leaves the problem to it.
+
+    Both writes are compare-and-swap on the holder, so two runs claiming at
+    once cannot both win: the loser's UPDATE matches no row and it reads the
+    winner back. A problem that does not exist is ``claimed``, because there
+    is nothing to race over and the flow's own checks deal with it.
+    """
+    row = await pool.fetchrow(
+        "UPDATE problems SET investigation_run = $2 "
+        "WHERE id = $1::uuid AND (investigation_run IS NULL OR investigation_run = $2) "
+        "RETURNING investigation_run",
+        problem_id,
+        run_id,
+    )
+    if row is not None:
+        return {"claimed": True, "holder": run_id}
+    holder = await pool.fetchval(
+        "SELECT investigation_run FROM problems WHERE id = $1::uuid", problem_id
+    )
+    if holder is None:
+        # Nothing ever sets the column back to NULL, so the first UPDATE
+        # missing it means there is no such problem.
+        return {"claimed": True, "holder": run_id}
+    if await is_running(holder):
+        return {"claimed": False, "holder": holder}
+    taken = await pool.fetchrow(
+        "UPDATE problems SET investigation_run = $3 "
+        "WHERE id = $1::uuid AND investigation_run = $2 RETURNING investigation_run",
+        problem_id,
+        holder,
+        run_id,
+    )
+    if taken is not None:
+        return {"claimed": True, "holder": run_id}
+    # Someone else took it over first; they are the live run now.
+    winner = await pool.fetchval(
+        "SELECT investigation_run FROM problems WHERE id = $1::uuid", problem_id
+    )
+    return {"claimed": winner == run_id, "holder": winner}
 
 
 async def list_events(

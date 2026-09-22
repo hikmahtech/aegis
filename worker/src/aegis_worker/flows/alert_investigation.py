@@ -107,6 +107,35 @@ _PATCH_KG_AFTER_DECISION = "kg-verdict-after-decision"
 # answers False on its replay and it goes on exactly as recorded.
 _PATCH_RETIRE_OLD_CARDS = "retire-superseded-cards"
 
+# #639: one investigation per problem. A run claims its problem at step 0 and
+# stands down when another run still holds it; and a run asks the hub once
+# more right before its Gate-2 card, and posts none for a problem that
+# resolved while it was investigating. Both are live patches for the same
+# reason as #629's: a run already past those points replays as recorded.
+_PATCH_CLAIM = "claim-investigation"
+_PATCH_RECHECK_BEFORE_CARD = "recheck-before-gate2-card"
+
+
+_PR_TITLE_MAX = 72
+
+
+def fix_pr_title(verdict: dict, alert_title: str) -> str:
+    """The title of a PR an investigation opens (#639): the first sentence of
+    the verdict's suggested fix, else of its root cause, else the alert's
+    title, as a `fix:` line short enough for a squash commit. The literal
+    "AEGIS-proposed fix" it replaces said nothing, so every merge needed its
+    title written by hand."""
+    for text in (verdict.get("suggested_fix"), verdict.get("root_cause"), alert_title):
+        line = " ".join(str(text or "").split())
+        line = re.split(r"(?<=[.!?])\s", line, maxsplit=1)[0].rstrip(".!? ")
+        if line:
+            line = line[0].lower() + line[1:]
+            head = f"fix: {line}"
+            if len(head) > _PR_TITLE_MAX:
+                head = head[: _PR_TITLE_MAX - 1].rstrip() + "…"
+            return head
+    return "fix: AEGIS-proposed fix"
+
 
 def _safe_workflow_id_segment(text: str, max_len: int = 60) -> str:
     """Replace characters illegal in Temporal workflow IDs with dashes."""
@@ -616,6 +645,50 @@ class AlertInvestigationFlow:
                 retry_policy=FAST,
             )
             track_task_id = status_now.get("todoist_task_id") or None
+
+        # ── Step 0.5: one investigation per problem (#639) ──
+        # A resolve and a new firing a second apart reopen the problem, and
+        # the reopen asks for an investigation while the first one is still
+        # running. Two runs mean two bills and two verdicts that contradict
+        # each other in Slack, so the later run leaves the problem to the one
+        # already on it. The occurrence that started this run is on the
+        # timeline already (the producer ingested it); this adds why nothing
+        # followed. A claim that fails is treated as won: a second run is the
+        # old behaviour, a lost investigation is worse.
+        if problem_id and workflow.patched(_PATCH_CLAIM):
+            try:
+                claim = await workflow.execute_activity_method(
+                    HubActivities.claim_investigation,
+                    args=[{"problem_id": problem_id, "run_id": workflow.info().workflow_id}],
+                    start_to_close_timeout=TIMEOUT_FAST,
+                    retry_policy=FAST,
+                )
+            except Exception as exc:  # noqa: BLE001
+                workflow.logger.warning(
+                    "alert_claim_failed problem_id=%s err=%s", problem_id, error_text(exc)
+                )
+                claim = {"claimed": True}
+            if not claim.get("claimed", True):
+                holder = str(claim.get("holder") or "")
+                workflow.logger.info(
+                    "alert_investigation_already_running problem_id=%s holder=%s",
+                    problem_id,
+                    holder,
+                )
+                await self._record(
+                    problem_id,
+                    "",
+                    f"Came back while {holder} was still investigating it; "
+                    "left to that run.",
+                    step="already_investigating",
+                )
+                return {
+                    "status": "already_investigating",
+                    "holder": holder,
+                    "task_id": None,
+                    "problem_id": problem_id,
+                    "todoist_task_id": track_task_id,
+                }
 
         # ── Step 2.6: Escalating heads-up ping ──
         # Escalating infra alerts (NodeDown / HeartbeatCollectFailed) get an
@@ -1401,6 +1474,52 @@ class AlertInvestigationFlow:
                 f"gate2-{_safe_workflow_id_segment(alert.get('fingerprint') or '')}"
                 f"-{workflow.info().workflow_id}"
             )
+            # Ask the hub once more before the card goes out (#639). The run
+            # checked at the end of its verification delay, but the
+            # investigation after it takes minutes, and a problem that
+            # resolved in that time must not get a card, a "Run fix" button or
+            # a PR. #629's retire-on-resolve cannot catch it: the card did not
+            # exist yet when the problem resolved. A hub that cannot answer
+            # reads as "not resolved", as at step 3.
+            if problem_id and workflow.patched(_PATCH_RECHECK_BEFORE_CARD):
+                try:
+                    before_card = await workflow.execute_activity_method(
+                        HubActivities.problem_status,
+                        args=[problem_id],
+                        start_to_close_timeout=TIMEOUT_FAST,
+                        retry_policy=FAST,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    workflow.logger.warning(
+                        "alert_gate2_precheck_failed problem_id=%s err=%s",
+                        problem_id,
+                        error_text(exc),
+                    )
+                    before_card = {"resolved": False}
+                if before_card.get("resolved"):
+                    workflow.logger.info(
+                        "alert_self_resolved_before_gate problem_id=%s", problem_id
+                    )
+                    await self._store_verdict(
+                        alert, verdict, investigation_output, "self_resolved"
+                    )
+                    await self._safe_post_note(
+                        track_task_id or "",
+                        "✅ Resolved while I was investigating, so no decision card. "
+                        f"What I found: {verdict_summary or verdict_status}",
+                    )
+                    await self._record(
+                        problem_id,
+                        "resolved",
+                        "Resolved before the decision card was posted; no card sent.",
+                        step="self_resolved_before_gate",
+                    )
+                    return {
+                        "status": "self_resolved_before_gate",
+                        "task_id": None,
+                        "problem_id": problem_id,
+                        "todoist_task_id": track_task_id,
+                    }
             # One live card per problem (#629). The older runs' cards are
             # retired before this one goes out: each is refused if pressed,
             # edited in Slack to say it was replaced, and its waiting run is
@@ -1729,7 +1848,7 @@ class AlertInvestigationFlow:
                             problem_id=problem_id,
                             repo=github_repo,
                             branch=branch_name,
-                            title="AEGIS-proposed fix",
+                            title=fix_pr_title(verdict, title),
                             body=verdict_summary,
                             diff="",
                             kimi_session_id=inv_result.get("session_id", ""),

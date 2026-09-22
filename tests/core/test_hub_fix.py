@@ -138,7 +138,14 @@ async def test_a_merged_fix_pr_moves_its_problem_to_verifying(db_pool):
         db_pool, url=url, merged=True, at=T0.isoformat(), now=T0
     )
 
-    assert out == [{"problem_id": pid, "state": "merged", "status": "verifying", "moved": True}]
+    [row] = out
+    assert row["text"].startswith(f"Fix PR merged: {url}.")
+    assert {k: v for k, v in row.items() if k != "text"} == {
+        "problem_id": pid,
+        "state": "merged",
+        "status": "verifying",
+        "moved": True,
+    }
     assert (await get_problem(db_pool, pid))["status"] == "verifying"
     [note] = await _notes(db_pool, pid)
     assert note["source"] == "github"

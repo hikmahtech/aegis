@@ -187,9 +187,13 @@ async def test_a_fix_pr_is_followed_from_merge_to_resolved(db_pool):
         {"url": url, "merged": True, "merged_at": "2026-09-12T10:00:00Z", "closed_at": "2026-09-12T10:00:00Z"},
     )
 
-    assert out == {
-        "followed": 1,
-        "problems": [{"problem_id": pid, "state": "merged", "status": "verifying", "moved": True}],
+    assert out["followed"] == 1
+    [row] = out["problems"]
+    assert {k: v for k, v in row.items() if k != "text"} == {
+        "problem_id": pid,
+        "state": "merged",
+        "status": "verifying",
+        "moved": True,
     }
     assert (await get_problem(db_pool, pid))["status"] == "verifying"
     # No window left to wait out: the next sweep resolves it.
@@ -525,3 +529,97 @@ async def test_stale_stuck_problems_only_answers_about_the_classes_asked_for(db_
     # No class list is still the old, wide question — for a caller that means it.
     wide = [r["id"] for r in await env.run(act.stale_stuck_problems, [s], 1.0, None)]
     assert memory.problem_id in wide
+
+
+async def test_a_merged_fix_pr_is_announced_in_the_channel(db_pool):
+    """#639: the owner opens a fix PR from a card in the channel, so the
+    channel hears the merge. The task note alone (`posted: false`) left a
+    merge the owner never saw AEGIS acknowledge."""
+    from unittest.mock import AsyncMock
+
+    delivery = AsyncMock()
+    delivery.channel = "slack"
+    delivery.db_pool = None
+    delivery.send_message.return_value = {"ok": True}
+    env = ActivityEnvironment()
+    act = HubActivities(db_pool=db_pool, delivery=delivery)
+    s = f"svc_{uuid.uuid4().hex[:8]}"
+    url = f"https://github.com/o/r/pull/{uuid.uuid4().int % 100000}"
+    pid = (await env.run(act.ingest_alert, _alert(s), False))["problem_id"]
+    await env.run(
+        act.record_investigation,
+        {"problem_id": pid, "status": "fixing", "text": "PR", "external_id": f"wf-{s}:prs_opened", "payload": {"pr_urls": [url]}},
+    )
+
+    await env.run(act.follow_fix_pr, {"url": url, "merged": True, "merged_at": "2026-09-21T21:28:00Z"})
+
+    delivery.send_message.assert_awaited_once()
+    kwargs = delivery.send_message.await_args.kwargs
+    assert kwargs["message"].startswith(f"Fix PR merged: {url}.")
+    assert kwargs["agent_id"]  # the `infra` holder, whoever that is
+
+
+async def test_claim_investigation_leaves_a_live_run_alone(db_pool):
+    """#639: a reopen started `-9` while `-8` was still running. The second
+    run finds the first holding the problem, and Temporal says it is still
+    going, so it stands down. Once the holder has ended, a new run takes over."""
+    from unittest.mock import MagicMock
+
+    from temporalio.client import WorkflowExecutionStatus
+
+    running = {"investigate-x-8": True}
+
+    def handle_for(wf_id):
+        h = MagicMock()
+
+        async def describe():
+            d = MagicMock()
+            d.status = (
+                WorkflowExecutionStatus.RUNNING
+                if running.get(wf_id)
+                else WorkflowExecutionStatus.COMPLETED
+            )
+            return d
+
+        h.describe = describe
+        return h
+
+    client = MagicMock()
+    client.get_workflow_handle.side_effect = handle_for
+    env = ActivityEnvironment()
+    act = HubActivities(db_pool=db_pool, temporal_client=client)
+    pid = (await env.run(act.ingest_alert, _alert(f"svc_{uuid.uuid4().hex[:8]}"), False))["problem_id"]
+
+    first = await env.run(act.claim_investigation, {"problem_id": pid, "run_id": "investigate-x-8"})
+    assert first == {"claimed": True, "holder": "investigate-x-8"}
+    second = await env.run(act.claim_investigation, {"problem_id": pid, "run_id": "investigate-x-9"})
+    assert second == {"claimed": False, "holder": "investigate-x-8"}
+    # The holder claiming again (a retried activity) keeps it.
+    again = await env.run(act.claim_investigation, {"problem_id": pid, "run_id": "investigate-x-8"})
+    assert again["claimed"] is True
+
+    running["investigate-x-8"] = False
+    third = await env.run(act.claim_investigation, {"problem_id": pid, "run_id": "investigate-x-10"})
+    assert third == {"claimed": True, "holder": "investigate-x-10"}
+
+
+async def test_claim_investigation_fails_open(db_pool):
+    """No Temporal client, or one that cannot answer: the holder is not
+    provably running, so the new run investigates. A duplicate run is the old
+    behaviour; a lost investigation is worse."""
+    from unittest.mock import MagicMock
+
+    env = ActivityEnvironment()
+    pid = (
+        await env.run(HubActivities(db_pool=db_pool).ingest_alert, _alert(f"svc_{uuid.uuid4().hex[:8]}"), False)
+    )["problem_id"]
+    no_client = HubActivities(db_pool=db_pool)
+    await env.run(no_client.claim_investigation, {"problem_id": pid, "run_id": "a"})
+    assert (await env.run(no_client.claim_investigation, {"problem_id": pid, "run_id": "b"}))["claimed"] is True
+
+    broken = MagicMock()
+    broken.get_workflow_handle.side_effect = RuntimeError("temporal down")
+    act = HubActivities(db_pool=db_pool, temporal_client=broken)
+    assert (await env.run(act.claim_investigation, {"problem_id": pid, "run_id": "c"}))["claimed"] is True
+    # No pool at all: nothing to claim against.
+    assert (await env.run(HubActivities(db_pool=None).claim_investigation, {"problem_id": pid, "run_id": "d"}))["claimed"] is True
