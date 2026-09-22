@@ -24,9 +24,10 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
-from aegis.agent_tags import BEHAVIOR_TAGS
+from aegis.agent_tags import BEHAVIOR_TAGS, GENERALIST_TAG
 from aegis.api.auth import verify_auth
 from aegis.api.deps import get_pool, get_settings
+from aegis.api.routes._flow_trigger import require_temporal_client, start_named_workflow
 from aegis.config import Settings
 from aegis.services import notes
 from aegis.services import record as vault_record
@@ -100,6 +101,21 @@ async def _waiting_drafts(settings: Settings, layout: vl.Layout) -> list[str]:
     except notes.NotesError:
         return []
     return [layout.record.draft_path(n) for n in files.drafts]
+
+
+_SEED_FLOW = {"record_seed": "RecordSeedFlow"}
+
+
+@router.post("/record/seed")
+async def start_record_seed(request: Request) -> dict[str, Any]:
+    """Draft the owner's record (vault record spec §12): starts RecordSeedFlow,
+    which writes each draft once as `<dir>/<name>.draft.md` and sends one
+    message listing them. Runs as the gtd holder; 503 without Temporal."""
+    client = require_temporal_client(request)
+    pool = get_pool(request)
+    owner = await resolve_tag(pool, GENERALIST_TAG) or ""
+    handle = await start_named_workflow("record_seed", {"agent_id": owner}, client, _SEED_FLOW, pool=pool)
+    return {"ok": True, "workflow_id": handle.id}
 
 
 @router.get("/layout/preview")

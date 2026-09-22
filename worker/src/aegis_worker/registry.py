@@ -89,6 +89,7 @@ from aegis_worker.flows.receipt_ingest import (
     ReceiptIngestFlow,
     ReceiptIngestInput,
 )
+from aegis_worker.flows.record_seed import RecordSeedFlow
 from aegis_worker.flows.research import ResearchFlow
 from aegis_worker.flows.review import (
     DailyReviewConfig,
@@ -342,6 +343,10 @@ FLOWS: tuple[FlowSpec, ...] = (
             aegis_ui_url=act["_settings"].get("aegis_ui_url", ""),
         ),
     ),
+    # The record's seed (vault record spec §12): started by hand from the admin
+    # Vault page (`POST /api/admin/notes/record/seed`). No schedule and no
+    # activities.yaml row.
+    FlowSpec(RecordSeedFlow),
     FlowSpec(
         RssIngestFlow,
         lambda act: RssIngestInput(agent_id=act["agent_id"]),

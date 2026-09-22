@@ -452,9 +452,13 @@ def test_books_write_flow_is_gated_on_money_hygiene():
         # Then +1 activity and NO new flow from the vault record's read side:
         # `notes_compile_record` on the new RecordActivities, the last step of
         # NotesSyncFlow. Unflagged, so all three rows move.
-        (True, True, 52, 258),
-        (False, False, 41, 222),
-        (True, False, 45, 240),
+        # Then +1 flow and +3 activities from the record's seed (vault record
+        # spec §12): RecordSeedFlow (hand-started, no seed row) and
+        # `record_seed_general`, `record_seed_money`, `record_seed_interests`
+        # on RecordActivities. Unflagged, so all three rows move.
+        (True, True, 53, 261),
+        (False, False, 42, 225),
+        (True, False, 46, 243),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):

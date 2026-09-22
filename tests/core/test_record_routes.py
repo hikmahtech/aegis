@@ -126,3 +126,21 @@ async def test_the_page_lists_no_drafts_without_a_vault(pool):
     async with _client(pool, Settings(**BASE)) as c:
         body = (await c.get(URL, headers=AUTH)).json()
     assert body["drafts"] == [] and body["record_state"] == {}
+
+
+async def test_the_seed_button_starts_the_flow_as_the_gtd_holder(pool):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock
+
+    client = MagicMock()
+    client.start_workflow = AsyncMock(return_value=SimpleNamespace(id="manual-record_seed-1"))
+    app = create_app(run_lifespan=False)
+    app.state.db_pool = pool
+    app.state.temporal_client = client
+    app.dependency_overrides[get_settings] = lambda: Settings(**BASE)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        r = await c.post("/api/admin/notes/record/seed", headers=AUTH)
+    assert r.status_code == 200 and r.json()["workflow_id"] == "manual-record_seed-1"
+    args, kwargs = client.start_workflow.call_args
+    assert args[0] == "RecordSeedFlow" and args[1] == {"agent_id": await _gtd_holder(pool)}
+    assert kwargs["task_queue"] == "aegis-main"
