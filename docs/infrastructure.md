@@ -1005,8 +1005,8 @@ the prior-incident search, but it is never the runbook. And resources of kind
 something:
 
 - the investigation staged a fix branch (**Open PR**),
-- the verdict is `actionable` and the investigation proposed commands
-  (**Run fix**),
+- the verdict is `actionable` and the investigation proposed commands that
+  change something (**Run fix**),
 - the alert escalates (a node down, the heartbeat unable to reach the swarm),
   which nags until you ack it, or
 - the problem came back right after an automatic restart (below).
@@ -1025,6 +1025,27 @@ acks and one **Run fix**. They go on the task comment instead, marked as not
 run, so you can still run them by hand. Without commands the status earns no
 card at all: an `actionable` verdict with no branch is work for you, but
 nothing a card could approve.
+
+**Checks are not fixes (#641).** An infra investigation ends with two lists:
+`CHECK_COMMANDS:` (read-only: ping, `node ls`, `service ps`, inspect, logs)
+and `FIX_COMMANDS:` (commands that change state). The list a command came in
+does not decide where it goes; `is_read_only_command` does. It knows a short
+list of read-only commands, and anything it does not know counts as a fix,
+so **Run checks** can never change anything. Only fixes earn a card. Checks
+ride on a card sent for another reason, as **Run checks**, and otherwise go on
+the task comment. On the card that prompted this, the "fix" was a ping to a
+node that was off, three inspects, and no fix at all.
+
+- A read-only command that exits non-zero does not stop the run. A ping to a
+  dead host failing is the answer. A failed fix still stops it.
+- A typed note overrides the commands on **Run fix** only. On **Run checks** it
+  is ignored, because it could run a change under the name of a check.
+- The run's status in `workflow_runs.result_summary`: `remediated` only when
+  a fix ran, every fix exited 0, and the hub then saw the problem resolve.
+  `waiting_human` when the fix ran and the problem is still there,
+  `remediation_failed` when a fix exited non-zero, `checked` when only
+  read-only commands ran (Run checks, or a note of checks), and
+  `remediation_refused` when nothing ran.
 
 `workflow_runs.result_summary` says what happened: `decision_card` (true or
 false) and `restart_repeat`. To count cards per investigation:
@@ -1146,6 +1167,7 @@ metadata and as an `outcome:<x>` tag:
 | `opened_pr` | you picked Open PR(s) and a PR opened |
 | `pr_failed` | you picked Open PR(s), but none could be opened |
 | `run_fix` | you picked Run fix |
+| `run_checks` | you picked Run checks (read-only, not a fix you took) |
 | `discarded` | you picked Discard |
 | `muted` | you picked Mute 24h |
 | `acknowledged` | you picked Acknowledge |

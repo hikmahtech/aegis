@@ -12,7 +12,12 @@ from unittest.mock import AsyncMock
 
 import pytest
 from aegis_worker.activities import alerts as alerts_mod
-from aegis_worker.activities.alerts import AlertActivities, extract_proposed_commands
+from aegis_worker.activities.alerts import (
+    AlertActivities,
+    extract_commands,
+    extract_proposed_commands,
+    is_read_only_command,
+)
 from aegis_worker.flows.alert_investigation import _build_repo_confirm_prompt
 from temporalio.testing import ActivityEnvironment
 
@@ -174,6 +179,113 @@ def test_extract_proposed_commands_caps_and_absent():
     assert extract_proposed_commands(long) == []  # over-long command dropped
 
 
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "ping -c 3 -W 2 10.20.0.17",
+        "docker node ls",
+        "docker --context swarm node ls",
+        "docker --context=swarm service ps hikmah_hikmah-web",
+        "docker service inspect hikmah_hikmah-web",
+        "docker service logs --tail 50 shop_web",
+        "docker ps -a",
+        "sudo journalctl -u docker --since '1 hour ago'",
+        "systemctl status docker",
+        "kubectl -n shop get pods",
+        "kubectl --context prod describe node wow",
+        "curl -sf http://10.20.0.103:8080/health",
+        "timeout 5 docker info",
+    ],
+)
+def test_read_only_commands_are_recognised(cmd):
+    assert is_read_only_command(cmd) is True
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "docker service update --force shop_web",
+        "docker --context swarm node update --availability drain wow",
+        "docker service scale shop_web=2",
+        "docker rm -f abc",
+        "systemctl restart docker",
+        "kubectl delete pod web-1",
+        "kubectl rollout restart deploy/web",
+        "curl -X POST http://x/restart",
+        "curl -d a=b http://x",
+        # Chained, redirected or substituted: never one simple read.
+        "docker node ls; docker node rm wow",
+        "docker node ls && reboot",
+        "cat /etc/hosts > /tmp/x",
+        "ls $(rm -rf /tmp/x)",
+        # Not something this code knows, so it might change things.
+        "service inspect hikmah_hikmah-web",
+        "reboot",
+        "",
+    ],
+)
+def test_anything_else_counts_as_a_change(cmd):
+    assert is_read_only_command(cmd) is False
+
+
+def test_extract_commands_splits_checks_from_fixes_whatever_the_footer_says():
+    """#641: the investigation's label does not decide. A ping under
+    FIX_COMMANDS is a check, a restart under CHECK_COMMANDS is a fix, and the
+    old PROPOSED_COMMANDS footer is split the same way."""
+    text = (
+        "findings\n\nCHECK_COMMANDS:\n"
+        "- docker node ls\n"
+        "- docker service update --force shop_web\n\n"
+        "FIX_COMMANDS:\n"
+        "- ping -c 3 10.20.0.17\n"
+        "- docker node update --availability drain wow\n"
+        "- docker node ls\n"
+    )
+    assert extract_commands(text) == {
+        "check": ["docker node ls", "ping -c 3 10.20.0.17"],
+        "fix": ["docker service update --force shop_web", "docker node update --availability drain wow"],
+    }
+    legacy = "PROPOSED_COMMANDS:\n- ping -c 3 -W 2 10.20.0.17\n- docker node ls\n"
+    assert extract_commands(legacy) == {
+        "check": ["ping -c 3 -W 2 10.20.0.17", "docker node ls"],
+        "fix": [],
+    }
+    assert extract_commands("no footer") == {"check": [], "fix": []}
+
+
+@pytest.mark.asyncio
+async def test_a_failed_check_does_not_stop_the_run_but_a_failed_change_does():
+    """#641: a ping to a dead host exits 1, and that is the answer, not a
+    reason to stop. A change that fails still stops the sequence."""
+    exits = {"ping -c 1 10.20.0.17": 1, "docker service update --force a": 1}
+    remote = AsyncMock()
+    remote.run_on_host.side_effect = lambda host, cmd, timeout=120: {
+        "status": "ok",
+        "exit_code": exits.get(cmd, 0),
+        "stdout": "",
+        "stderr": "",
+    }
+    pool = AsyncMock()
+    pool.fetchval.return_value = False
+    act = AlertActivities(db_pool=pool, remote_script=remote)
+    result = await ActivityEnvironment().run(
+        act.run_remediation_commands,
+        [
+            "ping -c 1 10.20.0.17",
+            "docker node ls",
+            "docker service update --force a",
+            "docker service update --force b",
+        ],
+        "meem",
+        "fix",
+    )
+    assert [(r["command"], r["exit_code"], r["read_only"]) for r in result["ran"]] == [
+        ("ping -c 1 10.20.0.17", 1, True),
+        ("docker node ls", 0, True),
+        ("docker service update --force a", 1, False),
+    ]
+
+
 @pytest.mark.asyncio
 async def test_run_remediation_commands_executes_and_audits():
     remote = AsyncMock()
@@ -196,9 +308,9 @@ async def test_run_remediation_commands_executes_and_audits():
     executed_args = pool.execute.await_args_list[1].args
     # started is recorded first, before execution, with the commands list.
     assert "remediation_started" in started_args
-    assert started_args[-1] == {"commands": ["docker service ls"], "host": "meem"}
+    assert started_args[-1] == {"commands": ["docker service ls"], "host": "meem", "kind": "fix"}
     assert "remediation_executed" in executed_args
-    assert executed_args[-1] == {"ran": result["ran"]}
+    assert executed_args[-1] == {"ran": result["ran"], "kind": "fix"}
 
 
 @pytest.mark.asyncio

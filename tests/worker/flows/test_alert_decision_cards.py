@@ -101,7 +101,42 @@ async def test_proposed_commands_on_an_actionable_verdict_get_a_card():
 
     assert len(S.cards) == 1
     assert "run_fix" in S.cards[0].options
+    # The `service ps` is a check, not part of the fix (#641).
+    assert "run_checks" in S.cards[0].options
+    assert "Fix commands (Run fix):\n  <code>docker service update --force shop_web</code>\n\n" in (
+        S.cards[0].prompt
+    )
+    assert "Read-only checks (Run checks):\n  <code>docker service ps shop_web</code>" in (
+        S.cards[0].prompt
+    )
     assert result["decision_card"] is True
+
+
+async def test_checks_alone_on_an_actionable_verdict_get_no_card():
+    """#641: the 2026-09-21 card offered "Run fix" for a ping and three
+    inspects. Read-only checks decide nothing, so without a fix command the
+    verdict earns no card, and the checks go on the task. That the
+    investigation filed them under FIX_COMMANDS does not make them fixes."""
+    reset()
+    S.run_investigation = {
+        **S.run_investigation,
+        "output": (
+            "wow is off.\n\nFIX_COMMANDS:\n"
+            "- ping -c 3 -W 2 10.20.0.17\n"
+            "- docker node ls\n"
+            "- docker service inspect hikmah_hikmah-web\n"
+        ),
+    }
+    S.verdict = {**S.verdict, "status": "actionable"}
+
+    result = await run_flow(AlertInvestigationFlow, _memory_alert())
+
+    assert S.cards == []
+    assert result["decision_card"] is False
+    final_note = S.notes[-1][1]
+    assert "fix commands" not in final_note
+    assert "Read-only checks it suggested" in final_note
+    assert "  - ping -c 3 -W 2 10.20.0.17" in final_note
 
 
 @pytest.mark.parametrize("verdict_status", ["inconclusive", "not_actionable"])
@@ -147,7 +182,7 @@ async def test_an_escalating_alert_with_nothing_to_decide_still_gets_a_card():
 
 
 def _needs(verdict_status="inconclusive", **kw) -> bool:
-    args = {"branches": {}, "proposed_cmds": [], "escalate": False, "restart_repeat": False}
+    args = {"branches": {}, "fix_cmds": [], "escalate": False, "restart_repeat": False}
     return gate2_needs_decision(**{**args, **kw}, verdict_status=verdict_status)
 
 
@@ -160,4 +195,4 @@ def test_the_rule_names_every_reason_for_a_card(verdict_status):
     assert _needs(verdict_status, branches={"r": "b"})
     assert _needs(verdict_status, escalate=True)
     assert _needs(verdict_status, restart_repeat=True)
-    assert _needs(verdict_status, proposed_cmds=["x"]) is (verdict_status == "actionable")
+    assert _needs(verdict_status, fix_cmds=["x"]) is (verdict_status == "actionable")

@@ -389,10 +389,12 @@ Configure on the admin Integrations page (worker restart required):
 can trip a heartbeat `DockerServiceDown` and get force-restarted (transient deploys usually
 converge before the 2-tick debounce, so this is rare).
 
-Infra Gate-2 cards can carry a **Run fix** option (kimi's `PROPOSED_COMMANDS:` footer);
-approval executes the commands on the coding host via SSH (refused if the infra row is
-`read_only`), posts outputs to the task, and re-verifies. Approving with a note runs the
-note's lines instead. To route hand-captured Todoist tasks ("noon is down") into the
+Infra Gate-2 cards can carry a **Run fix** option (the investigation's `FIX_COMMANDS:`)
+and a **Run checks** option (read-only `CHECK_COMMANDS:`; code, not the model, decides
+which is which — see `docs/infrastructure.md`, #641); approval executes the commands on
+the coding host via SSH (refused if the infra row is `read_only`), posts outputs to the
+task, and re-verifies after a fix. Approving Run fix with a note runs the note's lines
+instead. To route hand-captured Todoist tasks ("noon is down") into the
 same pipeline, add a content route with `alert_overrides`, e.g.
 `{"source": "todoist-infra", "alertname": "NodeDown", "severity": "critical"}`.
 
