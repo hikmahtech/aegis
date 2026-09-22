@@ -101,6 +101,7 @@ class AgentRunActivities:
         agent_id: str = "",
         gated: bool = False,
         timeout_minutes: int = 0,
+        run_id: str = "",
     ) -> dict:
         """Start one CLI run on the coding host. NOT idempotent — see the flow.
 
@@ -153,6 +154,8 @@ class AgentRunActivities:
             # hour so a run that overruns still has its tools (the flow does
             # not kill an overrunning run — it reports and leaves it attached).
             token_ttl_seconds=(int(timeout_minutes) * 60 + 3600) if timeout_minutes else 0,
+            # The id the dispatch already reported (#640); "" makes a fresh one.
+            run_id=(run_id or "").strip(),
         )
         if started.get("status") != "running":
             return {

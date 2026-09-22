@@ -67,3 +67,32 @@ def test_prompt_includes_tool_descriptions():
 
     assert "## Available Tools" in prompt
     assert "get_quote" in prompt
+
+
+def test_an_agent_with_tools_is_told_to_state_only_what_a_tool_returned():
+    """#640: an agent with list_nodes stated a node's state without calling
+    it, and offered a drain it had no tool for. The rule is in code, so a
+    persona cannot drop it, and it comes after the tools it is about."""
+    prompt = _build_agent_system_prompt(
+        "pandoras-actor",
+        fallback="fallback",
+        persona={"soul": "I am Pandora."},
+        tool_descriptions="You have: list_nodes",
+    )
+    assert "## Evidence" in prompt
+    assert prompt.index("## Available Tools") < prompt.index("## Evidence")
+    assert "only when a tool returned it" in prompt
+    assert "I have not checked" in prompt
+    assert "Offer only actions one of your tools can carry out" in prompt
+
+
+def test_the_evidence_rule_reaches_an_agent_with_no_persona():
+    prompt = _build_agent_system_prompt(
+        "zz", fallback="DB prompt", persona={}, tool_descriptions="You have: x"
+    )
+    assert prompt.startswith("DB prompt\n\n## Evidence")
+
+
+def test_no_tools_no_evidence_rule():
+    prompt = _build_agent_system_prompt("zz", fallback="DB prompt", persona={"soul": "I am Z."})
+    assert "## Evidence" not in prompt

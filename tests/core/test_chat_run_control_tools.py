@@ -42,7 +42,11 @@ async def test_a_task_bound_run_gets_a_deterministic_id():
     ctx = ToolContext(agent_id="sebas", temporal_client=tc)
     out = await _exec_dispatch_agent_run(None, {"prompt": "do it", "todoist_task_id": "9x7"}, ctx)
     assert tc.started[0]["id"] == "agent-run-task-9x7"
-    assert "agent-run-task-9x7" in out
+    # The confirmation names the RUN id, the one stop_agent_run takes and the
+    # result header prints; the task id stays in the workflow id (#640).
+    run_id = tc.started[0]["arg"]["run_id"]
+    assert f"Dispatched agent run {run_id}" in out
+    assert f"stop_agent_run(run_id='{run_id}')" in out
 
 
 async def test_an_untied_run_keeps_a_random_id():

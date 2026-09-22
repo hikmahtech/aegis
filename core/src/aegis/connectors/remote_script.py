@@ -309,6 +309,9 @@ def _plan_tmux_launch(list_windows_output: str, cap: int) -> tuple[list[str], bo
 # of long task-handler output visible.
 _STDOUT_CAP = 32 * 1024
 _STDERR_CAP = 4 * 1024
+# A run id is spliced into shell commands (tmux window names, file paths), so
+# one given by a caller must match this; `stop_coding_run` checks the same.
+_RUN_ID_RE = re.compile(r"[A-Za-z0-9_-]{4,64}")
 # Coding-CLI stream-json logs are mostly tool results; keep enough of the tail
 # that the agent's own assistant turns survive the slice.
 _KIMI_OUTPUT_CAP = 512 * 1024
@@ -752,6 +755,14 @@ class RemoteScriptConnector:
         """Pick the coding-CLI engine for a repo (routing-table lookup)."""
         return self._route_for(github_repo)[0]
 
+    async def routed_engine(self, github_repo: str = "") -> str:
+        """The engine a launch with no `engine_override` would use, from the
+        current coding block. `start_kimi_run` decides with the same lookup,
+        so a caller can name the engine before the run starts rather than
+        leave a gap a model fills with a guess (#640)."""
+        await self._refresh_config()
+        return self._engine_for(github_repo)
+
     async def _resolve_kimi_host(self) -> tuple[str, bool]:
         """Resolve the effective host for a kimi run.
 
@@ -912,8 +923,15 @@ class RemoteScriptConnector:
         resume: bool = False,
         name: str = "",
         worktree_path: str = "",
+        run_id: str = "",
     ) -> dict:
         """Start a coding-CLI run (kimi or claude) on the effective host.
+
+        `run_id`, when set, is the id the caller already told someone about
+        (the dispatch confirmation, #640), so the tmux window, the output file
+        and the result header all carry the id `stop_agent_run` was given. It
+        is spliced into shell commands, so anything but `[A-Za-z0-9_-]{4,64}`
+        is ignored and a fresh id is made, as when it is unset.
 
         `token_ttl_seconds` bounds the life of the MCP mount token (issue #288);
         0 uses the generous default. Pass the run's own deadline when the caller
@@ -990,7 +1008,9 @@ class RemoteScriptConnector:
         """
         import uuid
 
-        run_id = str(uuid.uuid4())[:8]
+        run_id = (run_id or "").strip()
+        if not _RUN_ID_RE.fullmatch(run_id):
+            run_id = str(uuid.uuid4())[:8]
         await self._refresh_config()
         repo_path = f"{self._repo_base}/{repo}" if self._repo_base else repo
         route_engine, route_config_dir = self._route_for(github_repo)
@@ -1559,7 +1579,7 @@ class RemoteScriptConnector:
         value is spliced into a remote shell command.
         """
         run_id = (run_id or "").strip()
-        if not run_id or not re.fullmatch(r"[A-Za-z0-9_-]{4,64}", run_id):
+        if not run_id or not _RUN_ID_RE.fullmatch(run_id):
             return {"stopped": False, "reason": "invalid_run_id", "window": ""}
         await self._refresh_config()
         target_host = host or self._host

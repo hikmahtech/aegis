@@ -381,7 +381,23 @@ async def _exec_dispatch_agent_run(
     # second CLI session on the same work. The untied case keeps a random id:
     # two "look into X" asks are two legitimate runs.
     task_id = (todoist_task_id or "").strip()
-    workflow_id = f"agent-run-task-{task_id}" if task_id else f"agent-run-{uuid4().hex[:8]}"
+    # The run id is chosen HERE and handed to the connector (#640). It used to
+    # make its own at launch, so the confirmation said agent-run-a5828448, the
+    # result said run=b580fd58, nothing linked the two, and the id the model
+    # was given could not stop the run.
+    run_id = uuid4().hex[:8]
+    workflow_id = f"agent-run-task-{task_id}" if task_id else f"agent-run-{run_id}"
+    # Name the engine the run will get, never "auto": a model handed a gap
+    # fills it, and on 2026-09-21 it told the owner "Kimi" for a claude run.
+    # The lookup is the one the launch makes; with no coding host to ask, say
+    # so instead of guessing.
+    engine_label = engine
+    connector = getattr(ctx, "remote_script_connector", None)
+    if not engine_label and connector is not None:
+        try:
+            engine_label = await connector.routed_engine()
+        except Exception as exc:  # noqa: BLE001 — the dispatch does not hinge on the label
+            logger.warning("dispatch_agent_run_engine_lookup_failed", error=error_text(exc))
     try:
         await ctx.temporal_client.start_workflow(
             "AgentRunFlow",
@@ -393,22 +409,34 @@ async def _exec_dispatch_agent_run(
                 "purpose": (purpose or "").strip(),
                 "gated": gated,
                 "timeout_minutes": _run_timeout_minutes(timeout_minutes, gated),
+                "run_id": run_id,
             },
             id=workflow_id,
             task_queue="aegis-main",
         )
     except WorkflowAlreadyStartedError:
+        # Its run id is the earlier dispatch's, which this call cannot see.
         return (
-            f"A run for that task is already in flight ({workflow_id}). "
-            "Stop it with stop_agent_run if you want to start over."
+            f"A run for that task is already in flight ({workflow_id}). To start "
+            "over, find its run id with list_coding_sessions and stop it with "
+            "stop_agent_run."
         )
     except Exception as exc:  # noqa: BLE001 — a dispatch failure is a chat answer, not a crash
         logger.warning("dispatch_agent_run_failed", workflow_id=workflow_id, error=error_text(exc))
         return f"Couldn't dispatch the agent run: {error_text(exc)}"
-    logger.info("dispatch_agent_run_started", workflow_id=workflow_id, agent_id=agent_id)
+    logger.info(
+        "dispatch_agent_run_started", workflow_id=workflow_id, run_id=run_id, agent_id=agent_id
+    )
+    engine_part = (
+        f"engine={engine_label}"
+        if engine_label
+        else "engine not known yet (the launch decides; the result header names it)"
+    )
     return (
-        f"Dispatched agent run {workflow_id} ({engine or 'auto'}) — "
-        "results will land in this channel."
+        f"Dispatched agent run {run_id} ({engine_part}). The result will land in this "
+        f"channel with the header `run={run_id}`; stop it with stop_agent_run(run_id="
+        f"'{run_id}'). Tell the user only what this line says: the run has not started "
+        "yet, so there is no outcome to report."
     )
 
 

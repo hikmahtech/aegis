@@ -69,6 +69,49 @@ async def test_start_kimi_run_happy_path(conn):
     assert "/home/user/Workspace/youruser/aegis" in combined
 
 
+async def _launch_with_run_id(conn, run_id: str) -> tuple[dict, str]:
+    with patch("asyncio.create_subprocess_exec") as mock_exec:
+        proc = AsyncMock()
+        proc.communicate = AsyncMock(return_value=(b"", b""))
+        proc.returncode = 0
+        mock_exec.return_value = proc
+        result = await conn.start_kimi_run(
+            repo="youruser/aegis",
+            prompt="x",
+            kimi_binary="/home/user/.local/bin/kimi",
+            run_id=run_id,
+        )
+    combined = " ".join(" ".join(str(a) for a in c.args) for c in mock_exec.call_args_list)
+    return result, combined
+
+
+@pytest.mark.asyncio
+async def test_start_kimi_run_uses_the_run_id_the_caller_already_reported(conn):
+    """#640: the dispatch said agent-run-a5828448 and the result said
+    run=b580fd58. The caller's id is now THE run id: in the result, the
+    output file and the worktree, which is what stop_coding_run looks for."""
+    result, combined = await _launch_with_run_id(conn, "a5828448")
+    assert result["run_id"] == "a5828448"
+    assert "a5828448" in result["output_file"]
+    assert "a5828448" in combined
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", ["x; rm -rf ~", "abc", "a" * 65, "$(id)"])
+async def test_start_kimi_run_ignores_a_run_id_it_cannot_put_in_a_shell(conn, bad):
+    result, combined = await _launch_with_run_id(conn, bad)
+    assert result["status"] == "running"
+    assert result["run_id"] != bad
+    assert len(result["run_id"]) == 8
+    assert bad not in combined
+
+
+@pytest.mark.asyncio
+async def test_routed_engine_is_what_a_launch_without_override_would_use(conn):
+    """Plain kimi when no org routing or default says otherwise."""
+    assert await conn.routed_engine() == "kimi"
+
+
 @pytest.mark.asyncio
 async def test_start_kimi_run_repo_missing_returns_failed(conn):
     with patch("asyncio.create_subprocess_exec") as mock_exec:

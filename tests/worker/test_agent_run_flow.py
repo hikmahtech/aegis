@@ -89,7 +89,8 @@ async def test_happy_path_delivers_output_tail():
 
     @activity.defn(name="launch_agent_run")
     async def launch(
-        prompt, repo="", engine="", purpose="", agent_id="", gated=False, timeout_minutes=0
+        prompt, repo="", engine="", purpose="", agent_id="", gated=False, timeout_minutes=0,
+        run_id="",
     ):
         launch_calls.append(
             {
@@ -177,7 +178,8 @@ async def test_launch_failure_is_attempted_once_and_delivered():
 
     @activity.defn(name="launch_agent_run")
     async def launch(
-        prompt, repo="", engine="", purpose="", agent_id="", gated=False, timeout_minutes=0
+        prompt, repo="", engine="", purpose="", agent_id="", gated=False, timeout_minutes=0,
+        run_id="",
     ):
         attempts["count"] += 1
         raise RuntimeError("ssh: connect to host node-a port 22: Connection refused")
@@ -219,7 +221,8 @@ async def test_missing_scratch_checkout_delivers_provision_command():
 
     @activity.defn(name="launch_agent_run")
     async def launch(
-        prompt, repo="", engine="", purpose="", agent_id="", gated=False, timeout_minutes=0
+        prompt, repo="", engine="", purpose="", agent_id="", gated=False, timeout_minutes=0,
+        run_id="",
     ):
         return {
             "status": "failed",
@@ -268,7 +271,8 @@ async def test_timeout_fires_at_the_deadline_and_reports_where_the_run_is():
 
     @activity.defn(name="launch_agent_run")
     async def launch(
-        prompt, repo="", engine="", purpose="", agent_id="", gated=False, timeout_minutes=0
+        prompt, repo="", engine="", purpose="", agent_id="", gated=False, timeout_minutes=0,
+        run_id="",
     ):
         return _launched(engine="kimi", tmux_window="kimi-scratch-ab12cd34")
 
@@ -340,7 +344,8 @@ async def test_the_deadline_holds_when_the_polls_themselves_are_slow():
 
     @activity.defn(name="launch_agent_run")
     async def launch(
-        prompt, repo="", engine="", purpose="", agent_id="", gated=False, timeout_minutes=0
+        prompt, repo="", engine="", purpose="", agent_id="", gated=False, timeout_minutes=0,
+        run_id="",
     ):
         return _launched()
 
@@ -389,7 +394,8 @@ async def test_elapsed_s_is_wall_clock_including_the_time_spent_in_the_last_poll
 
     @activity.defn(name="launch_agent_run")
     async def launch(
-        prompt, repo="", engine="", purpose="", agent_id="", gated=False, timeout_minutes=0
+        prompt, repo="", engine="", purpose="", agent_id="", gated=False, timeout_minutes=0,
+        run_id="",
     ):
         return _launched()
 
@@ -599,6 +605,7 @@ class _LaunchRecorder:
         resume: bool = False,
         name: str = "",
         worktree_path: str = "",
+        run_id: str = "",
     ) -> dict:
         self.calls.append(
             {
@@ -607,6 +614,7 @@ class _LaunchRecorder:
                 "agent_id": agent_id,
                 "gated": gated,
                 "token_ttl_seconds": token_ttl_seconds,
+                "run_id": run_id,
             }
         )
         return {"status": "running", "run_id": "r1", "output_file": "/tmp/o", "engine": "claude"}
@@ -630,6 +638,8 @@ async def test_launch_forwards_agent_id_to_the_connector():
             "gated": False,
             # No timeout supplied ⇒ 0 ⇒ the connector's default mount-token TTL.
             "token_ttl_seconds": 0,
+            # No run id supplied ⇒ the connector makes one.
+            "run_id": "",
         }
     ]
 
@@ -720,7 +730,8 @@ async def test_gated_input_reaches_the_launch_activity():
 
     @activity.defn(name="launch_agent_run")
     async def launch(
-        prompt, repo="", engine="", purpose="", agent_id="", gated=False, timeout_minutes=0
+        prompt, repo="", engine="", purpose="", agent_id="", gated=False, timeout_minutes=0,
+        run_id="",
     ):
         launch_calls.append({"gated": gated, "engine": engine})
         return _launched()
@@ -749,3 +760,39 @@ async def test_gated_input_reaches_the_launch_activity():
 
     # Both values cross the boundary — a hardcoded True or False fails.
     assert [call["gated"] for call in launch_calls] == [True, False]
+
+
+@pytest.mark.asyncio
+async def test_the_dispatched_run_id_reaches_the_connector():
+    """#640: the id in the dispatch confirmation must be the run's id, all the
+    way to `start_kimi_run`, so the result header and stop_agent_run use the
+    one the owner was told."""
+    launch_calls: list[str] = []
+
+    @activity.defn(name="launch_agent_run")
+    async def launch(
+        prompt, repo="", engine="", purpose="", agent_id="", gated=False, timeout_minutes=0,
+        run_id="",
+    ):
+        launch_calls.append(run_id)
+        return _launched()
+
+    @activity.defn(name="check_agent_run")
+    async def check(output_file, host="", probe_alive=True):
+        return {"status": "finished", "output": "done", "reason": ""}
+
+    @activity.defn(name="send_message")
+    async def send_message(agent_id, message, chat_id=0, keyboard=None):
+        return {"ok": True, "message_id": 1}
+
+    await _run_flow(
+        [launch, check, send_message, _cleanup_activity([])],
+        AgentRunInput(agent_id="sebas", prompt="x", run_id="a5828448"),
+        id_prefix="arf-runid",
+    )
+    assert launch_calls == ["a5828448"]
+
+    rec = _LaunchRecorder()
+    acts = AgentRunActivities(remote_script=rec)
+    await acts.launch_agent_run("x", "", "", "", "sebas", False, 30, "a5828448")
+    assert rec.calls[0]["run_id"] == "a5828448"

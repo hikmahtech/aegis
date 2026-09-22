@@ -196,6 +196,9 @@ class AgentRunInput:
     purpose: str = ""
     timeout_minutes: int = 30
     gated: bool = False
+    # The run id the dispatch already reported (#640), so the result header
+    # and `stop_agent_run` use the same one. "" lets the connector make one.
+    run_id: str = ""
 
 
 @workflow.defn(name="AgentRunFlow")
@@ -225,6 +228,7 @@ class AgentRunFlow:
                     inp.agent_id,
                     inp.gated,
                     inp.timeout_minutes,
+                    inp.run_id,
                 ],
                 start_to_close_timeout=TIMEOUT_LONG,
                 retry_policy=NO_RETRY,
