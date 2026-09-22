@@ -60,6 +60,7 @@ KG_OUTCOME_LABELS: dict[str, str] = {
     "opened_pr": "the operator approved it and opened a fix PR",
     "pr_failed": "the operator approved a fix PR, but it could not be opened",
     "run_fix": "the operator ran the proposed commands",
+    "run_checks": "the operator ran the read-only checks, and no fix",
     "acknowledged": "the operator acknowledged it",
     "muted": "the operator muted it",
     "self_resolved": "it cleared before anyone decided",
@@ -212,16 +213,17 @@ _MAX_REMEDIATION_COMMANDS = 5
 _MAX_REMEDIATION_CMD_CHARS = 500
 
 
-def extract_proposed_commands(text: str) -> list[str]:
-    """Parse the `PROPOSED_COMMANDS:` footer an infra investigation is asked to
-    emit — `- <command>` lines after the marker, until a non-list line. Pure and
+def extract_proposed_commands(text: str, marker: str = "PROPOSED_COMMANDS:") -> list[str]:
+    """Parse a command footer an infra investigation is asked to emit — `-
+    <command>` lines after `marker`, until a non-list line. Pure and
     deterministic (called from workflow code). Over-long commands are dropped,
-    the list is capped."""
+    the list is capped. `PROPOSED_COMMANDS:` is the footer from before checks
+    and fixes were asked for apart (#641); `extract_commands` reads both."""
     if not text:
         return []
     lines = text.splitlines()
     try:
-        start = next(i for i, ln in enumerate(lines) if ln.strip() == "PROPOSED_COMMANDS:")
+        start = next(i for i, ln in enumerate(lines) if ln.strip() == marker)
     except StopIteration:
         return []
     out: list[str] = []
@@ -237,6 +239,109 @@ def extract_proposed_commands(text: str) -> list[str]:
         if len(out) >= _MAX_REMEDIATION_COMMANDS:
             break
     return out
+
+
+# What `is_read_only_command` accepts. Deliberately a short allowlist: anything
+# it does not recognise counts as a fix, so the mistake it can make is showing
+# a harmless command under "Run fix", never running a mutating one as a check.
+_READ_ONLY_PROGRAMS = frozenset(
+    {
+        "ping", "dig", "nslookup", "host", "traceroute", "tracepath", "uptime",
+        "df", "du", "free", "cat", "ls", "head", "tail", "journalctl", "ss",
+        "netstat", "whoami", "hostname", "date", "nproc", "lsblk", "stat", "getent",
+    }
+)  # fmt: skip
+_READ_ONLY_DOCKER_TOP = frozenset({"ps", "logs", "inspect", "info", "version", "stats", "top"})
+_DOCKER_OBJECTS = frozenset(
+    {"node", "service", "container", "stack", "network", "volume", "image",
+     "config", "secret", "task", "context", "system"}
+)  # fmt: skip
+_READ_ONLY_DOCKER_VERBS = frozenset({"ls", "ps", "inspect", "logs", "df", "info"})
+_DOCKER_GLOBAL_ARG_FLAGS = frozenset({"--context", "-c", "--host", "-H", "--config", "--log-level"})
+_READ_ONLY_KUBECTL = frozenset(
+    {"get", "describe", "logs", "top", "version", "cluster-info", "explain", "api-resources"}
+)
+_KUBECTL_ARG_FLAGS = frozenset({"--context", "-n", "--namespace", "--kubeconfig", "--cluster"})
+_READ_ONLY_SYSTEMCTL = frozenset({"status", "is-active", "is-enabled", "is-failed", "show", "list-units"})
+_CURL_WRITE_FLAGS = ("-X", "--request", "-d", "--data", "-F", "--form", "-T", "--upload-file",
+                     "-o", "--output", "-O", "--remote-name")  # fmt: skip
+# Anything that chains, redirects or substitutes is not one simple command.
+_SHELL_META = re.compile(r"[;&|<>`]|\$\(")
+
+
+def _skip_flags(tokens: list[str], arg_flags: frozenset[str]) -> list[str]:
+    """Drop leading options (and the value of those in `arg_flags`) so the
+    first token left is the subcommand."""
+    i = 0
+    while i < len(tokens) and tokens[i].startswith("-"):
+        tok = tokens[i]
+        i += 1
+        if "=" not in tok and tok in arg_flags:
+            i += 1
+    return tokens[i:]
+
+
+def is_read_only_command(cmd: str) -> bool:
+    """True when `cmd` is one this code recognises as only reading state: a
+    ping, a `docker node ls`, a `kubectl get`, a `systemctl status`, a plain
+    GET with curl. Pure (called from workflow code).
+
+    The investigation labels its own commands, and on 2026-09-21 it labelled a
+    ping and three `inspect`s as the fix (#641). This is the check that does
+    not trust the label: a read-only command is never offered as a fix, and a
+    read-only command that exits non-zero (a ping to a dead host) is evidence,
+    not a reason to stop. Unknown means "might change something"."""
+    cmd = (cmd or "").strip()
+    if not cmd or _SHELL_META.search(cmd):
+        return False
+    tokens = cmd.split()
+    while tokens and tokens[0] in ("sudo", "timeout"):
+        tokens = tokens[2:] if tokens[0] == "timeout" and len(tokens) > 1 else tokens[1:]
+    if not tokens:
+        return False
+    prog, rest = tokens[0].rsplit("/", 1)[-1], tokens[1:]
+    if prog in _READ_ONLY_PROGRAMS:
+        return True
+    if prog == "systemctl":
+        rest = _skip_flags(rest, frozenset())
+        return bool(rest) and rest[0] in _READ_ONLY_SYSTEMCTL
+    if prog == "curl":
+        return not any(t == f or t.startswith(f + "=") for t in rest for f in _CURL_WRITE_FLAGS)
+    if prog == "kubectl":
+        rest = _skip_flags(rest, _KUBECTL_ARG_FLAGS)
+        return bool(rest) and rest[0] in _READ_ONLY_KUBECTL
+    if prog == "docker":
+        rest = _skip_flags(rest, _DOCKER_GLOBAL_ARG_FLAGS)
+        if not rest:
+            return False
+        if rest[0] in _READ_ONLY_DOCKER_TOP:
+            return True
+        return rest[0] in _DOCKER_OBJECTS and len(rest) > 1 and rest[1] in _READ_ONLY_DOCKER_VERBS
+    return False
+
+
+def extract_commands(text: str) -> dict[str, list[str]]:
+    """The investigation's `CHECK_COMMANDS:` and `FIX_COMMANDS:` footers, as
+    `{"check": [...], "fix": [...]}` (#641). Pure (called from workflow code).
+
+    The footer a command came in does not decide where it goes;
+    `is_read_only_command` does, both ways. A ping listed as a fix is a check,
+    and a command it does not recognise is a fix even when listed as a check,
+    because "Run checks" must never change anything. A transcript still
+    carrying the old single `PROPOSED_COMMANDS:` footer is split the same way.
+    Each list keeps the cap, and a command is never in both."""
+    listed = (
+        extract_proposed_commands(text, "CHECK_COMMANDS:")
+        + extract_proposed_commands(text, "FIX_COMMANDS:")
+        + extract_proposed_commands(text)
+    )
+    check: list[str] = []
+    fix: list[str] = []
+    for cmd in listed:
+        target = check if is_read_only_command(cmd) else fix
+        if cmd not in target and len(target) < _MAX_REMEDIATION_COMMANDS:
+            target.append(cmd)
+    return {"check": check, "fix": fix}
 
 
 def _iter_kimi_assistant_text(raw: str):
@@ -1385,10 +1490,18 @@ class AlertActivities:
         }
 
     @activity.defn
-    async def run_remediation_commands(self, commands: list[str], host: str = "") -> dict:
+    async def run_remediation_commands(
+        self, commands: list[str], host: str = "", kind: str = "fix"
+    ) -> dict:
         """Execute HUMAN-APPROVED remediation commands on the coding host via
-        SSH. Only reachable from the Gate-2 'Run fix' approval — never
-        autonomous. Refuses when the coding-host infra row is read_only.
+        SSH. Only reachable from the Gate-2 'Run fix' / 'Run checks' approval —
+        never autonomous. Refuses when the coding-host infra row is read_only.
+        `kind` ("fix" or "check") is recorded on the audit rows.
+
+        Each entry says whether it was `read_only` (`is_read_only_command`).
+        A failing command that changes things stops the sequence; a failing
+        read-only one does not, because a ping to a dead host failing is the
+        answer, not a fault (#641).
 
         Writes a `remediation_started` audit row BEFORE executing (so the
         approval leaves a trail even if the activity is later killed), then a
@@ -1423,7 +1536,7 @@ class AlertActivities:
                 action="remediation_started",
                 target_type="infra",
                 target_id=host or "coding-host",
-                details={"commands": commands, "host": host or "coding-host"},
+                details={"commands": commands, "host": host or "coding-host", "kind": kind},
             )
 
         async def _heartbeater() -> None:
@@ -1448,10 +1561,11 @@ class AlertActivities:
                     "exit_code": env.get("exit_code", -1),
                     "stdout": str(env.get("stdout") or "")[:1500],
                     "stderr": str(env.get("stderr") or "")[:1500],
+                    "read_only": is_read_only_command(cmd),
                 }
                 result["ran"].append(entry)
-                if entry["exit_code"] != 0:
-                    break  # stop the sequence on first failure — report, don't cascade
+                if entry["exit_code"] != 0 and not entry["read_only"]:
+                    break  # a failed change stops the sequence — report, don't cascade
         finally:
             hb.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -1463,7 +1577,7 @@ class AlertActivities:
                 action="remediation_executed",
                 target_type="infra",
                 target_id=host or "coding-host",
-                details={"ran": result["ran"]},
+                details={"ran": result["ran"], "kind": kind},
             )
         return result
 

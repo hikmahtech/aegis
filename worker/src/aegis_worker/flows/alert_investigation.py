@@ -28,7 +28,7 @@ Pipeline:
      that did not stick. Escalating alerts race the card against the hub
      seeing the problem resolve
 7.9. Store the verdict in the knowledge store, tagged with what became of it
-     (#502): opened_pr / pr_failed / run_fix / discarded / muted /
+     (#502): opened_pr / pr_failed / run_fix / run_checks / discarded / muted /
      acknowledged / expired / self_resolved / no_card. Before #502 this was
      Step 7b, before the card, so a discarded fix was recalled like a taken one
 8.5. Post the final report on the task via `AlertActivities.post_task_note`
@@ -64,6 +64,7 @@ with workflow.unsafe.imports_passed_through():
     )
     from aegis_worker.activities.alerts import (
         AlertActivities,
+        extract_commands,
         extract_proposed_commands,
         is_infra_alert,
         is_remediable_alert,
@@ -115,6 +116,11 @@ _PATCH_RETIRE_OLD_CARDS = "retire-superseded-cards"
 _PATCH_CLAIM = "claim-investigation"
 _PATCH_RECHECK_BEFORE_CARD = "recheck-before-gate2-card"
 
+# #641: the investigation's commands are split into read-only checks and
+# fixes, and only a fix earns "Run fix". Live: a run whose card went out
+# before this carries the old single list, and replays with it.
+_PATCH_CHECKS_APART = "gate2-checks-apart-from-fixes"
+
 
 _PR_TITLE_MAX = 72
 
@@ -145,7 +151,7 @@ def _safe_workflow_id_segment(text: str, max_len: int = 60) -> str:
 def gate2_needs_decision(
     *,
     branches: dict,
-    proposed_cmds: list[str],
+    fix_cmds: list[str],
     escalate: bool,
     restart_repeat: bool,
     verdict_status: str,
@@ -168,13 +174,52 @@ def gate2_needs_decision(
     verdict; in those two weeks 22 such cards drew 17 bare acks and one Run
     fix. The flow puts them on the task comment instead, for a person to run
     by hand. Without commands the status earns nothing: `actionable` with no
-    branch is work for a person, but nothing a card can approve."""
+    branch is work for a person, but nothing a card can approve.
+
+    Only FIX commands count (#641). Read-only checks decide nothing, so they
+    ride on a card sent for another reason (as "Run checks") and otherwise go
+    to the task comment."""
     return (
         bool(branches)
         or escalate
         or restart_repeat
-        or (bool(proposed_cmds) and verdict_status == "actionable")
+        or (bool(fix_cmds) and verdict_status == "actionable")
     )
+
+
+def remediation_outcome(ran: list[dict], *, refused: bool) -> str:
+    """What an approved command run did (#641): `refused` (nothing ran),
+    `fix_failed` (a command that changes things exited non-zero), `fix_ran`
+    (at least one change ran and none failed) or `checks_only` (every command
+    was read-only, whatever they exited). An entry without `read_only` (an
+    activity from before the flag) counts as a change, as it always did."""
+    if refused:
+        return "refused"
+    changes = [r for r in ran if not r.get("read_only")]
+    if any(r.get("exit_code") != 0 for r in changes):
+        return "fix_failed"
+    return "fix_ran" if changes else "checks_only"
+
+
+def remediation_status(outcome: str, *, refused: bool, resolved: bool) -> str:
+    """The run's terminal status for a Run fix (#641). `remediated` is
+    claimed only when a change ran cleanly AND the hub saw the problem
+    resolve; a change that ran but did not clear it waits on a person."""
+    if refused:
+        return "remediation_refused"
+    if outcome == "fix_failed":
+        return "remediation_failed"
+    if outcome == "checks_only":
+        return "checked"
+    return "remediated" if resolved else "waiting_human"
+
+
+def _ran_summary(ran: list[dict]) -> str:
+    """"Ran 1 fix and 3 checks" — the head of a command-run note."""
+    fixes = sum(1 for r in ran if not r.get("read_only"))
+    checks = len(ran) - fixes
+    parts = [f"{n} {word}{'' if n == 1 else 's'}" for n, word in ((fixes, "fix"), (checks, "check")) if n]
+    return "Ran " + (" and ".join(parts) or "nothing")
 
 
 def _task_line(t: dict) -> str:
@@ -1121,11 +1166,15 @@ class AlertInvestigationFlow:
             if platform_hint:
                 infra_hint += f"\nAbout this cluster: {platform_hint}"
             infra_hint += (
-                " End your report with a PROPOSED_COMMANDS: section — one `- <command>` "
-                "line per safe, idempotent recovery command you recommend (max 5). "
-                "Propose ONLY read-safe or idempotent commands; omit the section if "
-                "no command is warranted. The commands are NOT run automatically — "
-                "a human approves them."
+                " End your report with up to two sections, each one `- <command>` "
+                "line per command (max 5 each). CHECK_COMMANDS: read-only commands "
+                "that show the current state (ping, `node ls`, `service ps`, "
+                "inspect, logs). FIX_COMMANDS: idempotent commands that CHANGE "
+                "state to carry out the fix you suggest (`service update --force`, "
+                "`node update --availability drain`, ...). A check is never a fix: "
+                "if you have no command that carries out the fix, leave "
+                "FIX_COMMANDS out. Omit a section with nothing in it. Nothing is "
+                "run automatically — a human approves each list."
             )
             if labels_str:
                 infra_hint += f"\nAlert labels: {labels_str}"
@@ -1372,15 +1421,24 @@ class AlertInvestigationFlow:
         # prompt and the options below can react to it. Never populated for
         # app-code alerts — running arbitrary commands only makes sense on the
         # infra-gitops host.
-        proposed_cmds: list[str] = (
-            extract_proposed_commands(investigation_output) if _is_infra else []
-        )
+        # #641: `fix_cmds` change state and are what "Run fix" runs;
+        # `check_cmds` only read it and get "Run checks". Before the patch
+        # every proposed command was a "fix".
+        fix_cmds: list[str] = []
+        check_cmds: list[str] = []
+        if _is_infra:
+            if workflow.patched(_PATCH_CHECKS_APART):
+                split = extract_commands(investigation_output)
+                fix_cmds, check_cmds = split["fix"], split["check"]
+            else:
+                fix_cmds = extract_proposed_commands(investigation_output)
         # Asked only when the answer can change something (#500), and #518
-        # narrows it further: proposed commands earn a card only on an
-        # actionable verdict.
+        # narrows it further: fix commands earn a card only on an actionable
+        # verdict. Checks alone earn none (#641): running read-only commands
+        # decides nothing.
         no_decision_card = not gate_skipped and not gate2_needs_decision(
             branches=branches,
-            proposed_cmds=proposed_cmds,
+            fix_cmds=fix_cmds,
             escalate=_escalate,
             restart_repeat=restart_repeat is not None,
             verdict_status=verdict_status,
@@ -1428,19 +1486,22 @@ class AlertInvestigationFlow:
                     prompt += f"\n\nRoot cause: {_html_escape(verdict_summary)}"
                 if suggested_fix:
                     prompt += f"\nSuggested: {_html_escape(suggested_fix)}"
-                if proposed_cmds:
-                    cmd_lines = "\n".join(
-                        f"  <code>{_html_escape(c)}</code>" for c in proposed_cmds
-                    )
-                    prompt += f"\n\nProposed fix commands:\n{cmd_lines}"
+                if fix_cmds:
+                    cmd_lines = "\n".join(f"  <code>{_html_escape(c)}</code>" for c in fix_cmds)
+                    prompt += f"\n\nFix commands (Run fix):\n{cmd_lines}"
+                if check_cmds:
+                    cmd_lines = "\n".join(f"  <code>{_html_escape(c)}</code>" for c in check_cmds)
+                    prompt += f"\n\nRead-only checks (Run checks):\n{cmd_lines}"
             if restart_repeat is not None:
                 prompt = _restart_repeat_card(restart_repeat) + "\n\n" + prompt
 
             options: dict[str, str] = {}
             if branches:
                 options["open_all_prs"] = f"📝 Open {len(branches)} PR(s)"
-            if proposed_cmds:
+            if fix_cmds:
                 options["run_fix"] = "🔧 Run fix"
+            if check_cmds:
+                options["run_checks"] = "🔍 Run checks"
             options["mute_24h"] = "🔕 Mute 24h"
             options["ack"] = "✅ Acknowledge"
             if branches:
@@ -1664,27 +1725,36 @@ class AlertInvestigationFlow:
                     "problem_id": problem_id,
                     "todoist_task_id": track_task_id,
                 }
-            if v2 == "run_fix" and proposed_cmds:
-                # The operator took the fix: that is the outcome, whatever
-                # the commands then do (the problem's timeline has that).
-                await self._store_verdict(alert, verdict, investigation_output, "run_fix")
-                # A free-text note on the card overrides the parsed commands
-                # (one command per line) — lets the operator correct/replace
-                # what the LLM proposed without re-running the investigation.
+            is_fix = v2 == "run_fix" and bool(fix_cmds)
+            is_checks = v2 == "run_checks" and bool(check_cmds)
+            if is_fix or is_checks:
+                # The operator took the fix (or asked for the checks): that is
+                # the outcome, whatever the commands then do (the problem's
+                # timeline has that).
+                await self._store_verdict(alert, verdict, investigation_output, v2)
+                # A free-text note on a Run fix card overrides the parsed
+                # commands (one command per line) — lets the operator
+                # correct/replace what the LLM proposed without re-running the
+                # investigation. Not on Run checks: a note there could run a
+                # change under the name of a check.
                 # No line here re-checks length/count: run_remediation_commands
                 # applies the same caps (_MAX_REMEDIATION_COMMANDS /
                 # _MAX_REMEDIATION_CMD_CHARS) to whatever it's handed, note or
                 # not, so the human-typed override can't bypass them either.
-                note = ((g2.response or {}).get("note") or "").strip()
+                note = ((g2.response or {}).get("note") or "").strip() if is_fix else ""
                 cmds = (
                     [ln.strip() for ln in note.splitlines() if ln.strip()]
                     if note
-                    else proposed_cmds
+                    else (fix_cmds if is_fix else check_cmds)
                 )
+                # Pre-#641 runs call with two args, and replay the same way.
+                run_args: list = [cmds, inv_result.get("host", "")]
+                if is_checks:
+                    run_args.append("check")
                 try:
                     exec_result = await workflow.execute_activity_method(
                         AlertActivities.run_remediation_commands,
-                        args=[cmds, inv_result.get("host", "")],
+                        args=run_args,
                         # 12 min: 5 commands × 120s + slack headroom. The
                         # activity now heartbeats continuously (background
                         # heartbeater), so heartbeat_timeout stays STANDARD while
@@ -1722,23 +1792,39 @@ class AlertInvestigationFlow:
                         "todoist_task_id": track_task_id,
                         "refused": "activity_error",
                     }
+                ran = exec_result.get("ran") or []
+                outcome = remediation_outcome(ran, refused=bool(exec_result.get("refused")))
                 if exec_result.get("refused"):
                     outcome_note = f"🚫 Remediation refused: {exec_result['refused']}"
                 else:
-                    ran = exec_result.get("ran") or []
-                    ok = all(r.get("exit_code") == 0 for r in ran)
                     detail = "\n".join(
                         f"$ {r['command']}\n  exit={r['exit_code']} {(r['stdout'] or r['stderr'])[:300]}"
                         for r in ran
                     )
-                    outcome_note = f"{'✅' if ok else '⚠️'} Ran {len(ran)} command(s):\n{detail}"
+                    mark = {"fix_failed": "⚠️", "fix_ran": "✅"}.get(outcome, "🔍")
+                    outcome_note = f"{mark} {_ran_summary(ran)}:\n{detail}"
                 await self._safe_post_note(track_task_id or "", outcome_note)
                 await self._safe_send_message(
                     agent_id=agent_id,
-                    message=f"<b>Remediation result</b> — {_html_escape(title)}\n"
-                    f"<pre>{_html_escape(outcome_note[:1500])}</pre>",
+                    message=(
+                        f"<b>{'Check' if is_checks else 'Remediation'} result</b> — "
+                        f"{_html_escape(title)}\n"
+                        f"<pre>{_html_escape(outcome_note[:1500])}</pre>"
+                    ),
                     log_event="alert_remediation_notify_failed",
                 )
+                if is_checks:
+                    # Checks change nothing, so there is nothing to wait for
+                    # and nothing that could have resolved the problem.
+                    await self._record(problem_id, "waiting_human", outcome_note, step="run_checks")
+                    return {
+                        "status": "remediation_refused" if exec_result.get("refused") else "checked",
+                        "task_id": None,
+                        "todoist_task_id": track_task_id,
+                        "commands_ran": len(ran),
+                        "refused": exec_result.get("refused"),
+                    }
+                resolved = False
                 if not exec_result.get("refused"):
                     await workflow.sleep(timedelta(seconds=180))
                     post_check = await workflow.execute_activity_method(
@@ -1747,31 +1833,39 @@ class AlertInvestigationFlow:
                         start_to_close_timeout=TIMEOUT_FAST,
                         retry_policy=FAST,
                     )
-                    verdict_note = (
-                        "✅ Verified: alert resolved after remediation."
-                        if post_check.get("resolved")
-                        else "⚠️ Alert not yet showing resolved — the next heartbeat tick "
-                        "confirms recovery; investigate further if it re-fires."
-                    )
+                    resolved = bool(post_check.get("resolved"))
+                    if resolved and outcome == "fix_ran":
+                        verdict_note = "✅ Verified: the problem cleared after the fix."
+                    elif resolved:
+                        verdict_note = (
+                            "The problem has cleared, but no fix command succeeded, "
+                            "so the fix did not clear it."
+                        )
+                    else:
+                        verdict_note = (
+                            "⚠️ Problem not yet showing resolved — the next heartbeat tick "
+                            "confirms recovery; investigate further if it re-fires."
+                        )
                     await self._safe_post_note(track_task_id or "", verdict_note)
                     await self._record(
                         problem_id,
-                        "resolved" if post_check.get("resolved") else "waiting_human",
+                        "resolved" if resolved else "waiting_human",
                         outcome_note,
                         step="run_fix",
                     )
                 else:
                     await self._record(problem_id, "waiting_human", outcome_note, step="run_fix")
                 return {
-                    # A refused run (read-only host, no commands, ...) never
-                    # executed anything — surface it distinctly in workflow_runs
-                    # rather than mislabelling it "remediated".
-                    "status": (
-                        "remediation_refused" if exec_result.get("refused") else "remediated"
+                    # `remediated` only when a change ran, every change
+                    # succeeded and the hub then saw the problem resolve
+                    # (#641). A refused run executed nothing; a run of only
+                    # read-only commands is `checked`, whatever they exited.
+                    "status": remediation_status(
+                        outcome, refused=bool(exec_result.get("refused")), resolved=resolved
                     ),
                     "task_id": None,
                     "todoist_task_id": track_task_id,
-                    "commands_ran": len(exec_result.get("ran") or []),
+                    "commands_ran": len(ran),
                     "refused": exec_result.get("refused"),
                 }
             if v2 == "discard":
@@ -2032,13 +2126,19 @@ class AlertInvestigationFlow:
             if kimi_attachment_name:
                 final_msg = f"{final_msg}\n\n📎 Transcript: {kimi_attachment_name}"
             if no_decision_card:
-                if proposed_cmds:
+                if fix_cmds:
                     # Carded only on an actionable verdict (#518); here they
                     # are a suggestion, kept where a person can still use it.
-                    cmd_lines = "\n".join(f"  - {c}" for c in proposed_cmds)
+                    cmd_lines = "\n".join(f"  - {c}" for c in fix_cmds)
                     final_msg += (
-                        "\n\nThe investigation proposed these commands. I have not "
-                        f"run them; run them by hand if you agree:\n{cmd_lines}"
+                        "\n\nThe investigation proposed these fix commands. I have "
+                        f"not run them; run them by hand if you agree:\n{cmd_lines}"
+                    )
+                if check_cmds:
+                    cmd_lines = "\n".join(f"  - {c}" for c in check_cmds)
+                    final_msg += (
+                        "\n\nRead-only checks it suggested, to see the current "
+                        f"state:\n{cmd_lines}"
                     )
                 final_msg += (
                     "\n\nNothing here needs your decision, so I sent no card. "

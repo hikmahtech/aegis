@@ -23,6 +23,7 @@ from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
 with workflow.unsafe.imports_passed_through():
+    from aegis_worker.activities.alerts import is_read_only_command
     from aegis_worker.activities.interactions import (
         ApplyTimeoutInput,
         InsertInteractionInput,
@@ -200,16 +201,24 @@ async def stub_send_voice(agent_id: str, text: str) -> dict:
 
 
 @activity.defn(name="run_remediation_commands")
-async def stub_run_remediation_commands(commands: list[str], host: str = "") -> dict:
+async def stub_run_remediation_commands(
+    commands: list[str], host: str = "", kind: str = "fix"
+) -> dict:
     _calls.setdefault("run_remediation_args", []).append((commands, host))
+    _calls.setdefault("run_remediation_kind", []).append(kind)
+    # The hub sees the problem resolve after the run when the test says so.
+    _HUB["resolved"] = _state.get("resolve_after_run", False)
+    exits = _state.get("exits", {})
     return {
         "ran": [
             {
-                "command": "docker --context swarm service update --force svc_a",
-                "exit_code": 0,
+                "command": c,
+                "exit_code": exits.get(c, 0),
                 "stdout": "ok",
                 "stderr": "",
+                "read_only": is_read_only_command(c),
             }
+            for c in commands
         ],
         "refused": None,
     }
@@ -381,41 +390,147 @@ async def _run_to_gate2_and_signal(response: dict, wf_id: str) -> dict:
         return await asyncio.wait_for(handle.result(), timeout=30.0)
 
 
+def _output(footer: str) -> dict:
+    return {**_state["run_investigation_result"], "output": "Root cause: noon NIC flapped\n" + footer}
+
+
 # ---------------------------------------------------------------------------
-# Test 1: run_fix executes proposed commands and reports the outcome
+# Run fix: a change that ran and cleared the problem is `remediated`
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_infra_gate2_run_fix_executes_and_reports():
-    _reset()
+    _reset(resolve_after_run=True)
 
-    result = await _run_to_gate2_and_signal(
-        {"value": "run_fix"}, "runfix-executes-test"
-    )
+    result = await _run_to_gate2_and_signal({"value": "run_fix"}, "runfix-executes-test")
 
     assert _calls["run_remediation_args"][0][0] == [
         "docker --context swarm service update --force svc_a"
     ]
     assert _calls["run_remediation_args"][0][1] == "meem"
+    assert _calls["run_remediation_kind"] == ["fix"]
     assert result["status"] == "remediated"
     gate_insert = _calls["insert_inputs"][-1]
     assert "service update --force svc_a" in gate_insert.prompt
     assert "run_fix" in gate_insert.options
+    assert "run_checks" not in gate_insert.options
+    assert any("cleared after the fix" in n[1] for n in _calls["notes"])
+
+
+@pytest.mark.asyncio
+async def test_a_fix_that_did_not_clear_the_problem_is_not_remediated():
+    """#641: the fix ran, but the hub still sees the problem. That waits on a
+    person; it is not a remediation."""
+    _reset()
+
+    result = await _run_to_gate2_and_signal({"value": "run_fix"}, "runfix-not-cleared-test")
+
+    assert result["status"] == "waiting_human"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_fix_is_remediation_failed():
+    _reset(
+        resolve_after_run=True,
+        exits={"docker --context swarm service update --force svc_a": 1},
+    )
+
+    result = await _run_to_gate2_and_signal({"value": "run_fix"}, "runfix-failed-test")
+
+    assert result["status"] == "remediation_failed"
+    assert any("⚠️ Ran 1 fix:" in m for m in _calls["messages"])
 
 
 # ---------------------------------------------------------------------------
-# Test 2: a free-text note on the gate overrides the proposed commands
+# A free-text note on the gate overrides the proposed commands
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_infra_gate2_note_overrides_commands():
-    _reset()
+    _reset(resolve_after_run=True)
 
     result = await _run_to_gate2_and_signal(
-        {"value": "run_fix", "note": "docker node ls"}, "runfix-note-override-test"
+        {"value": "run_fix", "note": "docker service update --force svc_b"},
+        "runfix-note-override-test",
+    )
+
+    assert _calls["run_remediation_args"][0][0] == ["docker service update --force svc_b"]
+    assert result["status"] == "remediated"
+
+
+@pytest.mark.asyncio
+async def test_a_note_of_only_checks_is_checked_even_when_the_problem_clears():
+    """The problem cleared, but nothing the operator ran changed anything, so
+    the run did not remediate it."""
+    _reset(resolve_after_run=True)
+
+    result = await _run_to_gate2_and_signal(
+        {"value": "run_fix", "note": "docker node ls"}, "runfix-note-checks-test"
     )
 
     assert _calls["run_remediation_args"][0][0] == ["docker node ls"]
-    assert result["status"] == "remediated"
+    assert result["status"] == "checked"
+    assert any("no fix command succeeded" in n[1] for n in _calls["notes"])
+
+
+# ---------------------------------------------------------------------------
+# #641: the 2026-09-21 card, replayed
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_checks_get_run_checks_and_a_failed_ping_does_not_count():
+    """The wow card listed a ping and inspects as "Proposed fix commands".
+    Now they are checks: the card offers Run checks, not Run fix; the run
+    goes as kind `check`, a failed ping is reported without ⚠️, nothing waits
+    for the problem to clear, and the status is `checked`."""
+    _reset(
+        exits={"ping -c 3 -W 2 10.20.0.17": 1},
+    )
+    _state["run_investigation_result"] = {
+        "status": "succeeded",
+        "output": (
+            "wow is off.\n\nFIX_COMMANDS:\n"
+            "- ping -c 3 -W 2 10.20.0.17\n"
+            "- docker node ls\n"
+        ),
+        "session_id": "sess-1",
+        "branch": "",
+        "branches": {},
+        "host": "meem",
+    }
+
+    result = await _run_to_gate2_and_signal({"value": "run_checks"}, "runchecks-test")
+
+    gate_insert = _calls["insert_inputs"][-1]
+    assert "run_fix" not in gate_insert.options
+    assert "run_checks" in gate_insert.options
+    assert "Proposed fix commands" not in gate_insert.prompt
+    assert "Read-only checks (Run checks)" in gate_insert.prompt
+    assert _calls["run_remediation_args"][0][0] == ["ping -c 3 -W 2 10.20.0.17", "docker node ls"]
+    assert _calls["run_remediation_kind"] == ["check"]
+    assert result["status"] == "checked"
+    assert result["commands_ran"] == 2
+    msg = next(m for m in _calls["messages"] if "Check result" in m)
+    assert "🔍 Ran 2 checks:" in msg
+    assert "⚠️" not in msg
+    assert not any(r.get("status") == "resolved" for r in _HUB["record"])
+
+
+@pytest.mark.asyncio
+async def test_run_checks_ignores_a_note():
+    """A note on Run checks could run a change under the name of a check."""
+    _reset()
+    _state["run_investigation_result"] = _output(
+        "CHECK_COMMANDS:\n- docker node ls\n\nFIX_COMMANDS:\n- docker service update --force svc_a\n"
+    )
+
+    await _run_to_gate2_and_signal(
+        {"value": "run_checks", "note": "docker node rm wow"}, "runchecks-note-test"
+    )
+
+    assert _calls["run_remediation_args"][0][0] == ["docker node ls"]
+
+

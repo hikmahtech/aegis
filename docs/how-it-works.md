@@ -628,13 +628,14 @@ The steps that make it trustworthy:
   ends in a structured verdict: `resolved` / `not_actionable` / `actionable` /
   `inconclusive`.
 - **Gate 2** puts every consequential outcome behind a card: open the
-  proposed PR(s), **Run fix** (execute the investigation's proposed commands
-  on the host — refused when the infra registry entry is `read_only`; a typed
-  note overrides the command list), mute, acknowledge, or discard. A card
-  goes out only when there is such a decision, or the alert escalates, or a
-  restart did not stick (#500). Proposed commands count only on an
-  `actionable` verdict (#518); on any other they go on the task comment, not
-  run. A verdict with nothing to decide is told, not asked: a comment on the
+  proposed PR(s), **Run fix** (execute the investigation's fix commands on
+  the host — refused when the infra registry entry is `read_only`; a typed
+  note overrides the command list), **Run checks** (its read-only commands;
+  code decides which commands are read-only, #641), mute, acknowledge, or
+  discard. A card goes out only when there is such a decision, or the alert
+  escalates, or a restart did not stick (#500). Fix commands count only on an
+  `actionable` verdict (#518), and checks alone never earn a card; otherwise
+  they go on the task comment, not run. A verdict with nothing to decide is told, not asked: a comment on the
   task, an event on the timeline and a chat ping. Mute such a problem from the
   admin **Problems** page.
 - **After the decision.** The verdict goes to the knowledge store only once

@@ -267,7 +267,7 @@ async def stub_recent_auto_restart(problem_id: str, alert: dict) -> dict:
 
 
 @activity.defn(name="run_remediation_commands")
-async def stub_run_remediation_commands(commands: list[str], host: str = "") -> dict:
+async def stub_run_remediation_commands(commands: list[str], host: str = "", kind: str = "fix") -> dict:
     return {"ran": [], "refused": "no_commands"}
 
 
