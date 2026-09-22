@@ -190,7 +190,7 @@ class CuriosityCardFlow:
             step = "spawn_card"
             novelty_key = str(top.get("novelty_key") or "")
             child_id = f"curiosity-{_ID_SAFE.sub('_', novelty_key)[:180]}"
-            # Most gaps ask an open question (`input`: a deep link in Slack, a
+            # Most gaps ask an open question (`input`: a text box in Slack, a
             # textarea in the admin), because we do not know the answer's
             # shape. "Track this?" (#513) has exactly two answers, so it is a
             # `choice` with two buttons, and the hook reads the button value
