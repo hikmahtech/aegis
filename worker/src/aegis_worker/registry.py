@@ -71,6 +71,7 @@ from aegis_worker.flows.infra_heartbeat import InfraHeartbeatConfig, InfraHeartb
 from aegis_worker.flows.intelligence_scan import IntelligenceScanFlow, IntelligenceScanInput
 from aegis_worker.flows.interaction import InteractionFlow
 from aegis_worker.flows.jira_sync import JiraSyncConfig, JiraSyncFlow
+from aegis_worker.flows.journal_prompt import JournalPromptConfig, JournalPromptFlow
 from aegis_worker.flows.llm_spend_guard import LLMSpendGuardConfig, LLMSpendGuardFlow
 from aegis_worker.flows.meeting_notes import MeetingNotesFlow
 from aegis_worker.flows.meeting_sweep import MeetingSweepFlow, MeetingSweepInput
@@ -323,6 +324,22 @@ FLOWS: tuple[FlowSpec, ...] = (
             limit=_int(act["config"], "limit", NotesBackfillConfig.limit),
             since_days=_int(act["config"], "since_days", NotesBackfillConfig.since_days),
             batch=_int(act["config"], "batch", NotesBackfillConfig.batch),
+        ),
+    ),
+    # The journal gap prompt (vault record spec §3): one `input` card on a day
+    # the user wrote nothing. aegis_ui_url comes from settings, as for the
+    # curiosity card, so the card also links to the admin textarea.
+    FlowSpec(
+        JournalPromptFlow,
+        lambda act: JournalPromptConfig(
+            agent_id=act["agent_id"],
+            min_words=_int(act["config"], "min_words", JournalPromptConfig.min_words),
+            timeout_seconds=_int(
+                act["config"], "timeout_seconds", JournalPromptConfig.timeout_seconds
+            ),
+            prompt=str(act["config"].get("prompt") or JournalPromptConfig.prompt),
+            label=str(act["config"].get("label") or JournalPromptConfig.label),
+            aegis_ui_url=act["_settings"].get("aegis_ui_url", ""),
         ),
     ),
     FlowSpec(
