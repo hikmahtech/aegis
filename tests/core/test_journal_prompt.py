@@ -4,7 +4,9 @@ holds, and what happens to an answer. Every note here is made up."""
 from __future__ import annotations
 
 from datetime import date, datetime
+from uuid import uuid4
 
+import pytest_asyncio
 from aegis.services import journal_prompt as jp
 from aegis.services import notes
 from aegis.services import vault_layout as vl
@@ -114,3 +116,63 @@ def test_the_prompt_ends_the_way_the_owner_decided():
     assert jp.DEFAULT_PROMPT.endswith("Ignore this if you already wrote the day on your phone.")
     assert "{day}" in jp.DEFAULT_PROMPT
     assert vl.DEFAULT_LAYOUT.render(jp.DAY_NAME_FORMAT, DAY) == "Monday 21 September"
+
+
+# ------------------------------------------------------------ the database
+
+
+@pytest_asyncio.fixture(loop_scope="function")
+async def cards(db_pool):
+    async def wipe():
+        await db_pool.execute("DELETE FROM interactions WHERE flow_run_id LIKE 'jp-test-%'")
+
+    await db_pool.execute(
+        "INSERT INTO agents (id, name, role, system_prompt_path, active) "
+        "VALUES ('sebas', 'Sebas', 'assistant', 'personalities/sebas', TRUE) "
+        "ON CONFLICT (id) DO NOTHING"
+    )
+    await wipe()
+    yield db_pool
+    await wipe()
+
+
+async def _card(pool, value, *, origin=jp.ORIGIN, status="resolved", days_ago=0) -> str:
+    return str(
+        await pool.fetchval(
+            "INSERT INTO interactions (flow_run_id, agent_id, kind, origin, prompt, status, "
+            " response, metadata, resolved_at) "
+            "VALUES ($1, 'sebas', 'input', $2, 'Your day?', $3, $4, $5, "
+            " now() - make_interval(days => $6)) RETURNING id",
+            f"jp-test-{uuid4()}",
+            origin,
+            status,
+            {"value": value},
+            {"day": "2026-09-21", "agent_id": "sebas"},
+            days_ago,
+        )
+    )
+
+
+async def _response(pool, iid):
+    return await pool.fetchval("SELECT response FROM interactions WHERE id = $1::uuid", iid)
+
+
+async def test_blanking_touches_only_a_resolved_journal_card(cards):
+    mine = await _card(cards, "a private day")
+    other = await _card(cards, "Acme is my gym", origin="curiosity")
+    assert await jp.blank_answer(cards, mine, "journal/x.md") is True
+    assert await jp.blank_answer(cards, other, "journal/x.md") is False
+    assert await _response(cards, mine) == {"value": "", "filed": "journal/x.md"}
+    assert await _response(cards, other) == {"value": "Acme is my gym"}
+
+
+async def test_the_unfiled_answers_are_resolved_cards_still_holding_words(cards):
+    old = await _card(cards, "old words", days_ago=20)
+    new = await _card(cards, "new words", days_ago=1)
+    await _card(cards, " \n\t ", days_ago=1)  # nothing to file
+    await _card(cards, "not answered yet", status="pending")
+    await jp.blank_answer(cards, await _card(cards, "filed words"), "journal/y.md")
+    assert [r["id"] for r in await jp.unfiled_answers(cards, 14)] == [new]
+    assert [r["id"] for r in await jp.unfiled_answers(cards, 0)] == [old, new]
+    row = (await jp.unfiled_answers(cards, 14))[0]
+    assert row["response"] == {"value": "new words"} and row["metadata"]["day"] == "2026-09-21"

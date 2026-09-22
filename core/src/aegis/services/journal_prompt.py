@@ -132,3 +132,38 @@ def keep_lines(text: str) -> str:
     them keeps each its own bullet. Indented and bulleted lines nest as
     before, and no character of any line changes."""
     return "\n\n".join(text.splitlines())
+
+
+async def blank_answer(pool: Any, interaction_id: str, path: str) -> bool:
+    """Take the user's words off the card once the vault holds them:
+    `interactions.response` becomes `{"value": "", "filed": <note path>}`.
+    Nothing prunes `interactions`, so without this the diary would stay in
+    the database for good. Only a resolved `journal_prompt` card is touched.
+    True when a row changed."""
+    status = await pool.execute(
+        "UPDATE interactions SET response = $2 "
+        "WHERE id = $1::uuid AND origin = $3 AND status = 'resolved'",
+        interaction_id,
+        {"value": "", "filed": path},
+        ORIGIN,
+    )
+    return status == "UPDATE 1"
+
+
+_UNFILED_SQL = """
+SELECT id::text AS id, response, metadata
+  FROM interactions
+ WHERE origin = $1 AND status = 'resolved'
+   AND COALESCE(response->>'value', '') ~ '\\S'
+   AND ($2::int <= 0 OR resolved_at > now() - make_interval(days => $2::int))
+ ORDER BY resolved_at
+"""
+
+
+async def unfiled_answers(pool: Any, since_days: int = 0) -> list[dict]:
+    """Resolved `journal_prompt` cards still holding an answer: their filing
+    failed after the card resolved (`InteractionFlow` swallows a failed
+    post-resolve hook). Only cards resolved in the last `since_days` days;
+    0 takes them all. Oldest first."""
+    rows = await pool.fetch(_UNFILED_SQL, ORIGIN, max(0, int(since_days or 0)))
+    return [dict(r) for r in rows]

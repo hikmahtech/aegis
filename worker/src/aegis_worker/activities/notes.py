@@ -51,6 +51,8 @@ INDEX_STATE_KEY = "notes_index_state"
 DEFAULT_INDEX_BATCH = 300
 # Journal entries per backfill commit (`notes-backfill-weekly`'s `batch`).
 BACKFILL_BATCH = 50
+# A journal write the vault now holds: pushed, or already there.
+_FILED = ("written", "exists")
 
 # Newest first: a weekly run is for the recent days whose vault write failed
 # and fell back to their knowledge row; the old rows went in on the first run.
@@ -240,6 +242,57 @@ class NotesActivities:
             "words": words,
             "day_name": layout.render(jp.DAY_NAME_FORMAT, d),
         }
+
+    @activity.defn
+    async def file_journal_answer(
+        self, interaction_id: str, response: dict, metadata: dict
+    ) -> dict:
+        """The journal prompt card's post-resolve hook: the user's answer, as
+        written, into the day's note as a `selfreport:<day>` block (one
+        bullet per line typed, no model call), then the stored copy blanked
+        (`journal_prompt.blank_answer`) once the note holds it.
+        `{"status": written | exists | empty | not_configured | disabled |
+        error, "path"}`. Never raises for a vault problem and never logs the
+        answer; the weekly `NotesBackfillFlow` files one whose write failed."""
+        text = jp.answer_text(response)
+        if not text:
+            return {"status": "empty"}
+        meta = metadata if isinstance(metadata, dict) else {}
+        day = str(meta.get("day") or "")
+        res = await self.notes_journal_write(
+            {
+                "kind": "daily",
+                "day": day,
+                "label": day,
+                "text": jp.keep_lines(text),
+                "agent_id": str(meta.get("agent_id") or ""),
+                "slot": jp.SLOT,
+            }
+        )
+        status = str(res.get("status") or "error")
+        path = str(res.get("path") or "")
+        if status in _FILED and self.db_pool is not None:
+            await jp.blank_answer(self.db_pool, interaction_id, path)
+        return {"status": status, "path": path}
+
+    @activity.defn
+    async def notes_file_answers(self, since_days: int = 0) -> dict:
+        """The journal prompt's answers still in the database, for the weekly
+        `NotesBackfillFlow`: filed and blanked now. Marker-idempotent: an
+        answer already in its note comes back `exists` and is only blanked.
+        `since_days` > 0 looks only at cards resolved in that many days; 0
+        (a run started by hand) takes them all."""
+        cfg = self._cfg()
+        if not cfg.configured:
+            return {"status": "not_configured"}
+        if self.db_pool is None:
+            return {"status": "no_database"}
+        rows = await jp.unfiled_answers(self.db_pool, since_days)
+        filed = 0
+        for r in rows:
+            res = await self.file_journal_answer(r["id"], r["response"], r["metadata"])
+            filed += int(res.get("status") in _FILED)
+        return {"status": "ok", "answers": len(rows), "filed": filed, "failed": len(rows) - filed}
 
     # ------------------------------------------------------------- index
 
