@@ -38,6 +38,7 @@ const LANGUAGE_HELP: Record<string, string> = {
   journal_title: 'How a journal note is titled inside a rollup. {day}.',
   also_in_note: 'Introduces what else the note held, after the agent\'s own block.',
   review_label: 'The label on the weekly review block, filed in the week\'s note.',
+  selfreport_label: 'The label on your answer to the journal prompt, filed in the day\'s note.',
 };
 
 function today(): string {

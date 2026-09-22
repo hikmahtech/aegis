@@ -97,6 +97,7 @@ DEFAULT_LANGUAGE: dict[str, str] = {
     # The label on a block that is not the day log; one `<slot>_label` per slot
     # (`Layout.label_for`), so a new slot is a word here, not a code change.
     "review_label": "weekly review",
+    "selfreport_label": "in my words",
 }
 
 # ------------------------------------------------------------------ the agent
