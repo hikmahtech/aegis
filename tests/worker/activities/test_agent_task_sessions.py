@@ -187,6 +187,7 @@ class _Connector:
         resume: bool = False,
         name: str = "",
         worktree_path: str = "",
+        run_id: str = "",
     ) -> dict:
         self.launches.append(
             {

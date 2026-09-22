@@ -962,6 +962,26 @@ def _validate_agent_tool_sets() -> None:
         logger.warning("chat_tool_unused", tool=name)
 
 
+# Every agent with tools gets this, whatever its persona says (#640). On
+# 2026-09-21 an agent made no tool call and still gave a node's state (a
+# service's UpdateStatus string, not a node state), two failure dates that
+# matched no record, "Confirmed" on an unchecked placement and an offer to run
+# a drain it had no tool for; and it told the owner a dispatched run was Kimi
+# when the tool had said "auto". Personas are the owner's to edit, so this
+# lives in code: it is a rule about evidence, not about any one agent.
+_EVIDENCE_RULE = (
+    "## Evidence\n\n"
+    "- State a fact about live systems (a node, service, run, task, account, "
+    "date or count) only when a tool returned it in this conversation, and "
+    "say which tool. If you have not checked, say \"I have not checked\" and "
+    "call the tool that would tell you, if you have one.\n"
+    "- Repeat what a tool returned in its own terms. Do not fill a gap it "
+    "left (an engine, an id, an outcome) with a guess.\n"
+    "- Offer only actions one of your tools can carry out. If none can, say "
+    "so and say what the user would run themselves."
+)
+
+
 def _build_agent_system_prompt(
     agent_id: str,
     fallback: str,
@@ -976,6 +996,10 @@ def _build_agent_system_prompt(
     system_prompt) when every kind is empty.
     """
     persona = persona or {}
+    if not any((persona.get(k) or "").strip() for k in ("soul", "agents", "user", "memory")):
+        # No persona: the DB prompt, plus the evidence rule when the agent
+        # can call tools, since that is when it has something to claim.
+        return f"{fallback}\n\n{_EVIDENCE_RULE}" if tool_descriptions else fallback
 
     sections: list[str] = []
     for kind, heading in (
@@ -988,11 +1012,9 @@ def _build_agent_system_prompt(
         if content:
             sections.append(f"## {heading}\n\n{content}")
 
-    if not sections:
-        return fallback
-
     if tool_descriptions:
         sections.append(f"## Available Tools\n\n{tool_descriptions}")
+        sections.append(_EVIDENCE_RULE)
 
     return "\n\n".join(sections)
 

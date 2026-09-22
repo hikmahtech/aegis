@@ -47,10 +47,52 @@ async def test_dispatch_starts_agent_run_flow_with_agent_and_prompt():
     assert payload["engine"] == "claude"
     assert payload["purpose"] == "gmail attachment trace"
     assert kwargs["task_queue"] == "aegis-main"
-    assert kwargs["id"].startswith("agent-run-")
+    # One id for the whole run (#640): the workflow, the connector's run and
+    # the confirmation all carry it.
+    run_id = payload["run_id"]
+    assert kwargs["id"] == f"agent-run-{run_id}"
+    assert f"Dispatched agent run {run_id} (engine=claude)" in result
+    assert f"`run={run_id}`" in result
+    assert f"stop_agent_run(run_id='{run_id}')" in result
+    assert "result will land in this channel" in result
 
-    assert kwargs["id"] in result
-    assert "results will land in this channel" in result
+
+class _Coding:
+    def __init__(self, engine="claude", boom=None):
+        self._engine, self._boom = engine, boom
+
+    async def routed_engine(self, github_repo=""):
+        if self._boom:
+            raise self._boom
+        return self._engine
+
+
+async def test_an_omitted_engine_is_named_from_the_routing_never_auto():
+    """#640: the tool said "(auto)", the agent told the owner "Kimi", and
+    routing sent it to claude. The confirmation names the routed engine."""
+    client = _client()
+    ctx = ToolContext(
+        agent_id="pandoras-actor", temporal_client=client, remote_script_connector=_Coding()
+    )
+
+    result = await _execute_tool(AsyncMock(), "dispatch_agent_run", {"prompt": "ssh run"}, ctx)
+
+    assert "engine=claude" in result
+    assert "auto" not in result
+    # The flow still lets the launch decide; only the label is resolved.
+    assert client.start_workflow.call_args[0][1]["engine"] == ""
+
+
+@pytest.mark.parametrize("coding", [None, _Coding(boom=RuntimeError("db down"))])
+async def test_an_engine_nobody_can_name_is_said_to_be_unknown(coding):
+    client = _client()
+    ctx = ToolContext(agent_id="sebas", temporal_client=client, remote_script_connector=coding)
+
+    result = await _execute_tool(AsyncMock(), "dispatch_agent_run", {"prompt": "x"}, ctx)
+
+    assert "engine not known yet" in result
+    assert "auto" not in result
+    client.start_workflow.assert_called_once()
 
 
 async def test_dispatch_omits_repo_as_none_so_the_flow_picks_scratch():
