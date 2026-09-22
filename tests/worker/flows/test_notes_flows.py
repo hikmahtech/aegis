@@ -68,15 +68,20 @@ async def test_the_sync_flow_passes_its_batch_size_and_index_cut():
     async def stub_index(max_files: int, index_max_chars: int = 0) -> dict:
         return {"status": "ok", "max_files": max_files, "index_max_chars": index_max_chars}
 
+    # The record compile is the flow's last step (vault record spec §5).
+    @activity.defn(name="notes_compile_record")
+    async def stub_compile() -> dict:
+        return {"status": "off"}
+
     async with (
         await WorkflowEnvironment.start_time_skipping() as env,
-        Worker(env.client, task_queue="tq", workflows=[NotesSyncFlow], activities=[stub_index]),
+        Worker(env.client, task_queue="tq", workflows=[NotesSyncFlow], activities=[stub_index, stub_compile]),
     ):
         out = await env.client.execute_workflow(
             NotesSyncFlow.run, NotesSyncConfig(max_files=42, index_max_chars=5000),
             id="ns-1", task_queue="tq",
         )
-    assert out == {"status": "ok", "max_files": 42, "index_max_chars": 5000}
+    assert out == {"status": "ok", "max_files": 42, "index_max_chars": 5000, "record": {"status": "off"}}
 
 
 @pytest.mark.asyncio
