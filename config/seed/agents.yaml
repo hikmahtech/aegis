@@ -54,7 +54,7 @@ agents:
       slack_icon: ":moneybag:"
       intent_keywords: [money, bill, invoice, subscription, payment, receipt, spend, cost, budget, renew, charge, refund, expense, price, market, stock, crypto, portfolio]
       knowledge_domains: [market, finance, trade]
-      tool_set: [get_quote, get_market_overview, get_finance_news, search_knowledge, remember_this, task_context, report_progress, merge_problems, list_interactions, capture_to_inbox, list_next_actions, list_projects, complete_task, defer_task, mark_waiting, handoff_task, ledger_query, ledger_post, ledger_reclassify, ledger_add_rule]
+      tool_set: [get_quote, get_market_overview, get_finance_news, search_knowledge, remember_this, task_context, report_progress, merge_problems, list_interactions, capture_to_inbox, list_next_actions, list_projects, complete_task, defer_task, mark_waiting, handoff_task, ledger_query, ledger_post, ledger_reclassify, ledger_add_rule, desk_status]
     active: true
 
   - id: pandoras-actor

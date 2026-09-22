@@ -1756,6 +1756,19 @@ admin **Agents → Maou** page (or `PUT /api/admin/agents/maou/personality`).
 Without it she has four tools she has never been told about, and the model
 picks them up only if a message happens to name one.
 
+**The desk is a fifth tool, `desk_status`, and the same two writes.** The
+paper desk runs as Maou, but its book is not in the ledger, and until this tool
+nothing let Maou read it: asked for its holdings, it reported none. The tool is
+read-only and returns what the admin **Trading desk** page shows, through the
+same `services/desk_view.py`, so the two cannot disagree. It is on the MCP
+read-only list. Grant it and tell Maou about it (the **What I Do** paragraph
+on the paper trading desk in `personalities/maou/SOUL.md`):
+
+```sql
+UPDATE agents SET metadata = jsonb_set(metadata, '{tool_set}', (metadata->'tool_set') || '["desk_status"]'::jsonb)
+WHERE id = 'maou' AND jsonb_typeof(metadata->'tool_set') = 'array' AND NOT (metadata->'tool_set' @> '["desk_status"]'::jsonb);
+```
+
 ## Chat
 
 Pandora's infra tools work against registry clusters by slug:

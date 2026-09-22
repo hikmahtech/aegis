@@ -518,6 +518,55 @@ async def test_desk_history_pairs_each_day_with_its_orders_and_its_reasons(clien
     assert body["days"][0]["data_date"] == traded.isoformat()
 
 
+# --------------------------------------------- the desk's agent reads it too
+
+
+async def _desk_status(pool, **args) -> dict:
+    import json
+
+    from aegis.services.chat import ToolContext, _execute_tool
+
+    return json.loads(await _execute_tool(pool, "desk_status", args, ToolContext(agent_id="maou")))
+
+
+async def test_the_chat_tool_reads_exactly_what_the_page_reads(client, pool):
+    """Asked for its holdings, Maou could read only the ledger and said "no
+    securities holdings recorded" while the desk held a book. `desk_status`
+    is the page's own read, so the two cannot disagree."""
+    bought, priced = date.today() - timedelta(days=10), date.today() - timedelta(days=1)
+    await _price(pool, "TCS.NS", bought, Decimal("1000.00"))
+    await _price(pool, "TCS.NS", priced, Decimal("1100.00"))
+    await _order(pool, bought, "TCS", "buy", 10, Decimal("1000.00"))
+    await _plan(pool, bought, outcome="orders", skipped=["SWIGGY"])
+
+    page = (await client.get("/api/admin/money/desk")).json()
+    tool = await _desk_status(pool)
+
+    assert tool == page
+    assert [p["symbol"] for p in tool["positions"]] == ["TCS"]
+    assert "history" not in tool
+
+    history = (await client.get("/api/admin/money/desk/history?limit=5")).json()["days"]
+    with_history = await _desk_status(pool, history_days=5)
+    assert with_history["history"] == history
+    assert with_history["history"][0]["orders"][0]["symbol"] == "TCS"
+
+
+async def test_a_desk_the_tool_cannot_read_is_an_error_not_an_empty_book(pool):
+    """An empty book would read as "the desk holds nothing"."""
+    from unittest.mock import AsyncMock
+
+    broken = AsyncMock()
+    broken.fetch.side_effect = RuntimeError("relation finance.desk_orders does not exist")
+    broken.fetchrow.side_effect = RuntimeError("down")
+    broken.acquire.side_effect = RuntimeError("pool closed")
+
+    out = await _desk_status(broken)
+
+    assert set(out) == {"error"}
+    assert "could not read the desk" in out["error"]
+
+
 # ------------------------------------------------- the desk's market settings
 
 
