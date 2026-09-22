@@ -207,6 +207,36 @@ async def test_the_interests_draft_cites_two_sources_and_never_the_journal(pool,
     assert "journal/" not in text
 
 
+@needs_git
+async def test_retire_takes_only_rows_found_in_an_accepted_note(pool, tmp_path):
+    v = make_vault(tmp_path, {
+        "me/about.md": "# About\n- How do you start the day? — Slow coffee, then a walk\n- Is it? — yes\n",
+        "me/money.draft.md": "# Money\n- Which card for travel? — The blue one\n",
+    })
+    ids = {}
+    for aid, q, a in ((GTD, "How do you start the day?", "Slow coffee,\n then a walk"),
+                      (GTD, "Do you cook?", "Most evenings, simply"),
+                      (FIN, "Which card for travel?", "The blue one"),
+                      (FIN, "Short?", "yes")):
+        await memory.record_memory(pool, aid, f"{q}\n{memory.CURIOSITY_ANSWER_PREFIX}{a}", importance=0.8, source="curiosity")
+        ids[a] = await pool.fetchval("SELECT max(id) FROM agent_memory WHERE agent_id = $1", aid)
+    on = vl.layout_from({"record": {"enabled": True}})
+    with pytest.raises(ValueError, match="record is off"):
+        await rs.retire_seeded_memory(pool, v["cfg"], LAYOUT, apply=True)
+    preview = await rs.retire_seeded_memory(pool, v["cfg"], on, apply=False)
+    assert preview["retire"] == {GTD: [ids["Slow coffee,\n then a walk"]]}
+    assert preview["kept"] >= 3   # other test files may leave curiosity rows of their own
+    assert await pool.fetchval(
+        "SELECT count(*) FROM agent_memory_ops_log WHERE run_id LIKE 'retire_seeded_memory%' AND agent_id = $1", GTD
+    ) == 0
+    done = await rs.retire_seeded_memory(pool, v["cfg"], on, apply=True)
+    assert done["status"] == "retired"
+    live = {r["id"] for r in await pool.fetch(
+        "SELECT id FROM agent_memory WHERE agent_id = ANY($1::text[]) AND superseded_at IS NULL", [GTD, FIN])}
+    assert ids["Slow coffee,\n then a walk"] not in live
+    assert {ids["Most evenings, simply"], ids["The blue one"], ids["yes"]} <= live, "not in a note, only in a draft, or too short alone"
+
+
 def test_the_message_lists_the_drafts_and_what_was_not_drafted():
     msg = rs.seed_message({
         "general": {"status": "written", "written": ["me/about.draft.md", "me/work.draft.md"]},

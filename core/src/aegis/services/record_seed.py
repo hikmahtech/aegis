@@ -45,8 +45,9 @@ from aegis.services.bank_parsers import has_money_shape
 from aegis.services.books_chart import get_chart
 from aegis.services.feeds import feed_label
 from aegis.services.meeting_rules import get_meeting_rules, is_self
-from aegis.services.memory import CURIOSITY_ANSWER_PREFIX
+from aegis.services.memory import CURIOSITY_ANSWER_PREFIX, apply_consolidation
 from aegis.services.personalities import get_personality
+from aegis.services.record import clean
 from aegis.services.research_topics import load_topics
 from aegis.services.user_time import user_now
 
@@ -507,3 +508,42 @@ async def draft_interests(
     except notes.NotesError as exc:
         return {"status": "error", "reason": error_text(exc, 200), "written": []}
     return {"status": "written" if out["written"] else "exists", **out, "dropped": dropped, "notes_omitted": omitted}
+
+
+# ------------------------------------------------- after the record is on
+
+
+async def retire_seeded_memory(pool: Any, cfg: notes.NotesConfig, layout: vl.Layout, *, apply: bool) -> dict:
+    """Retire each live curiosity row whose answer is now in an accepted record
+    note (spec §12), through `apply_consolidation` — a DELETE plan per agent,
+    a soft retire the ops log records. `apply=False` only reports what it
+    would retire and writes nothing. Refused while the record is off: until
+    then the rows are the only copy the prompts read."""
+    if not layout.record.enabled:
+        raise ValueError(
+            "the record is off: turn it on and accept the drafts first, because until then "
+            "these rows are the only copy of the answers the prompts read"
+        )
+    files = await asyncio.to_thread(notes.read_record_sync, cfg, layout)
+    texts = [one_line(clean(t)) for t in files.notes.values()]
+    rows = await pool.fetch(
+        "SELECT id, agent_id, content FROM agent_memory "
+        "WHERE source = 'curiosity' AND superseded_at IS NULL ORDER BY agent_id, id"
+    )
+    retire: dict[str, list[int]] = {}
+    kept = 0
+    for r in rows:
+        head, answer = split_answer(r["content"])
+        needle = one_line(answer) if len(one_line(answer)) >= MIN_ANSWER_CHARS else answer_line(head, answer)
+        if needle and any(needle in t for t in texts):
+            retire.setdefault(r["agent_id"], []).append(int(r["id"]))
+        else:
+            kept += 1
+    if apply:
+        run_id = f"retire_seeded_memory:{(await user_now(pool)).date().isoformat()}"
+        for agent_id, ids in retire.items():
+            await apply_consolidation(
+                pool, agent_id, [{"op": "DELETE", "id": i, "apply": True} for i in ids],
+                run_id=run_id, dry_run=False,
+            )
+    return {"status": "retired" if apply else "preview", "retire": retire, "kept": kept}

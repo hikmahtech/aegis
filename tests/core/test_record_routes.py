@@ -128,6 +128,12 @@ async def test_the_page_lists_no_drafts_without_a_vault(pool):
     assert body["drafts"] == [] and body["record_state"] == {}
 
 
+async def test_retire_is_refused_while_the_record_is_off(pool):
+    async with _client(pool, Settings(**BASE)) as c:
+        r = await c.post("/api/admin/notes/record/retire-seeded-memory", headers=AUTH, json={"apply": True})
+    assert r.status_code == 409 and "record is off" in r.json()["detail"]
+
+
 async def test_the_seed_button_starts_the_flow_as_the_gtd_holder(pool):
     from types import SimpleNamespace
     from unittest.mock import AsyncMock, MagicMock

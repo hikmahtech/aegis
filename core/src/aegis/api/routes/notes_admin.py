@@ -29,7 +29,7 @@ from aegis.api.auth import verify_auth
 from aegis.api.deps import get_pool, get_settings
 from aegis.api.routes._flow_trigger import require_temporal_client, start_named_workflow
 from aegis.config import Settings
-from aegis.services import notes
+from aegis.services import notes, record_seed
 from aegis.services import record as vault_record
 from aegis.services import vault_layout as vl
 from aegis.services.agents import resolve_tag
@@ -116,6 +116,31 @@ async def start_record_seed(request: Request) -> dict[str, Any]:
     owner = await resolve_tag(pool, GENERALIST_TAG) or ""
     handle = await start_named_workflow("record_seed", {"agent_id": owner}, client, _SEED_FLOW, pool=pool)
     return {"ok": True, "workflow_id": handle.id}
+
+
+@router.post("/record/retire-seeded-memory")
+async def retire_seeded_memory_route(
+    request: Request, settings: Settings = Depends(get_settings)
+) -> dict[str, Any]:
+    """Retire the curiosity memory rows whose answers are now in an accepted
+    record note (vault record spec §12). Body `{"apply": false}` (the default)
+    previews and writes nothing; `{"apply": true}` retires through
+    `apply_consolidation`. 409 while the record is off."""
+    try:
+        body = await request.json()
+    except ValueError:
+        body = {}
+    pool = get_pool(request)
+    layout = vl.layout_from(await vl.get_layout_value(pool))
+    try:
+        return await record_seed.retire_seeded_memory(
+            pool, notes.config_from_settings(settings), layout,
+            apply=bool((body if isinstance(body, dict) else {}).get("apply")),
+        )
+    except notes.NotesError as exc:
+        raise HTTPException(status_code=503, detail=f"the vault could not be read: {exc}") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.get("/layout/preview")
