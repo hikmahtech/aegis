@@ -236,6 +236,100 @@ async def test_on_message_async_path_triggers_and_acks():
     assert akw["target"] == {"channel": "CPANDORA"}
 
 
+async def test_every_message_is_acknowledged_with_eyes_before_the_agent_answers():
+    """A sync agent used to be silent until its whole tool loop finished (13s
+    for Maou's holdings answer, read as no reply at all), while an async one
+    said "Routing to". Every routed message now gets :eyes: on arrival."""
+    inbound, core, adapter = _inbound()
+    calls: list[str] = []
+    adapter.add_reaction.side_effect = lambda **k: calls.append("react") or True
+    core.chat.side_effect = lambda **k: calls.append("chat") or {"response": "r"}
+    adapter.send_message.return_value = SendResult(ok=True, ref=None, used_html=False)
+
+    await inbound.on_message(channel_id="CSEBAS", text="hi", user_id="UME", ts="100.1")
+
+    assert adapter.add_reaction.await_args.kwargs == {
+        "channel": "CSEBAS", "ts": "100.1", "name": "eyes"
+    }
+    assert calls[:2] == ["react", "chat"]
+
+
+async def test_an_acknowledged_async_message_gets_no_routing_text():
+    inbound, core, adapter = _inbound()
+    adapter.add_reaction.return_value = True
+    core.agent_reply_trigger.return_value = {"workflow_id": "wf-1"}
+
+    await inbound.on_message(channel_id="CPANDORA", text="check swarm", user_id="UME", ts="5.5")
+
+    # The answer goes to the channel it was asked in, not wherever the
+    # agent's own channel happens to be.
+    assert core.agent_reply_trigger.await_args.kwargs["reply_ref"] == {"channel": "CPANDORA"}
+    adapter.send_message.assert_not_awaited()
+
+
+async def test_without_the_reaction_scope_async_falls_back_to_the_routing_text():
+    """No `reactions:write` yet: the reaction fails and an async answer can
+    be minutes away, so the old words still say it arrived."""
+    inbound, core, adapter = _inbound()
+    adapter.add_reaction.return_value = False
+    core.agent_reply_trigger.return_value = {"workflow_id": "wf-1"}
+
+    await inbound.on_message(channel_id="CPANDORA", text="check swarm", user_id="UME", ts="5.5")
+
+    assert "Routing" in adapter.send_message.await_args.kwargs["text"]
+
+
+async def test_a_question_asked_in_a_thread_is_answered_in_that_thread():
+    """It used to be answered in the channel, where nobody reading the
+    thread would see it."""
+    inbound, core, adapter = _inbound()
+    adapter.add_reaction.return_value = True
+    core.task_by_thread.return_value = None  # a thread no task owns
+    core.chat.return_value = {"response": "in thread"}
+    adapter.send_message.return_value = SendResult(ok=True, ref=None, used_html=False)
+
+    await inbound.on_message(
+        channel_id="CSEBAS", text="and this?", user_id="UME", ts="7.2", thread_ts="7.0"
+    )
+
+    assert adapter.send_message.await_args.kwargs["target"] == {
+        "channel": "CSEBAS", "thread_ts": "7.0"
+    }
+
+
+async def test_an_async_question_in_a_thread_carries_the_thread_root():
+    inbound, core, adapter = _inbound()
+    adapter.add_reaction.return_value = False
+    core.task_by_thread.return_value = None
+    core.agent_reply_trigger.return_value = {"workflow_id": "wf-1"}
+
+    await inbound.on_message(
+        channel_id="CPANDORA", text="and now?", user_id="UME", ts="8.3", thread_ts="8.0"
+    )
+
+    assert core.agent_reply_trigger.await_args.kwargs["reply_ref"] == {
+        "channel": "CPANDORA", "ts": "8.0"
+    }
+    # The fallback words go in the same thread.
+    assert adapter.send_message.await_args.kwargs["target"] == {
+        "channel": "CPANDORA", "thread_ts": "8.0"
+    }
+
+
+async def test_a_thread_root_is_a_top_level_message():
+    """Slack sets thread_ts == ts on a root; that is not a threaded ask."""
+    inbound, core, adapter = _inbound()
+    adapter.add_reaction.return_value = True
+    core.chat.return_value = {"response": "top"}
+    adapter.send_message.return_value = SendResult(ok=True, ref=None, used_html=False)
+
+    await inbound.on_message(
+        channel_id="CSEBAS", text="hi", user_id="UME", ts="9.0", thread_ts="9.0"
+    )
+
+    assert adapter.send_message.await_args.kwargs["target"] == {"channel": "CSEBAS"}
+
+
 async def test_on_message_async_trigger_failure_falls_back_to_sync():
     """Fix 2: async trigger failure → sync fallback (chat called, no bare ack)."""
     inbound, core, adapter = _inbound()

@@ -377,6 +377,46 @@ async def test_taskless_dm_path_skips_todoist_mirror():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reply_ref", [{"channel": "CMAOU"}, {"channel": "CMAOU", "ts": "8.0"}]
+)
+async def test_the_reply_goes_where_the_question_was_asked(reply_ref):
+    """A question to Pandora asked in Maou's channel (or inside a thread) was
+    answered in Pandora's own channel. `reply_ref` rides to `send_message` as
+    its `thread_ref`: a channel alone posts there, with `ts` into the thread."""
+    delivered: list[tuple] = []
+
+    @activity.defn(name="synthesize_reply")
+    async def synth(agent_id, message, thread_id, task_id):
+        return {"reply_text": "answer", "tool_trace_summary": "", "error": None}
+
+    @activity.defn(name="send_message")
+    async def deliver(agent_id, message, chat_id=0, thread_ref=None, thread_overflow=False):
+        delivered.append((agent_id, message, chat_id, thread_ref))
+        return {"ok": True, "message_id": 1}
+
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        task_queue = f"tq-{uuid.uuid4().hex[:8]}"
+        async with Worker(
+            env.client, task_queue=task_queue, workflows=[AgentChatReplyFlow], activities=[synth, deliver]
+        ):
+            result = await env.client.execute_workflow(
+                AgentChatReplyFlow.run,
+                AgentChatReplyInput(
+                    target_agent="pandoras-actor",
+                    synthetic_user_message="and now?",
+                    thread_id="slack-CMAOU-pandoras-actor",
+                    reply_ref=reply_ref,
+                ),
+                id=f"acf-ref-{uuid.uuid4().hex[:8]}",
+                task_queue=task_queue,
+            )
+
+    assert result["status"] == "ok"
+    assert delivered == [("pandoras-actor", "answer", 0, reply_ref)]
+
+
+@pytest.mark.asyncio
 async def test_taskless_dm_synthesize_failure_skips_error_comment():
     """DM path + synth failure: no error comment (there is no task), and the
     person hears about it in the channel instead of the turn vanishing."""

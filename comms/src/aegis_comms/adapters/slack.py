@@ -403,6 +403,29 @@ class SlackAdapter:
             return SendResult(ok=False, used_html=False, error=error_text(exc, 500))
         return SendResult(ok=True, ref=first_ref, used_html=False)
 
+    async def add_reaction(self, *, channel: str, ts: str, name: str) -> bool:
+        """Put `:name:` on a message. Best-effort: False on any failure, and
+        never raises — an acknowledgement must not cost the message it
+        acknowledges. `already_reacted` counts as done. Needs the bot's
+        `reactions:write` scope; without it Slack answers `missing_scope`."""
+        if not channel or not ts:
+            return False
+        try:
+            await self._client.reactions_add(channel=channel, timestamp=ts, name=name)
+        except SlackApiError as exc:
+            if (getattr(exc, "response", None) or {}).get("error") == "already_reacted":
+                return True
+            _logger.warning(
+                "slack_reaction_failed", channel=channel, name=name, error=error_text(exc, 300)
+            )
+            return False
+        except Exception as exc:  # noqa: BLE001 — transport trouble is not the message's problem
+            _logger.warning(
+                "slack_reaction_failed", channel=channel, name=name, error=error_text(exc, 300)
+            )
+            return False
+        return True
+
     async def send_system_event(self, *, text: str) -> SendResult:
         channel, _username, _icon, _voice_id = await self._resolve("system")
         if not channel:
