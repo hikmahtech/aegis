@@ -31,11 +31,13 @@ GET /api/admin/task-sessions/by-thread + POST /api/admin/tasks/{id}/comment.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import json
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import quote, urlencode
 
 import httpx
@@ -291,6 +293,50 @@ def parse_action(value: str) -> tuple[str, str]:
     return interaction_id, val
 
 
+def dead_card_text(status: str) -> str:
+    """What a card says once core reports it closed without an answer."""
+    if status == "retired":
+        # A newer card replaced it or its problem resolved (#629). The worker
+        # edits the card itself; this covers a tap that beat it, and the
+        # reminder copies of an escalating card.
+        return (
+            "⏭ Retired — a newer card replaced this one, or the problem "
+            "resolved on its own. Nothing was done."
+        )
+    return f"⏰ Expired — this card timed out before a response ({status})"
+
+
+# One try at saving a typed answer, made BEFORE the modal is acked, so a save
+# that is not confirmed leaves the modal open with the text still in it.
+# Slack wants the ack within 3 seconds of sending the submission, and the trip
+# over the socket each way comes out of that, so the save (the resolve, plus a
+# read when the card was already resolved) gets 2.0 s and the rest keeps a
+# second of margin. Core's resolve is a SELECT, an UPDATE and a Temporal
+# signal, normally a small fraction of the budget.
+TEXT_SAVE_BUDGET_S = 2.0
+
+_TEXT_ANSWERED = "✅ Answered"
+_TEXT_CLOSED_CARD = (
+    "✅ Already answered — this card was closed before your answer arrived, "
+    "so your answer was not recorded."
+)
+_TEXT_TRY_AGAIN = "Could not save just now. Press Send again."
+_TEXT_KEEP_IT = " Copy your answer if you want to keep it."
+
+
+class _TextOutcome(NamedTuple):
+    """What a save attempt means for the modal and for the card.
+
+    `error` non-empty keeps the modal open with that message; `card`
+    non-empty is what the card is edited to after the ack. `reason` is for
+    the log. None of the three ever holds the answer text.
+    """
+
+    reason: str
+    error: str = ""
+    card: str = ""
+
+
 class SlackCoreClient:
     """Async httpx client for the Core API calls the Slack inbound makes.
 
@@ -488,6 +534,13 @@ class SlackCoreClient:
             timeout=30,
             error_sink=error_sink,
         )
+
+    async def get_interaction(self, interaction_id: str) -> dict | None:
+        """GET /api/interactions/{id} — one card, its status and stored response.
+
+        None on any failure. The body is never logged: it can hold the answer.
+        """
+        return await self._get(f"/api/interactions/{interaction_id}")
 
     async def attach_delivery_ref(self, *, message_id: str, delivery_ref: dict) -> dict | None:
         """POST /api/chat/messages/{id}/delivery-ref — attach the reply ref.
@@ -1035,17 +1088,7 @@ class SlackInbound:
                 interaction_id=interaction_id,
                 status=status,
             )
-            if status == "retired":
-                # A newer card replaced it or its problem resolved (#629). The
-                # worker edits the card itself; this covers a tap that beat it,
-                # and the reminder copies of an escalating card.
-                text = (
-                    "⏭ Retired — a newer card replaced this one, or the problem "
-                    "resolved on its own. Nothing was done."
-                )
-            else:
-                text = f"⏰ Expired — this card timed out before a response ({status})"
-            await self._adapter.edit_card(ref=ref, text=text)
+            await self._adapter.edit_card(ref=ref, text=dead_card_text(status))
             return
 
         status_code = error_sink.get("status_code")
@@ -1084,6 +1127,103 @@ class SlackInbound:
                 "⚠️ Couldn't reach AEGIS — your tap was not recorded; the "
                 "buttons are still active, try again."
             ),
+        )
+
+    async def on_text_answer(
+        self, *, interaction_id: str, text: str, channel_id: str, message_ts: str, ack
+    ) -> None:
+        """Save an `input` card's typed answer, then close the modal only if it saved.
+
+        `ack` is the view_submission's ack. It is called exactly once, and only
+        after one save attempt bounded by `TEXT_SAVE_BUDGET_S`:
+
+          - saved → `ack()` closes the modal and the card is edited to
+            "Answered". The card never quotes the text.
+          - not confirmed (core down, slow, or a 5xx) → the modal stays open
+            with the text still in it and says to press Send again. There is
+            no retry after the modal closes: that is the path that loses text.
+          - closed without this answer (answered by someone else, expired,
+            gone) → the modal stays open and says the answer was not saved,
+            so the text can still be copied; the card says why it is closed.
+
+        The answer is stored as `{"value": text}`, the shape the admin
+        textarea sends. The text is private (a diary answer can come through
+        here), so no log line carries it: only the id, the length and the
+        outcome.
+        """
+        logger.info("slack_text_answer_submitted", interaction_id=interaction_id, length=len(text))
+        try:
+            async with asyncio.timeout(TEXT_SAVE_BUDGET_S):
+                outcome = await self._save_text_answer(interaction_id, text)
+        except TimeoutError:
+            outcome = _TextOutcome("timeout", error=_TEXT_TRY_AGAIN)
+        if outcome.error:
+            logger.warning(
+                "slack_text_answer_not_saved",
+                interaction_id=interaction_id,
+                reason=outcome.reason,
+            )
+            await ack(response_action="errors", errors={"answer": outcome.error})
+        else:
+            await ack()
+        if outcome.card:
+            await self._adapter.edit_card(
+                ref=DeliveryRef("slack", {"channel": channel_id, "ts": message_ts}),
+                text=outcome.card,
+            )
+
+    async def _save_text_answer(self, interaction_id: str, text: str) -> _TextOutcome:
+        """One resolve, and one read when core says the card was already resolved.
+
+        "Already resolved" has two causes that must read differently: an
+        earlier Send of this same answer that timed out here but landed at
+        core (saved), or an answer from somewhere else (closed). The stored
+        value decides. The same words from the admin page count as saved,
+        because they are the same answer.
+        """
+        error_sink: dict = {}
+        result = await self._core.resolve_interaction(
+            interaction_id=interaction_id, value=text, error_sink=error_sink
+        )
+        if result is None:
+            status_code = error_sink.get("status_code")
+            if status_code == 404:
+                return _TextOutcome(
+                    "gone",
+                    error="This card no longer exists, so your answer was not saved." + _TEXT_KEEP_IT,
+                )
+            if status_code is not None and 400 <= status_code < 500:
+                return _TextOutcome(
+                    f"refused_{status_code}",
+                    error="AEGIS refused this answer, so it was not saved." + _TEXT_KEEP_IT,
+                )
+            return _TextOutcome("unreachable", error=_TEXT_TRY_AGAIN)
+
+        status = result.get("status", "")
+        if status != "resolved":
+            return _TextOutcome(
+                status or "closed",
+                error="This card has closed, so your answer was not saved." + _TEXT_KEEP_IT,
+                card=dead_card_text(status),
+            )
+        if not result.get("already_resolved"):
+            return _TextOutcome("saved", card=_TEXT_ANSWERED)
+
+        stored = await self._core.get_interaction(interaction_id)
+        if stored is None:
+            return _TextOutcome("unconfirmed", error=_TEXT_TRY_AGAIN)
+        response = stored.get("response")
+        if isinstance(response, str):
+            try:
+                response = json.loads(response)
+            except ValueError:
+                response = None
+        if isinstance(response, dict) and response.get("value") == text:
+            return _TextOutcome("saved_earlier", card=_TEXT_ANSWERED)
+        return _TextOutcome(
+            "answered_elsewhere",
+            error="This card was already answered, so your answer was not saved." + _TEXT_KEEP_IT,
+            card=_TEXT_CLOSED_CARD,
         )
 
     async def on_capture(self, *, text: str, user_id: str) -> str:

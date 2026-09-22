@@ -1,3 +1,5 @@
+import json
+
 from aegis_comms.adapters.base import CardSpec
 from aegis_comms.cards import render_slack_blocks
 
@@ -80,10 +82,34 @@ def test_ack_default_button_label_and_no_url():
 
 def test_input_url_button():
     blocks = render_slack_blocks(_c("input", {"aegis_ui_url": "https://ui/"}))
-    el = _actions(blocks)["elements"][0]
+    el = _actions(blocks)["elements"][1]
     assert el["url"] == "https://ui/interactions/i1"
     assert el["text"]["text"] == "📝 Open in admin"
     assert "value" not in el
+
+
+def test_input_card_leads_with_an_answer_button():
+    """Phase 3 of the vault-record spec: the answer is typed in Slack.
+
+    The button carries the id and the modal's label and placeholder, so the
+    open handler needs no call to core inside Slack's 3-second trigger window.
+    """
+    blocks = render_slack_blocks(
+        _c("input", {"aegis_ui_url": "https://ui/", "label": "Who is Sam?",
+                     "placeholder": "A name and a role"})
+    )
+    answer = _actions(blocks)["elements"][0]
+    assert answer["action_id"] == "text_open"
+    assert "url" not in answer
+    assert json.loads(answer["value"]) == {
+        "id": "i1", "label": "Who is Sam?", "placeholder": "A name and a role",
+    }
+
+
+def test_input_answer_button_value_is_empty_label_when_options_are_silent():
+    blocks = render_slack_blocks(_c("input", None))
+    answer = _actions(blocks)["elements"][0]
+    assert json.loads(answer["value"]) == {"id": "i1", "label": "", "placeholder": ""}
 
 
 def test_draft_review_url_button():
@@ -93,10 +119,11 @@ def test_draft_review_url_button():
     assert el["text"]["text"] == "✏️ Review & send"
 
 
-def test_input_without_ui_url_has_no_actions_block():
+def test_input_without_ui_url_has_only_the_answer_button():
     blocks = render_slack_blocks(_c("input", None))
-    assert all(b["type"] != "actions" for b in blocks)
     assert blocks[0]["type"] == "section"
+    elements = _actions(blocks)["elements"]
+    assert [e["action_id"] for e in elements] == ["text_open"]
 
 
 def test_unknown_kind_section_only():
