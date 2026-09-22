@@ -1179,7 +1179,10 @@ class SlackInbound:
         earlier Send of this same answer that timed out here but landed at
         core (saved), or an answer from somewhere else (closed). The stored
         value decides. The same words from the admin page count as saved,
-        because they are the same answer.
+        because they are the same answer. So does a stored value blanked to
+        `{"value": "", "filed": <note>}`: only the journal prompt's card is
+        blanked, once its answer is in the vault, and only one person answers
+        it, so that blank is this answer, saved and filed.
         """
         error_sink: dict = {}
         result = await self._core.resolve_interaction(
@@ -1220,6 +1223,8 @@ class SlackInbound:
                 response = None
         if isinstance(response, dict) and response.get("value") == text:
             return _TextOutcome("saved_earlier", card=_TEXT_ANSWERED)
+        if isinstance(response, dict) and response.get("filed"):
+            return _TextOutcome("saved_and_filed", card=_TEXT_ANSWERED)
         return _TextOutcome(
             "answered_elsewhere",
             error="This card was already answered, so your answer was not saved." + _TEXT_KEEP_IT,

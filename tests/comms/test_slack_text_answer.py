@@ -279,6 +279,23 @@ async def test_a_resend_after_a_late_landing_first_try_reads_as_answered(monkeyp
     assert text == "✅ Answered"
 
 
+async def test_a_resend_after_the_answer_was_filed_reads_as_answered():
+    """The journal prompt files its answer in the vault, then blanks the stored
+    copy to `{"value": "", "filed": <note>}`. A late resend finds that blank:
+    it is this answer, saved and filed, not someone else closing the card."""
+    core = _FakeCore(
+        status="resolved", stored={"value": "", "filed": "journal/2026/09. Sep/21 Sep 26.md"}
+    )
+    inbound, adapter = _inbound(core)
+
+    ack = await _answer(inbound)
+
+    _closed(ack)
+    assert core.applied == 0
+    text = adapter.edit_card.await_args.kwargs["text"]
+    assert text == "✅ Answered"
+
+
 async def test_a_card_answered_elsewhere_says_closed_and_keeps_the_text():
     core = _FakeCore(status="resolved", stored={"value": "someone else's words"})
     inbound, adapter = _inbound(core)
