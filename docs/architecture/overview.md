@@ -337,6 +337,7 @@ Slack Socket Mode (`slack_sdk`) + FastAPI delivery server (port 8081). One Slack
 - Message bodies are authored in a light HTML dialect and converted to Slack mrkdwn (`html_to_mrkdwn`); all user-controlled strings pass through `_safe()` (`html.escape()`).
 - Interaction cards render as Block Kit with the uniform callback identity `interaction:{id}:{value}` — resolved by `/api/interactions/{id}/resolve`. Comment-channel reply callbacks use a separate `agent-chat-reply-…` workflow id namespace.
 - Approval/choice/ack cards also carry an optional free-text note input (`correction_note`). Slack includes the message's input state with every button tap, so a typed note rides along as `response.note` — which core records as a durable `agent_memory` lesson (the learning loop).
+- An `input` card has an **Answer** button that opens a Slack text box (`text_open` → modal `text_submit`, up to 3,000 characters; `options.label` and `options.placeholder` word it). The answer is stored as `response.value`, the same shape the admin page sends, so the learning loop records nothing from it. A blank answer is refused in the modal. The card then says "Answered" and never quotes the text, and no log line carries it (only the interaction id and the length). A card already answered or expired is reported closed and is not resolved again.
 - The delivery server exposes `/api/deliver/message`, `/api/deliver/document`, `/api/deliver/voice`, `/api/deliver/card`, `/api/comms/delete` and `/api/health` (inbound Socket Mode liveness).
 
 ## Database
