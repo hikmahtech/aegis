@@ -2034,5 +2034,23 @@
         "properties": {}
       }
     }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "desk_status",
+      "description": "Read the paper trading desk you run: what it holds now, what the book is worth, cash, gain against the starting capital, orders waiting to fill, the latest plan and what it held back, this month's score against the benchmark, and any open problems. Read-only; the desk trades on its own schedule and this cannot place, change or cancel an order. Use it whenever the user asks about holdings, positions, trades, the portfolio or how the desk is doing \u2014 the ledger does not hold these.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "history_days": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 30,
+            "description": "Also return the last N decision dates (1-30) with the orders written on each. Omit or 0 for the current state only."
+          }
+        }
+      }
+    }
   }
 ]

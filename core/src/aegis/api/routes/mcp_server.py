@@ -246,6 +246,9 @@ _APPROVAL_TOOL_DESCRIPTOR = {
 _READ_ONLY_TOOLS = frozenset(
     {
         "ask_knowledge",
+        # The paper desk's book (`desk_view`): SELECTs over finance.desk_* and
+        # the stored prices, no fetch and no write.
+        "desk_status",
         "find_reference",
         "get_finance_news",
         "get_market_overview",

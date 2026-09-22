@@ -56,6 +56,7 @@ from aegis.services.tools.content import (  # noqa: F401 — re-export: imported
     _exec_pdf_to_text,
     _exec_youtube_transcript,
 )
+from aegis.services.tools.desk import _exec_desk_status
 from aegis.services.tools.feeds import (
     _exec_follow_feed,
     _exec_list_feeds,
@@ -454,6 +455,8 @@ CHAT_TOOLS = [
     _registry_schema("ledger_post"),
     _registry_schema("ledger_reclassify"),
     _registry_schema("ledger_add_rule"),
+    # The paper trading desk (Maou) — read-only; `services/tools/desk.py`.
+    _registry_schema("desk_status"),
     _registry_schema("last_contact_with_person"),
     _registry_schema("query_observations"),
     # --- Vercel read-only (Pandora) ---
@@ -720,6 +723,7 @@ TOOL_EXECUTORS: dict[str, Any] = {
     "ledger_post": _exec_ledger_post,
     "ledger_reclassify": _exec_ledger_reclassify,
     "ledger_add_rule": _exec_ledger_add_rule,
+    "desk_status": _exec_desk_status,
     "last_contact_with_person": _exec_last_contact_with_person,
     "query_observations": _exec_query_observations,
     # Vercel read-only (Pandora) — see PR for design notes.
@@ -914,6 +918,8 @@ AGENT_TOOL_SETS: dict[str, set[str]] = {
         "ledger_post",
         "ledger_reclassify",
         "ledger_add_rule",
+        # The paper trading desk it runs — read-only.
+        "desk_status",
     },
 }
 
