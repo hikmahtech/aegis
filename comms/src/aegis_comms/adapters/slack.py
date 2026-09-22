@@ -144,12 +144,12 @@ async def handle_text_open(client, body) -> None:
 
 
 async def handle_text_submit(ack, inbound, body) -> None:
-    """Resolve an `input` card with the text typed in its modal.
+    """Save the text typed in an `input` card's modal.
 
     A blank answer is refused inside the modal, so the card is never resolved
-    with nothing. Otherwise the modal closes first (Slack wants the ack within
-    3 seconds) and `SlackInbound.on_text_answer` resolves the card. The text
-    is never logged here.
+    with nothing. Anything else goes to `SlackInbound.on_text_answer` with the
+    ack: it saves first and closes the modal only on a confirmed save, so an
+    answer that did not save is still in the box. The text is never logged.
     """
     from aegis_comms.slack_modal import parse_text_submission
 
@@ -163,12 +163,12 @@ async def handle_text_submit(ack, inbound, body) -> None:
             errors={"answer": "Type an answer, or press Cancel."},
         )
         return
-    await ack()
     await inbound.on_text_answer(
         interaction_id=parsed.interaction_id,
         text=parsed.text,
         channel_id=parsed.channel,
         message_ts=parsed.ts,
+        ack=ack,
     )
 
 
@@ -680,7 +680,8 @@ class SlackAdapter:
 
         @app.view("text_submit")
         async def _on_text_submit(ack, body):  # noqa: ANN001
-            # The handler acks itself: a blank answer is refused in the ack.
+            # The handler acks itself, after one bounded save: the modal only
+            # closes once the answer is saved.
             await handle_text_submit(ack, inbound, body)
 
         @app.action("open_url")
