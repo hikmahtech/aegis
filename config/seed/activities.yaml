@@ -326,6 +326,31 @@ activities:
     config: {lookback_days: 7, max_per_day: 1}
     active: true
 
+  # The weekly draft for every other agent's own `user` doc. Same reason as
+  # the memory rows: the flow is per-agent and only Sebas had a row, so his
+  # was the only persona that ever changed. Each lands on its own weekday so
+  # the owner gets one draft card a day, not four on Sunday morning.
+  - slug: profile-reflection-weekly-maou
+    workflow_type: ProfileReflectionFlow
+    agent_id: maou
+    schedule_cron: "31 2 * * 2"
+    config: {lookback_days: 7, max_per_day: 1}
+    active: true
+
+  - slug: profile-reflection-weekly-raphael
+    workflow_type: ProfileReflectionFlow
+    agent_id: raphael
+    schedule_cron: "31 2 * * 4"
+    config: {lookback_days: 7, max_per_day: 1}
+    active: true
+
+  - slug: profile-reflection-weekly-pandoras-actor
+    workflow_type: ProfileReflectionFlow
+    agent_id: pandoras-actor
+    schedule_cron: "31 2 * * 6"
+    config: {lookback_days: 7, max_per_day: 1}
+    active: true
+
   # Raphael — knowledge ingestion (raindrop + rss + intel scans)
   - slug: raindrop-ingest-2h
     workflow_type: RaindropIngestFlow
@@ -475,6 +500,34 @@ activities:
       max_ops_pct: 0.25
       min_age_hours: 24
       retire_grace_days: 0
+    active: true
+
+  # The same pass for every other agent. The flow is per-agent and was only
+  # ever scheduled for Sebas, so Maou's memories were never capped or planned
+  # and nobody else's were either. One row per agent, because a row is one
+  # schedule; and they have to be HERE, because seed.py deletes every
+  # activities row the yaml does not name, so a row added on /admin/flows
+  # disappears on the next core restart. Odd minutes no stepper or fixed row
+  # owns (`test_every_agent_has_its_learning_rows`).
+  - slug: memory-reflection-nightly-maou
+    workflow_type: MemoryReflectionFlow
+    agent_id: maou
+    schedule_cron: "11 3 * * *"
+    config: {keep: 50, consolidate: true, dry_run: true, max_ops_pct: 0.25, min_age_hours: 24, retire_grace_days: 0}
+    active: true
+
+  - slug: memory-reflection-nightly-raphael
+    workflow_type: MemoryReflectionFlow
+    agent_id: raphael
+    schedule_cron: "17 3 * * *"
+    config: {keep: 50, consolidate: true, dry_run: true, max_ops_pct: 0.25, min_age_hours: 24, retire_grace_days: 0}
+    active: true
+
+  - slug: memory-reflection-nightly-pandoras-actor
+    workflow_type: MemoryReflectionFlow
+    agent_id: pandoras-actor
+    schedule_cron: "29 3 * * *"
+    config: {keep: 50, consolidate: true, dry_run: true, max_ops_pct: 0.25, min_age_hours: 24, retire_grace_days: 0}
     active: true
 
   # significance_threshold: the LLM scorer rates 1–5; only items >= this ingest.

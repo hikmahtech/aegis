@@ -631,6 +631,63 @@ def test_flow_in_schedule_map():
     assert config.aegis_ui_url == "https://aegis.example.com"
 
 
+def test_every_agent_has_its_learning_rows():
+    """Both learning flows are per-agent: a row is one schedule for one
+    agent. Only Sebas ever had rows, so his was the only persona that
+    changed and the only memory anyone tidied, for months. Every seeded agent
+    but `system` (which never chats) gets one row of each; a new agent in
+    agents.yaml without them fails here. None may share a minute with
+    another row or land on a stepper's minute."""
+    from pathlib import Path
+
+    import yaml
+
+    repo = Path(__file__).resolve().parents[2]
+    seed = repo / "config" / "seed"
+    rows = yaml.safe_load((seed / "activities.yaml").read_text())["activities"]
+    agents = {
+        a["id"] for a in yaml.safe_load((seed / "agents.yaml").read_text())["agents"]
+    } - {"system"}
+    assert {"sebas", "maou", "raphael", "pandoras-actor"} <= agents
+
+    for flow in ("ProfileReflectionFlow", "MemoryReflectionFlow"):
+        mine = [r for r in rows if r["workflow_type"] == flow]
+        assert {r["agent_id"] for r in mine} == agents, flow
+        assert len(mine) == len(agents), f"{flow}: one row per agent"
+        assert all(r["active"] is True for r in mine), flow
+
+    learning = [
+        r for r in rows if r["workflow_type"] in ("ProfileReflectionFlow", "MemoryReflectionFlow")
+    ]
+    # A CRON_TZ= prefix is not a field.
+    others = [
+        " ".join(t for t in r["schedule_cron"].split() if not t.startswith("CRON_TZ="))
+        for r in rows
+        if r not in learning
+    ]
+    # Sebas's two rows predate this and are DB-owned on every live deploy
+    # (his :23 does share a minute with the 3-58/5 stepper, and his memory pass
+    # runs at :00); moving them here would change nothing that runs.
+    for row in (r for r in learning if r["agent_id"] != "sebas"):
+        cron = row["schedule_cron"]
+        assert cron not in others, f"{row['slug']} shares {cron}"
+        minute = int(cron.split()[0])
+        for other in others:
+            field = other.split()[0]
+            if field.startswith("*/"):
+                assert minute % int(field[2:]) != 0, f"{row['slug']} collides with {other}"
+            elif "/" in field:
+                start, step = field.split("/")
+                lo = int(start.split("-")[0])
+                assert (minute - lo) % int(step) != 0 or minute < lo, (
+                    f"{row['slug']} collides with {other}"
+                )
+            elif field != "*":
+                assert minute not in {int(m) for m in field.split(",")} or other.split()[1] != (
+                    cron.split()[1]
+                ), f"{row['slug']} collides with {other}"
+
+
 def test_profile_reflection_seed_row_exists():
     from pathlib import Path
 
