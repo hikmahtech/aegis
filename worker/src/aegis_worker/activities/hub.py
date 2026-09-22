@@ -23,6 +23,7 @@ import httpx
 from aegis.errors import error_text, logged_failure
 from aegis.services import hub, hub_cards, hub_fix, hub_group, hub_project, hub_watch
 from temporalio import activity
+from temporalio.client import WorkflowExecutionStatus
 from temporalio.service import RPCError, RPCStatusCode
 
 from aegis_worker.activities.delivery import safe_send_message
@@ -78,9 +79,11 @@ class HubActivities:
         self.llm_client = llm_client
         self.model = model
         self.delivery = delivery
-        # Only `retire_cards` needs it: it signals a retired card's waiting
-        # `InteractionFlow`, which may belong to any run. Without one the card
-        # is still retired and edited, and its run waits out its own timeout.
+        # `retire_cards` signals a retired card's waiting `InteractionFlow`,
+        # which may belong to any run; without a client the card is still
+        # retired and edited, and its run waits out its own timeout.
+        # `claim_investigation` asks whether the run holding a problem is still
+        # going; without a client it assumes not, and investigates (#639).
         self.temporal_client = temporal_client
 
     async def _infra_agent(self) -> str:
@@ -240,6 +243,45 @@ class HubActivities:
         }
 
     @activity.defn
+    async def claim_investigation(self, inp: dict) -> dict:
+        """Make the calling run the one investigation of its problem (#639).
+        `{"claimed": False, "holder": <id>}` means another run is still going
+        and the caller must stand down.
+
+        Keys: `problem_id`, `run_id` (the caller's workflow id).
+
+        Fails open: no pool, no Temporal client, or a describe that errors
+        for any reason but "no such workflow" all count as "the holder is not
+        provably running", and the caller investigates. A second run is the
+        old behaviour; a lost investigation is worse."""
+        problem_id = str(inp.get("problem_id") or "")
+        run_id = str(inp.get("run_id") or "")
+        if self.db_pool is None or not problem_id or not run_id:
+            return {"claimed": True, "holder": run_id}
+
+        async def is_running(holder: str) -> bool:
+            if self.temporal_client is None:
+                return False
+            try:
+                desc = await self.temporal_client.get_workflow_handle(holder).describe()
+            except RPCError as exc:
+                if exc.status != RPCStatusCode.NOT_FOUND:
+                    activity.logger.warning(
+                        "hub_claim_describe_failed holder=%s err=%s", holder, error_text(exc)
+                    )
+                return False
+            except Exception as exc:  # noqa: BLE001 — see the docstring: fail open
+                activity.logger.warning(
+                    "hub_claim_describe_failed holder=%s err=%s", holder, error_text(exc)
+                )
+                return False
+            return desc.status == WorkflowExecutionStatus.RUNNING
+
+        return await hub.claim_investigation(
+            self.db_pool, problem_id, run_id, is_running=is_running
+        )
+
+    @activity.defn
     async def project_problem(self, problem_id: str) -> dict:
         """Bring the problem's task up to date and report the task's id.
 
@@ -348,6 +390,7 @@ class HubActivities:
             merged=merged,
             at=str((pr.get("merged_at") if merged else pr.get("closed_at")) or ""),
         )
+        agent_id = await self._infra_agent() if rows else ""
         for row in rows:
             try:
                 await hub_project.project(self.db_pool, row["problem_id"])
@@ -356,6 +399,16 @@ class HubActivities:
                     "follow_fix_pr_project_failed problem=%s err=%s",
                     row["problem_id"],
                     error_text(exc),
+                )
+            # The owner opened this PR from a decision card in the channel, so
+            # the channel hears how it ended, not only the task (#639): the
+            # task note alone left a merge nobody saw AEGIS acknowledge.
+            if agent_id and row.get("text"):
+                await safe_send_message(
+                    self.delivery,
+                    agent_id=agent_id,
+                    message=str(row["text"]),
+                    log_event="follow_fix_pr_notify_failed",
                 )
         return {"followed": len(rows), "problems": rows}
 

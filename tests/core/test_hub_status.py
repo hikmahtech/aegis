@@ -188,3 +188,34 @@ async def test_link_task_adopts_an_existing_task_once(db_pool):
     assert await hub_project.link_task(db_pool, r.problem_id, "T_OTHER") is False
     assert (await get_problem(db_pool, r.problem_id))["todoist_task_id"] == "T_EXISTING"
     assert await hub_project.link_task(db_pool, str(uuid.uuid4()), "T") is False
+
+
+async def test_claim_investigation_has_one_winner(db_pool):
+    """#639: two runs claiming the same problem at once. The claim is a
+    compare-and-swap, so exactly one wins and the other sees it as holder."""
+    import asyncio
+
+    from aegis.services.hub import claim_investigation
+
+    res = await ingest_event(db_pool, _occ(_subject()), now=NOW)
+
+    async def live(_holder: str) -> bool:
+        return True
+
+    a, b = await asyncio.gather(
+        claim_investigation(db_pool, res.problem_id, "run-a", is_running=live),
+        claim_investigation(db_pool, res.problem_id, "run-b", is_running=live),
+    )
+    assert sorted([a["claimed"], b["claimed"]]) == [False, True]
+    winner = "run-a" if a["claimed"] else "run-b"
+    assert a["holder"] == b["holder"] == winner
+
+
+async def test_claim_investigation_on_a_missing_problem_is_claimed(db_pool):
+    from aegis.services.hub import claim_investigation
+
+    async def never(_holder: str) -> bool:
+        raise AssertionError("no holder to ask about")
+
+    out = await claim_investigation(db_pool, str(uuid.uuid4()), "run-a", is_running=never)
+    assert out == {"claimed": True, "holder": "run-a"}

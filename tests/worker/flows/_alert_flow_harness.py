@@ -293,7 +293,14 @@ async def stub_retire_cards(inp: dict) -> dict:
     return {"retired": 1, "finished": 1, "waiting": 0}
 
 
+@activity.defn(name="claim_investigation")
+async def stub_claim_investigation(inp: dict) -> dict:
+    """No other run holds the problem (#639)."""
+    return {"claimed": True, "holder": inp["run_id"]}
+
+
 STUBS = [
+    stub_claim_investigation,
     stub_retire_cards,
     stub_resolve_agents,
     stub_routing,

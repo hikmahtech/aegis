@@ -200,6 +200,7 @@ async def stub_send_card_v2(
     options,
     allow_hint: bool = False,
 ) -> dict:
+    _state.setdefault("cards_sent", []).append(interaction_id)
     return {"ok": True, "message_id": 1}
 
 
@@ -236,6 +237,12 @@ _HUB: dict = {
     "resolved": False,
     "investigate": True,
     "delay": 0,
+    # `problem_status` reports resolved from its Nth call on (0 = never), so a
+    # test can resolve the problem after the verification check (#639).
+    "resolve_from": 0,
+    # What `claim_investigation` answers; None = the caller wins.
+    "holder": None,
+    "claims": [],
 }
 
 
@@ -256,10 +263,13 @@ async def stub_ingest_alert(alert: dict, resolved: bool = False) -> dict:
 @activity.defn(name="problem_status")
 async def stub_problem_status(problem_id: str) -> dict:
     _HUB["status"].append(problem_id)
+    resolved = _HUB["resolved"] or (
+        _HUB["resolve_from"] > 0 and len(_HUB["status"]) >= _HUB["resolve_from"]
+    )
     return {
         "found": True,
-        "status": "resolved" if _HUB["resolved"] else "open",
-        "resolved": _HUB["resolved"],
+        "status": "resolved" if resolved else "open",
+        "resolved": resolved,
         "occurrences": 1,
         "todoist_task_id": "task-hub-1",
     }
@@ -269,6 +279,15 @@ async def stub_problem_status(problem_id: str) -> dict:
 async def stub_record_investigation(inp: dict) -> dict:
     _HUB["record"].append(inp)
     return {"recorded": True, "status_changed": True}
+
+
+@activity.defn(name="claim_investigation")
+async def stub_claim_investigation(inp: dict) -> dict:
+    _HUB["claims"].append(inp)
+    holder = _HUB["holder"]
+    if holder and holder != inp["run_id"]:
+        return {"claimed": False, "holder": holder}
+    return {"claimed": True, "holder": inp["run_id"]}
 
 
 @activity.defn(name="mute_problem")
@@ -283,16 +302,19 @@ async def stub_verification_delay(alert: dict) -> dict:
 
 
 def _hub_reset() -> None:
-    for key in ("ingest", "status", "record", "mute"):
+    for key in ("ingest", "status", "record", "mute", "claims"):
         _HUB[key].clear()
     _HUB["resolved"] = False
     _HUB["investigate"] = True
     _HUB["delay"] = 0
+    _HUB["resolve_from"] = 0
+    _HUB["holder"] = None
 
 
 ALL_ACTIVITIES = [
     stub_ingest_alert,
     stub_problem_status,
+    stub_claim_investigation,
     stub_record_investigation,
     stub_mute_problem,
     stub_verification_delay,
@@ -729,3 +751,91 @@ async def test_flow_jira_source_skips_gate2_even_with_branches():
 
     # Flow terminated normally (logged), no PR staging side-effects.
     assert result["status"] in {"logged", "actionable"}, result["status"]
+
+
+# ── #639: one investigation per problem, and no card for a resolved one ──
+
+
+async def _run_flow(wf_id: str) -> dict:
+    async with (
+        await WorkflowEnvironment.start_time_skipping() as env,
+        Worker(
+            env.client,
+            task_queue="test-q",
+            workflows=[AlertInvestigationFlow, InteractionFlow],
+            activities=ALL_ACTIVITIES,
+        ),
+    ):
+        return await env.client.execute_workflow(
+            AlertInvestigationFlow.run,
+            _make_alert(severity="warning"),
+            id=wf_id,
+            task_queue="test-q",
+        )
+
+
+async def test_flow_stands_down_while_another_run_holds_the_problem():
+    """The reopen at 21:07 started run 9 while run 8 was still investigating.
+    Run 9 must leave the problem to run 8: no investigation, no card, and a
+    line on the timeline saying why."""
+    _reset()
+    _HUB["holder"] = "investigate-prob-1-8"
+
+    result = await _run_flow("investigate-prob-1-9")
+
+    assert result["status"] == "already_investigating"
+    assert result["holder"] == "investigate-prob-1-8"
+    assert _HUB["claims"] == [{"problem_id": "prob-1", "run_id": "investigate-prob-1-9"}]
+    assert not _state["run_investigation_called"] and not _state["assess_called"]
+    assert "cards_sent" not in _state
+    [rec] = _HUB["record"]
+    assert rec["status"] == "" and rec["external_id"].endswith(":already_investigating")
+    assert "investigate-prob-1-8" in rec["text"]
+
+
+async def test_flow_sends_no_card_for_a_problem_resolved_during_the_investigation():
+    """Run 9 carded a problem that had resolved nine minutes before. The
+    verification check passes (call 1); the problem resolves while the
+    investigation runs; the check right before the card (call 2) sees it."""
+    _reset(
+        assess_result={
+            "status": "actionable",
+            "root_cause": "Null check missing",
+            "suggested_fix": "Add guard",
+            "confidence": 0.98,
+        },
+    )
+    _state["run_investigation_result"] = {
+        **_state["run_investigation_result"],
+        "branch": "aegis-fix/null-check",
+        "branches": {"aegis": "aegis-fix/null-check"},
+    }
+    _HUB["resolve_from"] = 2
+
+    result = await _run_flow("investigate-prob-1-precheck")
+
+    assert result["status"] == "self_resolved_before_gate"
+    assert _state["run_investigation_called"]
+    assert "cards_sent" not in _state
+    steps = [r["external_id"].rsplit(":", 1)[-1] for r in _HUB["record"]]
+    assert "gate2" not in steps
+    assert steps[-1] == "self_resolved_before_gate"
+    assert _HUB["record"][-1]["status"] == "resolved"
+
+
+def test_fix_pr_title_names_the_fix():
+    from aegis_worker.flows.alert_investigation import fix_pr_title
+
+    assert (
+        fix_pr_title(
+            {"suggested_fix": "Guard the empty frame. Then rerun the job.", "root_cause": "x"},
+            "DagsterRunFailed",
+        )
+        == "fix: guard the empty frame"
+    )
+    # No fix: the root cause. Neither: the alert title.
+    assert fix_pr_title({"root_cause": "Missing null check."}, "t") == "fix: missing null check"
+    assert fix_pr_title({}, "Dagster pipeline failed") == "fix: dagster pipeline failed"
+    assert fix_pr_title({}, "") == "fix: AEGIS-proposed fix"
+    long = fix_pr_title({"suggested_fix": "word " * 40}, "t")
+    assert len(long) == 72 and long.endswith("…")
