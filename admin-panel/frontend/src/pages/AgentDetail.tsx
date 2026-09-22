@@ -18,6 +18,10 @@ export default function AgentDetail() {
   const [loading, setLoading] = useState(true);
   const [persona, setPersona] = useState({ name: '', role: '', model_tier: 'balanced' });
   const [kinds, setKinds] = useState({ soul: '', agents: '', user: '', memory: '' });
+  // While the vault's record is on, `user` is compiled from its notes and is
+  // read-only here (vault record spec §5).
+  const [recordOn, setRecordOn] = useState(false);
+  const [recordNotes, setRecordNotes] = useState<string[]>([]);
   const [savingP, setSavingP] = useState(false);
   const [pmsg, setPmsg] = useState('');
   const [draftDesc, setDraftDesc] = useState('');
@@ -69,6 +73,9 @@ export default function AgentDetail() {
       setKinds({
         soul: pk.soul || '', agents: pk.agents || '', user: pk.user || '', memory: pk.memory || '',
       });
+      const vr = await api.getVaultLayout().catch(() => null);
+      setRecordOn(!!vr?.layout?.record?.enabled);
+      setRecordNotes(vr?.record_state?.agents?.[id]?.notes || []);
     } catch (e: any) { setError(e); }
     finally { setLoading(false); }
   }
@@ -77,7 +84,11 @@ export default function AgentDetail() {
     setSavingP(true); setPmsg(''); setError(null);
     try {
       await api.updateAgent(id, persona);
-      await api.putPersonality(id, kinds);
+      // The server refuses a change to `user` while the record is on, so the
+      // page does not send it.
+      const { user: _user, ...others } = kinds;
+      void _user;
+      await api.putPersonality(id, recordOn ? others : kinds);
       setPmsg('Saved.'); await load();
     }
     catch (e: any) { setError(e); } finally { setSavingP(false); }
@@ -202,7 +213,14 @@ export default function AgentDetail() {
           <div key={k} style={{ marginBottom: 8 }}>
             <label style={{ fontSize: 13, color: 'var(--text-muted)' }}>{label}</label>
             <textarea style={{ width: '100%' }} rows={5} value={(kinds as any)[k]}
+              readOnly={k === 'user' && recordOn}
               onChange={e => setKinds({ ...kinds, [k]: e.target.value })} />
+            {k === 'user' && recordOn && (
+              <div className="meta">
+                Compiled from the vault: {recordNotes.join(', ') || 'no note yet'}. Edit those notes;
+                the hourly sync updates this document.
+              </div>
+            )}
           </div>
         ))}
         <button className="btn btn-primary" disabled={savingP} onClick={savePersona}>

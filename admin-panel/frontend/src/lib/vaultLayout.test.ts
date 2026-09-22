@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { changedKeys, joinList, splitList, toSaveBody, type VaultLayout } from './vaultLayout';
+import {
+  changedKeys, formatByTag, joinList, parseByTag, splitList, toSaveBody, type VaultLayout,
+} from './vaultLayout';
 
 const kind = {
   enabled: true, folder: '[journal/]YYYY/MM[. ]MMM', format: 'DD MMM YY', live_folder: 'journal',
@@ -20,6 +22,7 @@ const defaults: VaultLayout = {
   daily: kind,
   weekly: { ...kind, format: '[W]ww MMM YY', sections: ['Review'], label: 'week in review' },
   monthly: { ...kind, format: 'MM[. ]MMM', live_folder: '', sections: ['Review', 'Month Review'], label: 'month in review' },
+  record: { enabled: false, dir: 'me', shared: ['about'], by_tag: {}, max_chars: 6000 },
 };
 
 describe('list fields', () => {
@@ -57,5 +60,18 @@ describe('changedKeys', () => {
       previous: { ...defaults },
     };
     expect(changedKeys(edited, defaults)).toEqual(['agent_dir', 'entry']);
+  });
+});
+
+describe('the record map', () => {
+  it('parses one line per capability and formats it back', () => {
+    const map = parseByTag('finance: money\n gtd : work, people ,\nno colon here\n: orphan');
+    expect(map).toEqual({ finance: ['money'], gtd: ['work', 'people'] });
+    expect(formatByTag(map)).toBe('finance: money\ngtd: work, people');
+    expect(parseByTag(formatByTag(map))).toEqual(map);
+  });
+  it('toSaveBody trims the shared notes', () => {
+    const body = toSaveBody({ ...defaults, record: { ...defaults.record, shared: [' about ', ''] } });
+    expect(body.record.shared).toEqual(['about']);
   });
 });

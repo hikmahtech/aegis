@@ -519,6 +519,15 @@ export const api = {
     apiFetch<any>('/api/admin/notes/layout/preview', {
       method: 'POST', body: JSON.stringify({ layout, date }),
     }),
+  // The owner's record (vault record spec §5, §12): draft it, and retire the
+  // curiosity rows whose answers it now holds (preview first, then apply).
+  startRecordSeed: () =>
+    apiFetch<{ ok: boolean; workflow_id: string }>('/api/admin/notes/record/seed', { method: 'POST' }),
+  retireSeededMemory: (apply: boolean) =>
+    apiFetch<{ status: string; retire: Record<string, number[]>; kept: number }>(
+      '/api/admin/notes/record/retire-seeded-memory',
+      { method: 'POST', body: JSON.stringify({ apply }) },
+    ),
   getTimezone: () => apiFetch<{ timezone: string; effective: string }>('/api/admin/preferences/timezone'),
   saveTimezone: (timezone: string) =>
     apiFetch<{ timezone: string; effective: string }>('/api/admin/preferences/timezone', {
