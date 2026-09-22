@@ -732,8 +732,10 @@ class ProfileActivities:
     async def check_profile_budget(self, agent_id: str, max_per_day: int = 1) -> dict:
         """Read-only gate the flow consults BEFORE it spawns anything.
 
-        Three reasons to stay quiet, checked in this order:
+        Four reasons to stay quiet, checked in this order:
 
+          `record_in_vault` — the record is on (checked before the others): the
+                            `user` document is then compiled from the vault.
           `budget`        — this flow already carded today. Checked first so a
                             same-day rerun reports the cap it hit rather than
                             the still-open card that cap left behind.
@@ -749,6 +751,18 @@ class ProfileActivities:
                             already been asked to change.
         """
         from aegis.services.notifications import should_send
+        from aegis.services.record import is_on as record_on
+
+        # Vault record spec §5: while the record is on, `user` is a cache of
+        # the vault and a whole-document draft would be overwritten within the
+        # hour. Checked first, so no model call is spent (#653 runs this flow
+        # for every agent).
+        if await record_on(self.db_pool):
+            activity.logger.info("profile_budget agent=%s reason=record_in_vault", agent_id)
+            return {
+                "allow": False, "reason": "record_in_vault",
+                "sent_today": 0, "pending": 0, "global_today": 0,
+            }
 
         sent_today = int(
             await self.db_pool.fetchval(
@@ -841,6 +855,17 @@ class ProfileActivities:
                 action or "-",
             )
             return {"applied": False, "status": action or "no_action"}
+
+        from aegis.services.record import is_on as record_on
+
+        # A card proposed before the record was switched on and approved after
+        # it would write into the cache, and the next compile would overwrite
+        # it with a false `record_cache_overwritten`.
+        if await record_on(self.db_pool):
+            activity.logger.warning(
+                "profile_reflection_not_applied interaction=%s reason=record_in_vault", interaction_id
+            )
+            return {"applied": False, "status": "record_in_vault"}
 
         doc = response.get("edited_doc")
         used = "edited_doc"
