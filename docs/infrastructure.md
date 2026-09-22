@@ -2310,6 +2310,27 @@ its marker. The paths below are those defaults.
   unconfigured vault, a weekly kind switched off or a failed write are reported in the run's
   `vault` field and never cost you the review. A second run for the same week adds nothing. A run
   already in flight when the worker is deployed skips the step and reports `skipped`.
+- **The journal gap prompt** (`JournalPromptFlow`, row `journal-prompt-daily`, shipped inactive:
+  turn it on on the Flows page). Once a day it reads the day the nightly daylog logged, the filed
+  note and the live one, from a fresh pull, and counts your own words. The seed's cron is 11:30
+  UTC, which is 17:00 at UTC+5:30; for 17:00 on your clock set `CRON_TZ=<your zone> 0 17 * * *`
+  on the Flows page. The day it asks about is read on your clock (`user_timezone`) whatever the
+  cron. Every AEGIS block, the frontmatter, headings, empty bullets, checkbox lines and the day
+  template's own text do not count (a template placeholder matches whatever was rendered or typed
+  there). Fewer than `min_words` (5) is a gap, and a gap sends one `input` card (Slack's Answer
+  box, or the admin textarea) as `journal-prompt-<day>`, so a day is asked about once. It expires
+  after `timeout_seconds` (22 h) with no reminder. Nothing is sent when the note already holds that
+  day's self-report or an encrypted block, when the vault is off or daily notes are switched off,
+  or when the pull fails. Your answer is filed with no model call in that day's note, as a block
+  marked `aegis:selfreport:<day>` and labelled `language.selfreport_label`, one bullet per line you
+  typed. The card's stored answer is then blanked to `{"value": "", "filed": "<note>"}`, and the
+  run's result never carries it, so `workflow_runs` does not either. If filing fails, the weekly
+  `NotesBackfillFlow` files and blanks it. The log says `journal_gap_checked day=… words=… gap=…`,
+  never your words; Temporal's own history keeps the answer for its retention period. `prompt`
+  (`{day}` is the day's name), `label`, `min_words` and `timeout_seconds` are the row's config.
+  Two limits: a day you wrote on the phone that has not reached git yet looks empty (the card says
+  to ignore it then), and Sunday's answer arrives after that week's rollup, so the week in review
+  does not include it.
 - **Conflicts:** `obsidian-git` commits from the phone and laptop. A push
   rejected as not a fast-forward, or a conflicting rebase, drops the agent's
   own unpushed commit, pulls fresh and retries once; a second failure is
@@ -2355,7 +2376,7 @@ the same code that writes the notes; the page shows that preview live.
 | `new_note.drop_open_tasks` | `true` | A note the agent creates loses the template's unticked checkboxes. |
 | `new_note.drop_empty_bullets_in_section` | `true` | …and the empty `- ` placeholders in the target section. |
 | `section_ends_at_rule_or_fence` | `true` | A section ends at a `---` rule or a code fence, not only at the next heading. |
-| `language.*` | English | `name` (the language the day log and rollups are written in — English adds nothing to the prompts), and the fixed words of a day log written without a model: `daylog_title`, `quiet_day`, the six labels, `rollup_header`, `journal_title`, `also_in_note`, and `review_label` (the label on the weekly review's block). |
+| `language.*` | English | `name` (the language the day log and rollups are written in — English adds nothing to the prompts), and the fixed words of a day log written without a model: `daylog_title`, `quiet_day`, the six labels, `rollup_header`, `journal_title`, `also_in_note`, `review_label` (the label on the weekly review's block), and `selfreport_label` (the label on your answer to the journal prompt). |
 | `daily` / `weekly` / `monthly` | see below | One block per kind: `enabled`, `folder`, `format`, `live_folder`, `template`, `sections`, `label`. |
 
 Per kind, the defaults: daily `folder "[journal/]YYYY/MM[. ]MMM"`, `format
