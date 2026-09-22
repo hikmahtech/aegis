@@ -38,6 +38,7 @@ from typing import Any
 
 import structlog
 
+from aegis.agent_tags import BEHAVIOR_TAGS
 from aegis.errors import error_text
 from aegis.services.settings_store import get_setting, put_setting
 
@@ -100,6 +101,45 @@ DEFAULT_LANGUAGE: dict[str, str] = {
     "selfreport_label": "in my words",
 }
 
+# ------------------------------------------------------------ the record
+
+# The owner's record (vault record spec §4): one flat folder of notes, one per
+# domain, which each agent's `user` document is compiled from while
+# `enabled`. A draft the seed writes is `<name>.draft.md` in the same folder:
+# never compiled, never indexed.
+DRAFT_SUFFIX = ".draft.md"
+RECORD_MAX_CHARS = (500, 50_000)
+_ROOT_PROBES = (date(2001, 1, 1), date(2099, 12, 31))
+
+
+@dataclass(frozen=True)
+class RecordLayout:
+    enabled: bool = False
+    dir: str = "me"
+    shared: tuple[str, ...] = ("about",)
+    # Capability tag → note names. Sorted pairs, so the layout stays hashable.
+    by_tag: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    max_chars: int = 6000
+
+    def names_for(self, tag: str) -> tuple[str, ...]:
+        return dict(self.by_tag).get(tag, ())
+
+    def claimed(self) -> frozenset[str]:
+        """Every note the map names: the shared ones and every tag's."""
+        return frozenset(self.shared) | {n for _, names in self.by_tag for n in names}
+
+    def note_path(self, name: str) -> str:
+        return f"{self.dir}/{name}.md"
+
+    def draft_path(self, name: str) -> str:
+        return f"{self.dir}/{name}{DRAFT_SUFFIX}"
+
+    def is_record_path(self, rel: str) -> bool:
+        """`<dir>/<name>.md` and nothing deeper."""
+        parts = rel.split("/")
+        return len(parts) == 2 and parts[0] == self.dir and parts[1].endswith(".md") and len(parts[1]) > 3
+
+
 # ------------------------------------------------------------------ the agent
 
 # The one placeholder `entry.tag` takes: the id of the agent whose block it is.
@@ -156,6 +196,7 @@ DEFAULTS: dict[str, Any] = {
         "sections": ["Review", "Month Review"],
         "label": "month in review",
     },
+    "record": {"enabled": False, "dir": "me", "shared": ["about"], "by_tag": {}, "max_chars": 6000},
 }
 
 # ------------------------------------------------------------ moment format
@@ -376,6 +417,7 @@ class Layout:
     daily: KindLayout = field(default_factory=lambda: _kind_from(DEFAULTS["daily"]))
     weekly: KindLayout = field(default_factory=lambda: _kind_from(DEFAULTS["weekly"]))
     monthly: KindLayout = field(default_factory=lambda: _kind_from(DEFAULTS["monthly"]))
+    record: RecordLayout = field(default_factory=RecordLayout)
     # The layout before this one, when the user changed it: its paths still
     # count as written. One step back only.
     previous: Layout | None = None
@@ -479,8 +521,37 @@ class Layout:
         """A live note the daylog appends to when it exists, never creates."""
         return any(r.match(rel) for r in self.journal_patterns()[1])
 
+    def journal_roots(self) -> tuple[str, ...]:
+        """The top folders the journal lives under, when the layout fixes one
+        (`journal` by default): a kind's folder whose first segment renders the
+        same for any year, and every live folder. The layout before this one
+        counts too. What the interests seed must never read (spec §11)."""
+        roots: set[str] = set()
+        for lay in (self, self.previous):
+            if lay is None:
+                continue
+            for kind in KINDS:
+                k = lay.kind(kind)
+                tops = {lay.render(k.folder, d).strip("/").split("/")[0] for d in _ROOT_PROBES}
+                if len(tops) == 1 and "" not in tops:
+                    roots |= tops
+                if k.live_folder.strip("/"):
+                    roots.add(k.live_folder.strip("/").split("/")[0])
+        return tuple(sorted(roots))
+
+    def is_journal_area(self, rel: str) -> bool:
+        return (
+            rel.split("/", 1)[0] in self.journal_roots()
+            or self.is_journal_path(rel)
+            or self.is_journal_root_path(rel)
+        )
+
     def is_indexable(self, rel: str) -> bool:
         if not rel.endswith(".md") or rel.startswith(self.index_skip_prefixes):
+            return False
+        # The record folder is compiled into the prompts; indexing it too would
+        # put the same text in a prompt twice (spec §5). Drafts live there too.
+        if rel.startswith(f"{self.record.dir}/"):
             return False
         return not any(part.startswith(".") for part in rel.split("/"))
 
@@ -524,6 +595,16 @@ def _kind_from(v: dict) -> KindLayout:
     )
 
 
+def _record_from(r: dict) -> RecordLayout:
+    return RecordLayout(
+        enabled=bool(r["enabled"]),
+        dir=str(r["dir"]),
+        shared=tuple(r["shared"]),
+        by_tag=tuple((t, tuple(names)) for t, names in sorted(r["by_tag"].items())),
+        max_chars=int(r["max_chars"]),
+    )
+
+
 def layout_from(value: Any) -> Layout:
     """A `Layout` from a stored row (merged over the defaults, leniently)."""
     v = merge(value)
@@ -546,6 +627,7 @@ def layout_from(value: Any) -> Layout:
         daily=_kind_from(v["daily"]),
         weekly=_kind_from(v["weekly"]),
         monthly=_kind_from(v["monthly"]),
+        record=_record_from(v["record"]),
         previous=layout_from({**prev, "previous": None}) if isinstance(prev, dict) else None,
     )
 
@@ -583,6 +665,13 @@ def layout_to_dict(layout: Layout) -> dict:
             }
             for kind in KINDS
             for k in (layout.kind(kind),)
+        },
+        "record": {
+            "enabled": layout.record.enabled,
+            "dir": layout.record.dir,
+            "shared": list(layout.record.shared),
+            "by_tag": {t: list(names) for t, names in layout.record.by_tag},
+            "max_chars": layout.record.max_chars,
         },
     }
 
@@ -681,10 +770,39 @@ def merge(value: Any) -> dict:
             "sections": _str_list_or(k, "sections", d["sections"], f"{kind}.") or list(d["sections"]),
             "label": _str_or(k, "label", d["label"], f"{kind}."),
         }
+    out["record"] = _merge_record(v.get("record"))
     prev = v.get("previous")
     if isinstance(prev, dict):
         out["previous"] = {k: x for k, x in merge({**prev, "previous": None}).items() if k != "previous"}
     return out
+
+
+def _merge_record(raw: Any) -> dict:
+    d = DEFAULTS["record"]
+    if raw is not None and not isinstance(raw, dict):
+        _warn("record", "not an object")
+    rec = raw if isinstance(raw, dict) else {}
+    by_tag: dict[str, list[str]] = {}
+    raw_map = rec.get("by_tag", {})
+    if isinstance(raw_map, dict):
+        for tag, names in raw_map.items():
+            if isinstance(tag, str) and isinstance(names, list) and all(isinstance(n, str) for n in names):
+                by_tag[tag] = list(names)
+            else:
+                _warn(f"record.by_tag.{tag}", "not a list of note names")
+    else:
+        _warn("record.by_tag", "not an object")
+    cap = rec.get("max_chars", d["max_chars"])
+    if not isinstance(cap, int) or isinstance(cap, bool) or not RECORD_MAX_CHARS[0] <= cap <= RECORD_MAX_CHARS[1]:
+        _warn("record.max_chars", "not a whole number from 500 to 50000")
+        cap = d["max_chars"]
+    return {
+        "enabled": _bool_or(rec, "enabled", d["enabled"], "record."),
+        "dir": _str_or(rec, "dir", d["dir"], "record.") or d["dir"],
+        "shared": _str_list_or(rec, "shared", d["shared"], "record."),
+        "by_tag": by_tag,
+        "max_chars": cap,
+    }
 
 
 DEFAULT_LAYOUT = layout_from({})
@@ -763,6 +881,14 @@ def validate(value: Any) -> dict:
         or out["questions_dir"].startswith(out["agent_dir"] + "/")
     ):
         raise ValueError(f"questions_dir: must be inside {out['agent_dir']}/ (the agent's folder)")
+    rec = out["record"]
+    _check_segment(rec["dir"], "record.dir")
+    if rec["dir"] == out["agent_dir"]:
+        raise ValueError("record.dir: must not be the agent's own folder")
+    if rec["dir"] in layout.journal_roots():
+        raise ValueError("record.dir: must not be a journal folder")
+    for name in [*rec["shared"], *(n for names in rec["by_tag"].values() for n in names)]:
+        _check_note_name(name)
     if not out["date_heading_format"].strip() or not any(
         layout.render(out["date_heading_format"], d).strip() for d in _SAMPLE_DATES
     ):
@@ -798,15 +924,24 @@ def validate(value: Any) -> dict:
     return out
 
 
+def _check_note_name(name: str) -> None:
+    _check_segment(name, "record note name")
+    if name.endswith(".md") or name.endswith(".draft"):
+        raise ValueError(f"record note name: {name!r} — give the name without .md, and not a draft")
+
+
 _SHAPE: dict[str, type | tuple[type, ...]] = {
     "agent_dir": str, "questions_dir": str, "locale": str, "week_start": str,
     "week_numbering": str, "date_heading_format": str, "index_skip_prefixes": list,
     "entry": dict, "new_note": dict, "section_ends_at_rule_or_fence": bool,
-    "language": dict, "daily": dict, "weekly": dict, "monthly": dict,
+    "language": dict, "daily": dict, "weekly": dict, "monthly": dict, "record": dict,
 }
 _KIND_SHAPE: dict[str, type | tuple[type, ...]] = {
     "enabled": bool, "folder": str, "format": str, "live_folder": str,
     "template": str, "sections": list, "label": str,
+}
+_RECORD_SHAPE: dict[str, type] = {
+    "enabled": bool, "dir": str, "shared": list, "by_tag": dict, "max_chars": int,
 }
 
 
@@ -860,6 +995,23 @@ def _check_shape(v: dict) -> None:
             not k["sections"] or not all(isinstance(s, str) for s in k["sections"])
         ):
             raise ValueError(f"{kind}.sections: needs at least one heading, none empty")
+    rec = v.get("record") or {}
+    for key, x in rec.items():
+        if key not in _RECORD_SHAPE:
+            raise ValueError(f"record.{key}: not a vault_layout key")
+        typ = _RECORD_SHAPE[key]
+        if not isinstance(x, typ) or (typ is not bool and isinstance(x, bool)):
+            raise ValueError(f"record.{key}: wrong type")
+    if "shared" in rec and not all(isinstance(n, str) for n in rec["shared"]):
+        raise ValueError("record.shared: must be a list of note names")
+    for tag, names in (rec.get("by_tag") or {}).items():
+        if tag not in BEHAVIOR_TAGS:
+            raise ValueError(f"record.by_tag.{tag}: not a capability tag ({', '.join(BEHAVIOR_TAGS)})")
+        if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+            raise ValueError(f"record.by_tag.{tag}: must be a list of note names")
+    cap = rec.get("max_chars")
+    if cap is not None and not RECORD_MAX_CHARS[0] <= cap <= RECORD_MAX_CHARS[1]:
+        raise ValueError("record.max_chars: must be a whole number from 500 to 50000")
 
 
 # --------------------------------------------------------------- storage
@@ -896,8 +1048,12 @@ async def get_layout(pool: Any) -> Layout:
 
 
 def _same(a: dict, b: dict) -> bool:
-    return {k: v for k, v in a.items() if k != "previous"} == {
-        k: v for k, v in b.items() if k != "previous"
+    """Same journal layout. `record` is left out: it moves no journal note,
+    and rotating `previous` for it would forget the layout before a real
+    change."""
+    skip = ("previous", "record")
+    return {k: v for k, v in a.items() if k not in skip} == {
+        k: v for k, v in b.items() if k not in skip
     }
 
 
