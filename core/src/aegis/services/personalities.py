@@ -49,6 +49,11 @@ _CACHE_TTL_SECONDS = 30.0
 _cache: dict[str, tuple[float, dict[str, str]]] = {}
 
 
+class RecordInVault(ValueError):  # noqa: N818 — a state, as NotesDisabled
+    """The `user` document is compiled from the vault's record while the
+    record is on (vault record spec §5); it is edited in the vault."""
+
+
 def personality_dir() -> Path:
     """Where personalities/<id>/ starter files live — env override, repo dir,
     or the container path."""
@@ -352,7 +357,8 @@ async def revert_profile_revision(
     The revert is itself a patch, so it lands its own revision row — undoing an
     undo is just another revert. `allow_shrink` is forced on: rolling back an
     edit that grew the doc is exactly the shrink the guard would otherwise
-    block. Raises ValueError when the revision id is unknown.
+    block. Raises ValueError when the revision id is unknown, and
+    `RecordInVault` for a `user` revision while the record is on.
     """
     row = await pool.fetchrow(
         "SELECT agent_id, kind, before_content FROM agent_profile_revisions WHERE id = $1",
@@ -360,6 +366,14 @@ async def revert_profile_revision(
     )
     if row is None:
         raise ValueError(f"unknown profile revision id: {revision_id}")
+    if row["kind"] == "user":
+        from aegis.services.record import is_on  # record imports this module
+
+        if await is_on(pool):
+            raise RecordInVault(
+                "the user document is compiled from the vault's record while the record is on; "
+                "edit the notes instead of reverting a revision"
+            )
     return await apply_profile_patch(
         pool,
         row["agent_id"],

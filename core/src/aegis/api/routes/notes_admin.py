@@ -10,18 +10,26 @@ journal — so the PUT 400s on it, as the email and meeting rules do.
 code (`vault_layout.preview`), so the admin page shows the writer's paths and
 not a reimplementation of them. GET previews the saved layout; POST previews a
 candidate without saving it.
+
+The layout also carries the owner's record (vault record spec §5): the GET
+returns its compile state and the drafts waiting in its folder, and the PUT
+refuses to turn it on while the gtd holder's compiled document would be empty.
 """
 
 from __future__ import annotations
 
+import asyncio
 from datetime import date, datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
+from aegis.agent_tags import BEHAVIOR_TAGS
 from aegis.api.auth import verify_auth
-from aegis.api.settings_routes import settings_row_routes
+from aegis.api.deps import get_pool, get_settings
+from aegis.config import Settings
 from aegis.services import notes
+from aegis.services import record as vault_record
 from aegis.services import vault_layout as vl
 from aegis.services.agents import resolve_tag
 
@@ -32,24 +40,66 @@ router = APIRouter(
 )
 
 
-settings_row_routes(
-    router,
-    "/layout",
-    get=vl.get_layout_value,
-    save=vl.save_layout,
-    view=lambda _pool, layout: {
+_LAYOUT_DOC = (
+    "The effective vault layout (the stored row merged over the defaults), the defaults "
+    "themselves, the vocabularies the page's selects need, the record's compile state "
+    "(`settings.notes_record_state`) and the drafts waiting in the record folder. The PUT "
+    "replaces the layout and answers 400 — not a silent drop — on any bad key, and when it "
+    "would turn the record on while the gtd holder's compiled document would be empty; the "
+    "layout in force before a change is kept as `previous`, so a day written under it is "
+    "still recognised and never written twice."
+)
+
+
+# Two explicit handlers rather than `settings_row_routes`: the PUT's switch
+# guard reads the vault, so it needs the settings through `Depends`, which a
+# `save` callback there cannot get.
+@router.get("/layout", description=_LAYOUT_DOC)
+async def get_layout_route(
+    pool: Any = Depends(get_pool), settings: Settings = Depends(get_settings)
+) -> dict[str, Any]:
+    return await _layout_view(pool, settings, await vl.get_layout_value(pool))
+
+
+@router.put("/layout", description=_LAYOUT_DOC)
+async def put_layout_route(
+    payload: dict[str, Any],
+    pool: Any = Depends(get_pool),
+    settings: Settings = Depends(get_settings),
+) -> dict[str, Any]:
+    try:
+        new = vl.validate(payload)
+        if new["record"]["enabled"] and not (await vl.get_layout_value(pool))["record"]["enabled"]:
+            await vault_record.check_switch(
+                pool, notes.config_from_settings(settings), vl.layout_from(new)
+            )
+        row = await vl.save_layout(pool, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return await _layout_view(pool, settings, row)
+
+
+async def _layout_view(pool: Any, settings: Settings, layout: dict) -> dict[str, Any]:
+    return {
         "layout": layout,
         "defaults": vl.merge({}),
         "options": _options(),
-    },
-    doc=(
-        "The effective vault layout (the stored row merged over the defaults), the defaults "
-        "themselves and the vocabularies the page's selects need. The PUT replaces the layout "
-        "and answers 400 — not a silent drop — on any bad key; the layout in force before a "
-        "change is kept as `previous`, so a day written under it is still recognised and never "
-        "written twice."
-    ),
-)
+        "record_state": await vault_record.get_state(pool),
+        "drafts": await _waiting_drafts(settings, vl.layout_from(layout)),
+    }
+
+
+async def _waiting_drafts(settings: Settings, layout: vl.Layout) -> list[str]:
+    """The drafts in the record folder, from the local checkout: no pull, and
+    never a clone from a GET. Empty when the vault is not configured."""
+    cfg = notes.config_from_settings(settings)
+    if not cfg.configured or not (cfg.path / ".git").is_dir():
+        return []
+    try:
+        files = await asyncio.to_thread(notes.read_record_sync, cfg, layout, pull=False)
+    except notes.NotesError:
+        return []
+    return [layout.record.draft_path(n) for n in files.drafts]
 
 
 @router.get("/layout/preview")
@@ -111,4 +161,5 @@ def _options() -> dict[str, list[str]]:
         "indent": list(vl.INDENTS),
         "kinds": list(vl.KINDS),
         "language_keys": list(vl.DEFAULT_LANGUAGE),
+        "tags": list(BEHAVIOR_TAGS),
     }
