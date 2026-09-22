@@ -125,6 +125,10 @@ def test_the_label_of_a_block_comes_from_its_slot():
         vl.validate({"language": {"reviewlabel": "x"}})
 
 
+def test_a_self_report_is_labelled_by_its_own_wording():
+    assert vl.layout_from({}).label_for("selfreport", "daily") == "in my words"
+
+
 # ---------------------------------------------------------------- merge
 
 

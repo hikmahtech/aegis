@@ -88,10 +88,14 @@ async def test_the_backfill_flow_passes_its_limit_window_batch_and_owner():
         return {"status": "ok", "limit": limit, "since_days": since_days, "batch": batch,
                 "agent_id": agent_id}
 
+    @activity.defn(name="notes_file_answers")
+    async def stub_answers(since_days: int = 0) -> dict:
+        return {"status": "ok", "answers": 0, "filed": 0, "failed": 0}
+
     async with (
         await WorkflowEnvironment.start_time_skipping() as env,
         Worker(env.client, task_queue="tq", workflows=[NotesBackfillFlow],
-               activities=[stub_backfill, stub_resolve]),
+               activities=[stub_backfill, stub_answers, stub_resolve]),
     ):
         out = await env.client.execute_workflow(
             NotesBackfillFlow.run,
@@ -101,7 +105,10 @@ async def test_the_backfill_flow_passes_its_limit_window_batch_and_owner():
         by_hand = await env.client.execute_workflow(
             NotesBackfillFlow.run, NotesBackfillConfig(), id="nb-2", task_queue="tq"
         )
-    assert out == {"status": "ok", "limit": 7, "since_days": 14, "batch": 3, "agent_id": "raphael"}
+    assert out == {
+        "status": "ok", "limit": 7, "since_days": 14, "batch": 3, "agent_id": "raphael",
+        "answers": {"status": "ok", "answers": 0, "filed": 0, "failed": 0},
+    }
     assert by_hand["since_days"] == 0, "a run started by hand takes every row"
     assert by_hand["batch"] == 50
     assert by_hand["agent_id"] == "holder", "no agent named: the research holder signs"

@@ -15,6 +15,8 @@ Four jobs:
   leaves out the layout's `index_skip_prefixes` and its `questions_dir`.
 * `notes_backfill_journal` — the daylog's knowledge rows into the journal,
   for the weekly `NotesBackfillFlow`.
+* `journal_gap_check` / `file_journal_answer` / `notes_file_answers` — the
+  journal gap prompt (vault record spec §3).
 
 Where the notes go is the vault layout (`vault_layout` settings row), read
 from the pool on every call so a change on the admin page applies without a
@@ -32,6 +34,7 @@ from datetime import date
 from typing import Any
 
 from aegis.errors import error_text
+from aegis.services import journal_prompt as jp
 from aegis.services import notes
 from aegis.services import notes_write as nw
 from aegis.services.agents import resolve_tag
@@ -48,6 +51,8 @@ INDEX_STATE_KEY = "notes_index_state"
 DEFAULT_INDEX_BATCH = 300
 # Journal entries per backfill commit (`notes-backfill-weekly`'s `batch`).
 BACKFILL_BATCH = 50
+# A journal write the vault now holds: pushed, or already there.
+_FILED = ("written", "exists")
 
 # Newest first: a weekly run is for the recent days whose vault write failed
 # and fell back to their knowledge row; the old rows went in on the first run.
@@ -185,6 +190,109 @@ class NotesActivities:
         # at the journal root when the user had one open.
         outcomes = res.get("outcomes") or [{}]
         return {"status": res["status"], "path": outcomes[0].get("path") or ap.rel}
+
+    # ---------------------------------------------------- journal prompt
+
+    @activity.defn
+    async def journal_gap_check(self, day: str, min_words: int = jp.DEFAULT_MIN_WORDS) -> dict:
+        """Whether the user wrote `day` in the journal, for `JournalPromptFlow`:
+        `{"status", "day", "words", "day_name"}`. `status` is `gap` only when
+        the day's notes (the filed one and the live one) were read from a
+        fresh pull and hold fewer than `min_words` words of the user's own
+        (`journal_prompt.gap_verdict`); `wrote`, `answered` and `encrypted`
+        say why not. When it cannot tell it says so, `not_configured`,
+        `disabled` (daily notes switched off) or `unreadable` (the pull or
+        the read failed), and the flow sends no card. Logs the count, never
+        the words."""
+        cfg = self._cfg()
+        if not cfg.configured:
+            return {"status": "not_configured", "day": day}
+        layout = await self._layout()
+        if not layout.daily.enabled:
+            return {"status": "disabled", "day": day}
+        d = date.fromisoformat(day)
+        rels = notes.journal_paths("daily", d, layout)
+        template = layout.daily.template
+        try:
+            found = await asyncio.to_thread(
+                notes.read_many_sync,
+                cfg,
+                [*rels, *([template] if template else [])],
+                pull=True,
+                strict=True,
+            )
+        except notes.NotesError as exc:
+            activity.logger.warning(
+                "journal_gap_unreadable day=%s err=%s", day, error_text(exc, 200)
+            )
+            return {"status": "unreadable", "day": day}
+        verdict, words = jp.gap_verdict(
+            [found[r] for r in rels if r in found],
+            found.get(template, ""),
+            day,
+            min_words,
+            layout.indent_width,
+        )
+        activity.logger.info(
+            "journal_gap_checked day=%s words=%d gap=%s", day, words, verdict == "gap"
+        )
+        return {
+            "status": verdict,
+            "day": day,
+            "words": words,
+            "day_name": layout.render(jp.DAY_NAME_FORMAT, d),
+        }
+
+    @activity.defn
+    async def file_journal_answer(
+        self, interaction_id: str, response: dict, metadata: dict
+    ) -> dict:
+        """The journal prompt card's post-resolve hook: the user's answer, as
+        written, into the day's note as a `selfreport:<day>` block (one
+        bullet per line typed, no model call), then the stored copy blanked
+        (`journal_prompt.blank_answer`) once the note holds it.
+        `{"status": written | exists | empty | not_configured | disabled |
+        error, "path"}`. Never raises for a vault problem and never logs the
+        answer; the weekly `NotesBackfillFlow` files one whose write failed."""
+        text = jp.answer_text(response)
+        if not text:
+            return {"status": "empty"}
+        meta = metadata if isinstance(metadata, dict) else {}
+        day = str(meta.get("day") or "")
+        res = await self.notes_journal_write(
+            {
+                "kind": "daily",
+                "day": day,
+                "label": day,
+                "text": jp.keep_lines(text),
+                "agent_id": str(meta.get("agent_id") or ""),
+                "slot": jp.SLOT,
+            }
+        )
+        status = str(res.get("status") or "error")
+        path = str(res.get("path") or "")
+        if status in _FILED and self.db_pool is not None:
+            await jp.blank_answer(self.db_pool, interaction_id, path)
+        return {"status": status, "path": path}
+
+    @activity.defn
+    async def notes_file_answers(self, since_days: int = 0) -> dict:
+        """The journal prompt's answers still in the database, for the weekly
+        `NotesBackfillFlow`: filed and blanked now. Marker-idempotent: an
+        answer already in its note comes back `exists` and is only blanked.
+        `since_days` > 0 looks only at cards resolved in that many days; 0
+        (a run started by hand) takes them all."""
+        cfg = self._cfg()
+        if not cfg.configured:
+            return {"status": "not_configured"}
+        if self.db_pool is None:
+            return {"status": "no_database"}
+        rows = await jp.unfiled_answers(self.db_pool, since_days)
+        filed = 0
+        for r in rows:
+            res = await self.file_journal_answer(r["id"], r["response"], r["metadata"])
+            filed += int(res.get("status") in _FILED)
+        return {"status": "ok", "answers": len(rows), "filed": filed, "failed": len(rows) - filed}
 
     # ------------------------------------------------------------- index
 

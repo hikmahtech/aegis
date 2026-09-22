@@ -45,6 +45,7 @@ from typing import Any
 
 from aegis.errors import error_text
 from aegis.services import notes
+from aegis.services.journal_prompt import ORIGIN as JOURNAL_PROMPT_ORIGIN
 from aegis.services.settings_store import put_setting
 from aegis.services.user_time import user_zone
 from aegis.services.vault_layout import DEFAULT_LANGUAGE, DEFAULT_LAYOUT, Layout, get_layout
@@ -340,10 +341,14 @@ class DayLogActivities:
             # log reports "Decided:" for a decision nobody ever made.
             "SELECT kind, origin, prompt, status, response FROM interactions "
             "WHERE resolved_at >= $1 AND resolved_at < $2 AND status = 'resolved' "
+            # The journal prompt's card is the user's diary, not a decision: its
+            # answer is filed in the day it is about, and then blanked.
+            "AND origin <> $4 "
             "ORDER BY resolved_at LIMIT $3",
             start,
             end,
             _LIMIT,
+            JOURNAL_PROMPT_ORIGIN,
         )
         out = []
         for r in rows:

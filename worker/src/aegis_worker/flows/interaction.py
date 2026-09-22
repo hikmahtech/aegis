@@ -58,6 +58,11 @@ class InteractionFlowInput:
     # buy 240s for ONE of those. Raising `_ACT_TIMEOUT` globally instead would
     # stretch every quick hook to match the slowest one.
     post_resolve_timeout_seconds: int = 30
+    # The answer is the user's own words (the journal prompt's card): the
+    # run's result leaves the response out, so the run recorder never copies
+    # it into `workflow_runs` (kept 90 days). The post-resolve hook still
+    # receives it.
+    private: bool = False
 
 
 @dataclass
@@ -249,5 +254,5 @@ class InteractionFlow:
         return InteractionResult(
             interaction_id=interaction_id,
             status="resolved",
-            response=self._response,
+            response=None if input.private else self._response,
         )

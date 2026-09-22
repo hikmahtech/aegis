@@ -6,7 +6,8 @@ to the journal itself and files a knowledge row only when the vault write
 fails, so a later run finds each such day and puts it where it belongs, and a
 week with nothing missing writes nothing. Every write carries the marker the
 live daylog uses, so a day already in the journal is left alone — under the
-current vault layout or the one before it.
+current vault layout or the one before it. It also files the journal prompt's
+answers whose filing failed, and blanks them (vault record spec §3).
 
 The scheduled run looks only at rows filed in the last `since_days` days (14
 in the seed: two weekly chances at each fallback day). The pre-vault rows are
@@ -36,6 +37,11 @@ with workflow.unsafe.imports_passed_through():
     from aegis_worker.shared.retry import NO_RETRY, TIMEOUT_FAST
 
 _BACKFILL_TIMEOUT = timedelta(minutes=30)
+# Live patch. The backfill runs weekly for minutes, so a deploy can land
+# mid-run; a run already in flight has no answer sweep in its history, so
+# `patched` answers False on its replay and it finishes as recorded. The next
+# week's run takes the step.
+PATCH_FILE_ANSWERS = "notes-backfill-file-answers"
 
 
 @dataclass
@@ -68,9 +74,20 @@ class NotesBackfillFlow:
         # NO_RETRY: every write is marker-idempotent, so a failed run is simply
         # next week's, or started again by hand; an automatic retry would only
         # hide the error.
-        return await workflow.execute_activity(
+        result = await workflow.execute_activity(
             "notes_backfill_journal",
             args=[config.limit, config.since_days, config.batch, agent_id],
             start_to_close_timeout=_BACKFILL_TIMEOUT,
             retry_policy=NO_RETRY,
         )
+        if workflow.patched(PATCH_FILE_ANSWERS):
+            # The journal prompt's answers whose filing failed after the card
+            # resolved: filed and blanked by the same marker-idempotent write.
+            answers = await workflow.execute_activity(
+                "notes_file_answers",
+                args=[config.since_days],
+                start_to_close_timeout=_BACKFILL_TIMEOUT,
+                retry_policy=NO_RETRY,
+            )
+            result = {**(result or {}), "answers": answers}
+        return result

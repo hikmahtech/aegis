@@ -346,3 +346,51 @@ async def test_interaction_flow_no_post_resolve_when_not_set(
         await handle.signal(InteractionFlow.submit_response, {"value": "approved"})
         await handle.result()
     assert called is False
+
+
+async def test_a_private_card_keeps_the_answer_out_of_its_result(
+    temporal_env: WorkflowEnvironment, db_pool, seeded_agent
+):
+    """The journal prompt's answer is the user's own words. The hook gets it;
+    the run's result does not, because the run recorder copies a result into
+    `workflow_runs`, which is kept for 90 days."""
+    acts = InteractionActivities(db_pool=db_pool)
+    tq = f"test-{uuid4().hex[:8]}"
+    captured: list[dict] = []
+
+    @activity.defn(name="file_journal_answer")
+    async def _hook(interaction_id: str, response: dict, metadata: dict) -> dict:
+        captured.append(response)
+        return {"status": "written"}
+
+    async with Worker(
+        temporal_env.client,
+        task_queue=tq,
+        workflows=[InteractionFlow],
+        activities=[
+            acts.insert_interaction,
+            acts.resolve_interaction,
+            acts.apply_interaction_timeout,
+            _stub_send_card,
+            _hook,
+        ],
+    ):
+        handle = await temporal_env.client.start_workflow(
+            InteractionFlow.run,
+            InteractionFlowInput(
+                agent_id="sebas",
+                kind="input",
+                origin="journal_prompt",
+                prompt="Your day?",
+                timeout_seconds=3600,
+                post_resolve_activity="file_journal_answer",
+                private=True,
+            ),
+            id=f"interaction-{uuid4()}",
+            task_queue=tq,
+        )
+        await handle.signal(InteractionFlow.submit_response, {"value": "a quiet day at home"})
+        result = await handle.result()
+    assert result.status == "resolved"
+    assert result.response is None
+    assert captured == [{"value": "a quiet day at home"}]

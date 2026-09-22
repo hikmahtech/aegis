@@ -965,15 +965,21 @@ def _pull_quietly(cfg: NotesConfig) -> None:
         logger.warning("notes_pull_failed", error=error_text(exc))
 
 
-def read_many_sync(cfg: NotesConfig, rels: list[str], *, pull: bool = False) -> dict[str, str]:
-    """`{rel: text}` for the notes that exist, encrypted blocks stripped."""
+def read_many_sync(
+    cfg: NotesConfig, rels: list[str], *, pull: bool = False, strict: bool = False
+) -> dict[str, str]:
+    """`{rel: text}` for the notes that exist, encrypted blocks stripped.
+
+    With `strict`, a failed pull raises instead of falling back to the local
+    copy: a caller that must not act on a stale vault (the journal gap check)
+    cannot tell "nothing was written" from "the pull failed" any other way."""
     if not cfg.configured:
         raise NotesDisabled("the vault is not configured")
     out: dict[str, str] = {}
     with _Lock(cfg):
         _ensure_checkout(cfg)
         if pull:
-            _pull_quietly(cfg)
+            (_pull if strict else _pull_quietly)(cfg)
         for rel in rels:
             path = cfg.path / rel
             if path.is_file():

@@ -412,7 +412,8 @@ activities:
   # into the vault journal, newest first. The daylog files a row only when its
   # vault write fails, so this is what puts such a day in the journal; a week
   # with nothing missing writes nothing (every write is marker-idempotent).
-  # `since_days: 14` looks only at rows filed in the last two weeks (two weekly
+  # It also files, and then blanks, any journal-prompt answer whose filing
+  # failed when its card resolved. `since_days: 14` looks only at rows filed in the last two weeks (two weekly
   # chances at each fallback day): the pre-vault rows are still in the store,
   # and rereading them every week would put back a block the user deleted
   # from an old journal note. `batch` is entries per commit. Inert
@@ -425,6 +426,25 @@ activities:
     schedule_cron: "47 4 * * 0"
     config: {limit: 1000, since_days: 14, batch: 50}
     active: true
+
+  # Sebas — the journal gap prompt (vault record spec §3). Once a day it reads
+  # yesterday's journal notes (the day the nightly daylog logged, from a fresh
+  # pull) and, when you wrote fewer than `min_words` words there yourself,
+  # sends ONE `input` card about that day. Your answer is filed in that day's
+  # note as you wrote it, and the stored copy is then blanked. It never asks
+  # when it cannot read the vault, and the card expires after
+  # `timeout_seconds` (22 h), before the next one. `prompt` ({day} is the
+  # day's name) and `label` are the card's words; unset, the code's defaults
+  # apply. 11:30 UTC is 17:00 at UTC+5:30; for 17:00 on your own clock set
+  # `CRON_TZ=<your zone> 0 17 * * *` on /admin/flows (the day asked about is
+  # read on your clock whatever the cron). Ships inactive — turn it on at
+  # /admin/flows. NOTE: `config` is DB-owned.
+  - slug: journal-prompt-daily
+    workflow_type: JournalPromptFlow
+    agent_id: sebas
+    schedule_cron: "30 11 * * *"
+    config: {min_words: 5, timeout_seconds: 79200}
+    active: false
 
   # Phase 4 — nightly per-agent memory consolidation (caps each agent's
   # agent_memory at `keep` rows; the learning loop writes corrections live).

@@ -445,9 +445,13 @@ def test_books_write_flow_is_gated_on_money_hygiene():
         # Then +1 activity and no flow from #633: `node_services` on
         # HomelabActivities, which lists what a node that went down carried.
         # HomelabActivities is homelab-flagged, so only the homelab rows move.
-        (True, True, 51, 254),
-        (False, False, 40, 218),
-        (True, False, 44, 236),
+        # Then +1 flow and +3 activities from the journal gap prompt (vault
+        # record spec §3): JournalPromptFlow, and `journal_gap_check`,
+        # `file_journal_answer` and `notes_file_answers` on the existing
+        # NotesActivities. Unflagged, so all three rows move.
+        (True, True, 52, 257),
+        (False, False, 41, 221),
+        (True, False, 45, 239),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):
