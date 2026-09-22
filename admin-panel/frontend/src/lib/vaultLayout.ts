@@ -13,6 +13,17 @@ export type KindLayout = {
   label: string;
 };
 
+/** The owner's record (vault record spec §4): the folder, which notes each
+ *  capability reads, and the switch that makes it the source of the `user`
+ *  persona documents. */
+export type RecordLayout = {
+  enabled: boolean;
+  dir: string;
+  shared: string[];
+  by_tag: Record<string, string[]>;
+  max_chars: number;
+};
+
 export type VaultLayout = {
   agent_dir: string;
   questions_dir: string;
@@ -28,6 +39,7 @@ export type VaultLayout = {
   daily: KindLayout;
   weekly: KindLayout;
   monthly: KindLayout;
+  record: RecordLayout;
   previous?: Omit<VaultLayout, 'previous'>;
 };
 
@@ -55,7 +67,24 @@ export function toSaveBody(layout: VaultLayout): Omit<VaultLayout, 'previous'> {
     daily: { ...rest.daily, sections: rest.daily.sections.map(s => s.trim()).filter(Boolean) },
     weekly: { ...rest.weekly, sections: rest.weekly.sections.map(s => s.trim()).filter(Boolean) },
     monthly: { ...rest.monthly, sections: rest.monthly.sections.map(s => s.trim()).filter(Boolean) },
+    record: { ...rest.record, shared: rest.record.shared.map(s => s.trim()).filter(Boolean) },
   };
+}
+
+/** The record's capability map as the page edits it: one `tag: a, b` line each. */
+export function formatByTag(map: Record<string, string[]>): string {
+  return Object.entries(map).map(([tag, names]) => `${tag}: ${names.join(', ')}`).join('\n');
+}
+
+/** The inverse. A line with no colon, or no tag before it, is ignored. */
+export function parseByTag(text: string): Record<string, string[]> {
+  const out: Record<string, string[]> = {};
+  for (const line of text.split('\n')) {
+    const i = line.indexOf(':');
+    const tag = i < 0 ? '' : line.slice(0, i).trim();
+    if (tag) out[tag] = splitList(line.slice(i + 1));
+  }
+  return out;
 }
 
 /** The keys whose values differ from the defaults, top level only — what the

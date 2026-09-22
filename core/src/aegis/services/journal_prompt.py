@@ -39,7 +39,7 @@ DEFAULT_LABEL = "Your day"
 DAY_NAME_FORMAT = "dddd D MMMM"
 
 _MARKER_RE = re.compile(r"%% aegis:([A-Za-z0-9:_.\-]{1,160}) %%")
-_FRONTMATTER_RE = re.compile(r"\A---[ \t]*\n.*?\n---[ \t]*(?:\n|\Z)", re.S)
+_FRONTMATTER_RE = notes.FRONTMATTER_RE
 _HEADING_RE = re.compile(r"^#{1,6} ")
 _CHECKBOX_RE = re.compile(r"^[-*+] \[.\]")
 _PLACEHOLDER_RE = re.compile(r"\{\{.*?\}\}")

@@ -78,9 +78,10 @@ def unindexed_prefixes(layout: Layout) -> tuple[str, ...]:
     """Notes the index leaves out. The questions folder holds ResearchFlow's
     answers, which the flow also keeps in the knowledge store
     (`aegis://research/<hash>`), so indexing the note put every answer in
-    retrieval twice. A row an earlier run made for one is dropped on the next
-    run."""
-    return (f"{layout.questions_dir.strip('/')}/",)
+    retrieval twice. The record folder is compiled into the prompts (vault
+    record spec §5). A row an earlier run made for either is dropped on the
+    next run."""
+    return (f"{layout.questions_dir.strip('/')}/", f"{layout.record.dir.strip('/')}/")
 
 
 @dataclass

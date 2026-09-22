@@ -99,6 +99,9 @@ _ENC_BARE_START_RE = re.compile("🔐[αβ]")
 _ENC_BARE_END = "🔐"
 ENCRYPTED_PLACEHOLDER = "[encrypted block]"
 
+# A note's YAML frontmatter: the `---` block at its very top.
+FRONTMATTER_RE = re.compile(r"\A---[ \t]*\n.*?\n---[ \t]*(?:\n|\Z)", re.S)
+
 
 class NotesError(Exception):
     """A vault operation failed; the checkout is left as it was upstream."""
@@ -395,6 +398,11 @@ class Append:
     agent     the agent writing the block; its id fills the layout's `{agent}`
     layout    the vault layout the append was built for: the gate, the
               template, the block's tag and indent all follow it
+    record    the path is in the owner's record folder (`layout.record.dir`);
+              only a create-only draft may be written there (the seed, spec §12)
+    create_only  write `body` as the whole of a new note, or nothing when the
+              note exists; no marker — the file's existence is what makes a
+              rerun a no-op
     """
 
     rel: str
@@ -411,9 +419,13 @@ class Append:
     label: str = ""
     agent: str = ""
     layout: Layout = DEFAULT_LAYOUT
+    record: bool = False
+    create_only: bool = False
 
 
-def check_path(rel: str, *, journal: bool = False, layout: Layout = DEFAULT_LAYOUT) -> str:
+def check_path(
+    rel: str, *, journal: bool = False, record: bool = False, layout: Layout = DEFAULT_LAYOUT
+) -> str:
     """`rel` if the agent may write it, else NotesPathError. Nothing is
     normalised away: a path that needs normalising is refused."""
     if not rel or "\x00" in rel or "\\" in rel or rel.startswith("/"):
@@ -427,9 +439,11 @@ def check_path(rel: str, *, journal: bool = False, layout: Layout = DEFAULT_LAYO
         return rel
     if journal and is_journal_path(rel, layout):
         return rel
+    if record and layout.record.is_record_path(rel):
+        return rel
     raise NotesPathError(
         f"notes may only be written under {layout.agent_dir}/ "
-        f"(and the daylog's journal notes): {rel!r}"
+        f"(and the daylog's journal notes, and the record's drafts): {rel!r}"
     )
 
 
@@ -629,6 +643,8 @@ def append_text(existing: str | None, ap: Append, new_note: str = "") -> str | N
     otherwise — and `_apply` checks that again before writing."""
     if not _KEY_RE.match(ap.key):
         raise NotesError(f"bad marker key {ap.key!r}")
+    if ap.create_only:
+        return None if existing is not None else clean_body(ap.body) + "\n"
     if existing is not None and marker(ap.key) in existing:
         return None
     base = existing if existing is not None else new_note
@@ -898,7 +914,11 @@ def write_sync(
     if author is not None and author != cfg.author:
         cfg = replace(cfg, author=author)
     for ap in appends:
-        check_path(ap.rel, journal=ap.journal, layout=ap.layout)
+        check_path(ap.rel, journal=ap.journal, record=ap.record, layout=ap.layout)
+        if ap.record and not (ap.create_only and ap.rel.endswith(vl.DRAFT_SUFFIX)):
+            raise NotesPathError(
+                f"the record's notes are the owner's; AEGIS writes only a new draft there: {ap.rel!r}"
+            )
         if ap.alt_rel and not (ap.journal and is_journal_root_path(ap.alt_rel, ap.layout)):
             raise NotesPathError(f"not a live journal note: {ap.alt_rel!r}")
         if ap.template and ap.template not in KINDS:
@@ -987,6 +1007,102 @@ def read_many_sync(
                     out[rel] = strip_encrypted(path.read_text("utf-8", errors="replace"))
                 except OSError as exc:  # pragma: no cover
                     logger.warning("notes_read_failed", path=rel, error=error_text(exc))
+    return out
+
+
+@dataclass(frozen=True)
+class RecordFiles:
+    """The record folder at one commit: the accepted notes (encrypted blocks
+    stripped), the names of the drafts waiting beside them, and whether the
+    folder exists at all."""
+
+    head: str
+    notes: dict[str, str]
+    drafts: tuple[str, ...] = ()
+    missing: bool = False
+
+
+def read_record_sync(cfg: NotesConfig, layout: Layout, *, pull: bool = True) -> RecordFiles:
+    """`<record.dir>/*.md`, one level only. A `<name>.draft.md` is a draft,
+    listed by name and never read. `pull=False` reads the local copy (the
+    admin page's list of drafts)."""
+    if not cfg.configured:
+        raise NotesDisabled("the vault is not configured")
+    rec = layout.record
+    try:
+        vl.safe_note_path(f"{rec.dir}/x.md", "record.dir")
+    except ValueError as exc:
+        raise NotesPathError(str(exc)) from None
+    with _Lock(cfg):
+        _ensure_checkout(cfg)
+        if pull:
+            _pull_quietly(cfg)
+        head = _run(["git", "rev-parse", "HEAD"], cfg, check=False).stdout.strip()
+        folder = cfg.path / rec.dir
+        if not folder.is_dir():
+            return RecordFiles(head=head, notes={}, missing=True)
+        found: dict[str, str] = {}
+        drafts: list[str] = []
+        for p in sorted(folder.iterdir()):
+            if not p.is_file() or p.name.startswith(".") or not p.name.endswith(".md"):
+                continue
+            if p.name.endswith(vl.DRAFT_SUFFIX):
+                drafts.append(p.name[: -len(vl.DRAFT_SUFFIX)])
+                continue
+            found[p.name[:-3]] = strip_encrypted(p.read_text("utf-8", errors="replace"))
+        return RecordFiles(head=head, notes=found, drafts=tuple(drafts))
+
+
+_INLINE_TAG_RE = re.compile(r"(?<![\w&/#])#([A-Za-z][\w/-]{0,40})")
+_FM_TAGS_RE = re.compile(r"^tags:[ \t]*(.*)$", re.M)
+# A block-list item needs the space after its dash, so the closing `---` of
+# the frontmatter is never read as an item.
+_FM_ITEM_RE = re.compile(r"^\s*-\s+(.+)$")
+
+
+def note_tags(text: str, limit: int = 10) -> tuple[str, ...]:
+    """A note's Obsidian tags, lower-cased and without `#`: the frontmatter's
+    `tags:` (a flow list, a comma or space list, or a block list) and the
+    inline `#tags` of the body. Encrypted blocks are stripped first."""
+    text = strip_encrypted(text or "")
+    found: list[str] = []
+    body = text
+    fm = FRONTMATTER_RE.match(text)
+    if fm:
+        block, body = fm.group(0), text[fm.end():]
+        m = _FM_TAGS_RE.search(block)
+        if m and m.group(1).strip():
+            found += re.split(r"[,\s]+", m.group(1).strip().strip("[]"))
+        elif m:
+            for line in block[m.end():].splitlines()[1:]:
+                item = _FM_ITEM_RE.match(line)
+                if not item:
+                    break
+                found.append(item.group(1))
+    found += _INLINE_TAG_RE.findall(body)
+    out = [t.strip().strip("'\"").lstrip("#").lower() for t in found]
+    return tuple(dict.fromkeys(t for t in out if t))[:limit]
+
+
+def catalogue_sync(cfg: NotesConfig, layout: Layout) -> list[tuple[str, tuple[str, ...]]]:
+    """Every indexable note outside the journal, the record folder and the
+    agent's own folder, with its tags — what the interests seed may send to a
+    model (spec §11). Bodies are read here to find tags; only paths and tags
+    leave this function."""
+    if not cfg.configured:
+        raise NotesDisabled("the vault is not configured")
+    out: list[tuple[str, tuple[str, ...]]] = []
+    with _Lock(cfg):
+        _ensure_checkout(cfg)
+        _pull_quietly(cfg)
+        for rel in _ls_files(cfg, layout):
+            if layout.is_journal_area(rel) or rel.startswith(f"{layout.agent_dir}/"):
+                continue
+            try:
+                text = (cfg.path / rel).read_text("utf-8", errors="replace")
+            except OSError:
+                continue
+            out.append((rel, note_tags(text)))
     return out
 
 

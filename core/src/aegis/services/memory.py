@@ -36,6 +36,11 @@ _CORRECTION_KEYS = ("reason", "note", "feedback", "comment", "correction")
 # `interactions` and the gate already sets it, so no new plumbing is needed.
 _UNLEARNABLE_ORIGINS = frozenset({"agent_run_gate"})
 
+# What a curiosity answer's memory row puts before the owner's words:
+# `<question>\nThe owner answered: <answer>` (apply_curiosity_answer). The
+# record's seed and `retire_seeded_memory` split on it, so it is written once.
+CURIOSITY_ANSWER_PREFIX = "The owner answered: "
+
 
 async def record_memory(
     pool: Any, agent_id: str, content: str, importance: float = 0.5, source: str = "correction"

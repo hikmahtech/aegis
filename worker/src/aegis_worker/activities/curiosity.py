@@ -899,7 +899,7 @@ class CuriosityActivities:
         the owner answered a question and that answer must not be lost when a
         pull, an `hledger check --strict` or the model has a bad day.
         """
-        from aegis.services.memory import record_memory
+        from aegis.services.memory import CURIOSITY_ANSWER_PREFIX, record_memory
 
         meta = metadata or {}
         answer = str((response or {}).get("value") or "").strip()
@@ -929,7 +929,7 @@ class CuriosityActivities:
         await record_memory(
             self.db_pool,
             agent_id,
-            f"{head}\nThe owner answered: {answer}",
+            f"{head}\n{CURIOSITY_ANSWER_PREFIX}{answer}",
             importance=0.8,
             source="curiosity",
         )

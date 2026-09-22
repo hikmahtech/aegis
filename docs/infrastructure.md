@@ -2391,6 +2391,11 @@ the same code that writes the notes; the page shows that preview live.
 | `section_ends_at_rule_or_fence` | `true` | A section ends at a `---` rule or a code fence, not only at the next heading. |
 | `language.*` | English | `name` (the language the day log and rollups are written in — English adds nothing to the prompts), and the fixed words of a day log written without a model: `daylog_title`, `quiet_day`, the six labels, `rollup_header`, `journal_title`, `also_in_note`, `review_label` (the label on the weekly review's block), and `selfreport_label` (the label on your answer to the journal prompt). |
 | `daily` / `weekly` / `monthly` | see below | One block per kind: `enabled`, `folder`, `format`, `live_folder`, `template`, `sections`, `label`. |
+| `record.enabled` | `false` | Off: nothing compiles and the `user` persona documents behave as before. On: each agent's `user` document is compiled from the record notes every hour and is read-only in admin. |
+| `record.dir` | `me` | The record's folder at the vault root. One level; never indexed. Not the agent's folder or a journal folder. |
+| `record.shared` | `["about"]` | Notes every agent reads. |
+| `record.by_tag` | `{}` | Capability tag → note names. The `gtd` holder also reads every note no tag names. |
+| `record.max_chars` | `6000` | The cap on one agent's compiled document (500–50000); a cut says so in the text. |
 
 Per kind, the defaults: daily `folder "[journal/]YYYY/MM[. ]MMM"`, `format
 "DD MMM YY"`, `live_folder "journal"`, `template
@@ -2422,6 +2427,39 @@ marker format and the forged-marker guard, the path safety refusals,
 pushed-only / never force-push, the flock, the encrypted-block stripping, the
 scrubbing of git output, never running a Templater tag, and the tools' size
 caps.
+
+### The record (`me/`)
+
+Vault record spec: `superpowers/specs/2026-09-22-vault-record-design.md` (§4, §5, §12).
+What AEGIS knows about you lives in `me/`, one note per domain. While
+`record.enabled` is on, the hourly `NotesSyncFlow` compiles each active agent's
+`user` persona document from them (`services/record.py`): the shared notes,
+then the notes its capability tags map to, then — for the `gtd` holder — every
+note no tag names. Frontmatter, encrypted blocks and `%% … %%` comments never
+reach the document. It is written through `apply_profile_patch` with
+`source = 'vault_record'` only when the text changed, and
+`settings.notes_record_state` records the commit and, per agent, the size,
+notes, cut and last write. The copy runs one way: the persona PUT answers 409
+for a change to `user`, a `user` revision cannot be reverted, and a row edited
+by hand is overwritten at the next compile with `record_cache_overwritten` in
+the worker log. The weekly persona draft stands down (`record_in_vault`)
+before it spends a model call.
+
+Turning the record on is refused (400) while the `gtd` holder's compiled
+document would be empty and its current row is not.
+
+**Seeding.** "Draft the record" on the Vault page starts `RecordSeedFlow`,
+which writes `me/<name>.draft.md` once per note — about, work, people and
+health from the `gtd` holder's `user` document and curiosity answers (one model
+call that returns line numbers, so no line is reworded or lost), money from
+the books' account names, the chart, billers and subscriptions (no model, no
+amount), and interests from your notes' titles and tags outside the journal,
+topics, feeds and book and bookmark tags (one model call; each theme cites two
+sources). A draft is never compiled or indexed. Accept one by renaming it to
+`<name>.md`; reject it by deleting it. Once the record is on and the drafts
+are accepted, "Retire seeded memory" previews, then retires, each curiosity
+memory row whose answer is now in an accepted note, through
+`apply_consolidation`.
 
 ### Setting it up
 

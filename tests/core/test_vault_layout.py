@@ -8,6 +8,7 @@ changed layout must keep the one before it.
 
 from __future__ import annotations
 
+import re
 from datetime import date, timedelta
 
 import pytest
@@ -301,3 +302,88 @@ async def test_a_broken_row_reads_as_the_defaults(layout_pool):
         "INSERT INTO settings (key, value) VALUES ($1, $2)", vl.SETTINGS_KEY, "not an object"
     )
     assert await vl.get_layout(layout_pool) == vl.DEFAULT_LAYOUT
+
+
+# ------------------------------------------------------------- the record
+
+
+def test_the_record_block_is_off_and_names_nobody():
+    rec = vl.DEFAULT_LAYOUT.record
+    assert (rec.enabled, rec.dir, rec.shared, rec.by_tag, rec.max_chars) == (
+        False, "me", ("about",), (), 6000,
+    )
+    assert vl.merge({})["record"] == {
+        "enabled": False, "dir": "me", "shared": ["about"], "by_tag": {}, "max_chars": 6000,
+    }
+    assert vl.layout_to_dict(vl.DEFAULT_LAYOUT)["record"] == vl.merge({})["record"]
+
+
+def test_merge_reads_a_bad_record_key_as_its_default():
+    m = vl.merge({"record": {"enabled": "yes", "by_tag": {"finance": "money"}, "max_chars": 10}})
+    assert m["record"]["enabled"] is False
+    assert m["record"]["by_tag"] == {}
+    assert m["record"]["max_chars"] == 6000
+    assert vl.merge({"record": "junk"})["record"] == vl.merge({})["record"]
+
+
+@pytest.mark.parametrize(
+    "bad,key",
+    [
+        ({"record": {"colour": 1}}, "record.colour"),
+        ({"record": {"enabled": "yes"}}, "record.enabled"),
+        ({"record": {"by_tag": {"chef": ["money"]}}}, "record.by_tag.chef"),
+        ({"record": {"by_tag": {"finance": "money"}}}, "record.by_tag.finance"),
+        ({"record": {"dir": "a/b"}}, "record.dir"),
+        ({"record": {"dir": "raphael"}}, "record.dir"),
+        ({"record": {"dir": "journal"}}, "record.dir"),
+        ({"record": {"shared": ["about.md"]}}, "record note name"),
+        ({"record": {"shared": ["about.draft"]}}, "record note name"),
+        ({"record": {"max_chars": 100}}, "record.max_chars"),
+    ],
+)
+def test_validate_refuses_a_bad_record_block(bad, key):
+    with pytest.raises(ValueError, match=f"^{re.escape(key)}"):
+        vl.validate(bad)
+
+
+def test_a_full_record_block_round_trips():
+    row = {
+        "record": {
+            "enabled": True, "dir": "me", "shared": ["about"],
+            "by_tag": {"finance": ["money"], "gtd": ["work", "people"]}, "max_chars": 4000,
+        }
+    }
+    lay = vl.layout_from(vl.validate(row))
+    assert lay.record.names_for("finance") == ("money",)
+    assert lay.record.names_for("infra") == ()
+    assert lay.record.claimed() == {"about", "money", "work", "people"}
+    assert lay.record.draft_path("money") == "me/money.draft.md"
+    assert lay.record.is_record_path("me/money.md") and not lay.record.is_record_path("me/a/b.md")
+    assert vl.layout_to_dict(lay)["record"] == vl.validate(row)["record"]
+
+
+def test_the_record_folder_is_never_indexed():
+    lay = vl.DEFAULT_LAYOUT
+    assert not lay.is_indexable("me/about.md")
+    assert not lay.is_indexable("me/about.draft.md")
+    assert lay.is_indexable("knowledge/me/about.md")
+    assert lay.is_indexable("meals.md")
+
+
+def test_the_journal_area_comes_from_the_layout():
+    lay = vl.DEFAULT_LAYOUT
+    assert lay.journal_roots() == ("journal",)
+    assert lay.is_journal_area("journal/2026/09. Sep/12 Sep 26.md")
+    assert lay.is_journal_area("journal/anything.md")
+    assert not lay.is_journal_area("knowledge/journal.md")
+    moved = vl.layout_from({"daily": {"folder": "[diary/]YYYY", "live_folder": ""}})
+    assert "diary" in moved.journal_roots()
+
+
+async def test_changing_only_the_record_keeps_previous(layout_pool):
+    first = await vl.save_layout(layout_pool, {"agent_dir": "assistant", "questions_dir": "assistant/q"})
+    body = {k: v for k, v in first.items() if k != "previous"}
+    body["record"] = {**body["record"], "enabled": True}
+    again = await vl.save_layout(layout_pool, body)
+    assert again["record"]["enabled"] is True
+    assert again["previous"]["agent_dir"] == "raphael", "a record-only change must not rotate previous"

@@ -56,6 +56,7 @@ from aegis_worker.activities.notes import NotesActivities
 from aegis_worker.activities.people import PeopleActivities
 from aegis_worker.activities.profile import ProfileActivities
 from aegis_worker.activities.raindrop import RaindropActivities
+from aegis_worker.activities.record import RecordActivities
 from aegis_worker.activities.research import ResearchActivities
 from aegis_worker.activities.review import ReviewActivities
 from aegis_worker.activities.rss import RssActivities
@@ -461,6 +462,11 @@ async def main():
         db_pool=deps.pool,
         knowledge_connector=connectors.get("knowledge"),
     )
+    # The owner's record (vault record spec §5, §12): the hourly compile, and
+    # the seed's drafters on the tier-resolved balanced model.
+    record_act = RecordActivities(
+        settings=settings, db_pool=deps.pool, llm_client=deps.llm, model=model_balanced
+    )
     rss_act = RssActivities(db_pool=deps.pool, user_agent=user_agent)
     # B7 — wearable vendor poll. An empty token is not an error here: the
     # activity refuses to issue a request and reports `token_missing`, which
@@ -668,6 +674,7 @@ async def main():
         research_act,
         calibre_act,
         notes_act,
+        record_act,
         wearable_act,
         intel_scan_act,
         sentry_ingest_act,

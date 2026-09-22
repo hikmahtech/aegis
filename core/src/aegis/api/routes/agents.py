@@ -9,6 +9,7 @@ import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from aegis.api.auth import verify_auth
+from aegis.services import record as vault_record
 from aegis.services.agents import create_agent as _create_agent
 from aegis.services.agents import delete_agent as _delete_agent
 from aegis.services.agents import get_agent as _get_agent
@@ -51,6 +52,20 @@ async def put_agent_personality(
     pool = request.app.state.db_pool
     if not await _get_agent(pool, agent_id):
         raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found")
+    # While the record is on, `user` is a cache of the vault's me/ notes and
+    # the copy runs one way (vault record spec §5). The persona page sends all
+    # four kinds on every save, so only a body that would CHANGE `user` is
+    # refused.
+    if "user" in body and await vault_record.is_on(pool):
+        current = (await get_personality(pool, agent_id, use_cache=False)).get("user", "") or ""
+        if (body.get("user") or "") != current:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "The user document is compiled from the vault's record notes while the "
+                    "record is on. Edit the notes in the vault; the hourly sync updates it."
+                ),
+            )
     try:
         return await set_personality(pool, agent_id, body)
     except ValueError as e:

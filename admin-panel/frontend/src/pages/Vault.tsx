@@ -4,8 +4,8 @@ import { useConfigRow } from '../lib/useConfigRow';
 import ErrorBanner from '../components/ErrorBanner';
 import { toast } from '../components/Toast';
 import {
-  changedKeys, joinList, KINDS, splitList, toSaveBody,
-  type Kind, type VaultLayout,
+  changedKeys, formatByTag, joinList, KINDS, parseByTag, splitList, toSaveBody,
+  type Kind, type RecordLayout, type VaultLayout,
 } from '../lib/vaultLayout';
 import DataTable from '../components/DataTable';
 
@@ -24,6 +24,9 @@ type Preview = {
   daily: KindPreview; weekly: KindPreview; monthly: KindPreview;
 };
 type KindPreview = { enabled: boolean; path: string; live_path: string; template: string; sections: string[] };
+// `settings.notes_record_state`, written by the hourly compile.
+type RecordAgentState = { chars: number; notes?: string[]; cut?: boolean; written_at?: string; commit?: string };
+type RecordState = { commit?: string; compiled_at?: string; agents?: Record<string, RecordAgentState> };
 
 const KIND_HELP: Record<Kind, string> = {
   daily: 'The nightly day log. Folder and name are rendered for the day.',
@@ -55,10 +58,15 @@ export default function Vault() {
   const [timezone, setTimezone] = useState('');
   const [effectiveTz, setEffectiveTz] = useState('UTC');
   const [showWording, setShowWording] = useState(false);
+  const [recordState, setRecordState] = useState<RecordState>({});
+  const [drafts, setDrafts] = useState<string[]>([]);
+  const [byTagText, setByTagText] = useState('');
 
   const { error, setError, loading, saving, save: saveRow } = useConfigRow(async () => {
     const r = await api.getVaultLayout();
     setLayout(r.layout); setDefaults(r.defaults); setOptions(r.options || {});
+    setRecordState(r.record_state || {}); setDrafts(r.drafts || []);
+    setByTagText(formatByTag(r.layout.record.by_tag));
     const tz = await api.getTimezone();
     setTimezone(tz.timezone || ''); setEffectiveTz(tz.effective || 'UTC');
   });
@@ -81,8 +89,29 @@ export default function Vault() {
   // The guard stays outside `saveRow`: with no layout loaded there is nothing
   // to write, and nothing to say was saved.
   const save = () => layout && saveRow(async () => {
-    setLayout((await api.saveVaultLayout(toSaveBody(layout))).layout);
+    const r = await api.saveVaultLayout(toSaveBody(layout));
+    setLayout(r.layout); setRecordState(r.record_state || {}); setDrafts(r.drafts || []);
   }, 'Vault layout saved — applies within ~30s. Existing notes stay where they are.');
+
+  async function draftRecord() {
+    setError(null);
+    try {
+      await api.startRecordSeed();
+      toast.ok('Drafting started. One Slack message will list the drafts; refresh this page to see them.');
+    } catch (e) { setError(e as Error); }
+  }
+
+  async function retireMemory() {
+    setError(null);
+    try {
+      const preview = await api.retireSeededMemory(false);
+      const n = Object.values(preview.retire).reduce((a, ids) => a + ids.length, 0);
+      if (!n) { toast.ok(`No memory row is in an accepted note yet (${preview.kept} stay).`); return; }
+      if (!window.confirm(`Retire ${n} memory rows whose answers are now in ${layout?.record.dir}/? ${preview.kept} stay.`)) return;
+      await api.retireSeededMemory(true);
+      toast.ok(`Retired ${n} memory rows. The ops log records each one.`);
+    } catch (e) { setError(e as Error); }
+  }
 
   async function saveTz() {
     setError(null);
@@ -103,6 +132,9 @@ export default function Vault() {
   }
   function setKind(kind: Kind, patch: Partial<VaultLayout[Kind]>) {
     setLayout(l => (l ? { ...l, [kind]: { ...l[kind], ...patch } } : l));
+  }
+  function setRecord(patch: Partial<RecordLayout>) {
+    setLayout(l => (l ? { ...l, record: { ...l.record, ...patch } } : l));
   }
 
   const row = (label: string, control: React.ReactNode, help?: string) => (
@@ -304,12 +336,81 @@ export default function Vault() {
             )}
           </div>
 
+          <div className="card" style={{ marginTop: 16 }}>
+            <h2 className="section-title">The record</h2>
+            <p className="meta" style={{ marginBottom: 8 }}>
+              Notes about you in <code>{layout.record.dir}/</code>, one per domain. While the record is on,
+              each agent's user document is compiled from them every hour and is read-only on its agent page.
+              A <code>&lt;name&gt;.draft.md</code> file is a draft: rename it to accept it, delete it to reject it.
+            </p>
+            <div className="table-scroll">
+              <table className="data-table">
+                <tbody>
+                  {row('On', (
+                    <input type="checkbox" checked={layout.record.enabled}
+                      onChange={e => setRecord({ enabled: e.target.checked })} />
+                  ), 'Refused while the gtd holder\'s document would be emptied: accept a draft first.')}
+                  {row('Folder', text(layout.record.dir, v => setRecord({ dir: v })),
+                    'One folder at the vault root. No subfolders. Never indexed.')}
+                  {row('Shared notes', text(joinList(layout.record.shared), v => setRecord({ shared: splitList(v) })),
+                    'Every agent reads these. Names without .md, comma-separated.')}
+                  {row('Notes by capability', (
+                    <textarea
+                      rows={4} style={{ width: '100%', fontFamily: 'var(--mono)' }} value={byTagText}
+                      placeholder={'finance: money\nresearch: interests'}
+                      onChange={e => { setByTagText(e.target.value); setRecord({ by_tag: parseByTag(e.target.value) }); }}
+                    />
+                  ), `One line per capability (${(options.tags || []).join(', ')}). The gtd holder also reads every note no line names.`)}
+                  {row('Most characters per agent', (
+                    <input
+                      type="number" min={500} max={50000} value={layout.record.max_chars}
+                      onChange={e => setRecord({ max_chars: Number(e.target.value) })}
+                      style={{ width: 100 }}
+                    />
+                  ), 'The compiled document is cut here, and says so.')}
+                </tbody>
+              </table>
+            </div>
+            {recordState.agents && (
+              <div className="table-scroll" style={{ marginTop: 12 }}>
+                <table className="data-table">
+                  <thead>
+                    <tr><th>Agent</th><th>Characters</th><th>Notes</th><th>Cut</th><th>Last written</th></tr>
+                  </thead>
+                  <tbody>
+                    {Object.entries(recordState.agents).map(([agent, s]) => (
+                      <tr key={agent}>
+                        <td>{agent}</td>
+                        <td>{s.chars}</td>
+                        <td>{(s.notes || []).join(', ') || '—'}</td>
+                        <td>{s.cut ? 'yes' : 'no'}</td>
+                        <td>{s.written_at ? `${s.written_at} (${String(s.commit || '').slice(0, 8)})` : '—'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+            <p className="meta" style={{ marginTop: 8 }}>
+              {drafts.length ? `Drafts waiting: ${drafts.join(', ')}.` : 'No draft is waiting.'}
+            </p>
+            <div style={{ display: 'flex', gap: 12, marginTop: 8 }}>
+              <button className="btn btn-sm" onClick={draftRecord}>Draft the record</button>
+              <button className="btn btn-sm" disabled={!layout.record.enabled} onClick={retireMemory}>
+                Retire seeded memory
+              </button>
+            </div>
+          </div>
+
           <div style={{ marginTop: 16, display: 'flex', gap: 12, alignItems: 'center' }}>
             <button className="btn btn-primary" disabled={saving} onClick={save}>
               {saving ? 'Saving…' : 'Save layout'}
             </button>
             {defaults && (
-              <button className="btn" onClick={() => setLayout({ ...defaults, previous: layout.previous })}>
+              <button className="btn" onClick={() => {
+                setLayout({ ...defaults, previous: layout.previous });
+                setByTagText(formatByTag(defaults.record.by_tag));
+              }}>
                 Reset to the shipped defaults
               </button>
             )}
