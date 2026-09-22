@@ -15,6 +15,7 @@ here are thin wrappers over them.
 
 from __future__ import annotations
 
+import json
 import time
 
 import httpx
@@ -108,6 +109,67 @@ async def handle_hint_submit(core, body) -> None:
         return
     interaction_id, text = parsed
     await core.resolve_interaction(interaction_id=interaction_id, value=f"hint:{text}")
+
+
+async def handle_text_open(client, body) -> None:
+    """Open the text box for an `input` card. The card stays pending.
+
+    The button's value carries the card id and the modal's label and
+    placeholder (`cards._text_open_value`), so no call to core happens inside
+    Slack's 3-second trigger window.
+    """
+    from aegis_comms.slack_modal import build_text_modal
+
+    actions = body.get("actions") or []
+    raw = actions[0].get("value", "") if actions else ""
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return
+    if not isinstance(data, dict) or not data.get("id"):
+        return
+    message = body.get("message") or {}
+    view = build_text_modal(
+        str(data["id"]),
+        message.get("text") or "",
+        str(data.get("label") or ""),
+        str(data.get("placeholder") or ""),
+        channel=(body.get("channel") or {}).get("id", ""),
+        ts=message.get("ts", ""),
+    )
+    try:
+        await client.views_open(trigger_id=body.get("trigger_id", ""), view=view)
+    except Exception as exc:  # noqa: BLE001 — original card stays usable
+        _logger.warning("slack_views_open_failed", error=error_text(exc, 500))
+
+
+async def handle_text_submit(ack, inbound, body) -> None:
+    """Resolve an `input` card with the text typed in its modal.
+
+    A blank answer is refused inside the modal, so the card is never resolved
+    with nothing. Otherwise the modal closes first (Slack wants the ack within
+    3 seconds) and `SlackInbound.on_text_answer` resolves the card. The text
+    is never logged here.
+    """
+    from aegis_comms.slack_modal import parse_text_submission
+
+    parsed = parse_text_submission(body)
+    if parsed is None:
+        await ack()
+        return
+    if not parsed.text:
+        await ack(
+            response_action="errors",
+            errors={"answer": "Type an answer, or press Cancel."},
+        )
+        return
+    await ack()
+    await inbound.on_text_answer(
+        interaction_id=parsed.interaction_id,
+        text=parsed.text,
+        channel_id=parsed.channel,
+        message_ts=parsed.ts,
+    )
 
 
 def _note_from_state(body: dict) -> str:
@@ -610,6 +672,16 @@ class SlackAdapter:
         async def _on_hint_submit(ack, body):  # noqa: ANN001
             await ack()
             await handle_hint_submit(core, body)
+
+        @app.action("text_open")
+        async def _on_text_open(ack, body):  # noqa: ANN001
+            await ack()
+            await handle_text_open(self._client, body)
+
+        @app.view("text_submit")
+        async def _on_text_submit(ack, body):  # noqa: ANN001
+            # The handler acks itself: a blank answer is refused in the ack.
+            await handle_text_submit(ack, inbound, body)
 
         @app.action("open_url")
         async def _on_open_url(ack):  # noqa: ANN001 — URL buttons need only an ack

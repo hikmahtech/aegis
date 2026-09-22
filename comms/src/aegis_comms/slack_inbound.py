@@ -993,11 +993,65 @@ class SlackInbound:
         interaction_id, val = parse_action(value)
         if not interaction_id:
             return
+        await self._resolve_card(
+            interaction_id=interaction_id,
+            val=val,
+            note=note,
+            ref=DeliveryRef("slack", {"channel": channel_id, "ts": message_ts}),
+            done_text=f"✅ {val}",
+        )
 
-        ref = DeliveryRef("slack", {"channel": channel_id, "ts": message_ts})
+    async def on_text_answer(
+        self, *, interaction_id: str, text: str, channel_id: str, message_ts: str
+    ) -> None:
+        """Resolve an `input` card with the text typed in its Slack modal.
 
+        The answer is stored as `{"value": text}`, the shape the admin
+        textarea sends, so the post-resolve hooks read it unchanged and the
+        learning loop (which reads `note`) records nothing. Outcomes follow
+        `on_action`, with two differences:
+
+          - the card says "Answered" and never quotes the text;
+          - a card someone answered first (core returns `already_resolved` on
+            the first try) says so, and that this answer was not recorded.
+
+        The text is private (a diary answer can come through here), so it is
+        never logged: the log line carries the id and the length only.
+        """
+        logger.info("slack_text_answer_submitted", interaction_id=interaction_id, length=len(text))
+        await self._resolve_card(
+            interaction_id=interaction_id,
+            val=text,
+            note="",
+            ref=DeliveryRef("slack", {"channel": channel_id, "ts": message_ts}),
+            done_text="✅ Answered",
+            closed_text=(
+                "✅ Already answered — this card was closed before your answer "
+                "arrived, so your answer was not recorded."
+            ),
+        )
+
+    async def _resolve_card(
+        self,
+        *,
+        interaction_id: str,
+        val: str,
+        note: str,
+        ref: DeliveryRef,
+        done_text: str,
+        closed_text: str | None = None,
+    ) -> None:
+        """Resolve a card and edit it to match what happened (see `on_action`).
+
+        `done_text` is what the card says once resolved. `closed_text`, when
+        set, replaces it for a card that was already resolved before this
+        call. Only the first attempt can tell that: after a failed attempt,
+        "already resolved" may be that attempt's own resolve landing late.
+        No log line here carries `val`.
+        """
         result = None
         error_sink: dict = {}
+        attempt = 0
         for attempt in range(1, 4):
             error_sink = {}
             result = await self._core.resolve_interaction(
@@ -1025,7 +1079,9 @@ class SlackInbound:
         if result is not None:
             status = result.get("status", "")
             if status == "resolved":
-                await self._adapter.edit_card(ref=ref, text=f"✅ {val}")
+                answered_before = attempt == 1 and bool(result.get("already_resolved"))
+                shown = closed_text if closed_text and answered_before else done_text
+                await self._adapter.edit_card(ref=ref, text=shown)
                 return
             # Any other non-pending status is a dead card (timed out before a
             # response, or some other terminal state) — clear the buttons so

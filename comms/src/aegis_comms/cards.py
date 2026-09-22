@@ -8,11 +8,17 @@ Dispatch matrix:
   choice       — one callback button per key in `options`
   ack          — one Acknowledge button + optional URL button from `options.url`
                  (supports `{interaction_id}` substitution)
-  input        — one URL button linking to AEGIS UI
+  input        — an Answer button that opens a Slack text box (`text_open`,
+                 see slack_modal.build_text_modal), plus a URL button linking
+                 to AEGIS UI when `options.aegis_ui_url` is set. The modal's
+                 label and placeholder come from `options.label` and
+                 `options.placeholder`.
   draft_review — one URL button linking to AEGIS UI
 """
 
 from __future__ import annotations
+
+import json
 
 import structlog
 
@@ -25,6 +31,9 @@ _logger = structlog.get_logger()
 _SLACK_BUTTON_MAX = 75
 # Slack section-block text.text max is 3000 chars.
 _SLACK_SECTION_MAX = 3000
+# What the `input` card's Answer button carries for its modal.
+_TEXT_LABEL_MAX = 500
+_TEXT_PLACEHOLDER_MAX = 150
 
 
 def _slack_button(text: str, *, value: str | None = None, url: str | None = None,
@@ -43,6 +52,22 @@ def _slack_button(text: str, *, value: str | None = None, url: str | None = None
     if style:
         btn["style"] = style
     return btn
+
+
+def _text_open_value(interaction_id: str, options: dict) -> str:
+    """The Answer button's value: the card id and the modal's own wording.
+
+    Slack caps a button value at 2000 characters, so the label and the
+    placeholder are cut here. Slack caps a placeholder at 150 anyway.
+    """
+    return json.dumps(
+        {
+            "id": interaction_id,
+            "label": str(options.get("label") or "")[:_TEXT_LABEL_MAX],
+            "placeholder": str(options.get("placeholder") or "")[:_TEXT_PLACEHOLDER_MAX],
+        },
+        ensure_ascii=False,
+    )
 
 
 def render_slack_blocks(spec: CardSpec) -> list[dict]:
@@ -85,6 +110,18 @@ def render_slack_blocks(spec: CardSpec) -> list[dict]:
             elements.append(_slack_button(button_label, url=url, action_id="open_url"))
         elements.append(_slack_button("✓ Acknowledge", **_cb("ack")))
     elif kind in ("input", "draft_review"):
+        if kind == "input":
+            # The answer is typed in a Slack modal. The button carries what the
+            # modal needs, so opening it makes no call to core inside Slack's
+            # 3-second trigger window.
+            elements.append(
+                _slack_button(
+                    "✍️ Answer",
+                    value=_text_open_value(interaction_id, options),
+                    action_id="text_open",
+                    style="primary",
+                )
+            )
         base_url = options.get("aegis_ui_url", "")
         if base_url:
             url = f"{str(base_url).rstrip('/')}/interactions/{interaction_id}"
