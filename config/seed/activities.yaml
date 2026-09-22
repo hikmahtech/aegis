@@ -412,7 +412,8 @@ activities:
   # into the vault journal, newest first. The daylog files a row only when its
   # vault write fails, so this is what puts such a day in the journal; a week
   # with nothing missing writes nothing (every write is marker-idempotent).
-  # `since_days: 14` looks only at rows filed in the last two weeks (two weekly
+  # It also files, and then blanks, any journal-prompt answer whose filing
+  # failed when its card resolved. `since_days: 14` looks only at rows filed in the last two weeks (two weekly
   # chances at each fallback day): the pre-vault rows are still in the store,
   # and rereading them every week would put back a block the user deleted
   # from an old journal note. `batch` is entries per commit. Inert
