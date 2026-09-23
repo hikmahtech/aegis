@@ -717,6 +717,50 @@ async def test_a_weekday_the_calendar_never_gave_is_counted_not_silently_skipped
     assert await open_problems(pool) == []
 
 
+async def test_a_traded_day_yahoo_later_blanks_is_still_planned(pool):
+    """Yahoo served 2026-09-22 live, then blanked it: open and close both null,
+    a day later and for good. The desk had stored that day's open from its own
+    post-open run, which proves the session happened. Reading the calendar off
+    closes alone made the next morning see Monday as the newest day, call it
+    idle and never act on Tuesday's decisions (#667)."""
+    closes = [bar(d, 25_000.0) for d in WEEK]
+    finance = FakeFinance({
+        "^NSEI": closes,
+        "SHARIABEES.NS": [bar(d, 400.0) for d in WEEK],
+        "TCS.NS": [bar(d, 3000.0) for d in WEEK],
+    })
+    ansaar = FakeAnsaar(
+        {MON: [row("TCS", 0.10, day=MON)], TUE: [row("TCS", 0.20, day=TUE)]},
+        prices={"TCS": [bar(TUE, 3050.0)], "SHARIABEES": [bar(TUE, 401.0)]},
+    )
+
+    assert (await run(pool, ansaar, finance, TUE))["planned"] == "orders"  # before the open
+    # After the open: Tuesday is live, so its open is kept and Monday's order fills.
+    finance.bars["^NSEI"] = [*closes, bar(TUE, 25_100.0, open=25_050.0)]
+    finance.bars["TCS.NS"] = [bar(d, 3000.0) for d in WEEK] + [bar(TUE, 3040.0, open=3020.0)]
+    assert (await run(pool, ansaar, finance, TUE))["filled"] == 1
+
+    # Wednesday before the open: Yahoo has blanked Tuesday.
+    finance.bars["^NSEI"] = [*closes, bar(TUE, None)]
+    finance.bars["TCS.NS"] = [bar(d, 3000.0) for d in WEEK] + [bar(TUE, None)]
+    out = await run(pool, ansaar, finance, WED)
+    assert (out["day"], out["idle_weekday"], out.get("planned")) == (TUE.isoformat(), 0, "orders")
+    # Tuesday's close for TCS came from the per-day ansaar fallback, and the
+    # order is sized on it rather than on Monday's.
+    order = await pool.fetchrow("SELECT side, ref_price FROM finance.desk_orders WHERE data_date = $1", TUE)
+    assert (order["side"], float(order["ref_price"])) == ("buy", 3050.0)
+    assert await open_problems(pool) == []
+
+
+def test_today_with_only_an_open_is_not_a_market_day_yet():
+    """The other half of the rule: today's open says the session started, not
+    that it ended, and the desk must never plan on a session with no decisions."""
+    bars = [dm.Bar(MON, 25_000.0), dm.Bar(TUE, None, open=25_050.0)]
+    assert dm.market_days(bars, TUE) == [MON]
+    assert dm.market_days(bars, WED) == [MON, TUE]
+    assert dm.market_days([*bars, dm.Bar(WED, None)], date(2026, 9, 17)) == [MON, TUE]
+
+
 # Three mornings of decisions, so a run on Wednesday is never held for stale
 # input while the benchmark is what the test is about.
 DECISIONS = FakeAnsaar({

@@ -471,14 +471,16 @@ async def _tick(
             )
         ], []
     index_bars = (await _bars(pool, rules, {index}))[index]
-    # THE CALENDAR IS DAYS WITH A CLOSE, AND MUST STAY THAT WAY. It is what
+    # THE CALENDAR IS COMPLETED SESSIONS, AND MUST STAY THAT WAY. It is what
     # `day` below is read off — the session whose decisions the desk acts on —
     # and a session that has not closed has no decisions yet. Let today in here
     # because it has an open, and `day` becomes today, `ansaar.decisions(today)`
     # returns nothing, and the desk reports `held_stale` and raises a task every
-    # single trading day. The same predicate guards valuation, the score and the
-    # staleness alarms, all of which want completed sessions too.
-    index_days = [b.day for b in index_bars if b.close is not None]
+    # single trading day. A PAST day with only an open is completed, though:
+    # Yahoo blanks some traded days entirely, and without it the desk skipped
+    # that day's decisions (#667). `dm.market_days` holds both rules. The same
+    # list guards valuation, the score and the staleness alarms.
+    index_days = dm.market_days(index_bars, today)
     # Trading is the one thing that does not need a completed session. Today
     # joins this list the moment it has an open, and it is used for nothing but
     # deciding which day an order fills on.
@@ -775,7 +777,8 @@ async def month_summary(
     index = rules.calendar_symbol
     benchmarks = {s for s in (rules.benchmark, rules.context_benchmark) if s}
     bars = await _bars(pool, rules, {f.symbol for f in fills} | {index} | benchmarks)
-    days = [b.day for b in bars[index] if b.close is not None and start <= b.day <= month_end]
+    calendar = dm.market_days(bars[index], today)
+    days = [d for d in calendar if start <= d <= month_end]
     if not days:
         return None
     series = dm.desk_series(fills, bars, rules.capital, days)
@@ -827,7 +830,7 @@ async def month_summary(
     # of the month: this is asked for the current month on the admin page, and
     # days that have not happened yet are not idle.
     scored = min(month_end, today - timedelta(days=1))
-    idle = dm.idle_days({b.day for b in bars[index] if b.close is not None}, max(start, month_first), scored)
+    idle = dm.idle_days(set(calendar), max(start, month_first), scored)
     return {
         "since": start.isoformat(),
         "weeks": st.n,
