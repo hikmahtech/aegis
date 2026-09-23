@@ -246,6 +246,15 @@ ORDER BY a.slug
 # on every call — the same "loud about nothing" state, and worth the same card.
 # `timeout` and `error` obviously don't count. The kill switch writes no row at
 # all, so a spend freeze cannot masquerade as a dead purpose.
+#
+# A streak the backend explains is dropped (#660). An outage fails every
+# purpose at once, and a sparse purpose keeps that stale streak as its newest
+# calls for days after the backend came back. So a streak is not judged when
+# its model was dark for everyone at the time — the other purposes' calls just
+# before and just after its newest failure failed too — and the model has
+# answered a call since. "Has since succeeded" alone is not enough: a purpose
+# broken on its own (a token floor, a prompt that overflows) sits beside
+# successes on the same model all day, and must still fire.
 _DEAD_LLM_SQL = """
 WITH recent AS (
     SELECT purpose, status, model, error, created_at,
@@ -256,7 +265,7 @@ WITH recent AS (
     WHERE created_at > now() - make_interval(hours => $2)
       AND purpose IS NOT NULL
       AND purpose <> ''
-)
+), dead AS (
 SELECT purpose,
        count(*) AS calls,
        count(*) FILTER (WHERE status = 'error') AS errors,
@@ -271,7 +280,29 @@ WHERE rn <= $1
 GROUP BY purpose
 HAVING count(*) = $1
    AND count(*) FILTER (WHERE status = 'success') = 0
-ORDER BY purpose
+)
+SELECT d.*
+FROM dead d
+WHERE NOT (
+    EXISTS (
+        SELECT 1 FROM llm_calls ok
+        WHERE ok.model = d.model AND ok.status = 'success'
+          AND ok.created_at > d.last_call_at
+    )
+    AND coalesce((
+        SELECT o.status FROM llm_calls o
+        WHERE o.model = d.model AND o.purpose IS DISTINCT FROM d.purpose
+          AND o.created_at < d.last_call_at
+        ORDER BY o.created_at DESC LIMIT 1
+    ), 'success') <> 'success'
+    AND coalesce((
+        SELECT o.status FROM llm_calls o
+        WHERE o.model = d.model AND o.purpose IS DISTINCT FROM d.purpose
+          AND o.created_at > d.last_call_at
+        ORDER BY o.created_at LIMIT 1
+    ), 'success') <> 'success'
+)
+ORDER BY d.purpose
 """
 
 
@@ -440,6 +471,11 @@ class FlowHealthActivities:
         A retired purpose whose final calls failed alerts until its last call
         ages past `staleness_hours` — accepted deliberately, see the
         module-level note on bounding that.
+
+        A streak is not judged when its model was failing for the other
+        purposes around its newest call and has succeeded since (#660): that
+        streak was the backend, not the purpose. A purpose that fails while its
+        model works for others still fires.
 
         Returns [] (never raises) on an empty `llm_calls`.
         """
