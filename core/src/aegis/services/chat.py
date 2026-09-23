@@ -20,7 +20,8 @@ from aegis.errors import error_text
 from aegis.llm import parse_llm_json
 from aegis.llm.tier import resolve_model_for_agent, tier_to_model, tier_to_model_or
 from aegis.observability import record_llm_call, record_tool_call
-from aegis.services.knowledge_ranking import DEFAULT_RANKING, Ranking, get_ranking
+from aegis.services.knowledge_ranking import Ranking, apply_decay, get_ranking
+from aegis.services.knowledge_ranking import score as score_knowledge
 from aegis.services.library import LIBRARY_READ_TIMEOUT_S
 from aegis.services.research import FETCH_TOOL_TIMEOUT_S, RESEARCH_TOOL_TIMEOUT_S
 from aegis.services.source_types import DEFAULT_DECAY_DAYS
@@ -1089,29 +1090,9 @@ def _extract_query_entities(message: str, agent_ids=()) -> list[str]:
 DEFAULT_DECAY_WINDOW = DEFAULT_DECAY_DAYS
 
 
-def _apply_knowledge_decay(items: list[dict], ranking: Ranking | None = None) -> list[dict]:
-    """Apply time-based decay to knowledge items based on source type.
-
-    When days_since_referenced is unknown, assume item is fresh (0 days).
-    Decay is only meaningful when age data is available from the knowledge store.
-    `ranking` carries the per-type decay window and rank boost — the
-    `knowledge_ranking` row over the registry; None is the registry alone.
-    """
-    ranking = ranking or DEFAULT_RANKING
-    for item in items:
-        source_type = item.get("source_type", "unknown")
-        decay_window = ranking.decay_days(source_type)
-        # Default to 0 (fresh) when age is unknown — don't penalize items without age data
-        days = item.get("days_since_referenced", 0)
-        decay_factor = max(0.1, 1.0 - (days / decay_window))
-        # Start from the domain-boosted `_score` when the caller set one, so
-        # the boost reaches the threshold and the order (#579); else from
-        # similarity, which can be None (BM25-only chunks) and is coerced. The
-        # rank boost is 1.0 for every type but the user's own notes, which rank
-        # above raw documents (#514), unless the row says otherwise.
-        base = item["_score"] if item.get("_score") is not None else (item.get("similarity") or 0)
-        item["effective_score"] = base * decay_factor * ranking.rank_boost(source_type)
-    return items
+# The scoring lives in knowledge_ranking (shared with KnowledgeStore.ask);
+# this name stays for the tests that import it from here.
+_apply_knowledge_decay = apply_decay
 
 
 # --- Knowledge injection feedback helpers ---
@@ -1377,17 +1358,9 @@ async def _gather_knowledge_context(
         if not results:
             return (None, [])
 
-        ranking = ranking or DEFAULT_RANKING
-        # Agent-scoped boosting: the agent's own domains get `domain_boost`.
-        domains = set(knowledge_domains or [])
-        for r in results:
-            boost = ranking.domain_boost if r.get("source_type") in domains else 0.0
-            r["_score"] = (r.get("similarity") or 0) + boost
-
-        # Decay starts from `_score`, so `effective_score` carries the boost
-        # into the threshold and the sort (#579) — before, it restarted from
-        # raw similarity and the boost changed nothing a prompt saw.
-        results = _apply_knowledge_decay(results, ranking)
+        # Agent-scoped boosting (the agent's own domains get `domain_boost`)
+        # then decay; shared with `KnowledgeStore.ask` (knowledge_ranking.score).
+        results = score_knowledge(results, ranking, knowledge_domains)
         results = [r for r in results if r["effective_score"] >= score_threshold]
 
         if not results:

@@ -10,7 +10,7 @@ sites pass free-form strings from user-facing forms (e.g. the
 `/api/knowledge/upload` endpoint's `source_type: str = Form("upload")`), so
 rejecting here would break normal usage.
 
-`chat.py`'s `_apply_knowledge_decay` resolves each item's decay window via
+`knowledge_ranking.apply_decay` resolves each item's decay window via
 `get_decay_days` instead of its own dict — this module is the only source of
 truth for decay windows now.
 """
