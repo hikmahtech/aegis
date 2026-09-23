@@ -112,6 +112,10 @@ TASK_COMPLETED_REASON = "its Todoist task was completed by a person, not by the 
 # not in `hub.SOURCES` — so the prefix tells a person's completion apart from
 # every other resolve without matching on the reason's wording.
 TASK_COMPLETED_SOURCE = "todoist"
+# What the timeline says when Todoist no longer knows the task (#659).
+TASK_DELETED_REASON = "its Todoist task was deleted"
+# `_post_note`'s answer when Todoist says the task does not exist.
+_TASK_GONE = "gone"
 # Where the admin Integrations page stores `books_todoist_projects`
 # (`integrations_config`, prefix `integration:`).
 _BOOKS_PROJECTS_SETTING = "integration:books_todoist_projects"
@@ -472,8 +476,12 @@ def _settings() -> Any:
         return None
 
 
-async def _post_note(pool: asyncpg.Pool, settings: Any, task_id: str, text: str) -> bool:
-    """Post one comment. False on any failure; the caller keeps the watermark."""
+async def _post_note(pool: asyncpg.Pool, settings: Any, task_id: str, text: str) -> bool | str:
+    """Post one comment. False on a failure worth retrying; the caller keeps
+    the watermark. `_TASK_GONE` when Todoist says the task does not exist
+    (#659): the user deleted it, and a retry would fail every five minutes
+    for ever. Any other permanent rejection drops the note and says True,
+    because replaying a command Todoist refused for good only burns calls."""
     try:
         key = await resolve_todoist_api_key(pool, settings or _settings())
         if not key:
@@ -487,6 +495,12 @@ async def _post_note(pool: asyncpg.Pool, settings: Any, task_id: str, text: str)
         status = TodoistConnector.check_sync_status(result, [cmd["uuid"]])
         if not status["ok"]:
             logger.warning("hub_project_note_failed", task_id=task_id, status=status)
+        if status["rejected"] and not status["rejected_retryable"]:
+            gone = any(
+                isinstance(st, dict) and st.get("error_tag") == "ITEM_NOT_FOUND"
+                for st in status["rejected"].values()
+            )
+            return _TASK_GONE if gone else True
         return bool(status["ok"])
     except Exception as exc:  # noqa: BLE001
         logger.warning("hub_project_note_failed", task_id=task_id, error=error_text(exc))
@@ -559,7 +573,18 @@ async def retire_task(
 ) -> bool:
     """Complete a task the hub no longer needs (its problem was merged away),
     with a note saying where the work went. True when the completion queued."""
-    await _post_note(pool, settings, task_id, note)
+    if task_id.startswith("item-"):
+        # An outbox temp id is no task Todoist knows, so a note on it can only
+        # fail. Use the real id once the drain has committed it (#659).
+        task_id = (
+            await pool.fetchval(
+                "SELECT committed_id FROM todoist_outbox WHERE temp_id = $1 AND status = 'committed'",
+                task_id,
+            )
+            or task_id
+        )
+    if not task_id.startswith("item-"):
+        await _post_note(pool, settings, task_id, note)
     return await _complete_task(pool, task_id)
 
 
@@ -939,7 +964,10 @@ async def project(
 
     posted = 0
     for text in comments:
-        if not await _post_note(pool, settings, task_id, text):
+        outcome = await _post_note(pool, settings, task_id, text)
+        if outcome == _TASK_GONE:
+            return await _task_gone(pool, p, task_id, now)
+        if not outcome:
             break
         posted += 1
     if posted < len(comments):
@@ -994,6 +1022,50 @@ async def project(
     )
     await _save_meta(pool, problem_id, meta)
     return {"problem_id": problem_id, "task_id": task_id, "created": False, "comments": posted}
+
+
+async def _task_gone(
+    pool: asyncpg.Pool, p: dict[str, Any], task_id: str, now: datetime
+) -> dict[str, Any]:
+    """Todoist says the problem's task does not exist: a person deleted it.
+
+    That is their word, like completing it, and it is read the same way as
+    `reconcile_completed_tasks` reads a completion. A topic's round resolves
+    and closes, so the next article opens a fresh round. Any other problem
+    resolves, and its dead task is unlinked: if the fault is not over, its
+    next occurrence reopens the problem and the projector mints a new task.
+    Keeping the dead id retried a note on it every five minutes for ever
+    (#659)."""
+    problem_id = str(p["id"])
+    logger.info("hub_project_task_gone", problem_id=problem_id, task_id=task_id)
+    if p["class"] == TOPIC_CLASS:
+        from aegis.services.research_topics import close_round
+
+        await close_round(
+            pool, problem_id, reason=TASK_DELETED_REASON, source=TASK_COMPLETED_SOURCE, now=now
+        )
+    else:
+        await pool.execute(
+            "UPDATE problems SET todoist_task_id = NULL WHERE id = $1::uuid AND todoist_task_id = $2",
+            problem_id,
+            task_id,
+        )
+        # The capture is idempotent on the problem, so without this the next
+        # projection would be handed the dead task back instead of a new one.
+        await pool.execute(
+            "DELETE FROM todoist_capture_idempotency WHERE external_id = $1 AND todoist_task_ref = $2",
+            f"problem-{problem_id}",
+            task_id,
+        )
+        await set_status(
+            pool,
+            problem_id,
+            "resolved",
+            reason=TASK_DELETED_REASON,
+            source=TASK_COMPLETED_SOURCE,
+            now=now,
+        )
+    return {"problem_id": problem_id, "task_id": task_id, "task_gone": True}
 
 
 async def project_pending(
