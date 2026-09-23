@@ -1515,3 +1515,25 @@ async def test_the_settle_window_is_db_configurable(db_pool, inbox, todoist):
     await _settle(db_pool, {"dockerservicedown": "soon"})
     bad = await ingest_event(db_pool, _occ(_subject(), 0, occurred_at=NOW), now=NOW)
     assert (await project(db_pool, bad.problem_id, now=NOW))["settle_seconds"] == 300
+
+
+@pytest.mark.asyncio
+async def test_rearm_restarts_the_outbox_retry_clock(db_pool):
+    """#661: drain_outbox retries a transient failure until the row is six
+    hours old, so a re-armed old row must start its clock again."""
+    temp_id = f"problem-close-{uuid.uuid4().hex[:8]}"
+    await db_pool.execute(
+        "INSERT INTO todoist_outbox (temp_id, command, status, attempt_count, created_at) "
+        "VALUES ($1, $2, 'failed', 9, now() - interval '3 days')",
+        temp_id,
+        {"type": "item_close"},
+    )
+
+    await hub_project._queue(db_pool, temp_id, {"type": "item_close", "uuid": "u"})
+
+    row = await db_pool.fetchrow(
+        "SELECT status, attempt_count, created_at > now() - interval '1 minute' AS fresh "
+        "FROM todoist_outbox WHERE temp_id = $1",
+        temp_id,
+    )
+    assert (row["status"], row["attempt_count"], row["fresh"]) == ("pending", 0, True)

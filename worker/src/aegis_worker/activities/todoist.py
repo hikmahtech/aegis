@@ -7,7 +7,7 @@ re-running a workflow (e.g. due to a worker restart) doesn't corrupt state.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 
 import asyncpg
@@ -16,6 +16,10 @@ from aegis.services.settings_store import get_setting
 from temporalio import activity
 
 _ASSIGNEE_LABELS = {"@me", "@sebas", "@raphael", "@maou", "@pandora"}
+
+# A transient outbox failure is retried until the row is this old: a count of
+# 5 drains (~30 min) was shorter than a homelab outage and lost writes (#661).
+OUTBOX_RETRY_WINDOW = timedelta(hours=6)
 
 
 def _pick_assignee(labels: list[str]) -> str | None:
@@ -637,16 +641,19 @@ class TodoistActivities:
         - Pull up to 50 pending rows (Sync API batch limit).
         - Submit as a single commands batch.
         - For each row: if response says committed → mark committed + store id.
-          If retryable error → increment attempt_count, leave pending.
-          If non-retryable OR attempt_count >= 5 → mark failed.
+          If retryable error → increment attempt_count, leave pending until
+          the row is older than OUTBOX_RETRY_WINDOW, then mark failed.
+          If non-retryable → mark failed at once.
         """
         if self.db_pool is None or self.connector is None:
             return {"committed": 0, "failed": 0}
 
         async with self.db_pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT id, temp_id, command, attempt_count FROM todoist_outbox "
-                "WHERE status = 'pending' ORDER BY created_at, id LIMIT 50"
+                "SELECT id, temp_id, command, attempt_count, "
+                "created_at < now() - $1::interval AS expired FROM todoist_outbox "
+                "WHERE status = 'pending' ORDER BY created_at, id LIMIT 50",
+                OUTBOX_RETRY_WINDOW,
             )
 
         if not rows:
@@ -679,11 +686,11 @@ class TodoistActivities:
                         # Per-command failure inside an otherwise-ok batch.
                         # Distinguish permanent rejections (4xx-class: ITEM_NOT_FOUND,
                         # INVALID_ARGUMENT, etc.) from transient (5xx-class). The
-                        # former are poison — five wasted retries each. Mark them
-                        # failed immediately so the operator can inspect.
+                        # former are poison — retried for hours for nothing. Mark
+                        # them failed immediately so the operator can inspect.
                         next_attempts = r["attempt_count"] + 1
                         permanent = _Tc._is_permanent_error(st)
-                        new_status = "failed" if permanent or next_attempts >= 5 else "pending"
+                        new_status = "failed" if permanent or r["expired"] else "pending"
                         await conn.execute(
                             "UPDATE todoist_outbox SET status=$1, attempt_count=$2, last_attempt_at=now() WHERE id=$3",
                             new_status,
@@ -703,7 +710,7 @@ class TodoistActivities:
                 retryable = result.get("retryable", False)
                 for r in rows:
                     next_attempts = r["attempt_count"] + 1
-                    if retryable and next_attempts < 5:
+                    if retryable and not r["expired"]:
                         await conn.execute(
                             "UPDATE todoist_outbox SET attempt_count=$1, last_attempt_at=now() WHERE id=$2",
                             next_attempts,

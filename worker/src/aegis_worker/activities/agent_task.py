@@ -531,12 +531,13 @@ class AgentTaskActivities:
         `labels = EXCLUDED.labels` upsert, silently dropping the park
         forever. Re-queue whenever the existing row is terminal; leave an
         undrained 'pending' row untouched so we don't clobber work in
-        flight."""
+        flight. A re-arm restarts `created_at`, the clock drain_outbox's
+        retry window runs on, or an old row would fail on its first retry."""
         await self.db_pool.execute(
             "INSERT INTO todoist_outbox (temp_id, command, status) "
             "VALUES ($1, $2, 'pending') "
             "ON CONFLICT (temp_id) DO UPDATE "
-            "SET command = EXCLUDED.command, status = 'pending', attempt_count = 0 "
+            "SET command = EXCLUDED.command, status = 'pending', attempt_count = 0, created_at = now() "
             "WHERE todoist_outbox.status <> 'pending'",
             temp_id,
             command,

@@ -229,8 +229,8 @@ async def test_drain_outbox_retries_on_retryable_error(db_pool):
 
 
 @pytest.mark.asyncio
-async def test_drain_outbox_marks_failed_after_max_attempts(db_pool):
-    """Non-retryable error OR attempt_count >= 5 marks the row failed."""
+async def test_drain_outbox_marks_failed_on_non_retryable_error(db_pool):
+    """A non-retryable batch error marks the row failed at once."""
 
     class HardFailConnector:
         async def commands(self, cmds):
@@ -252,6 +252,90 @@ async def test_drain_outbox_marks_failed_after_max_attempts(db_pool):
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow("SELECT status FROM todoist_outbox WHERE temp_id = 'temp-d'")
     assert row["status"] == "failed"
+
+
+async def _seed_outbox_row(db_pool, temp_id, *, attempts, age_hours):
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM todoist_outbox")
+        await conn.execute(
+            "INSERT INTO todoist_outbox (temp_id, command, status, attempt_count, created_at) "
+            "VALUES ($1, $2, 'pending', $3, now() - make_interval(hours => $4))",
+            temp_id,
+            {"type": "item_add", "uuid": f"u-{temp_id}", "temp_id": temp_id, "args": {}},
+            attempts,
+            age_hours,
+        )
+
+
+async def _outbox_row(db_pool, temp_id):
+    async with db_pool.acquire() as conn:
+        return await conn.fetchrow(
+            "SELECT status, attempt_count FROM todoist_outbox WHERE temp_id = $1", temp_id
+        )
+
+
+class _BatchDownConnector:
+    async def commands(self, cmds):
+        return {"ok": False, "data": None, "error": "http_503", "retryable": True}
+
+
+class _RejectConnector:
+    """An ok batch whose every command is rejected with ``entry``."""
+
+    def __init__(self, entry):
+        self.entry = entry
+
+    async def commands(self, cmds):
+        return {
+            "ok": True,
+            "data": {"sync_status": {c["uuid"]: self.entry for c in cmds}, "temp_id_mapping": {}},
+            "error": None,
+            "retryable": False,
+        }
+
+
+_TRANSIENT = {"error_tag": "SERVICE_UNAVAILABLE", "http_code": 503}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("connector", [_BatchDownConnector(), _RejectConnector(_TRANSIENT)])
+async def test_drain_outbox_keeps_retrying_transient_failure_inside_window(db_pool, connector):
+    """#661: a transient failure is retried past five attempts while the row
+    is younger than the window — a count of five lost writes in an outage."""
+    await _seed_outbox_row(db_pool, "temp-w", attempts=7, age_hours=1)
+
+    result = await ActivityEnvironment().run(TodoistActivities(db_pool=db_pool, connector=connector).drain_outbox)
+
+    assert result["failed"] == 0
+    row = await _outbox_row(db_pool, "temp-w")
+    assert row["status"] == "pending"
+    assert row["attempt_count"] == 8
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("connector", [_BatchDownConnector(), _RejectConnector(_TRANSIENT)])
+async def test_drain_outbox_fails_transient_failure_past_window(db_pool, connector):
+    """Past the window a transient failure gives up, whatever the count."""
+    await _seed_outbox_row(db_pool, "temp-x", attempts=1, age_hours=7)
+
+    result = await ActivityEnvironment().run(TodoistActivities(db_pool=db_pool, connector=connector).drain_outbox)
+
+    assert result["failed"] == 1
+    row = await _outbox_row(db_pool, "temp-x")
+    assert row["status"] == "failed"
+    assert row["attempt_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_drain_outbox_fails_permanent_rejection_at_once(db_pool):
+    """A permanent per-command rejection fails on its first try, inside the window."""
+    connector = _RejectConnector({"error_tag": "ITEM_NOT_FOUND", "http_code": 404})
+    await _seed_outbox_row(db_pool, "temp-y", attempts=0, age_hours=0)
+
+    result = await ActivityEnvironment().run(TodoistActivities(db_pool=db_pool, connector=connector).drain_outbox)
+
+    assert result["failed"] == 1
+    assert (await _outbox_row(db_pool, "temp-y"))["status"] == "failed"
 
 
 @pytest.mark.asyncio

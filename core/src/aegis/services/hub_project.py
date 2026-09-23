@@ -505,11 +505,14 @@ async def _queue(
     every write is the whole description. Without it the newer block is dropped
     on the floor: the queue keeps the older command, while `block_hash` records
     the new one as written, so no later projection ever queues it again.
+
+    A re-arm restarts ``created_at`` too: it is the clock ``drain_outbox``
+    retries against, and an old row re-armed without it would fail at once.
     """
     await pool.execute(
         "INSERT INTO todoist_outbox (temp_id, command, status) VALUES ($1, $2, 'pending') "
         "ON CONFLICT (temp_id) DO UPDATE "
-        "SET command = EXCLUDED.command, status = 'pending', attempt_count = 0 "
+        "SET command = EXCLUDED.command, status = 'pending', attempt_count = 0, created_at = now() "
         + ("" if supersede else "WHERE todoist_outbox.status <> 'pending'"),
         temp_id,
         command,
