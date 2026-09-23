@@ -30,6 +30,12 @@ TYPE_B = "zzwd-type-b"
 SLUG_A = "zzwd-sched-a"
 PURPOSE_A = "zzwd-purpose-a"
 PURPOSE_B = "zzwd-purpose-b"
+PURPOSE_C = "zzwd-purpose-c"
+# Every llm_calls row here is on a `zzwd-` model, so another file's calls on a
+# real model can never be the neighbour or the later success a streak is
+# judged against (#660).
+MODEL = "zzwd-kimi"
+OTHER_MODEL = "zzwd-glm"
 
 
 async def _prep(db_pool):
@@ -43,7 +49,9 @@ async def _prep(db_pool):
             "UPDATE problems SET status = 'closed', closed_at = now() "
             "WHERE subject_kind = 'flow' AND subject LIKE '%zzwd-%' AND closed_at IS NULL"
         )
-        await conn.execute("DELETE FROM llm_calls WHERE purpose LIKE 'zzwd-%'")
+        await conn.execute(
+            "DELETE FROM llm_calls WHERE purpose LIKE 'zzwd-%' OR model LIKE 'zzwd-%'"
+        )
 
 
 async def _run_row(
@@ -88,7 +96,7 @@ async def _llm_row(
     status: str,
     minutes_ago: float,
     *,
-    model: str = "kimi-k2.5",
+    model: str = MODEL,
     error: str | None = "truncated: empty content",
 ):
     async with db_pool.acquire() as conn:
@@ -500,7 +508,7 @@ async def test_a_purpose_that_never_succeeds_is_reported(db_pool):
     assert hit["kind"] == "llm_dead"
     assert hit["calls"] == 2, "the streak is judged, so `calls` is the streak length"
     assert hit["errors"] == 2
-    assert hit["model"] == "kimi-k2.5"
+    assert hit["model"] == MODEL
     assert (hit["consecutive"], hit["staleness_hours"]) == (2, 720)
 
 
@@ -642,6 +650,77 @@ async def test_a_longer_streak_can_be_demanded_and_is_satisfiable(db_pool):
     # ...and one more than the streak is honestly not a match.
     found = await ActivityEnvironment().run(_acts(db_pool).find_dead_llm_purposes, 5, 720)
     assert PURPOSE_A not in {f["purpose"] for f in found}
+
+
+CONN = "APIConnectionError: Connection error."
+
+
+async def _outage_streak(db_pool, *, model: str = MODEL):
+    """The 2026-09-20 shape: the backend goes dark for every purpose, and a
+    sparse purpose's last two calls land inside it."""
+    await _llm_row(db_pool, PURPOSE_B, "success", 60 * 24 * 5, model=model, error=None)
+    await _llm_row(db_pool, PURPOSE_B, "error", 60 * 24 * 4 + 5, model=model, error=CONN)
+    await _llm_row(db_pool, PURPOSE_A, "error", 60 * 24 * 4 + 3, error=CONN)
+    await _llm_row(db_pool, PURPOSE_A, "error", 60 * 24 * 4 + 2, error=CONN)
+    await _llm_row(db_pool, PURPOSE_B, "error", 60 * 24 * 4, model=model, error=CONN)
+
+
+@pytest.mark.asyncio
+async def test_an_outage_streak_clears_once_its_model_works_again(db_pool):
+    """#660. The streak was the backend: every purpose on the model failed
+    around it, and the model has answered since. It is not a dead purpose,
+    however long the purpose itself goes without being called."""
+    await _prep(db_pool)
+    await _outage_streak(db_pool)
+    await _llm_row(db_pool, PURPOSE_B, "success", 60 * 24 * 3, error=None)
+
+    found = await ActivityEnvironment().run(_acts(db_pool).find_dead_llm_purposes)
+
+    assert PURPOSE_A not in {f["purpose"] for f in found}
+
+
+@pytest.mark.asyncio
+async def test_an_outage_streak_still_fires_while_its_model_is_dark(db_pool):
+    """Nothing has succeeded on the model since, so nothing has proven the
+    backend back. The streak still counts."""
+    await _prep(db_pool)
+    await _outage_streak(db_pool)
+    await _llm_row(db_pool, PURPOSE_B, "error", 60 * 24 * 3, error=CONN)
+
+    found = await ActivityEnvironment().run(_acts(db_pool).find_dead_llm_purposes)
+
+    assert PURPOSE_A in {f["purpose"] for f in found}
+
+
+@pytest.mark.asyncio
+async def test_a_success_on_another_model_does_not_clear_an_outage_streak(db_pool):
+    """Only the streak's own model can prove its backend. Other purposes
+    working on a different model say nothing about this one."""
+    await _prep(db_pool)
+    await _outage_streak(db_pool)
+    await _llm_row(db_pool, PURPOSE_B, "error", 60 * 24 * 3, error=CONN)
+    await _llm_row(db_pool, PURPOSE_C, "success", 60 * 24 * 2, model=OTHER_MODEL, error=None)
+
+    found = await ActivityEnvironment().run(_acts(db_pool).find_dead_llm_purposes)
+
+    assert PURPOSE_A in {f["purpose"] for f in found}
+
+
+@pytest.mark.asyncio
+async def test_a_purpose_broken_on_a_working_model_still_fires(db_pool):
+    """The case #660 must not excuse: a token floor or an overflowing prompt.
+    The model answers other purposes before, between and after the streak,
+    so a later success on it proves nothing about this purpose."""
+    await _prep(db_pool)
+    await _llm_row(db_pool, PURPOSE_B, "success", 60 * 24 * 12, error=None)
+    await _llm_row(db_pool, PURPOSE_A, "error", 60 * 24 * 11)
+    await _llm_row(db_pool, PURPOSE_B, "success", 60 * 24 * 6, error=None)
+    await _llm_row(db_pool, PURPOSE_A, "error", 60 * 24 * 5)
+    await _llm_row(db_pool, PURPOSE_B, "success", 60 * 24 * 4, error=None)
+
+    found = await ActivityEnvironment().run(_acts(db_pool).find_dead_llm_purposes)
+
+    assert PURPOSE_A in {f["purpose"] for f in found}
 
 
 @pytest.mark.asyncio
