@@ -26,15 +26,19 @@ NOW = datetime(2026, 9, 12, 9, 0, tzinfo=UTC)
 
 @pytest.fixture
 def todoist(monkeypatch):
-    state = {"batches": []}
+    state = {"batches": [], "deleted": set()}
 
     async def fake_commands(self, commands):
         state["batches"].append(commands)
         mapping = {c["temp_id"]: f"T{uuid.uuid4().hex[:10]}" for c in commands if "temp_id" in c}
-        return {
-            "ok": True,
-            "data": {"sync_status": {c["uuid"]: "ok" for c in commands}, "temp_id_mapping": mapping},
+        # A task a person deleted: Todoist refuses a note on it for good.
+        sync_status = {
+            c["uuid"]: {"error_code": 22, "error_tag": "ITEM_NOT_FOUND", "http_code": 400}
+            if c["type"] == "note_add" and c["args"]["item_id"] in state["deleted"]
+            else "ok"
+            for c in commands
         }
+        return {"ok": True, "data": {"sync_status": sync_status, "temp_id_mapping": mapping}}
 
     async def fake_key(pool, settings):
         return "test-key"
@@ -226,6 +230,31 @@ async def test_completing_a_topic_task_closes_the_round_and_the_next_item_starts
     )
     fresh = await research_topics.live_problem(world, research_topics.Topic(name, ("alpha",)))
     assert fresh is not None and fresh["id"] != pid and fresh["todoist_task_id"] is None
+
+
+async def test_deleting_a_topic_task_closes_the_round_like_completing_it(world, todoist):
+    """#659: a deleted topic task means "seen", as a completed one does. The
+    round resolves and closes, instead of noting the dead task every five
+    minutes for ever.
+
+    Falsifiable: drop the `_TASK_GONE` branch in `project` and the round stays
+    open behind a watermark that never moves.
+    """
+    name = _name()
+    pid = (await research_topics.track(world, name, ["alpha"], "high", now=NOW))["problem_id"]
+    await research_topics.attach_items(
+        world, [_item(n, "alpha") for n in range(2)], origin="intel:hn", now=NOW
+    )
+    task_id = (await get_problem(world, pid))["todoist_task_id"]
+    todoist["deleted"].add(task_id)
+    await research_topics.attach_items(
+        world, [_item(9, "alpha")], origin="rss", now=NOW + timedelta(hours=1)
+    )
+    out = await project(world, pid, now=NOW + timedelta(hours=1))
+    assert out.get("task_gone") is True
+    p = await get_problem(world, pid)
+    assert p["status"] == "closed" and p["closed_at"] is not None
+    assert pid not in {r["problem_id"] for r in await project_pending(world, now=NOW)}
 
 
 # --- owners, groups, digest ----------------------------------------------------

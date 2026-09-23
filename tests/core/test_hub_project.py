@@ -70,10 +70,14 @@ def _resolved(subject: str, n: int) -> Event:
     )
 
 
+# What Todoist's Sync API answers for a command on a task that no longer exists.
+_ITEM_NOT_FOUND = {"error_code": 22, "error": "Item not found", "error_tag": "ITEM_NOT_FOUND", "http_code": 400}
+
+
 @pytest.fixture
 def todoist(monkeypatch):
     """Record every Sync command; accept them all; mint an id per item_add."""
-    state = {"batches": [], "fail_notes": False, "fail_adds": False}
+    state = {"batches": [], "fail_notes": False, "fail_adds": False, "deleted": set()}
 
     async def fake_commands(self, commands):
         state["batches"].append(commands)
@@ -82,10 +86,14 @@ def todoist(monkeypatch):
         if state["fail_adds"] and any(c["type"] == "item_add" for c in commands):
             return {"ok": False, "error": "503", "retryable": True}
         mapping = {c["temp_id"]: f"T{uuid.uuid4().hex[:10]}" for c in commands if "temp_id" in c}
-        return {
-            "ok": True,
-            "data": {"sync_status": {c["uuid"]: "ok" for c in commands}, "temp_id_mapping": mapping},
+        # A task a person deleted: Todoist refuses a note on it for good.
+        sync_status = {
+            c["uuid"]: _ITEM_NOT_FOUND
+            if c["type"] == "note_add" and c["args"]["item_id"] in state["deleted"]
+            else "ok"
+            for c in commands
         }
+        return {"ok": True, "data": {"sync_status": sync_status, "temp_id_mapping": mapping}}
 
     async def fake_key(pool, settings):
         return "test-key"
@@ -935,6 +943,73 @@ async def test_a_task_a_person_completes_resolves_its_problem(db_pool, inbox, to
 
     # A second sweep finds nothing left to do.
     assert r.problem_id not in await _resolved_by_task(db_pool, later)
+
+
+async def test_a_task_a_person_deleted_resolves_its_problem_and_is_unlinked(
+    db_pool, inbox, todoist
+):
+    """#659: prod had problems whose task a person had deleted. Todoist
+    answered every note with ITEM_NOT_FOUND, the projector kept its watermark,
+    and the sweep tried again every five minutes for ever.
+
+    Falsifiable: drop the `_TASK_GONE` branch in `project` and the second
+    sweep posts the same note to the dead task again.
+    """
+    s = _subject()
+    r = await ingest_event(db_pool, _occ(s, 1), now=NOW)
+    task = (await project(db_pool, r.problem_id, now=NOW))["task_id"]
+    await _mirror_task(db_pool, task)
+    todoist["deleted"].add(task)
+    await ingest_event(db_pool, _occ(s, 2), now=NOW)
+
+    out = await project(db_pool, r.problem_id, now=NOW + timedelta(minutes=5))
+    assert out["task_gone"] is True
+    p = await get_problem(db_pool, r.problem_id)
+    assert p["status"] == "resolved" and p["todoist_task_id"] is None
+    change = [e for e in await list_events(db_pool, r.problem_id) if e["kind"] == "state_change"][0]
+    assert change["payload"]["reason"] == hub_project.TASK_DELETED_REASON
+
+    # The next sweep has nothing to say to the dead task.
+    await project(db_pool, r.problem_id, now=NOW + timedelta(minutes=10))
+    assert len(_notes_on(todoist, task)) == 1
+
+    # If the fault comes back, the problem reopens and gets a fresh task.
+    await ingest_event(db_pool, _occ(s, 20), now=NOW + timedelta(minutes=20))
+    out = await project(db_pool, r.problem_id, now=NOW + timedelta(minutes=20))
+    assert out["created"] is True and out["task_id"] != task
+
+
+async def test_a_transient_note_failure_still_retries(db_pool, inbox, todoist):
+    """A 5xx rejection is not a deleted task: the watermark stays and the
+    task stays linked."""
+    s = _subject()
+    r = await ingest_event(db_pool, _occ(s, 1), now=NOW)
+    task = (await project(db_pool, r.problem_id, now=NOW))["task_id"]
+    await _mirror_task(db_pool, task)
+    await ingest_event(db_pool, _occ(s, 2), now=NOW)
+    todoist["fail_notes"] = True
+    out = await project(db_pool, r.problem_id, now=NOW + timedelta(minutes=5))
+    assert out.get("partial") is True
+    p = await get_problem(db_pool, r.problem_id)
+    assert p["status"] == "open" and p["todoist_task_id"] == task
+
+
+async def test_retiring_a_task_still_in_the_outbox_posts_no_note(db_pool, inbox, todoist):
+    """#659: `item-…` is an outbox temp id, not a Todoist task, so a note on
+    it can only fail. Once the drain commits it, the real id gets the note."""
+    temp = f"item-{uuid.uuid4().hex[:8]}"
+    await hub_project.retire_task(db_pool, temp, "Merged away.")
+    assert not [c for c in _cmds(todoist, "note_add") if c["args"]["item_id"] == temp]
+
+    real = f"T{uuid.uuid4().hex[:10]}"
+    await db_pool.execute(
+        "INSERT INTO todoist_outbox (temp_id, command, status, committed_id) "
+        "VALUES ($1, '{}'::jsonb, 'committed', $2)",
+        temp,
+        real,
+    )
+    await hub_project.retire_task(db_pool, temp, "Merged away.")
+    assert _notes_on(todoist, real) == ["Merged away."]
 
 
 async def test_a_problem_that_comes_back_after_a_person_completed_it_reopens_the_task(
