@@ -247,6 +247,23 @@ class Check:
     problems: tuple[str, ...]
 
 
+def market_days(index_bars: list[Bar], today: date) -> list[date]:
+    """The sessions the market has completed, read off the calendar index's bars.
+
+    A day counts when it has a close, or when it is before ``today`` and has an
+    open. Yahoo sometimes serves a day the market plainly traded with both
+    fields null, even a day later, while the desk kept that day's open from its
+    own post-open run. An open is proof the session happened, and once the day
+    is over it has ended, so it is a market day whatever Yahoo says now (#667).
+
+    Today still needs a close. With an open alone it has not ended, has no
+    decisions yet, and must never become the day the desk plans."""
+    return [
+        b.day for b in index_bars
+        if b.close is not None or (b.open is not None and b.day < today)
+    ]
+
+
 def last_trading_day(index_days: list[date], today: date) -> date | None:
     """The latest market day strictly before ``today``, from the index's bars."""
     before = [d for d in index_days if d < today]
