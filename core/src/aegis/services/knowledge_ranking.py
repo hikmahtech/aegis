@@ -209,3 +209,47 @@ async def save_ranking_config(pool: Any, value: Any) -> dict:
 async def get_ranking(pool: Any) -> Ranking:
     """The effective ranking. Never raises: an unreadable row is the defaults."""
     return Ranking.from_config(await ROW.get(pool))
+
+
+def apply_decay(items: list[dict], ranking: Ranking | None = None) -> list[dict]:
+    """Apply time-based decay to knowledge items based on source type.
+
+    When days_since_referenced is unknown, assume item is fresh (0 days).
+    Decay is only meaningful when age data is available from the knowledge store.
+    `ranking` carries the per-type decay window and rank boost — the
+    `knowledge_ranking` row over the registry; None is the registry alone.
+    """
+    ranking = ranking or DEFAULT_RANKING
+    for item in items:
+        source_type = item.get("source_type", "unknown")
+        decay_window = ranking.decay_days(source_type)
+        # Default to 0 (fresh) when age is unknown — don't penalize items without age data
+        days = item.get("days_since_referenced", 0)
+        decay_factor = max(0.1, 1.0 - (days / decay_window))
+        # Start from the domain-boosted `_score` when the caller set one, so
+        # the boost reaches the threshold and the order (#579); else from
+        # similarity, which can be None (BM25-only chunks) and is coerced. The
+        # rank boost is 1.0 for every type but the user's own notes, which rank
+        # above raw documents (#514), unless the row says otherwise.
+        base = item["_score"] if item.get("_score") is not None else (item.get("similarity") or 0)
+        item["effective_score"] = base * decay_factor * ranking.rank_boost(source_type)
+    return items
+
+
+def score(
+    items: list[dict], ranking: Ranking | None = None, domains: list[str] | None = None
+) -> list[dict]:
+    """Set each item's `effective_score`: `(similarity + domain boost) * decay * rank boost`.
+
+    The agent's own `domains` (its `metadata.knowledge_domains`) get
+    `ranking.domain_boost`. Chat injection and `KnowledgeStore.ask` both rank
+    through here, so an agent's boost means the same thing in both.
+    """
+    ranking = ranking or DEFAULT_RANKING
+    own = set(domains or [])
+    for r in items:
+        boost = ranking.domain_boost if r.get("source_type") in own else 0.0
+        r["_score"] = (r.get("similarity") or 0) + boost
+    # Decay starts from `_score`, so `effective_score` carries the boost into
+    # the threshold and the sort (#579).
+    return apply_decay(items, ranking)

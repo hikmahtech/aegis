@@ -279,3 +279,66 @@ async def test_search_dedupes_nearest_chunk_orders_by_similarity_and_filters(sto
     scoped = await store.search(query, limit=5, content_id=near_id)
     assert len(scoped) == 1
     assert scoped[0]["content"] == "near-exact-chunk"
+
+
+async def _two_docs_for_662(db_pool):
+    """Two docs under a tag of their own: `near` (article, similarity 1.0 to
+    "Q") and `mid` (reportX, ~0.447), with `mid` ingested 40 days ago."""
+    near_id, mid_id = "test-662-near", "test-662-mid"
+    await _insert_content(db_pool, near_id, "aegis://test/662-near", "Near", "article", ["t662"])
+    await _insert_content(db_pool, mid_id, "aegis://test/662-mid", "Mid", "reportX", ["t662"])
+    await _insert_chunk(db_pool, near_id, 0, "near-chunk", _vec_for("Q"))
+    await _insert_chunk(db_pool, mid_id, 0, "mid-chunk", _unit_at(1))
+    await db_pool.execute(
+        "UPDATE knowledge_content SET ingested_at = now() - interval '40 days' "
+        "WHERE content_id = $1",
+        mid_id,
+    )
+    return near_id, mid_id
+
+
+async def test_search_since_days_keeps_only_recent_documents(store, db_pool):
+    """#662: `since_days` filters on ingested_at; leaving it out changes nothing."""
+    near_id, mid_id = await _two_docs_for_662(db_pool)
+
+    def ids(hits):
+        return [h["content_id"] for h in hits]
+
+    assert ids(await store.search("Q", limit=10, tags=["t662"])) == [near_id, mid_id]
+    assert ids(await store.search("Q", limit=10, tags=["t662"], since_days=30)) == [near_id]
+    assert ids(await store.search("Q", limit=10, tags=["t662"], since_days=60)) == [near_id, mid_id]
+
+    answer = await store.ask("Q", tags=["t662"], since_days=30)
+    assert [s["url"] for s in answer["sources"]] == ["aegis://test/662-near"]
+
+
+async def test_ask_ranks_with_the_agents_domains_and_cites_type_and_date(store, db_pool):
+    """#662: given a ranking, ask orders sources the way chat injection does,
+    so the agent's own domain can outrank a closer document. Without one it
+    keeps raw similarity order, as the admin page always had."""
+    from aegis.services.knowledge_ranking import Ranking
+
+    await _two_docs_for_662(db_pool)
+
+    plain = await store.ask("Q", max_sources=1, tags=["t662"])
+    assert [s["title"] for s in plain["sources"]] == ["Near"]
+
+    ranked = await store.ask(
+        "Q",
+        max_sources=1,
+        tags=["t662"],
+        ranking=Ranking(domain_boost=1.0),
+        knowledge_domains=["reportX"],
+    )
+    assert [s["title"] for s in ranked["sources"]] == ["Mid"]
+    src = ranked["sources"][0]
+    assert src["source_type"] == "reportX"
+    assert src["url"] == "aegis://test/662-mid"
+    assert isinstance(src["date"], str) and src["date"]
+    assert src["similarity"] == pytest.approx(0.4472136, abs=1e-6)
+
+
+async def test_ask_with_no_matching_documents_is_empty(store, db_pool):
+    await _two_docs_for_662(db_pool)
+    out = await store.ask("Q", tags=["t662"], source_type="nothing-of-this-type")
+    assert out == {"answer": "", "sources": [], "confidence": 0.0}

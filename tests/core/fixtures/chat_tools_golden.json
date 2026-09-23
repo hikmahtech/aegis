@@ -27,13 +27,28 @@
     "type": "function",
     "function": {
       "name": "ask_knowledge",
-      "description": "Ask a question and get a synthesized answer from the knowledge base with sources and confidence scores.",
+      "description": "Get a short answer to a factual question from the knowledge base, written from the best few documents and citing them as [n], with each source's title, url, source_type and date. Use this when you want a fact or a summary (what did the bank mail say about the card limit, what did last week's meeting decide). Use search_knowledge instead to browse, or when you need the documents themselves. Narrow the question with source_type, tags or since_days: the store is mostly research papers, so an unfiltered question about mail or meetings can miss. If answered is false, nothing in the knowledge base matched.",
       "parameters": {
         "type": "object",
         "properties": {
           "question": {
             "type": "string",
-            "description": "Natural language question"
+            "description": "The question, in plain words"
+          },
+          "source_type": {
+            "type": "string",
+            "description": "Only documents of this type, e.g. email, meeting, note, research, chat"
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Only documents carrying at least one of these tags"
+          },
+          "since_days": {
+            "type": "integer",
+            "description": "Only documents added in the last this many days"
           }
         },
         "required": [

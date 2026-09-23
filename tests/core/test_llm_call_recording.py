@@ -325,6 +325,12 @@ async def test_knowledge_ask_records_its_call(pool):
         rows = await _rows(pool, "knowledge_ask")
         assert len(rows) == 1, f"expected one knowledge_ask row, got {len(rows)}"
         assert rows[0]["status"] == "success"
+        assert rows[0]["agent_id"] is None  # the admin page asks as nobody
+
+        # #662: the chat tool passes the calling agent, and the row carries it.
+        await store.ask("how many nodes?", agent_id="raphael")
+        rows = await _rows(pool, "knowledge_ask")
+        assert sorted(r["agent_id"] or "" for r in rows) == ["", "raphael"]
     finally:
         await pool.execute("DELETE FROM knowledge_chunks WHERE content_id = $1", content_id)
         await pool.execute("DELETE FROM knowledge_content WHERE content_id = $1", content_id)

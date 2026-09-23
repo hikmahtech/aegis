@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from aegis.services.knowledge_ranking import Ranking, score
 from aegis.services.source_types import warn_if_unknown
 
 if TYPE_CHECKING:
@@ -205,8 +206,11 @@ class KnowledgeStore:
         source_type: str | None = None,
         tags: list[str] | None = None,
         content_id: str | None = None,
+        since_days: int | None = None,
     ) -> list[dict]:
         """Semantic search over ingested content. One best chunk per document.
+
+        `since_days` keeps only documents ingested in the last that many days.
 
         Two-stage "ANN candidates, then filter" (the standard pgvector
         pattern): an inner subquery orders by raw vector distance and takes
@@ -263,13 +267,15 @@ class KnowledgeStore:
                 JOIN knowledge_content c ON c.content_id = cand.content_id
                 WHERE ($2::text IS NULL OR c.source_type = $2)
                   AND ($4::text[] IS NULL OR c.tags && $4::text[])
+                  AND ($7::int IS NULL
+                       OR c.ingested_at >= now() - make_interval(days => $7::int))
                 ORDER BY c.content_id, cand.dist
             ) s
             ORDER BY s.similarity DESC
             LIMIT $5
             """,
             _vec_literal(qvec), source_type, content_id,
-            list(tags) if tags else None, limit, oversample,
+            list(tags) if tags else None, limit, oversample, since_days,
         )
         return [self._row_to_result(r) for r in rows]
 
@@ -291,8 +297,21 @@ class KnowledgeStore:
         question: str,
         max_sources: int = 5,
         min_confidence: float = 0.0,
+        *,
+        source_type: str | None = None,
+        tags: list[str] | None = None,
+        since_days: int | None = None,
+        ranking: Ranking | None = None,
+        knowledge_domains: list[str] | None = None,
+        agent_id: str | None = None,
     ) -> dict:
         """RAG: retrieve top sources, synthesize an answer.
+
+        `source_type`, `tags` and `since_days` narrow the search. With a
+        `ranking` (the calling agent's), sources are ordered the way chat
+        injection orders them (`knowledge_ranking.score`: the agent's
+        `knowledge_domains` boosted); without one, by raw similarity, as the
+        admin page has always had them. `agent_id` goes on the `llm_calls` row.
 
         The answer model is the `knowledge_ask` route in `config/models.yaml`
         (category `write`), NOT the tier map and NOT `think()`'s default.
@@ -300,8 +319,19 @@ class KnowledgeStore:
         stay on whatever embedded `knowledge_chunks` — the stored vectors
         and the query vector have to come from one model.
         """
-        sources = await self.search(question, limit=max_sources)
-        sources = [s for s in sources if s.get("similarity", 0) >= min_confidence]
+        sources = await self.search(
+            question,
+            # Ranked: pull a wider pool so a boosted domain can move up into it.
+            limit=max_sources * 3 if ranking is not None else max_sources,
+            source_type=source_type,
+            tags=tags,
+            since_days=since_days,
+        )
+        sources = [s for s in sources if (s.get("similarity") or 0) >= min_confidence]
+        if ranking is not None:
+            score(sources, ranking, knowledge_domains)
+            sources.sort(key=lambda s: s["effective_score"], reverse=True)
+            sources = sources[:max_sources]
         if not sources:
             return {"answer": "", "sources": [], "confidence": 0.0}
         context = "\n\n".join(
@@ -313,11 +343,19 @@ class KnowledgeStore:
             f"If the sources don't answer it, say so.\n\n"
             f"SOURCES:\n{context}\n\nQUESTION: {question}"
         )
-        result = await self._llm.think(prompt, max_tokens=1000, db_pool=self._pool, purpose="knowledge_ask")
+        result = await self._llm.think(
+            prompt, max_tokens=1000, db_pool=self._pool, purpose="knowledge_ask", agent_id=agent_id
+        )
         return {
             "answer": result.get("response", ""),
             "sources": [
-                {"title": s.get("title"), "url": s.get("url"), "similarity": s.get("similarity")}
+                {
+                    "title": s.get("title"),
+                    "url": s.get("url"),
+                    "source_type": s.get("source_type"),
+                    "date": s.get("ingested_at"),
+                    "similarity": s.get("similarity"),
+                }
                 for s in sources
             ],
             "confidence": max((s.get("similarity", 0.0) for s in sources), default=0.0),
