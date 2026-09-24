@@ -115,7 +115,10 @@ export function LineChart({
           </g>
         ))}
         {zero && <line x1={PAD.left} x2={PAD.left + w} y1={y(0)} y2={y(0)} className="chart-zero" />}
-        {labels.map((l, i) => (i % every === 0 || i === labels.length - 1) && (
+        {/* Every `every`-th label plus the last, but never one too close to the
+            last: with 8 labels at every=3, "Sep 23" and "Sep 24" printed on top
+            of each other. */}
+        {labels.map((l, i) => (i === labels.length - 1 || (i % every === 0 && labels.length - 1 - i >= every)) && (
           <text key={l + i} x={x(i)} y={height - 6} className="chart-axis"
             textAnchor={i === labels.length - 1 && labels.length > 1 ? 'end' : 'middle'}>{l}</text>
         ))}
