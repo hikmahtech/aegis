@@ -834,3 +834,44 @@ button { font-family: inherit; }
 .login-card input { width: 100%; padding: 0.6rem 0.75rem; font-size: var(--fs-base); }
 .login-card .btn { padding: 0.6rem 0.85rem; font-size: var(--fs-base); margin-top: 0.2rem; }
 .login-error { background: var(--danger-tint); color: var(--danger-text); border: 1px solid var(--danger); border-radius: var(--radius-sm); padding: 0.55rem 0.75rem; font-size: var(--fs-sm); }
+
+/* ── Charts (components/charts.tsx) ─────────────────────────────────────── */
+.chart { position: relative; width: 100%; }
+.chart svg { display: block; touch-action: pan-y; }
+.chart-grid { stroke: var(--border); stroke-width: 1; }
+.chart-zero { stroke: var(--border-strong); stroke-width: 1; }
+.chart-cross { stroke: var(--text-subtle); stroke-width: 1; stroke-dasharray: 3 3; }
+.chart-band { fill: var(--surface-3); opacity: 0.6; }
+.chart-axis { fill: var(--text-muted); font-size: 11px; font-family: var(--mono); }
+.chart-tip { position: absolute; top: 8px; pointer-events: none; background: var(--surface); border: 1px solid var(--border-strong); border-radius: var(--radius-sm); box-shadow: var(--shadow-md); padding: 0.45rem 0.6rem; font-size: var(--fs-xs); min-width: 150px; z-index: 2; }
+.chart-tip div { display: flex; align-items: center; gap: 6px; margin-top: 3px; }
+.chart-tip div span { margin-left: auto; padding-left: 10px; }
+.chart-tip i, .chart-legend i.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; }
+.chart-legend { display: flex; flex-wrap: wrap; gap: 0.4rem 1rem; font-size: var(--fs-xs); color: var(--text-muted); margin: 0.4rem 0 0.6rem; }
+.chart-legend span { display: inline-flex; align-items: center; gap: 6px; }
+.chart-legend i { display: inline-block; width: 16px; border-top: 2px solid; }
+.chart-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 0.9rem 1rem 0.6rem; margin-bottom: 1rem; }
+.chart-card h3 { margin: 0 0 0.15rem; font-size: var(--fs-md); }
+.chart-card .meta { font-size: var(--fs-xs); }
+.chart-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 1rem; }
+.chart-row .chart-card { margin-bottom: 0; }
+.hbars { display: flex; flex-direction: column; gap: 6px; }
+.hbar { display: grid; grid-template-columns: minmax(90px, 36%) 1fr auto; gap: 10px; align-items: center; font-size: var(--fs-sm); }
+.hbar-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-xs); }
+.hbar-track { height: 10px; background: var(--surface-3); border-radius: 5px; overflow: hidden; }
+.hbar-track span { display: block; height: 100%; border-radius: 5px; }
+.hbar-value { font-size: var(--fs-xs); text-align: right; white-space: nowrap; }
+.hbar-value em { color: var(--text-muted); font-style: normal; }
+.stackbar { display: flex; height: 14px; border-radius: 7px; overflow: hidden; background: var(--surface-3); margin-top: 0.4rem; }
+.stackbar span { display: block; height: 100%; }
+.stackbar span + span { border-left: 2px solid var(--surface); }
+.range-chips { display: inline-flex; gap: 4px; }
+.range-chips .btn { padding: 0.2rem 0.55rem; font-size: var(--fs-xs); }
+.tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--border); margin: 0 0 1.25rem; overflow-x: auto; scrollbar-width: none; }
+.tabs button { background: none; border: 0; border-bottom: 2px solid transparent; padding: 0.55rem 0.85rem; font: inherit; font-size: var(--fs-sm); color: var(--text-muted); cursor: pointer; white-space: nowrap; }
+.tabs button:hover { color: var(--text); }
+.tabs button.active { color: var(--text); border-bottom-color: var(--accent); font-weight: 600; }
+.tabs button .badge { margin-left: 6px; }
+.up { color: var(--success-text); }
+.down { color: var(--danger-text); }
+@media (max-width: 640px) { .hbar { grid-template-columns: 1fr auto; } .hbar-track { grid-column: 1 / -1; grid-row: 2; } }

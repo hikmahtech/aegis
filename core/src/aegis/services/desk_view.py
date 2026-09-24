@@ -247,3 +247,51 @@ async def history(pool: asyncpg.Pool, limit: int = HISTORY_DAYS) -> dict:
             for p in plans
         ],
     }
+
+
+async def series(pool: asyncpg.Pool) -> dict:
+    """The desk's value at every market day's close since its first fill, beside
+    the two benchmarks, for the page's return chart.
+
+    Built from exactly the calls `month_summary` scores with — `desk_series`
+    over `market_days`, and `benchmark_values` with the same cost on each side —
+    so the line on the chart ends at the figure the scorecard prints. Empty
+    before the first fill or with no calendar: there is no line to draw yet,
+    and a flat line at capital would read as a result.
+    """
+    rules = await trading_desk.load_rules(pool)
+    today = datetime.now(rules.tz()).date()
+    fills = await trading_desk._fills(pool)
+    out: dict = {
+        "capital": rules.capital,
+        "currency": rules.currency,
+        "benchmark": rules.benchmark,
+        "context": rules.context_benchmark,
+        "days": [],
+    }
+    if not fills or not rules.configured():
+        return out
+    benches = {s for s in (rules.benchmark, rules.context_benchmark) if s}
+    bars = await trading_desk._bars(
+        pool, rules, {f.symbol for f in fills} | {rules.calendar_symbol} | benches
+    )
+    start = fills[0].day
+    days = [d for d in desk_math.market_days(bars[rules.calendar_symbol], today) if d >= start]
+    desk = desk_math.desk_series(fills, bars, rules.capital, days)
+    bench = dict(desk_math.benchmark_values(
+        bars[rules.benchmark], rules.capital, rules.cost_pct_per_side, days
+    )) if rules.benchmark else {}
+    context = dict(desk_math.benchmark_values(
+        bars[rules.context_benchmark], rules.capital, 0.0, days
+    )) if rules.context_benchmark else {}
+    out["days"] = [
+        {
+            "day": d.isoformat(),
+            "value": _round(v),
+            "invested_pct": _round(w, 4),
+            "benchmark": _round(bench.get(d)),
+            "context": _round(context.get(d)),
+        }
+        for d, v, w in desk
+    ]
+    return out
