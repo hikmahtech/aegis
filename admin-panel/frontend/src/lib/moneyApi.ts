@@ -158,6 +158,8 @@ export type DeskPlan = {
   outcome: string;
   findings: DeskFinding[];
   skipped: string[];
+  /** What the plan did to the pipeline's weights, e.g. the target_exposure scaling. */
+  note: string | null;
   planned_at: string;
 };
 
@@ -367,7 +369,41 @@ export type MoneyDigest = { path: string; markdown: string };
 /** `digest` is null until a month has been closed. */
 export type MoneyDigestResponse = { digest: MoneyDigest | null };
 
+/** One market day's close: the desk and the same money in each benchmark. */
+export type DeskSeriesDay = {
+  day: string;
+  value: number;
+  invested_pct: number;
+  benchmark: number | null;
+  context: number | null;
+};
+
+export type DeskSeries = {
+  capital: number;
+  currency: string;
+  benchmark: string;
+  context: string;
+  /** Empty before the first fill. */
+  days: DeskSeriesDay[];
+};
+
+/** Money over time, as numbers for the charts. Income is positive here. */
+export type MoneyTrend = {
+  as_of: string;
+  home_currency: string;
+  home_symbol: string;
+  books_ok: boolean;
+  error: string | null;
+  months: { month: string; income: number; expenses: number; net: number; net_worth: number }[];
+  spend: { account: string; amount: number }[];
+  /** Amounts in a currency with no rate, left out of the numbers above. */
+  unconverted: string[];
+};
+
 export const moneyApi = {
+  trend: (months?: number) =>
+    apiFetch<MoneyTrend>(`/api/admin/money/trend${months ? `?months=${months}` : ''}`),
+  deskSeries: () => apiFetch<DeskSeries>('/api/admin/money/desk/series'),
   state: () => apiFetch<MoneyState>('/api/admin/money/state'),
   digest: () => apiFetch<MoneyDigestResponse>('/api/admin/money/digest'),
   runFlow: (flow: string) =>

@@ -27,14 +27,7 @@ import {
   type MoneyUnknowns,
 } from '../lib/moneyApi';
 
-type Tab = 'standing' | 'bills' | 'unexplained' | 'statements';
-
-const TABS: Array<[Tab, string]> = [
-  ['standing', 'Where it stands'],
-  ['bills', 'Bills'],
-  ['unexplained', 'Unexplained'],
-  ['statements', 'Statements'],
-];
+export type AccountingTab = 'standing' | 'bills' | 'unexplained' | 'statements';
 
 /**
  * One hledger report as a table. The balance cell is printed exactly as hledger
@@ -150,8 +143,11 @@ function DueTable({ rows, asOf, paid }: { rows: Due[]; asOf: string; paid?: bool
   );
 }
 
-export default function MoneyAccounting() {
-  const [tab, setTab] = useState<Tab>('standing');
+/**
+ * Renders the section for `tab`, and nothing for a tab it does not own. The
+ * parent keeps it mounted across tabs so the four reads happen once.
+ */
+export default function MoneyAccounting({ tab }: { tab: string }) {
   const [balances, setBalances] = useState<MoneyBalances | null>(null);
   const [dues, setDues] = useState<MoneyDues | null>(null);
   const [unknowns, setUnknowns] = useState<MoneyUnknowns | null>(null);
@@ -184,6 +180,7 @@ export default function MoneyAccounting() {
     return () => { live = false; };
   }, []);
 
+  if (!['standing', 'bills', 'unexplained', 'statements'].includes(tab)) return null;
   if (loading) return <div className="loading">Reading the books…</div>;
 
   const asOf = dues?.as_of ?? new Date().toISOString().slice(0, 10);
@@ -193,44 +190,35 @@ export default function MoneyAccounting() {
     <>
       {error && <div className="error">{error}</div>}
 
-      <div className="stats-bar">
-        <div className="stat-item">
-          <span className="stat-value">{dues?.open.length ?? '—'}</span>
-          <span className="stat-label">Bills to pay</span>
-        </div>
-        <div className="stat-item">
-          <span
-            className="stat-value"
-            style={dues?.overdue_count ? { color: 'var(--danger-text)' } : undefined}
-          >
-            {dues?.overdue_count ?? '—'}
-          </span>
-          <span className="stat-label">Overdue</span>
-        </div>
-        <div className="stat-item">
-          <span className="stat-value">{unknowns?.rows.length ?? '—'}</span>
-          <span className="stat-label">Unexplained · {unknowns?.days ?? 60}d</span>
-        </div>
-        <div className="stat-item">
-          <span className="stat-value">{unmatched || '—'}</span>
-          <span className="stat-label">Statement lines unmatched</span>
-        </div>
-      </div>
-
-      <div className="filter-bar" style={{ marginBottom: 14 }}>
-        {TABS.map(([key, label]) => (
-          <button
-            key={key}
-            className={`btn ${tab === key ? 'active' : ''}`}
-            onClick={() => setTab(key)}
-          >
-            {label}
-          </button>
-        ))}
-      </div>
-
       {tab === 'standing' && (
         <>
+          <div className="stats-bar">
+            <div className="stat-item">
+              <span className="stat-value">{dues?.open.length ?? '—'}</span>
+              <span className="stat-label">Bills to pay</span>
+            </div>
+            <div className="stat-item">
+              <span
+                className="stat-value"
+                style={dues?.overdue_count ? { color: 'var(--danger-text)' } : undefined}
+              >
+                {dues?.overdue_count ?? '—'}
+              </span>
+              <span className="stat-label">Overdue</span>
+            </div>
+            <div className="stat-item">
+              {/* The totals count the whole window; `rows` is capped for the table. */}
+              <span className="stat-value">
+                {unknowns ? unknowns.totals.reduce((n, t) => n + t.count, 0) : '—'}
+              </span>
+              <span className="stat-label">Unexplained · {unknowns?.days ?? 60}d</span>
+            </div>
+            <div className="stat-item">
+              <span className="stat-value">{unmatched || '—'}</span>
+              <span className="stat-label">Statement lines unmatched</span>
+            </div>
+          </div>
+
           {balances && !balances.books_ok && (
             <div
               style={{

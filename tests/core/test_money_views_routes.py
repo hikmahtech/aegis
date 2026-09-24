@@ -189,6 +189,46 @@ async def test_balances_read_the_real_journal(pool, tmp_path):
     assert body["month_start"] == date.today().replace(day=1).isoformat()
 
 
+def test_a_mixed_cell_charts_its_rupees_and_names_the_rest():
+    """A cell with a commodity `prices.journal` cannot convert has no true
+    single rupee figure. The chart plots the rupee part and names the rest,
+    and Indian grouping commas are not mistaken for the commodity separator."""
+    assert money_routes._home_amount("₹1,00,000.50", "₹") == (100_000.50, [])
+    assert money_routes._home_amount("₹ -785598.75", "₹") == (-785_598.75, [])
+    assert money_routes._home_amount("$ 200.00, ₹ 704371.93", "₹") == (704_371.93, ["$"])
+    assert money_routes._home_amount("0", "₹") == (0.0, [])
+
+
+@pytest.mark.skipif(not HAS_HLEDGER, reason="hledger not installed")
+async def test_trend_reads_the_real_journal(pool, tmp_path):
+    """Income comes back positive (the ledger's credit sign flipped for the
+    chart), spending positive, and net worth is assets plus liabilities."""
+    _journal(tmp_path / "books")
+    async with _client(pool, books_path=str(tmp_path / "books")) as c:
+        resp = await c.get("/api/admin/money/trend?months=3")
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["books_ok"] is True
+    # The journal starts this month, so the two empty months before it are
+    # dropped rather than charted as months of no income.
+    assert len(body["months"]) == 1
+    now = body["months"][-1]
+    assert now["income"] == pytest.approx(100_000.0)
+    assert now["expenses"] == pytest.approx(1_234.50)
+    assert now["net"] == pytest.approx(98_765.50)
+    assert now["net_worth"] == pytest.approx(98_765.50)
+    assert body["spend"] == [{"account": "expenses:food", "amount": 1234.5}]
+    assert body["unconverted"] == []
+
+
+async def test_trend_reports_a_missing_checkout_instead_of_a_500(client):
+    body = (await client.get("/api/admin/money/trend")).json()
+
+    assert body["books_ok"] is False and body["error"]
+    assert body["months"] == []
+
+
 # --------------------------------------------------------------------- the bills
 
 
@@ -516,6 +556,39 @@ async def test_desk_history_pairs_each_day_with_its_orders_and_its_reasons(clien
     assert days[traded.isoformat()]["orders"][0]["status"] == "filled"
     # Newest first, so the page opens on what just happened.
     assert body["days"][0]["data_date"] == traded.isoformat()
+
+
+async def test_desk_series_is_empty_before_the_first_fill(client, pool):
+    """No fill, no line: a flat line at capital would read as a result."""
+    body = (await client.get("/api/admin/money/desk/series")).json()
+
+    assert body["days"] == []
+    assert body["capital"] == 100_000.0
+
+
+async def test_desk_series_ends_at_the_figure_the_scorecard_prints(client, pool):
+    """The chart and the score are one computation. The last point of the
+    line is the month summary's value and benchmark value, to the rupee."""
+    bought, priced = date.today() - timedelta(days=3), date.today() - timedelta(days=1)
+    for day, px in ((bought, "1000.00"), (priced, "1100.00")):
+        await _price(pool, "TCS.NS", day, Decimal(px))
+        await _price(pool, "^NSEI", day, Decimal("25000.00"))
+        await _price(pool, "SHARIABEES.NS", day, Decimal("400.00"))
+    await _order(pool, bought, "TCS", "buy", 10, Decimal("1000.00"))
+
+    body = (await client.get("/api/admin/money/desk/series")).json()
+    first = date.today().replace(day=1)
+    score = await td.month_summary(pool, first, (first + timedelta(days=32)).replace(day=1))
+
+    assert [d["day"] for d in body["days"]] == [bought.isoformat(), priced.isoformat()]
+    last = body["days"][-1]
+    assert last["value"] == pytest.approx(100_990.0)
+    # Only meaningful when both days fall in this month, which is what the
+    # score covers; early in a month the bought day may be last month's.
+    if bought >= first:
+        assert last["value"] == score["value"]
+        assert last["benchmark"] == score["benchmark_value"]
+    assert last["invested_pct"] == pytest.approx(11_000.0 / 100_990.0, rel=1e-3)
 
 
 # --------------------------------------------- the desk's agent reads it too

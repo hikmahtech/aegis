@@ -313,6 +313,128 @@ async def money_balances(
     return out | {"standing": _balance_report(standing), "month": _balance_report(month)}
 
 
+def _home_amount(cell: str, symbol: str) -> tuple[float, list[str]]:
+    """A hledger cell as its home-currency number, plus any other commodity in it.
+
+    Charts need numbers where the tables above pass cells through verbatim. A
+    mixed cell (`"$ 200.00, ₹ 704371.93"`) has no true single rupee figure, so
+    the chart plots the rupee part and hands back the rest by name — the page
+    prints them under the chart rather than folding them in at a made-up rate.
+    Commodities are split on ", " (hledger's separator); the grouping commas
+    inside one amount are never followed by a space.
+    """
+    home, others = 0.0, []
+    for part in (p.strip() for p in cell.split(", ")):
+        if part.startswith(symbol):
+            home += float(part[len(symbol):].replace(",", "").replace(" ", "") or 0)
+        elif part.replace(".", "").replace("-", "").isdigit():
+            home += float(part)  # a bare "0": an empty month
+        elif part:
+            # The commodity alone ("$", "£", "USD"): the page names which
+            # currencies are missing a rate, not every amount in them.
+            others.append("".join(c for c in part if not (c.isdigit() or c in ".,- ")))
+    return home, others
+
+
+def _period_rows(text: str) -> tuple[list[str], dict[str, list[str]]]:
+    """A multi-period `hledger bal -O csv` report: its period headers, and each
+    row's cells by account (the total row under "Total:")."""
+    reader = list(csv.reader(io.StringIO(text)))
+    if not reader:
+        return [], {}
+    return reader[0][1:], {r[0].strip(): r[1:] for r in reader[1:] if r}
+
+
+@router.get("/trend")
+async def money_trend(
+    request: Request,
+    months: int = Query(12, ge=2, le=36),
+    settings: Settings = Depends(get_settings),
+) -> dict:
+    """Money over time, for the Money page's charts.
+
+    * `months`: each calendar month's income and spending, and net worth
+      (assets plus liabilities, `--historical`) at its end. Income is flipped
+      to a positive number here, because a chart of "money in" drawn below the
+      axis reads as a loss; the tables keep the ledger's own sign.
+    * `spend`: this month's spending by category, three levels deep, so an
+      entity's own tree (`expenses:hikmah:saas`) splits by category rather
+      than arriving as one bar for the whole business.
+    * `unconverted`: each currency `prices.journal` has no rate for. Its
+      amounts are left out of the numbers and the currency named, never guessed.
+
+    Months before the books' first posting are dropped: a year of zeros ahead
+    of the backfill's start would read as a year of no income.
+
+    Same failure shape as `/balances`: a missing or refused checkout is
+    `books_ok: false`, not a 500.
+    """
+    cfg = books.config_from_settings(settings)
+    symbol = _home_symbol(settings)
+    today = date.today()
+    first = today.replace(day=1)
+    for _ in range(months - 1):
+        first = (first - timedelta(days=1)).replace(day=1)
+    end = (today + timedelta(days=1)).isoformat()
+    window = ["-M", "-b", first.isoformat(), "-e", end, "--depth", "1", "-X", symbol]
+    out: dict[str, Any] = {
+        "as_of": today.isoformat(),
+        "home_currency": getattr(settings, "home_currency", "INR"),
+        "home_symbol": symbol,
+        "books_ok": True,
+        "error": None,
+        "months": [],
+        "spend": [],
+        "unconverted": [],
+    }
+    try:
+        flows = await books.run_hledger(["bal", *window, "income", "expenses"], cfg, output_format="csv")
+        worth = await books.run_hledger(
+            ["bal", *window, "--historical", "assets", "liabilities"], cfg, output_format="csv"
+        )
+        spend = await books.run_hledger(
+            ["bal", "-X", symbol, "-b", today.replace(day=1).isoformat(), "-e", end,
+             "expenses", "--depth", "3"],
+            cfg,
+            output_format="csv",
+        )
+    except books.BooksError as exc:
+        logger.warning("money_trend_unavailable error=%s", error_text(exc))
+        return out | {"books_ok": False, "error": error_text(exc, 300)}
+
+    unconverted: set[str] = set()
+
+    def num(cell: str) -> float:
+        v, others = _home_amount(cell, symbol)
+        unconverted.update(others)
+        return round(v, 2)
+
+    periods, flow_rows = _period_rows(flows)
+    _, worth_rows = _period_rows(worth)
+    blank = ["0"] * len(periods)
+    for i, period in enumerate(periods):
+        income = 0.0 - num(flow_rows.get("income", blank)[i])  # 0.0 - : never "-0.0"
+        expenses = num(flow_rows.get("expenses", blank)[i])
+        net_worth = num(worth_rows.get("Total:", blank)[i])
+        if not out["months"] and not (income or expenses or net_worth):
+            continue
+        out["months"].append({
+            "month": period,
+            "income": income,
+            "expenses": expenses,
+            "net": round(income - expenses, 2),
+            "net_worth": net_worth,
+        })
+    # Sorted here on the home-currency figure: hledger's --sort-amount orders
+    # a mixed cell by its first commodity, which puts a $5 row above ₹1 lakh.
+    out["spend"] = sorted(
+        ({"account": r["account"], "amount": num(r["balance"])} for r in _balance_report(spend)["rows"]),
+        key=lambda r: -r["amount"],
+    )
+    out["unconverted"] = sorted(unconverted)
+    return out
+
+
 def _due(row) -> dict:
     """One bill, JSON-safe. The amount stays the ledger's own string."""
     return {
@@ -582,6 +704,13 @@ async def desk_history(
     """Each decision date the desk acted on, with the orders it wrote
     (`desk_view.history`)."""
     return await desk_view.history(request.app.state.db_pool, limit)
+
+
+@router.get("/desk/series")
+async def desk_series(request: Request) -> dict:
+    """The desk's daily value beside its benchmarks, for the return chart
+    (`desk_view.series`)."""
+    return await desk_view.series(request.app.state.db_pool)
 
 
 settings_row_routes(
