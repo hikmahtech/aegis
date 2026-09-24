@@ -667,6 +667,7 @@ async def _tick(
             )
         orders: list[dm.Order] = []
         skipped: list[str] = []
+        note = None
         if check.outcome in ("ok", "flatten"):
             # A name whose price has gone stale is left out of the sizing, so
             # plan_orders reports it rather than sizing or selling on an old
@@ -695,11 +696,17 @@ async def _tick(
             # On a flatten ``check.rows`` is empty, so every holding is a name
             # with no target: plan_orders sizes each as the full exit it already
             # knows how to size, and there is nothing left to buy.
+            rows = dm.scale_to_exposure(check.rows, rules) if check.outcome == "ok" else check.rows
+            if rows is not check.rows:
+                before, after = sum(r.target_weight for r in check.rows), sum(r.target_weight for r in rows)
+                note = (
+                    f"Weights scaled from {before:.1%} to {after:.1%} of the portfolio "
+                    f"(target_exposure {rules.target_exposure:.0%}, at most {rules.max_order_pct:.0%} a name)."
+                )
             orders, skipped = dm.plan_orders(
-                check.rows, book, closes, rules,
+                rows, book, closes, rules,
                 frozen=frozenset(o["symbol"] for o in open_orders), cash_reserved=reserved,
             )
-        note = None
         if check.outcome == "flatten":
             outcome = "flattened"
             note = str((halt or {}).get("reason") or "").strip() or (

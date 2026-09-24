@@ -188,6 +188,9 @@ activities:
       band_abs: 0.02
       band_rel: 0.25
       max_order_pct: 0.25
+      # The share of capital to invest, e.g. 1.0. Unset follows the pipeline's
+      # own weights (its heat cap, less any class this desk does not trade).
+      # target_exposure: 1.0
       # --- the tax model ---
       tax_rate: {equity: 0.20, etf: 0.30}
       long_term_rate: 0.125

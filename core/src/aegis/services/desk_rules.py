@@ -10,7 +10,8 @@ This module owns the small, checked write path behind the admin Trading desk
 page. Two things it deliberately is not:
 
 * **Not a general config editor.** It touches only the settings that used to be
-  Python constants — the market, the money, the tax model and the benchmarks.
+  Python constants — the market, the money, the tax model and the benchmarks —
+  plus `target_exposure`, how much of the money the desk puts to work.
   Every other knob in that row (the trading bands, the order cap, the asset
   classes, the benchmark price mappings) is left alone by a save, and the admin
   Flows page still edits the row as raw JSON for anyone who needs one of those.
@@ -45,6 +46,7 @@ EDITABLE = (
     "stale_calendar_days",
     "stale_price_days",
     "capital",
+    "target_exposure",
     "fill_at",
     "sell_charge",
     "tax_rate",
@@ -85,6 +87,23 @@ def _number(body: dict, key: str, *, low: float, high: float) -> float:
         raise ValueError(f"{key} must be a number") from exc
     if not low <= out <= high:
         raise ValueError(f"{key} must be between {low:g} and {high:g}")
+    return out
+
+
+def _exposure(body: dict) -> float | None:
+    """``target_exposure``: empty means follow the pipeline's own weights (the
+    default); otherwise a fraction above 0 and at most 1, the whole portfolio."""
+    value = body.get("target_exposure")
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    if isinstance(value, bool):
+        raise ValueError("target_exposure must be a number")
+    try:
+        out = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("target_exposure must be a number") from exc
+    if not 0.0 < out <= 1.0:
+        raise ValueError("target_exposure must be above 0 and at most 1 (the whole portfolio), or empty")
     return out
 
 
@@ -184,6 +203,7 @@ def validate(body: dict[str, Any]) -> dict[str, Any]:
         "stale_calendar_days": _whole(body, "stale_calendar_days", low=1, high=_MAX_STALE_DAYS),
         "stale_price_days": _whole(body, "stale_price_days", low=1, high=_MAX_STALE_DAYS),
         "capital": _number(body, "capital", low=0, high=1e12),
+        "target_exposure": _exposure(body),
         "fill_at": _choice(body, "fill_at", ("open", "close")),
         "sell_charge": _number(body, "sell_charge", low=0, high=1e9),
         "tax_rate": _tax_rate(body),
