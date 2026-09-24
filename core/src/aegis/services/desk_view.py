@@ -98,7 +98,7 @@ async def snapshot(pool: asyncpg.Pool) -> dict:
             "WHERE status = 'pending' ORDER BY created_day, seq"
         )
         latest_plan = await conn.fetchrow(
-            "SELECT data_date, outcome, findings, skipped, planned_at "
+            "SELECT data_date, outcome, findings, skipped, note, planned_at "
             "FROM finance.desk_plans ORDER BY data_date DESC LIMIT 1"
         )
         problems = await desk_problems(conn)
@@ -182,6 +182,7 @@ async def snapshot(pool: asyncpg.Pool) -> dict:
             "outcome": latest_plan["outcome"],
             "findings": list(latest_plan["findings"] or []),
             "skipped": list(latest_plan["skipped"] or []),
+            "note": latest_plan["note"],
             "planned_at": latest_plan["planned_at"].isoformat(),
         },
         "score": score,
@@ -201,7 +202,7 @@ async def history(pool: asyncpg.Pool, limit: int = HISTORY_DAYS) -> dict:
     """
     async with pool.acquire() as conn:
         plans = await conn.fetch(
-            "SELECT data_date, outcome, findings, skipped, planned_at "
+            "SELECT data_date, outcome, findings, skipped, note, planned_at "
             "FROM finance.desk_plans ORDER BY data_date DESC LIMIT $1",
             limit,
         )
@@ -239,6 +240,7 @@ async def history(pool: asyncpg.Pool, limit: int = HISTORY_DAYS) -> dict:
                 "outcome": p["outcome"],
                 "findings": list(p["findings"] or []),
                 "skipped": list(p["skipped"] or []),
+                "note": p["note"],
                 "planned_at": p["planned_at"].isoformat(),
                 "orders": by_day.get(p["data_date"], []),
             }

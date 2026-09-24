@@ -15,7 +15,7 @@ import statistics
 from bisect import bisect_right
 from collections import defaultdict
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -83,6 +83,12 @@ class Rules:
     band_abs: float = 0.02
     band_rel: float = 0.25
     max_order_pct: float = 0.25
+    # The share of the portfolio the desk puts to work. None follows the
+    # pipeline's own weights, which carry its heat cap and its crypto sleeve
+    # (a class this desk may not trade), so the desk sits largely in cash. A
+    # number rescales the tradeable weights to sum to it (`scale_to_exposure`):
+    # the pipeline still says what to hold and in what proportion.
+    target_exposure: float | None = None
     # Which print an order fills at: "open" (the session's first trade, the
     # earliest price a signal from the previous close could actually have
     # bought) or "close". Defaults to "close" because that is what every desk
@@ -189,6 +195,7 @@ class Rules:
             band_abs=num("band_abs"),
             band_rel=num("band_rel"),
             max_order_pct=num("max_order_pct"),
+            target_exposure=_exposure(cfg.get("target_exposure")),
             # Read leniently, like every other key here. `fill_price_on` treats
             # anything that is not "open" as the close, so a typo degrades to
             # the old behaviour rather than stopping the desk trading. The
@@ -203,6 +210,17 @@ class Rules:
             expected_excess_pa=num("expected_excess_pa"),
             benchmark_prices=benches,
         )
+
+
+def _exposure(value: Any) -> float | None:
+    """``target_exposure`` read leniently: anything that is not a number in
+    (0, 1] follows the pipeline, today's behaviour, rather than stopping the
+    run. `desk_rules.validate` refuses the same junk with a 400."""
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if 0.0 < out <= 1.0 else None
 
 
 def legacy_keys(cfg: dict | None) -> list[str]:
@@ -358,6 +376,35 @@ def check_decisions(
         )
         return Check("held_suspect", (), tuple(problems))
     return Check("ok", tuple(enabled), tuple(problems))
+
+
+def scale_to_exposure(rows: tuple[Decision, ...], rules: Rules) -> tuple[Decision, ...]:
+    """The rows with their weights rescaled to sum to ``rules.target_exposure``.
+
+    Proportional, so the pipeline's relative sizes hold, and no name above
+    ``max_order_pct``: a name that would go over is capped and its excess is
+    spread over the rest in proportion, until nothing is over. When every name
+    is capped the remainder stays cash. With no target the rows come back
+    unchanged. Run it on rows `check_decisions` already passed, which is what
+    checks the pipeline's own weights."""
+    target = rules.target_exposure
+    if target is None or not rows:
+        return rows
+    cap = rules.max_order_pct
+    free = {r.symbol: r.target_weight for r in rows}
+    out: dict[str, float] = {}
+    left = target
+    while free:
+        scale = left / sum(free.values())
+        over = [s for s, w in free.items() if w * scale > cap]
+        if not over:
+            out.update({s: w * scale for s, w in free.items()})
+            break
+        for s in over:
+            out[s] = cap
+            left -= cap
+            del free[s]
+    return tuple(replace(r, target_weight=out[r.symbol]) for r in rows)
 
 
 @dataclass(frozen=True)

@@ -832,3 +832,38 @@ async def test_a_dark_benchmark_clears_when_its_price_comes_back(pool):
     await run(pool, DECISIONS, finance, WED)
 
     assert await open_problems(pool) == []
+
+
+# --- target_exposure (#669) ---------------------------------------------------
+
+
+@pytest.mark.parametrize("exposure, spent_share", [(None, 0.35), (1.0, 1.0)])
+async def test_a_target_exposure_puts_the_cash_to_work(pool, exposure, spent_share):
+    """The pipeline's rows add up to 35% here, plus a crypto row the desk does
+    not trade. Following them leaves 65% in cash; a target of 1.0 scales the
+    same names up to the whole book, 25% at most a name, and the plan says so."""
+    if exposure is not None:
+        await pool.execute(
+            "UPDATE activities SET config = config || $2::jsonb WHERE slug = $1",
+            td.DESK_SLUG, {"target_exposure": exposure},
+        )
+    names = {"AAA": 0.10, "BBB": 0.10, "CCC": 0.10, "DDD": 0.05}
+    finance = market({f"{s}.NS": [bar(FRI, 100.0), bar(MON, 100.0)] for s in names})
+    ansaar = FakeAnsaar({
+        FRI: [row(s, w, rank=i) for i, (s, w) in enumerate(names.items(), 1)]
+        + [row("BTC", 0.21, cls="crypto", rank=9)],
+    })
+
+    out = await run(pool, ansaar, finance, MON)
+    assert out["planned"] == "orders"
+    orders = await pool.fetch("SELECT symbol, side, qty, ref_price FROM finance.desk_orders ORDER BY seq")
+    assert {o["side"] for o in orders} == {"buy"} and "BTC" not in {o["symbol"] for o in orders}
+    spent = sum(o["qty"] * float(o["ref_price"]) for o in orders)
+    # Whole shares and the 0.2% cost on each buy keep it a little under the target.
+    assert spent == pytest.approx(spent_share * 100000, rel=0.01)
+    assert max(o["qty"] * float(o["ref_price"]) for o in orders) <= 25000
+    note = await pool.fetchval("SELECT note FROM finance.desk_plans WHERE data_date = $1", FRI)
+    if exposure is None:
+        assert note is None
+    else:
+        assert note.startswith("Weights scaled from 35.0% to 100.0%")

@@ -269,6 +269,8 @@ export type DeskRuleValues = {
   stale_calendar_days: number;
   stale_price_days: number;
   capital: number;
+  /** The share of the portfolio to invest; null follows the pipeline's own weights. */
+  target_exposure: number | null;
   /** Which print an order fills at: the session's open, or its close. */
   fill_at: 'open' | 'close';
   sell_charge: number;

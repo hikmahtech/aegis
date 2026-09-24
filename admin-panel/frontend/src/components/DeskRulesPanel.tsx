@@ -222,6 +222,16 @@ export default function DeskRulesPanel({ onSaved }: { onSaved?: () => void }) {
                 />
               </Field>
               <Field
+                label="Share of the money to invest"
+                hint="A fraction: 1 invests it all, spread over the pipeline's picks in its own proportions, at most the order cap a name. Empty follows the pipeline's weights, which keep most of it in cash."
+              >
+                <input
+                  type="number" style={BOX} min={0} max={1} step="any" placeholder="follow the pipeline"
+                  value={values.target_exposure ?? ''}
+                  onChange={e => set('target_exposure', e.target.value === '' ? null : Number(e.target.value))}
+                />
+              </Field>
+              <Field
                 label="Fills at"
                 hint="Which price an order gets. The open is the earliest one a signal from the previous close could actually have bought. It only works because the desk plans before the market opens — a plan made after the open is skipped rather than filled at a price struck before it."
               >
