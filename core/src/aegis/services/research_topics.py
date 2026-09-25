@@ -552,6 +552,74 @@ async def _check_attention(
     return str(tag).endswith(" 1")
 
 
+async def _ingest_item(
+    pool: asyncpg.Pool,
+    topic: Topic,
+    item: dict[str, Any],
+    url: str,
+    title: str,
+    summary: str,
+    origin: str,
+    now: datetime,
+) -> bool:
+    """One item as an occurrence on the topic's round. True when it is new."""
+    result = await ingest_event(
+        pool,
+        _event(
+            topic,
+            external_id=_item_id(url, topic),
+            kind="occurrence",
+            title=title[:500],
+            payload={
+                "item": True,
+                "topic": topic.name,
+                "url": url,
+                "title": title[:300],
+                "summary": summary[:300],
+                "origin": origin,
+                **(
+                    {"significance": item["significance"]}
+                    if item.get("significance") is not None
+                    else {}
+                ),
+            },
+            occurred_at=now,
+        ),
+        now=now,
+    )
+    return result.action != "duplicate"
+
+
+async def attach_to_topic(
+    pool: asyncpg.Pool,
+    topic_name: str,
+    items: list[dict[str, Any]],
+    *,
+    origin: str,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Attach items to ONE named topic, without matching terms: for a source
+    whose items are already about that topic (the world watch, #676). Raises
+    no task — such a topic belongs in an area, whose digest is the way out.
+    ``missing_topic`` is True when nobody tracks ``topic_name``: nothing is
+    attached, because a round with no registry entry would reach no area."""
+    now = now or datetime.now(UTC)
+    topic = next((t for t in await load_topics(pool) if t.slug == slug(topic_name)), None)
+    if topic is None:
+        logger.warning("research_attach_to_untracked_topic", topic=topic_name, origin=origin)
+        return {"attached": 0, "missing_topic": True}
+    attached = 0
+    if items and await ensure_round(pool, topic, now=now):
+        for item in items:
+            url = str(item.get("url") or "").strip()
+            title = str(item.get("title") or "").strip()
+            if url and title and await _ingest_item(
+                pool, topic, item, url, title, str(item.get("summary") or ""), origin, now
+            ):
+                attached += 1
+    return {"attached": attached, "missing_topic": False}
+
+
 async def attach_items(
     pool: asyncpg.Pool,
     items: list[dict[str, Any]],
@@ -587,31 +655,7 @@ async def attach_items(
                 if not pid:
                     continue
                 rounds[topic.slug] = pid
-            result = await ingest_event(
-                pool,
-                _event(
-                    topic,
-                    external_id=_item_id(url, topic),
-                    kind="occurrence",
-                    title=title[:500],
-                    payload={
-                        "item": True,
-                        "topic": topic.name,
-                        "url": url,
-                        "title": title[:300],
-                        "summary": summary[:300],
-                        "origin": origin,
-                        **(
-                            {"significance": item["significance"]}
-                            if item.get("significance") is not None
-                            else {}
-                        ),
-                    },
-                    occurred_at=now,
-                ),
-                now=now,
-            )
-            if result.action != "duplicate":
+            if await _ingest_item(pool, topic, item, url, title, summary, origin, now):
                 attached += 1
     tasks = 0
     cfg = await topics_config.get_topics_config(pool)
