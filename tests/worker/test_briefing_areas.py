@@ -81,6 +81,45 @@ async def test_weekly_and_vault_areas_wait_for_the_weekly_day(pool):
     assert vault is None
 
 
+async def test_each_brief_story_is_a_thread_reply_and_every_story_is_recorded(pool):
+    tag = uuid.uuid4().hex[:8]
+
+    class _Delivery:
+        def __init__(self):
+            self.sent = []
+
+        async def send_message(self, agent_id, text, chat_id=0, thread_ref=None):
+            self.sent.append((text, thread_ref))
+            return {"ok": True, "delivery_ref": {"adapter": "slack", "channel": "C1", "ts": f"{tag}.{len(self.sent)}"}}
+
+    delivery = _Delivery()
+    act = BriefingActivities(db_pool=pool, delivery=delivery)
+    brief = [{"area": f"India {tag}", "stories": [
+        {"key": f"{tag}-a", "title": "RBI <holds>", "url": "https://r/1", "why": "your loan"}]}]
+    vault = [{"area": f"Curio {tag}", "stories": [{"key": f"{tag}-b", "title": "Old map", "url": "https://m/1"}]}]
+    root = {"adapter": "slack", "channel": "C1", "ts": "root"}
+    try:
+        out = await act.post_area_stories("raphael", brief, root, vault)
+        assert out == {"posted": 1, "recorded": 2}
+        # A hint, then the story, both in the brief's thread.
+        assert [ref for _, ref in delivery.sent] == [root, root]
+        assert delivery.sent[1][0] == (
+            f'<b>India {tag}</b> · <a href="https://r/1">RBI &lt;holds&gt;</a>\nyour loan'
+        )
+        rows = await pool.fetch(
+            "SELECT story_key, channel, ts FROM area_stories WHERE story_key LIKE $1 ORDER BY 1", f"{tag}-%"
+        )
+        assert [tuple(r) for r in rows] == [(f"{tag}-a", "C1", f"{tag}.2"), (f"{tag}-b", None, None)]
+
+        # With no message ref (not Slack), stories are recorded, not posted.
+        delivery.sent.clear()
+        brief[0]["stories"][0]["key"] = f"{tag}-c"
+        out = await act.post_area_stories("raphael", brief, None, [])
+        assert out == {"posted": 0, "recorded": 1} and delivery.sent == []
+    finally:
+        await pool.execute("DELETE FROM area_stories WHERE story_key LIKE $1", f"{tag}-%")
+
+
 async def test_area_stories_are_their_own_block_and_stay_out_of_the_summary_prompt():
     story = {"key": "k", "title": "RBI <cuts> rates", "url": "https://r/1", "sources": 3, "why": "your loan"}
     changes = {"quiet": False, "nothing_else": True, "areas": [{"area": "Money", "stories": [story]}]}

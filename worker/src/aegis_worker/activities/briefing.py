@@ -600,6 +600,7 @@ class BriefingActivities:
         budget = int(cfg["brief_items"])
         brief: list[dict] = []
         vault_lines: list[str] = []
+        vault_areas: list[dict] = []
         for area in areas:
             if area.cadence != "daily" and not weekly:
                 continue
@@ -611,6 +612,7 @@ class BriefingActivities:
                 since=daily_since if area.cadence == "daily" else now - timedelta(days=7),
                 seen_keys=set(seen),
                 shown_titles=list(shown.get(area.slug) or []),
+                feedback=await research_areas.recent_feedback(self.db_pool, area.name),
                 llm=self.llm_client,
                 model=self.frame_model,
                 agent_id=self.agent_id or None,
@@ -624,6 +626,7 @@ class BriefingActivities:
             seen += [s["key"] for s in stories]
             shown[area.slug] = (list(shown.get(area.slug) or []) + [s["title"] for s in stories])[-20:]
             if area.cadence == "vault":
+                vault_areas.append({"area": area.name, "stories": stories})
                 vault_lines.append(f"{area.name}:")
                 vault_lines += [
                     f"  - [{s['title']}]({s['url']})" + (f" — {s['why']}" if s["why"] else "")
@@ -638,6 +641,8 @@ class BriefingActivities:
             vault = {
                 "kind": "weekly", "day": start.isoformat(), "label": label,
                 "text": "\n".join(vault_lines), "slot": "reading",
+                # Not the vault write's: `post_area_stories` records them (#675).
+                "areas": vault_areas,
             }
         return brief, vault, {"seen_story_keys": seen[-500:], "area_shown": shown}
 
@@ -744,6 +749,61 @@ class BriefingActivities:
                 why = f" — {_esc(str(s['why']))}" if s.get("why") else ""
                 lines.append(f"  • {head}{why}")
         return "\n".join(lines)
+
+    @activity.defn
+    async def post_area_stories(
+        self, agent_id: str, areas: list[dict], root_ref: dict | None, vault_areas: list[dict]
+    ) -> dict:
+        """Post each area story as its own reply in the brief's thread, so a
+        👍 or 👎 on it is a verdict on ONE story, and record every story shown
+        (#675). With no message ref (not Slack) the stories are recorded but
+        not posted. Vault stories are recorded only. Never raises: feedback is
+        a nicety, and the brief is already out."""
+        from aegis.services import research_areas
+
+        posted = recorded = 0
+        thread = root_ref if (root_ref or {}).get("ts") and self.delivery is not None else None
+        if thread and any(a.get("stories") for a in areas):
+            with logged_failure("briefing_area_hint_failed", logger=activity.logger):
+                await self.delivery.send_message(
+                    agent_id,
+                    "React 👍 useful or 👎 noise on each story below. Raphael learns from it.",
+                    0,
+                    thread_ref=thread,
+                )
+        groups = [(g, True) for g in areas] + [(g, False) for g in vault_areas]
+        for group, in_brief in groups:
+            for story in group.get("stories") or []:
+                ref = None
+                if thread and in_brief:
+                    with logged_failure("briefing_area_story_post_failed", logger=activity.logger):
+                        resp = await self.delivery.send_message(
+                            agent_id, self._story_message(group["area"], story), 0, thread_ref=thread
+                        )
+                        ref = (resp or {}).get("delivery_ref")
+                        posted += 1 if ref else 0
+                with logged_failure("briefing_area_story_record_failed", logger=activity.logger):
+                    await research_areas.record_shown(self.db_pool, group["area"], story, ref)
+                    recorded += 1
+        return {"posted": posted, "recorded": recorded}
+
+    @staticmethod
+    def _story_message(area: str, story: dict) -> str:
+        url = str(story.get("url") or "")
+        title = _esc(str(story.get("title") or ""))
+        head = f'<a href="{_esc(url)}">{title}</a>' if url.startswith(("http://", "https://")) else title
+        why = f"\n{_esc(str(story['why']))}" if story.get("why") else ""
+        return f"<b>{_esc(area)}</b> · {head}{why}"
+
+    @activity.defn
+    async def area_scorecard_line(self) -> str:
+        """The monthly per-area scorecard (#675): shown, 👍, 👎, saved, and the
+        areas nobody liked in 60 days. Empty when nothing was shown."""
+        from aegis.services import research_areas
+
+        if not self.db_pool:
+            return ""
+        return research_areas.scorecard_text(await research_areas.scorecard(self.db_pool))
 
     @activity.defn
     async def feed_review_line(self) -> str:

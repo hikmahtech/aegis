@@ -109,6 +109,27 @@ async def test_reaction_with_missing_item_user_does_nothing():
     assert client.calls == []
 
 
+# --- #675: a reaction on the bot's message is story feedback ----------------
+
+
+async def test_owner_reacting_to_the_bots_message_is_forwarded_as_story_feedback():
+    """Core decides whether it is an area story; the body is never fetched."""
+    inbound, core, _adapter, client = _inbound()
+
+    await _react(inbound, client, reaction="+1", item_user="UBOT", ts="1700.1")
+
+    core.story_feedback.assert_awaited_once_with(channel="CSEBAS", ts="1700.1", reaction="+1")
+    core.knowledge_ingest.assert_not_awaited()
+    assert client.calls == []
+
+
+async def test_only_the_owners_reactions_are_story_feedback():
+    inbound, core, _adapter, client = _inbound()
+    await _react(inbound, client, reaction="+1", user=OTHER, item_user="UBOT")
+    await _react(inbound, client, reaction="brain", user=OWNER, item_user=OWNER)
+    core.story_feedback.assert_not_awaited()
+
+
 # --- fail-safe when unconfigured --------------------------------------------
 
 

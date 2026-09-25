@@ -238,13 +238,26 @@ async def area_items(pool: Any, area: Area, since: datetime) -> list[dict[str, A
 # ------------------------------------------------------------------ judge
 
 
-def judge_prompt(area: Area, stories: list[dict[str, Any]], shown: list[str]) -> str:
+def judge_prompt(
+    area: Area,
+    stories: list[dict[str, Any]],
+    shown: list[str],
+    feedback: dict[str, list[str]] | None = None,
+) -> str:
     listing = "\n".join(
         f"{n}. {s['title']} ({s['sources']} source{'s' if s['sources'] != 1 else ''})"
         + (f" — {s['summary'][:160]}" if s.get("summary") else "")
         for n, s in enumerate(stories, start=1)
     )
     recent = "\n".join(f"- {t}" for t in shown[-20:]) or "- (nothing yet)"
+    # What the person said about earlier picks (#675): the only ground truth
+    # the judge ever gets about its own taste.
+    taste = ""
+    fb = feedback or {}
+    if fb.get("up"):
+        taste += "They marked these earlier picks useful:\n" + "\n".join(f"- {t}" for t in fb["up"]) + "\n\n"
+    if fb.get("down"):
+        taste += "They marked these earlier picks noise:\n" + "\n".join(f"- {t}" for t in fb["down"]) + "\n\n"
     return (
         f"You pick news for one person. Area: {area.name}.\n"
         f"Why they care, in their words: {area.why or '(not given)'}\n\n"
@@ -255,6 +268,7 @@ def judge_prompt(area: Area, stories: list[dict[str, Any]], shown: list[str]) ->
         "Skip opinion, listicles, minor updates, repeats of what they were "
         "already shown, and anything you would call routine. Picking none is fine.\n\n"
         f"Already shown recently:\n{recent}\n\n"
+        f"{taste}"
         f"Stories:\n{listing}\n\n"
         'Answer with JSON only: [{"n": <story number>, "why": "<one short line: '
         'what changed and why it matters to them>"}]'
@@ -299,6 +313,7 @@ async def build_digest(
     since: datetime,
     seen_keys: set[str],
     shown_titles: list[str],
+    feedback: dict[str, list[str]] | None = None,
     llm: Any = None,
     model: str | None = None,
     agent_id: str | None = None,
@@ -315,7 +330,7 @@ async def build_digest(
     if llm is not None:
         try:
             resp = await llm.think(
-                judge_prompt(area, stories, shown_titles),
+                judge_prompt(area, stories, shown_titles, feedback),
                 model=model,
                 db_pool=pool,
                 purpose="area_digest",
@@ -338,3 +353,124 @@ async def build_digest(
             "sources": s["sources"], "why": p["why"],
         })
     return result
+
+
+# ------------------------------------------------------------------ feedback (#675)
+
+# Slack reaction names (no colons) → the owner's verdict on a story. Anything
+# else is not feedback and changes nothing.
+VERDICTS: dict[str, str] = {
+    **dict.fromkeys(("+1", "thumbsup", "heart", "star", "fire", "white_check_mark"), "up"),
+    **dict.fromkeys(("-1", "thumbsdown", "x", "no_entry_sign", "zzz"), "down"),
+}
+
+
+def verdict_for(reaction: str) -> str | None:
+    """A reaction's verdict. A skin tone (`+1::skin-tone-3`) counts as its base."""
+    return VERDICTS.get((reaction or "").strip().strip(":").split("::")[0].lower())
+
+
+async def record_shown(pool: Any, area: str, story: dict[str, Any], ref: dict | None) -> None:
+    """One story the brief showed, with the Slack message it was posted as.
+    A story is shown once (its key is unique); a second record only fills in
+    a message ref the first did not have."""
+    ref = ref or {}
+    await pool.execute(
+        "INSERT INTO area_stories (story_key, area, title, url, why, channel, ts) "
+        "VALUES ($1, $2, $3, $4, $5, $6, $7) "
+        "ON CONFLICT (story_key) DO UPDATE SET "
+        "  channel = COALESCE(area_stories.channel, EXCLUDED.channel), "
+        "  ts = COALESCE(area_stories.ts, EXCLUDED.ts)",
+        story["key"],
+        area,
+        str(story.get("title") or "")[:300],
+        str(story.get("url") or ""),
+        str(story.get("why") or "")[:200],
+        ref.get("channel") or None,
+        ref.get("ts") or None,
+    )
+
+
+async def record_verdict(pool: Any, *, channel: str, ts: str, reaction: str) -> bool:
+    """The owner reacted to a story's message. True when it was a story and
+    the reaction a verdict; the latest verdict wins."""
+    verdict = verdict_for(reaction)
+    if not verdict or not channel or not ts:
+        return False
+    tag = await pool.execute(
+        "UPDATE area_stories SET verdict = $3, verdict_at = now() WHERE channel = $1 AND ts = $2",
+        channel,
+        ts,
+        verdict,
+    )
+    return str(tag).endswith(" 1")
+
+
+async def recent_feedback(
+    pool: Any, area: str, *, days: int = 30, limit: int = 5
+) -> dict[str, list[str]]:
+    """The area's recent 👍 and 👎 titles, newest first, for the judge."""
+    rows = await pool.fetch(
+        "SELECT title, verdict FROM area_stories WHERE area = $1 AND verdict IS NOT NULL "
+        "AND verdict_at > now() - make_interval(days => $2) ORDER BY verdict_at DESC LIMIT $3",
+        area,
+        days,
+        limit * 4,
+    )
+    out: dict[str, list[str]] = {"up": [], "down": []}
+    for r in rows:
+        if len(out[r["verdict"]]) < limit:
+            out[r["verdict"]].append(r["title"])
+    return out
+
+
+_SAVED = (
+    "EXISTS (SELECT 1 FROM knowledge_content k "
+    "WHERE s.url <> '' AND k.url = s.url AND 'raindrop' = ANY(k.tags))"
+)
+
+
+async def scorecard(pool: Any, *, days: int = 30, idle_days: int = 60) -> list[dict[str, Any]]:
+    """Per area over the last ``days``: stories shown, 👍, 👎 and saved to
+    raindrop. ``idle`` is True when the area showed stories over ``idle_days``
+    and earned no 👍 and no save in any of them."""
+    rows = await pool.fetch(
+        f"""
+        SELECT s.area,
+               count(*) FILTER (WHERE s.shown_at > now() - make_interval(days => $1)) AS shown,
+               count(*) FILTER (WHERE s.shown_at > now() - make_interval(days => $1)
+                                  AND s.verdict = 'up') AS up,
+               count(*) FILTER (WHERE s.shown_at > now() - make_interval(days => $1)
+                                  AND s.verdict = 'down') AS down,
+               count(*) FILTER (WHERE s.shown_at > now() - make_interval(days => $1)
+                                  AND {_SAVED}) AS saved,
+               count(*) FILTER (WHERE s.verdict = 'up' OR {_SAVED}) AS liked
+        FROM area_stories s
+        WHERE s.shown_at > now() - make_interval(days => $2)
+        GROUP BY s.area ORDER BY s.area
+        """,
+        days,
+        idle_days,
+    )
+    return [
+        {
+            "area": r["area"], "shown": r["shown"], "up": r["up"], "down": r["down"],
+            "saved": r["saved"], "idle": r["liked"] == 0,
+        }
+        for r in rows
+    ]
+
+
+def scorecard_text(card: list[dict[str, Any]], *, days: int = 30, idle_days: int = 60) -> str:
+    """The monthly brief block. Empty when no area showed anything."""
+    if not card:
+        return ""
+    lines = [f"<b>Your news areas, last {days} days</b> (shown · 👍 · 👎 · saved)"]
+    lines += [f"  • {c['area']}: {c['shown']} · {c['up']} · {c['down']} · {c['saved']}" for c in card]
+    idle = [c["area"] for c in card if c["idle"]]
+    if idle:
+        lines.append(
+            f"No 👍 or save in {idle_days} days: {', '.join(idle)}. "
+            "Drop the area, or reword its \"why\" on Admin → Research."
+        )
+    return "\n".join(lines)

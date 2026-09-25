@@ -634,6 +634,16 @@ class SlackCoreClient:
             return result.get("content_id")
         return None
 
+    async def story_feedback(self, *, channel: str, ts: str, reaction: str) -> bool:
+        """POST /api/admin/research/story-feedback — True when core took the
+        reaction as a verdict on an area story (#675)."""
+        result = await self._post(
+            "/api/admin/research/story-feedback",
+            {"channel": channel, "ts": ts, "reaction": reaction},
+            timeout=10,
+        )
+        return bool(isinstance(result, dict) and result.get("matched"))
+
 
 class SlackInbound:
     """Testable Slack inbound: routing + core calls + adapter posting.
@@ -895,6 +905,12 @@ class SlackInbound:
         if user_id != self._owner_member_id:
             return
         if item_user != self._owner_member_id:
+            # The owner reacting to a message someone else wrote — the bot's
+            # own, in practice. Core decides whether it is an area story and
+            # the reaction a verdict (#675); nothing is fetched here, so the
+            # message body never leaves Slack.
+            if channel_id and ts:
+                await self._core.story_feedback(channel=channel_id, ts=ts, reaction=reaction)
             return
         if reaction.strip().strip(":").lower() not in self._saveit_emojis:
             return
