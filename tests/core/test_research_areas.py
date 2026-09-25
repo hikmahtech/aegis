@@ -88,3 +88,22 @@ def test_judge_prompt_carries_the_why_the_cap_and_what_was_shown():
     prompt = ra.judge_prompt(area, [{"title": "T1", "sources": 3, "summary": "s"}], ["Old story"])
     assert "I invest here" in prompt and "at most 2" in prompt
     assert "1. T1 (3 sources) — s" in prompt and "- Old story" in prompt
+    # The roundup rule: the why must be about the title, not the summary.
+    assert "only when its TITLE is the development" in prompt and "roundups" in prompt
+
+
+@pytest.mark.parametrize(
+    ("title", "stale"),
+    [
+        # The re-published episode the 2026-09-26 preview picked.
+        ("Watch: Telegram under fire: NTA's crackdown explained | Above the Fold | 17.06.2026", True),
+        ("Bulletin 2026-09-01", True),
+        ("Report dated 20/09/2026", False),
+        ("RBI holds repo rate", False),
+        ("Scheme notified on 31.02.2026", False),  # not a date
+    ],
+)
+def test_a_title_dated_more_than_two_weeks_ago_is_stale(title, stale):
+    from datetime import date
+
+    assert ra.stale_title(title, date(2026, 9, 26)) is stale
