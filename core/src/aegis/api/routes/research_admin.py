@@ -30,6 +30,7 @@ from aegis.api.settings_routes import settings_row_routes
 from aegis.services import (
     feeds_config,
     library_config,
+    news_overview,
     research_areas,
     research_config,
     research_topics,
@@ -89,6 +90,19 @@ async def story_feedback(request: Request, body: dict[str, Any]) -> dict[str, An
 async def get_scorecard(request: Request) -> dict[str, Any]:
     """Per area, the last 30 days: shown, 👍, 👎, saved, and idle areas."""
     return {"areas": await research_areas.scorecard(get_pool(request))}
+
+
+@router.get("/stories")
+async def get_stories(request: Request, area: str = "", limit: int = 100) -> dict[str, Any]:
+    """The area stories the brief showed, newest first, with verdicts."""
+    return {"stories": await news_overview.stories(get_pool(request), area=area, limit=limit)}
+
+
+@router.get("/watchers")
+async def get_watchers(request: Request) -> dict[str, Any]:
+    """Every scheduled source filing onto a tracked topic: state, last run,
+    area, recent items, and what keeps its items from the brief."""
+    return {"watchers": await news_overview.watchers(get_pool(request))}
 
 
 settings_row_routes(

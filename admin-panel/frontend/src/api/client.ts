@@ -475,6 +475,11 @@ export const api = {
   // Email triage rules (user-owned sender verdicts + notification phrases)
   // Research (the research agent's DB-owned config rows)
   getResearchTopics: () => apiFetch<any>('/api/admin/research/topics'),
+  // The News page (what the news lane surfaced).
+  getNewsStories: (area = '') =>
+    apiFetch<any>(`/api/admin/research/stories${area ? `?area=${encodeURIComponent(area)}` : ''}`),
+  getNewsScorecard: () => apiFetch<any>('/api/admin/research/scorecard'),
+  getNewsWatchers: () => apiFetch<any>('/api/admin/research/watchers'),
   saveResearchTopics: (body: { topics: any[]; areas?: any[] }) =>
     apiFetch<any>('/api/admin/research/topics', { method: 'PUT', body: JSON.stringify(body) }),
   getResearchTopicsConfig: () => apiFetch<any>('/api/admin/research/topics-config'),

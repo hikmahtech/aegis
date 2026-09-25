@@ -22,6 +22,7 @@ import TradingDesk from './pages/TradingDesk';
 import EmailTriage from './pages/EmailTriage';
 import Vault from './pages/Vault';
 import Research from './pages/Research';
+import News from './pages/News';
 import Todoist from './pages/Todoist';
 import Overview from './pages/Overview';
 import Problems from './pages/Problems';
@@ -79,6 +80,7 @@ export default function App() {
           <Route path="/admin/email-triage" element={<EmailTriage />} />
           <Route path="/admin/vault" element={<Vault />} />
           <Route path="/admin/research" element={<Research />} />
+          <Route path="/news" element={<News />} />
         </Route>
       </Routes>
     </BrowserRouter>

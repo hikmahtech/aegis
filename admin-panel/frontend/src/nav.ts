@@ -22,6 +22,7 @@ export const NAV: NavSection[] = [
       { path: '/knowledge', label: 'Knowledge', icon: 'knowledge' },
       { path: '/references', label: 'References', icon: 'references' },
       { path: '/content', label: 'Content', icon: 'content' },
+      { path: '/news', label: 'News', icon: 'content' },
       { path: '/people', label: 'People', icon: 'people' },
       { path: '/expiring-items', label: 'Expiry Radar', icon: 'expiry' },
       { path: '/assets', label: 'Assets', icon: 'assets' },
