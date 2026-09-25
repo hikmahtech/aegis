@@ -2364,7 +2364,11 @@ class AlertActivities:
                 "- Otherwise return one of resolved|actionable|not_actionable based "
                 "on what the investigation actually established. "
                 '`not_actionable` covers "no action needed"; `actionable` covers '
-                "everything that requires a fix.\n\n"
+                "everything that requires a fix. `resolved` means the fault has "
+                "ALREADY stopped in production with no change from us (the service "
+                "recovered, the error stopped firing). A fix the investigation wrote "
+                "or committed has not shipped, so it is `actionable`, never "
+                "`resolved`.\n\n"
                 "Return JSON only:\n"
                 '{"status": "<resolved|actionable|not_actionable|inconclusive>", '
                 '"root_cause": "<brief root cause, or empty string if inconclusive>", '

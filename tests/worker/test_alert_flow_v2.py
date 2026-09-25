@@ -844,3 +844,20 @@ def test_fix_pr_title_names_the_fix():
     )
     long = fix_pr_title({"suggested_fix": "word " * 40}, "t")
     assert len(long) == 72 and long.endswith("…")
+
+
+def test_reconcile_verdict_status_a_committed_fix_is_never_resolved():
+    from aegis_worker.flows.alert_investigation import reconcile_verdict_status
+
+    fix = {"screener-p-server": "aegis-fix/sentry-7753553147"}
+    # aegis#682: the assessor called a committed-but-unshipped fix "resolved",
+    # which skipped the Open-PR card and resolved the problem.
+    assert reconcile_verdict_status("resolved", fix) == "actionable"
+    assert reconcile_verdict_status("inconclusive", fix) == "actionable"
+    assert reconcile_verdict_status("not_actionable", fix) == "actionable"
+    assert reconcile_verdict_status("actionable", fix) == "actionable"
+    # No branch: the verdict stands, "resolved" included.
+    assert reconcile_verdict_status("resolved", {}) == "resolved"
+    assert reconcile_verdict_status("inconclusive", {}) == "inconclusive"
+    # A run replaying from before the patch keeps its recorded verdict.
+    assert reconcile_verdict_status("resolved", fix, include_resolved=False) == "resolved"

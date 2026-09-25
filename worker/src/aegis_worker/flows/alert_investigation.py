@@ -121,6 +121,11 @@ _PATCH_RECHECK_BEFORE_CARD = "recheck-before-gate2-card"
 # before this carries the old single list, and replays with it.
 _PATCH_CHECKS_APART = "gate2-checks-apart-from-fixes"
 
+# aegis#682: a run that committed a fix never ends `resolved` — it gets the
+# Open-PR card and the problem stays live until the fix ships. Live: a run
+# already past Step 7a replays with the verdict it recorded.
+_PATCH_FIX_IS_NOT_RESOLVED = "committed-fix-is-not-resolved"
+
 
 _PR_TITLE_MAX = 72
 
@@ -144,6 +149,22 @@ def fix_pr_title(verdict: dict, alert_title: str) -> str:
                 head = head[: _PR_TITLE_MAX - 1].rstrip() + "…"
             return head
     return "fix: AEGIS-proposed fix"
+
+
+def reconcile_verdict_status(
+    status: str, branches: dict, *, include_resolved: bool = True
+) -> str:
+    """The verdict a run that committed fix branches reports (Step 7a).
+
+    A committed fix makes the run actionable by construction: there is a PR
+    to open. So a verdict that says otherwise is overruled — "inconclusive"
+    and "not_actionable" contradict the branch, and "resolved" (aegis#682)
+    claims a fix nobody has shipped. ``include_resolved`` is False only for a
+    run replaying from before that rule."""
+    overruled = {"inconclusive", "not_actionable"}
+    if include_resolved:
+        overruled.add("resolved")
+    return "actionable" if branches and status in overruled else status
 
 
 def _safe_workflow_id_segment(text: str, max_len: int = 60) -> str:
@@ -1378,17 +1399,27 @@ class AlertInvestigationFlow:
         # status to "actionable" so the Gate-2 prompt, the final track-task
         # comment (Step 8.5) and the chat ping (Step 9) all render an
         # actionable / PR outcome consistent with the staged fix.
-        if (inv_result.get("branches") or {}) and verdict_status in (
-            "inconclusive",
-            "not_actionable",
-        ):
+        #
+        # aegis#682: "resolved" too. A committed fix is not a shipped one, yet
+        # the assessor read "I committed a fix" as resolved — which skipped the
+        # card (no Open-PR button) AND resolved the problem, so the branch sat
+        # on the run host while Sentry still showed the error.
+        branches_made = inv_result.get("branches") or {}
+        reconciled = reconcile_verdict_status(
+            verdict_status,
+            branches_made,
+            include_resolved=bool(branches_made)
+            and verdict_status == "resolved"
+            and workflow.patched(_PATCH_FIX_IS_NOT_RESOLVED),
+        )
+        if reconciled != verdict_status:
             workflow.logger.info(
                 "alert_verdict_reconciled_to_actionable from=%s title=%s",
                 verdict_status,
                 title,
             )
-            verdict_status = "actionable"
-            verdict["status"] = "actionable"
+            verdict_status = reconciled
+            verdict["status"] = reconciled
 
         # deprecate_patch: remove after the next release, see #614
         workflow.deprecate_patch(_PATCH_KG_AFTER_DECISION)
