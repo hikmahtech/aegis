@@ -31,6 +31,7 @@ with workflow.unsafe.imports_passed_through():
 
 
 PATCH_AREA_VAULT = "daily-briefing-area-vault"
+PATCH_AREA_FEEDBACK = "daily-briefing-area-feedback"
 
 
 @dataclass
@@ -117,17 +118,20 @@ class DailyBriefingFlow:
 
         msg = f"<b>Daily Briefing</b>\n\n{narrative}"
         sent_ok = False
+        root_ref: dict | None = None
         try:
             # `deliver_briefing`, not `send_message`: it appends the health block
             # and sends it in the same activity, so the readings never become an
             # argument or a result. `narrative` below therefore carries no body
             # data into the voice note or the knowledge store either (#215).
-            await workflow.execute_activity_method(
+            delivered = await workflow.execute_activity_method(
                 BriefingActivities.deliver_briefing,
                 args=[config.agent_id, msg],
                 start_to_close_timeout=TIMEOUT_FAST, retry_policy=RETRY_ONCE,
             )
             sent_ok = True
+            # The brief's own message: the area stories are posted in its thread.
+            root_ref = (delivered or {}).get("delivery_ref") if isinstance(delivered, dict) else None
         except Exception:
             workflow.logger.warning("briefing_delivery_failed")
 
@@ -187,6 +191,18 @@ class DailyBriefingFlow:
                             args=[config.agent_id, line, 0],
                             start_to_close_timeout=TIMEOUT_FAST, retry_policy=NO_RETRY,
                         )
+                    # The areas' month, beside the feeds' (#675).
+                    if workflow.patched(PATCH_AREA_FEEDBACK):
+                        card = await workflow.execute_activity_method(
+                            BriefingActivities.area_scorecard_line,
+                            start_to_close_timeout=TIMEOUT_FAST, retry_policy=NO_RETRY,
+                        )
+                        if card:
+                            await workflow.execute_activity_method(
+                                DeliveryActivities.send_message,
+                                args=[config.agent_id, card, 0],
+                                start_to_close_timeout=TIMEOUT_FAST, retry_policy=NO_RETRY,
+                            )
             except Exception:
                 workflow.logger.warning("briefing_feed_review_failed")
 
@@ -200,12 +216,29 @@ class DailyBriefingFlow:
                 # imported into the workflow sandbox.
                 await workflow.execute_activity(
                     "notes_journal_write",
-                    {**vault_digest, "agent_id": config.agent_id},
+                    {
+                        **{k: v for k, v in vault_digest.items() if k != "areas"},
+                        "agent_id": config.agent_id,
+                    },
                     start_to_close_timeout=timedelta(seconds=NOTES_WRITE_TIMEOUT_S),
                     retry_policy=RETRY_ONCE,
                 )
             except Exception:
                 workflow.logger.warning("briefing_area_vault_failed")
+
+        # Each story as its own reply in the brief's thread, so a reaction is a
+        # verdict on one story, and every story shown recorded (#675). Only
+        # after a sent brief: an unsent one showed nothing.
+        vault_areas = (vault_digest or {}).get("areas") or []
+        if sent_ok and (changes.get("areas") or vault_areas) and workflow.patched(PATCH_AREA_FEEDBACK):
+            try:
+                await workflow.execute_activity_method(
+                    BriefingActivities.post_area_stories,
+                    args=[config.agent_id, changes.get("areas") or [], root_ref, vault_areas],
+                    start_to_close_timeout=timedelta(minutes=2), retry_policy=NO_RETRY,
+                )
+            except Exception:
+                workflow.logger.warning("briefing_area_stories_failed")
 
         target_date = workflow.now().strftime("%Y-%m-%d")
         try:

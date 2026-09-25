@@ -70,6 +70,27 @@ async def put_topics(request: Request, body: dict[str, Any]) -> dict[str, Any]:
     return await get_topics(request)
 
 
+@router.post("/story-feedback")
+async def story_feedback(request: Request, body: dict[str, Any]) -> dict[str, Any]:
+    """The owner reacted to a message (#675): comms forwards `{channel, ts,
+    reaction}` for every owner reaction on a message it did not write, and
+    this records it when the message is an area story and the reaction a
+    verdict. `matched: false` is the normal answer for any other message."""
+    matched = await research_areas.record_verdict(
+        get_pool(request),
+        channel=str(body.get("channel") or ""),
+        ts=str(body.get("ts") or ""),
+        reaction=str(body.get("reaction") or ""),
+    )
+    return {"matched": matched}
+
+
+@router.get("/scorecard")
+async def get_scorecard(request: Request) -> dict[str, Any]:
+    """Per area, the last 30 days: shown, 👍, 👎, saved, and idle areas."""
+    return {"areas": await research_areas.scorecard(get_pool(request))}
+
+
 settings_row_routes(
     router,
     "/topics-config",

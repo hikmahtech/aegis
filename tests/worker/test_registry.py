@@ -459,9 +459,12 @@ def test_books_write_flow_is_gated_on_money_hygiene():
         # Then +1 flow and +1 activity from the world watch (#676):
         # WorldWatchFlow and `world_watch_tick` on WorldWatchActivities.
         # Unflagged, so all three rows move.
-        (True, True, 54, 262),
-        (False, False, 43, 226),
-        (True, False, 47, 244),
+        # Then +2 activities and NO new flow from story feedback (#675):
+        # `post_area_stories` and `area_scorecard_line` on BriefingActivities.
+        # Unflagged, so all three rows move.
+        (True, True, 54, 264),
+        (False, False, 43, 228),
+        (True, False, 47, 246),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):
