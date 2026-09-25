@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from aegis.connectors.remote_script import FIX_BRANCH_PREFIX, GIT_HYGIENE
 from aegis.errors import error_text
 from aegis.llm import parse_llm_json
 from aegis.observability import log_audit
@@ -545,6 +546,7 @@ def _build_alert_investigation_prompt(
             "welcome. But do NOT commit a speculative, broad, or risky change — if the root "
             "cause is unclear or the fix is non-trivial, report the diagnosis WITHOUT "
             "committing.\n"
+            f"   {GIT_HYGIENE}\n"
         )
     else:
         prompt += "4. Do not propose or commit speculative fixes.\n"
@@ -2105,7 +2107,7 @@ class AlertActivities:
         # alerts pass allow_fix=False — they're investigate-only (auto-restart
         # remediation already ran; we don't auto-commit to infra-gitops).
         fix_branch = (
-            f"aegis-fix/{branch_slug}"
+            f"{FIX_BRANCH_PREFIX}{branch_slug}"
             if (not is_jira and allow_fix and branch_slug)
             else ""
         )

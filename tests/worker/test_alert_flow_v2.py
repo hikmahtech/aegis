@@ -837,5 +837,10 @@ def test_fix_pr_title_names_the_fix():
     assert fix_pr_title({"root_cause": "Missing null check."}, "t") == "fix: missing null check"
     assert fix_pr_title({}, "Dagster pipeline failed") == "fix: dagster pipeline failed"
     assert fix_pr_title({}, "") == "fix: AEGIS-proposed fix"
+    # aegis#682: a numbered fix used to become the title "fix: 1".
+    assert (
+        fix_pr_title({"suggested_fix": "1. In `group_as_list`, check the type. 2. Add tests."}, "t")
+        == "fix: in `group_as_list`, check the type"
+    )
     long = fix_pr_title({"suggested_fix": "word " * 40}, "t")
     assert len(long) == 72 and long.endswith("…")

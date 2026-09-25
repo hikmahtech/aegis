@@ -139,6 +139,51 @@ def _mcp_run_config(agent_id: str, external_url: str, api_key: str, gated: bool 
     )
 
 
+def _with_user_path(remote_cmd: str) -> str:
+    """Put the user's own bin dir on PATH for a command run over SSH.
+
+    A non-interactive SSH session skips the login profile, so tools installed
+    per-user (git-lfs in ~/.local/bin) are missing. In a repo that uses Git
+    LFS, that made `git worktree add` fail at checkout and `git push` fail in
+    the pre-push hook — the first sent a coding run into the shared checkout,
+    the second stopped every approved PR from opening (aegis#682)."""
+    return f'PATH="$HOME/.local/bin:$PATH"; {remote_cmd}'
+
+
+FIX_BRANCH_PREFIX = "aegis-fix/"
+
+# Said to every coding run that may commit. The per-run worktree is what keeps
+# the shared checkout clean; this is the agent's half of that bargain.
+GIT_HYGIENE = (
+    "Git hygiene — your working directory is already a git worktree made for this "
+    "run. Create the branch and commit HERE, and nowhere else: do not `cd` to the "
+    "repository's main checkout, do not run `git checkout`, `git switch`, `git stash` "
+    "or `git worktree` against any other directory, and never commit to "
+    "`main`/`master`. Before your final line, run `git status` and "
+    "`git branch --show-current` here and confirm the branch holds your commit and "
+    "the tree is clean. If anything you ran changed another checkout, put it back "
+    "the way you found it — even when the fix itself failed."
+)
+
+
+def _restore_shared_checkout(repo_path: str) -> str:
+    """Shell that puts the shared checkout back on its default branch when a
+    run left it on one of AEGIS's own fix branches.
+
+    Only an `aegis-fix/` branch with no uncommitted tracked changes is
+    switched away from: a branch the user checked out is theirs, and a dirty
+    tree might be their work. The fix branch itself is kept — it is what the
+    PR is opened from. Always exits 0, so it never changes a cleanup's rc."""
+    r = shlex.quote(repo_path)
+    return (
+        f"(b=$(git -C {r} branch --show-current 2>/dev/null); "
+        f'd=$(git -C {r} symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null); d="${{d#origin/}}"; '
+        f'case "$b" in {FIX_BRANCH_PREFIX}*) '
+        f'[ -n "$d" ] && git -C {r} diff --quiet HEAD && git -C {r} checkout -q "$d" ;; esac) '
+        "2>/dev/null; true"
+    )
+
+
 def _skills_copy_fragment(skills_src: str, worktree_path: str) -> str:
     """Shell fragment appended to the worktree-creation command that seeds
     `<worktree>/.claude/skills` from AEGIS's own checkout.
@@ -695,7 +740,7 @@ class RemoteScriptConnector:
                 host,
                 self._user,
                 key_file,
-                remote_cmd,
+                _with_user_path(remote_cmd),
                 known_hosts=self._known_hosts,
                 connect_timeout=connect_timeout,
                 batch_mode=batch_mode,
@@ -1100,11 +1145,15 @@ class RemoteScriptConnector:
             )
             wt = await self._exec(host, wt_cmd, timeout=30)
             if wt["status"] != "succeeded":
-                logger.warning("kimi_worktree_add_failed", repo=repo, error=wt["stderr"][:300])
-                work_path = repo_path
-                worktree_path = ""
-            else:
-                work_path = worktree_path
+                # Never fall back to the shared checkout: an agent run there
+                # switches its branch and commits on it, and the checkout the
+                # user works in is left on a fix branch (aegis#682). A run
+                # that cannot be isolated does not run.
+                error = f"worktree add failed: {wt['stderr'][:300]}"
+                logger.warning("kimi_worktree_add_failed", repo=repo, error=error)
+                await self.remove_worktree(worktree_path, host=host)
+                return {"run_id": run_id, "status": "failed", "error": error, "engine": engine}
+            work_path = worktree_path
 
         # Phase 3: write prompt to temp file on remote via stdin
         prompt_file = f"/tmp/aegis-prompt-{run_id}.txt"
@@ -1743,7 +1792,8 @@ class RemoteScriptConnector:
             f"git -C {shlex.quote(repo_path)} worktree remove --force "
             f"{shlex.quote(worktree_path)} 2>/dev/null; "
             f"rm -rf {shlex.quote(worktree_path)}; "
-            f"git -C {shlex.quote(repo_path)} worktree prune"
+            f"git -C {shlex.quote(repo_path)} worktree prune; "
+            f"{_restore_shared_checkout(repo_path)}"
         )
         await self._refresh_config()
         result = await self._exec(host or self._host, rm_cmd, timeout=30)
