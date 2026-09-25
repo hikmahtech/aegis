@@ -465,9 +465,12 @@ def test_books_write_flow_is_gated_on_money_hygiene():
         # Then +1 flow and +1 activity from the rising repos (#677):
         # GithubRisingFlow and `github_rising_tick` on GitHubSignalsActivities.
         # Unflagged, so all three rows move.
-        (True, True, 55, 265),
-        (False, False, 44, 229),
-        (True, False, 48, 247),
+        # Then +1 flow and +1 activity from the tender watch (#673):
+        # TenderWatchFlow and `tender_watch_tick` on TenderWatchActivities.
+        # Unflagged, so all three rows move.
+        (True, True, 56, 266),
+        (False, False, 45, 230),
+        (True, False, 49, 248),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):

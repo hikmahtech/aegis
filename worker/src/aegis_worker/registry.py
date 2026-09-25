@@ -107,6 +107,7 @@ from aegis_worker.flows.statement_reconcile import (
     StatementReconcileConfig,
     StatementReconcileFlow,
 )
+from aegis_worker.flows.tender_watch import TenderWatchConfig, TenderWatchFlow
 from aegis_worker.flows.todoist_sync import TodoistSyncConfig, TodoistSyncFlow
 from aegis_worker.flows.trading_desk import TradingDeskConfig, TradingDeskFlow
 from aegis_worker.flows.wearable_ingest import WearableIngestFlow, WearableIngestInput
@@ -710,6 +711,11 @@ FLOWS: tuple[FlowSpec, ...] = (
     FlowSpec(
         GithubRisingFlow,
         lambda act: GithubRisingConfig(agent_id=act["agent_id"], rising=dict(act["config"] or {})),
+    ),
+    # The daily GeM tender watch (#673): keywords and limits are the row's config.
+    FlowSpec(
+        TenderWatchFlow,
+        lambda act: TenderWatchConfig(agent_id=act["agent_id"], watch=dict(act["config"] or {})),
     ),
     # Child of GmailIngestFlow (the `meeting` tag fan-out); never scheduled.
     FlowSpec(MeetingNotesFlow),

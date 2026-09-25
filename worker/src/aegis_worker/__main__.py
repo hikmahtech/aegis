@@ -65,6 +65,7 @@ from aegis_worker.activities.runs_v3 import RunRecorderActivities
 from aegis_worker.activities.sentry_ingest import SentryIngestActivities
 from aegis_worker.activities.social import SocialActivities
 from aegis_worker.activities.statements import StatementActivities
+from aegis_worker.activities.tender_watch import TenderWatchActivities
 from aegis_worker.activities.todoist import TodoistActivities
 from aegis_worker.activities.trading_desk import TradingDeskActivities
 from aegis_worker.activities.wearable import WearableActivities
@@ -330,6 +331,8 @@ async def main():
     world_watch_act = WorldWatchActivities(db_pool=deps.pool, settings=settings)
     # The weekly rising-repos run (#677).
     github_act = GitHubSignalsActivities(db_pool=deps.pool, settings=settings)
+    # The daily GeM tender watch (#673).
+    tender_act = TenderWatchActivities(db_pool=deps.pool, settings=settings)
 
     channel_act = ChannelActivities(db_pool=deps.pool)
     calendar_act = CalendarActivities(
@@ -672,6 +675,7 @@ async def main():
         desk_act,
         world_watch_act,
         github_act,
+        tender_act,
         meeting_act,
         memory_act,
         profile_act,
