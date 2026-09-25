@@ -462,9 +462,12 @@ def test_books_write_flow_is_gated_on_money_hygiene():
         # Then +2 activities and NO new flow from story feedback (#675):
         # `post_area_stories` and `area_scorecard_line` on BriefingActivities.
         # Unflagged, so all three rows move.
-        (True, True, 54, 264),
-        (False, False, 43, 228),
-        (True, False, 47, 246),
+        # Then +1 flow and +1 activity from the rising repos (#677):
+        # GithubRisingFlow and `github_rising_tick` on GitHubSignalsActivities.
+        # Unflagged, so all three rows move.
+        (True, True, 55, 265),
+        (False, False, 44, 229),
+        (True, False, 48, 247),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):

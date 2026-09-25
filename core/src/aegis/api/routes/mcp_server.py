@@ -276,6 +276,7 @@ _READ_ONLY_TOOLS = frozenset(
         # search, a paper — fetched and returned, never stored. Not
         # `research_topic`: since #509 it starts `ResearchFlow`, which saves
         # its answer to the knowledge store.
+        "github_issues",
         "paper_read",
         "paper_search",
         "query_activities",

@@ -138,6 +138,7 @@ from aegis.services.tools.notes import (
 )
 from aegis.services.tools.registry import TOOL_REGISTRY
 from aegis.services.tools.research import (  # noqa: F401 — re-export: imported from here by tests
+    _exec_github_issues,
     _exec_paper_read,
     _exec_paper_search,
     _exec_read_url,
@@ -400,6 +401,8 @@ CHAT_TOOLS = [
     _registry_schema("read_url"),
     _registry_schema("paper_search"),
     _registry_schema("paper_read"),
+    # Where a project hurts, from its GitHub issues (#677).
+    _registry_schema("github_issues"),
     # The feed list (#511), generated from services/tools/feeds.py.
     _registry_schema("list_feeds"),
     _registry_schema("subscribe_feed"),
@@ -506,6 +509,7 @@ _TOOL_TIMEOUT_OVERRIDES: dict[str, int] = {
     "read_url": FETCH_TOOL_TIMEOUT_S,
     "paper_search": FETCH_TOOL_TIMEOUT_S,
     "paper_read": FETCH_TOOL_TIMEOUT_S,
+    "github_issues": FETCH_TOOL_TIMEOUT_S,
     # subscribe_feed fetches the URL to check it is a feed (#511).
     "subscribe_feed": FETCH_TOOL_TIMEOUT_S,
     # The library tools reach calibre-web; a read downloads one book and
@@ -676,6 +680,7 @@ TOOL_EXECUTORS: dict[str, Any] = {
     "read_url": _exec_read_url,
     "paper_search": _exec_paper_search,
     "paper_read": _exec_paper_read,
+    "github_issues": _exec_github_issues,
     "list_feeds": _exec_list_feeds,
     "subscribe_feed": _exec_follow_feed,
     "unsubscribe_feed": _exec_unsubscribe_feed,
@@ -798,6 +803,7 @@ AGENT_TOOL_SETS: dict[str, set[str]] = {
         "read_url",
         "paper_search",
         "paper_read",
+        "github_issues",
         # The feed list (#511): see it, add a feed, drop one.
         "list_feeds",
         "subscribe_feed",

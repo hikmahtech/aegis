@@ -167,6 +167,24 @@ activities:
       link: "https://quantamentry.com/countries/{iso}"
     active: false
 
+  # Raphael's weekly rising repos (#677): the most-starred repositories created
+  # in the last `window_days` for each GitHub topic below, filed once each under
+  # one tracked topic so the weekly area digest judges them. Ships INACTIVE:
+  # `topic` must be a tracked topic inside an area. A `github_token` on the
+  # Integrations page is optional. Saturday, so Sunday's weekly digest has it.
+  # The topics are an EXAMPLE.
+  - slug: github-rising-weekly
+    workflow_type: GithubRisingFlow
+    agent_id: raphael
+    schedule_cron: "CRON_TZ=Asia/Kolkata 0 9 * * 6"
+    config:
+      topics: [llm, ai-agents, data-engineering, observability, postgres, duckdb, clickhouse, kubernetes]
+      topic: GitHub rising
+      window_days: 30
+      min_stars: 100
+      per_topic: 3
+    active: false
+
   # Maou's paper trading desk (spec 2026-09-12-maou-trading-desk-design.md).
   # Weekdays 02:30 UTC (08:00 at UTC+5:30), before the example market's 09:15 open. Ships INACTIVE: it
   # needs ansaar_url + ansaar_service_secret (admin Integrations page) and a

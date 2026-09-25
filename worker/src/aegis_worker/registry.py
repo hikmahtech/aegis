@@ -65,6 +65,7 @@ from aegis_worker.flows.drive_sync import DriveSyncFlow, DriveSyncInput
 from aegis_worker.flows.expiry_radar import ExpiryRadarConfig, ExpiryRadarFlow
 from aegis_worker.flows.flow_health import FlowHealthConfig, FlowHealthWatchdogFlow
 from aegis_worker.flows.github_alert import GitHubAlertFlow
+from aegis_worker.flows.github_rising import GithubRisingConfig, GithubRisingFlow
 from aegis_worker.flows.gmail_ingest import GmailIngestFlow, GmailIngestInput
 from aegis_worker.flows.hub_sweep import HubSweepConfig, HubSweepFlow
 from aegis_worker.flows.infra_heartbeat import InfraHeartbeatConfig, InfraHeartbeatFlow
@@ -703,6 +704,12 @@ FLOWS: tuple[FlowSpec, ...] = (
     FlowSpec(
         WorldWatchFlow,
         lambda act: WorldWatchConfig(agent_id=act["agent_id"], watch=dict(act["config"] or {})),
+    ),
+    # The weekly rising-repos run (#677): its topics and limits are the row's
+    # config, handed to the activity whole.
+    FlowSpec(
+        GithubRisingFlow,
+        lambda act: GithubRisingConfig(agent_id=act["agent_id"], rising=dict(act["config"] or {})),
     ),
     # Child of GmailIngestFlow (the `meeting` tag fan-out); never scheduled.
     FlowSpec(MeetingNotesFlow),

@@ -248,6 +248,8 @@ class Settings(BaseSettings):
     # v3 per-source webhook signing secrets. Each source verifies its own HMAC.
     # Kept as env vars (not settings table) per spec §15 resolution.
     github_webhook_secret: str = ""  # X-Hub-Signature-256
+    # Optional read-only token for GitHub search (#677). Empty = unauthenticated.
+    github_token: str = ""
     sentry_webhook_secret: str = ""  # Sentry's HMAC header
     # /api/webhooks/alert has no vendor HMAC to verify (Alertmanager/Grafana
     # don't sign). Set this to require an X-Alert-Token header matching it;
