@@ -29,7 +29,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, date, datetime
 from typing import Any
 
 import structlog
@@ -266,13 +266,37 @@ def judge_prompt(
         "would want to know about: something changed that affects their money, "
         "work, city or decisions, or a turning point in a story they follow. "
         "Skip opinion, listicles, minor updates, repeats of what they were "
-        "already shown, and anything you would call routine. Picking none is fine.\n\n"
+        "already shown, and anything you would call routine. Picking none is fine.\n"
+        "Pick a story only when its TITLE is the development: your why must be "
+        "about what the title says, never about something only its summary "
+        "mentions. Skip roundups, bulletins and video episodes that cover "
+        "several stories at once.\n\n"
         f"Already shown recently:\n{recent}\n\n"
         f"{taste}"
         f"Stories:\n{listing}\n\n"
         'Answer with JSON only: [{"n": <story number>, "why": "<one short line: '
         'what changed and why it matters to them>"}]'
     )
+
+
+# A date written into a title: 17.06.2026, 17/06/2026, 17-06-2026 or 2026-06-17.
+_TITLE_DATE = re.compile(r"\b(\d{1,2})[./-](\d{1,2})[./-](20\d\d)\b|\b(20\d\d)-(\d{2})-(\d{2})\b")
+STALE_TITLE_DAYS = 14
+
+
+def stale_title(title: str, today: date) -> bool:
+    """Whether the title carries a date more than ``STALE_TITLE_DAYS`` old: a
+    feed re-publishing an old episode ("… | Above the Fold | 17.06.2026" came
+    in on 2026-09-25). A title with no date, or one that does not parse, is
+    not stale."""
+    for m in _TITLE_DATE.finditer(title or ""):
+        d, mo, y = (m.group(1), m.group(2), m.group(3)) if m.group(3) else (m.group(6), m.group(5), m.group(4))
+        try:
+            if (today - date(int(y), int(mo), int(d))).days > STALE_TITLE_DAYS:
+                return True
+        except ValueError:
+            continue
+    return False
 
 
 def parse_picks(raw: str, count: int, cap: int) -> list[dict[str, Any]] | None:
@@ -321,7 +345,9 @@ async def build_digest(
     """One area's digest: ``{"area", "stories": [{key, title, url, sources,
     why}], "candidates", "judged"}``. ``judged`` is False when the model was
     not asked or failed and the fallback picked."""
-    stories = [s for s in cluster(await area_items(pool, area, since)) if s["key"] not in seen_keys]
+    today = datetime.now(UTC).date()
+    items = [i for i in await area_items(pool, area, since) if not stale_title(str(i.get("title") or ""), today)]
+    stories = [s for s in cluster(items) if s["key"] not in seen_keys]
     result: dict[str, Any] = {"area": area.name, "stories": [], "candidates": len(stories), "judged": False}
     if not stories:
         return result
