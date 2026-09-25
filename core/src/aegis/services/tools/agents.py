@@ -22,6 +22,7 @@ import structlog
 from pydantic import Field
 
 from aegis.agent_tags import GENERALIST_TAG
+from aegis.connectors.remote_script import FIX_BRANCH_PREFIX, GIT_HYGIENE
 from aegis.errors import error_text
 from aegis.services.agents import resolve_tag
 from aegis.services.tools.base import ToolContext
@@ -70,6 +71,7 @@ def _build_aegis_self_diagnose_prompt(issue: str, mode: str, fix_branch: str) ->
             "test plan. Output a line: `BRANCH: aegis:<branch_name>` and "
             "`PR: <url>`. Do NOT commit speculative or untested changes. "
             "Do NOT commit directly to main.\n"
+            f"   {GIT_HYGIENE}\n"
         )
     else:
         prompt += (
@@ -124,7 +126,7 @@ async def _exec_aegis_self_diagnose(
         coding = {}
     repo = coding.get("self_repo_path") or settings.aegis_self_repo_path or "personal/aegis"
     kimi_binary = coding.get("kimi_binary") or settings.kimi_cli_binary_path
-    fix_branch = f"aegis-fix/{_slugify_issue(issue)}"
+    fix_branch = f"{FIX_BRANCH_PREFIX}{_slugify_issue(issue)}"
     prompt = _build_aegis_self_diagnose_prompt(issue, mode, fix_branch)
 
     # Single wall-clock deadline covering BOTH launch (start_kimi_run's SSH

@@ -256,17 +256,19 @@ async def test_start_kimi_run_creates_worktree_and_runs_kimi_there(conn):
 
 
 @pytest.mark.asyncio
-async def test_start_kimi_run_worktree_failure_falls_back_to_shared(conn):
-    """When worktree add fails (rc=1), kimi should run in the shared clone.
+async def test_start_kimi_run_worktree_failure_never_runs_in_shared_checkout(conn):
+    """When worktree add fails, the run fails — it must never launch in the
+    shared checkout, where an agent switches the branch the user works on and
+    commits to it (aegis#682: a git-lfs checkout failure left screener-p's main
+    checkout on a fix branch).
 
     Call sequence:
       0: test -d check (rc=0)
       1: git pull (rc=0)
       2: mkdir + git worktree add --detach (rc=1 — FAIL)
-      3: cat > prompt_file (rc=0)
-      4: kimi launch (rc=0)
+      3: cleanup of the half-made worktree (rc=0)
     """
-    procs = _make_proc_sequence([0, 0, 1, 0, 0])
+    procs = _make_proc_sequence([0, 0, 1, 0])
     with patch("asyncio.create_subprocess_exec", side_effect=procs) as mock_exec:
         result = await conn.start_kimi_run(
             repo="youruser/bcp",
@@ -274,19 +276,11 @@ async def test_start_kimi_run_worktree_failure_falls_back_to_shared(conn):
             kimi_binary="/usr/local/bin/kimi",
         )
 
-    assert result["status"] == "running"
-    # Fallback: worktree_path must be empty string
-    assert result["worktree_path"] == ""
-
-    repo_path = "/home/user/Workspace/youruser/bcp"
+    assert result["status"] == "failed"
+    assert "worktree add failed" in result["error"]
     all_cmds = [" ".join(str(a) for a in c.args) for c in mock_exec.call_args_list]
-    kimi_cmd = all_cmds[-1]
-
-    # kimi must run from the shared repo_path (not a worktree); the `cd` prefix
-    # carries cwd since kimi CLI 0.31.x has no --work-dir flag.
-    assert "--work-dir" not in kimi_cmd
-    assert repo_path in kimi_cmd
-    assert "-aegis-wt/" not in kimi_cmd
+    assert not any("/usr/local/bin/kimi" in cmd for cmd in all_cmds)
+    assert "worktree remove" in all_cmds[-1]
 
 
 @pytest.mark.asyncio
@@ -1768,3 +1762,50 @@ async def test_mcp_config_write_is_atomic(conn_mount):
 
     assert "cat > $HOME/.aegis/mcp-sebas.json.$$.tmp" in write_cmd
     assert "mv $HOME/.aegis/mcp-sebas.json.$$.tmp $HOME/.aegis/mcp-sebas.json" in write_cmd
+
+
+def _git(cwd, *args):
+    import subprocess
+
+    return subprocess.run(
+        ["git", "-C", str(cwd), *args], check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+@pytest.fixture
+def shared_checkout(tmp_path):
+    """A clone whose origin/HEAD is `main`, like a real shared checkout."""
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    _git(origin, "init", "-q", "-b", "main")
+    _git(origin, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "i")
+    _git(tmp_path, "clone", "-q", str(origin), "repo")
+    return tmp_path / "repo"
+
+
+@pytest.mark.parametrize(
+    "branch, dirty, expected",
+    [
+        ("aegis-fix/sentry-1", False, "main"),  # a run left it here: put it back
+        ("my-feature", False, "my-feature"),  # the user's own branch: never touched
+        ("aegis-fix/sentry-1", True, "aegis-fix/sentry-1"),  # uncommitted work: leave it
+    ],
+)
+def test_restore_shared_checkout(shared_checkout, branch, dirty, expected):
+    import subprocess
+
+    from aegis.connectors.remote_script import _restore_shared_checkout
+
+    _git(shared_checkout, "checkout", "-q", "-b", branch)
+    tracked = shared_checkout / "f.txt"
+    tracked.write_text("a")
+    _git(shared_checkout, "add", "f.txt")
+    _git(shared_checkout, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "c")
+    if dirty:
+        tracked.write_text("b")
+
+    proc = subprocess.run(["sh", "-c", _restore_shared_checkout(str(shared_checkout))])
+
+    assert proc.returncode == 0
+    assert _git(shared_checkout, "branch", "--show-current") == expected
+    assert _git(shared_checkout, "rev-parse", "--verify", branch)  # the branch itself is kept

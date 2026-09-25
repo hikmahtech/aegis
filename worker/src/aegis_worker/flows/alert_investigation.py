@@ -133,6 +133,9 @@ def fix_pr_title(verdict: dict, alert_title: str) -> str:
     title written by hand."""
     for text in (verdict.get("suggested_fix"), verdict.get("root_cause"), alert_title):
         line = " ".join(str(text or "").split())
+        # A numbered fix ("1. In `group_as_list`…") cut at its first full stop
+        # became the title "fix: 1" (aegis#682); drop the list marker first.
+        line = re.sub(r"^(\d+[.)]|[-*•])\s+", "", line)
         line = re.split(r"(?<=[.!?])\s", line, maxsplit=1)[0].rstrip(".!? ")
         if line:
             line = line[0].lower() + line[1:]
@@ -1931,6 +1934,7 @@ class AlertInvestigationFlow:
                             repo_to_github[key] = gh
                             repo_to_path[key] = rp
                 pr_urls: list[str] = []
+                pr_errors: list[str] = []
                 for repo_name, branch_name in branches.items():
                     github_repo = repo_to_github.get(repo_name.lower(), "")
                     if not github_repo or not branch_name:
@@ -1970,6 +1974,8 @@ class AlertInvestigationFlow:
                     pr_url = pr_result.get("pr_url", "")
                     if pr_url:
                         pr_urls.append(pr_url)
+                    elif pr_result.get("error"):
+                        pr_errors.append(f"{branch_name}: {pr_result['error'][:300]}")
 
                 if pr_urls:
                     opened_pr_urls = pr_urls
@@ -2028,7 +2034,8 @@ class AlertInvestigationFlow:
                         await self._safe_post_note(
                             track_task_id,
                             "⚠️ Open-PR was approved but no PR could be opened. "
-                            f"Fix branch(es) still exist on the run host: {branch_list}",
+                            f"Fix branch(es) still exist on the run host: {branch_list}"
+                            + ("\n\nWhy:\n" + "\n".join(pr_errors) if pr_errors else ""),
                         )
 
         # ── Step 7.9: Store the verdict with what became of it (#502) ──
