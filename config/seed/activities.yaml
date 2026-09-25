@@ -185,6 +185,26 @@ activities:
       per_topic: 3
     active: false
 
+  # Raphael's tender watch (#673): ongoing GeM bids matching each keyword,
+  # newest first, filed once each under one tracked topic so the area digest
+  # judges them. Bids closing within `min_days_left` are skipped. Only GeM:
+  # CPPP's public listing is the latest ten and its search needs a captcha, and
+  # MahaTenders' robots.txt disallows everything. Ships INACTIVE: `topic` must be
+  # a tracked topic inside an area. The keywords are an EXAMPLE.
+  - slug: tender-watch-daily
+    workflow_type: TenderWatchFlow
+    agent_id: raphael
+    schedule_cron: "CRON_TZ=Asia/Kolkata 0 9 * * *"
+    config:
+      keywords: [software development, MIS, dashboard, data migration, digitisation, GIS, ETL, cloud, machine learning, document management system, annual maintenance software]
+      topic: Government IT tenders
+      per_keyword: 10
+      min_days_left: 3
+      # GeM's search is loose ("GIS" returns stationery), so a bid is kept only
+      # when its title names one of these at the start of a word.
+      title_terms: [software, application, portal, website, web, data, database, analytics, dashboard, MIS, GIS, ERP, cloud, digiti, e-governance, e-office, AI, artificial intelligence, machine learning, IT, system integrat, automation]
+    active: false
+
   # Maou's paper trading desk (spec 2026-09-12-maou-trading-desk-design.md).
   # Weekdays 02:30 UTC (08:00 at UTC+5:30), before the example market's 09:15 open. Ships INACTIVE: it
   # needs ansaar_url + ansaar_service_secret (admin Integrations page) and a
