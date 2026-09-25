@@ -47,6 +47,7 @@ EXPECTED_TOOL_NAMES = [
     "get_pod_logs",
     "get_quote",
     "get_service_logs",
+    "github_issues",
     "handoff_task",
     "inspect_service",
     "investigate_resource",

@@ -39,6 +39,7 @@ from aegis_worker.activities.delivery import DeliveryActivities
 from aegis_worker.activities.drive import DriveActivities
 from aegis_worker.activities.expiring_items import ExpiringItemsActivities
 from aegis_worker.activities.flow_health import FlowHealthActivities
+from aegis_worker.activities.github_signals import GitHubSignalsActivities
 from aegis_worker.activities.gmail import GmailActivities
 from aegis_worker.activities.homelab import HomelabActivities
 from aegis_worker.activities.hub import HubActivities
@@ -327,6 +328,8 @@ async def main():
 
     # Raphael's world watch (#676): reads its connection on every run.
     world_watch_act = WorldWatchActivities(db_pool=deps.pool, settings=settings)
+    # The weekly rising-repos run (#677).
+    github_act = GitHubSignalsActivities(db_pool=deps.pool, settings=settings)
 
     channel_act = ChannelActivities(db_pool=deps.pool)
     calendar_act = CalendarActivities(
@@ -668,6 +671,7 @@ async def main():
         statement_act,
         desk_act,
         world_watch_act,
+        github_act,
         meeting_act,
         memory_act,
         profile_act,

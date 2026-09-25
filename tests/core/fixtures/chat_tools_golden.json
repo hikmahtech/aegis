@@ -421,6 +421,48 @@
   {
     "type": "function",
     "function": {
+      "name": "github_issues",
+      "description": "Search one GitHub project's issues, most-reacted first, to see where it hurts in real use: bugs, performance or production trouble. Returns title, url, state, comments, reactions, labels and an excerpt. Nothing is saved.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "repo": {
+            "type": "string",
+            "description": "The project as owner/name, e.g. duckdb/duckdb."
+          },
+          "focus": {
+            "type": "string",
+            "enum": [
+              "bug",
+              "performance",
+              "production",
+              "any"
+            ],
+            "description": "bug (label:bug), performance (slow, memory, latency), production (outages, data loss) or any.",
+            "default": "bug"
+          },
+          "terms": {
+            "type": "string",
+            "description": "Extra words to narrow the search, e.g. \"parquet s3\".",
+            "default": ""
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 20,
+            "description": "How many issues (1-20).",
+            "default": 10
+          }
+        },
+        "required": [
+          "repo"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "list_feeds",
       "description": "List the RSS feeds the research agent follows and what each is worth: entries and stored documents in the last 30 days, how many of its documents a prompt used in the last 30 and 90 days, its ingest mode, its last entry and any fetch failures.",
       "parameters": {

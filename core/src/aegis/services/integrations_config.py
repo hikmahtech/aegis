@@ -40,6 +40,12 @@ class ConfigKey:
 # paths/homelab/remote-script) are deliberately NOT here — they're env-only.
 CONFIG_REGISTRY: list[ConfigKey] = [
     ConfigKey("github_webhook_secret", "Webhook secret", "GitHub", True),
+    ConfigKey(
+        "github_token", "Read-only API token (optional)", "GitHub", True,
+        help="Used by the github_issues tool and the weekly rising-repos run (#677). "
+        "Unset = unauthenticated, which GitHub limits to 10 searches a minute. "
+        "A fine-grained token with no permissions is enough.",
+    ),
     ConfigKey("sentry_url", "Base URL", "Sentry", False),
     ConfigKey("sentry_token", "API token", "Sentry", True),
     ConfigKey("sentry_org", "Org slug", "Sentry", False),

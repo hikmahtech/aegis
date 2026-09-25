@@ -125,6 +125,43 @@ async def _exec_paper_read(
 
 
 @aegis_tool
+async def _exec_github_issues(
+    pool: asyncpg.Pool,
+    ctx: ToolContext,
+    *,
+    repo: str,
+    focus: Literal["bug", "performance", "production", "any"] = "bug",
+    terms: str = "",
+    limit: Annotated[int, Field(ge=1, le=20)] = 10,
+) -> str:
+    """Search one GitHub project's issues, most-reacted first, to see where it hurts in real use: bugs, performance or production trouble. Returns title, url, state, comments, reactions, labels and an excerpt. Nothing is saved.
+
+    Args:
+        repo: The project as owner/name, e.g. duckdb/duckdb.
+        focus: bug (label:bug), performance (slow, memory, latency), production (outages, data loss) or any.
+        terms: Extra words to narrow the search, e.g. "parquet s3".
+        limit: How many issues (1-20).
+    """
+    from aegis.connectors.github import GitHubClient
+    from aegis.services import github_signals as gs
+    from aegis.services.integrations_config import read_integration
+
+    repo = (repo or "").strip().strip("/")
+    if repo.count("/") != 1 or " " in repo:
+        return json.dumps({"error": "repo must be owner/name, e.g. duckdb/duckdb"})
+    token = await read_integration(pool, ctx.settings, "github_token") if ctx.settings is not None else ""
+    client = GitHubClient(token, db_pool=pool)
+    query = gs.issues_query(repo, focus, terms)
+    try:
+        hits = await client.search_issues(query, per_page=limit)
+    except Exception as exc:  # noqa: BLE001 — a failed search is an answer, not a crash
+        return json.dumps({"error": f"GitHub search failed: {error_text(exc)}", "query": query})
+    finally:
+        await client.close()
+    return json.dumps({"query": query, "issues": [gs.issue_row(i) for i in hits[:limit]]})
+
+
+@aegis_tool
 async def _exec_research_topic(
     pool: asyncpg.Pool,
     ctx: ToolContext,
