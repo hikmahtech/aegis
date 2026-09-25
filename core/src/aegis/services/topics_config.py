@@ -6,9 +6,13 @@ items a round's task and digest list. Edited on Admin → Research → Topic
 thresholds (`GET/PUT /api/admin/research/topics-config`); a topic's own
 `threshold` in the registry overrides the per-priority number.
 
-    {"attention": {"high": 2, "medium": 3, "low": 5}, "digest_items": 10}
+    {"attention": {"high": 2, "medium": 3, "low": 5}, "digest_items": 10,
+     "brief_items": 7, "weekly_day": 6}
 
 The defaults are what `ATTENTION_ITEMS` and the three copies of 10 said.
+`brief_items` caps the area stories (#674) in one morning brief across all
+areas; `weekly_day` (0 = Monday … 6 = Sunday, on the user's clock) is the day
+weekly and vault areas get their digest.
 """
 
 from __future__ import annotations
@@ -21,7 +25,12 @@ SETTINGS_KEY = "research_topics_config"
 PRIORITIES = ("high", "medium", "low")
 
 DEFAULT_ATTENTION: dict[str, int] = {"high": 2, "medium": 3, "low": 5}
-DEFAULTS: dict[str, Any] = {"attention": dict(DEFAULT_ATTENTION), "digest_items": 10}
+DEFAULTS: dict[str, Any] = {
+    "attention": dict(DEFAULT_ATTENTION),
+    "digest_items": 10,
+    "brief_items": 7,
+    "weekly_day": 6,
+}
 
 
 def merge(value: Any) -> dict:
@@ -30,9 +39,12 @@ def merge(value: Any) -> dict:
     attention = {
         p: as_int(raw.get(p), DEFAULT_ATTENTION[p], minimum=1) for p in PRIORITIES
     }
+    weekly_day = as_int(v.get("weekly_day"), DEFAULTS["weekly_day"], minimum=0)
     return {
         "attention": attention,
         "digest_items": as_int(v.get("digest_items"), DEFAULTS["digest_items"], minimum=1),
+        "brief_items": as_int(v.get("brief_items"), DEFAULTS["brief_items"], minimum=1),
+        "weekly_day": weekly_day if weekly_day <= 6 else DEFAULTS["weekly_day"],
     }
 
 
@@ -48,7 +60,12 @@ def validate(value: Any) -> dict:
         if key not in PRIORITIES:
             raise ValueError(f"attention has an unknown priority {key!r}")
     out = {p: require_int(attention, p, minimum=1, maximum=1000) for p in PRIORITIES}
-    return {"attention": out, "digest_items": require_int(v, "digest_items", minimum=1, maximum=100)}
+    return {
+        "attention": out,
+        "digest_items": require_int(v, "digest_items", minimum=1, maximum=100),
+        "brief_items": require_int(v, "brief_items", minimum=1, maximum=50),
+        "weekly_day": require_int(v, "weekly_day", minimum=0, maximum=6),
+    }
 
 
 ROW = SettingsRow(SETTINGS_KEY, merge, validate)

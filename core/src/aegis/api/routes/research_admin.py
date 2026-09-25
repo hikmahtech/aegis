@@ -30,6 +30,7 @@ from aegis.api.settings_routes import settings_row_routes
 from aegis.services import (
     feeds_config,
     library_config,
+    research_areas,
     research_config,
     research_topics,
     topics_config,
@@ -50,6 +51,11 @@ async def get_topics(request: Request) -> dict[str, Any]:
         "topics": await research_topics.list_registry(pool),
         "priorities": list(research_topics.PRIORITIES),
         "config": await topics_config.get_topics_config(pool),
+        "areas": [
+            {"name": a.name, "why": a.why, "cadence": a.cadence, "cap": a.cap, "topics": list(a.topics)}
+            for a in await research_topics.load_areas(pool)
+        ],
+        "cadences": list(research_areas.CADENCES),
     }
 
 

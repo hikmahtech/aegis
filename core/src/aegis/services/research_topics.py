@@ -45,7 +45,7 @@ import asyncpg
 import structlog
 
 from aegis.errors import error_text
-from aegis.services import topics_config
+from aegis.services import research_areas, topics_config
 from aegis.services.hub import (
     TOPIC_CLASS,
     Event,
@@ -195,6 +195,12 @@ async def load_topics(pool: asyncpg.Pool) -> list[Topic]:
     return parse_topics(await get_setting(pool, TOPICS_SETTING))
 
 
+async def load_areas(pool: asyncpg.Pool) -> list[research_areas.Area]:
+    """The areas (#674), holding only topics the registry still tracks."""
+    value = await get_setting(pool, TOPICS_SETTING)
+    return research_areas.parse_areas(value, [t.name for t in parse_topics(value)])
+
+
 def _pattern(topic: Topic) -> re.Pattern[str]:
     alts = "|".join(re.escape(t) for t in sorted(topic.terms, key=len, reverse=True))
     return re.compile(rf"(?<![\w])(?:{alts})(?![\w])", re.IGNORECASE)
@@ -297,8 +303,17 @@ async def ensure_round(
     return result.problem_id
 
 
-async def _save_registry(db: Any, topics: list[dict[str, Any]]) -> None:
-    await put_setting(db, TOPICS_SETTING, {"topics": topics})
+async def _save_registry(
+    db: Any, topics: list[dict[str, Any]], areas: list[dict[str, Any]] | None = None
+) -> None:
+    """Write the topics, keeping the row's other keys (the areas, #674)
+    unless ``areas`` replaces them."""
+    value = await get_setting(db, TOPICS_SETTING)
+    value = dict(value) if isinstance(value, dict) else {}
+    value["topics"] = topics
+    if areas is not None:
+        value["areas"] = areas
+    await put_setting(db, TOPICS_SETTING, value)
 
 
 async def _raw_registry(db: Any) -> list[dict[str, Any]]:
@@ -317,11 +332,17 @@ async def save_registry(
     ValueError). A topic that was dropped has its live round closed; a topic
     that is new gets a round opened, as `track` does."""
     entries = validate_registry(value)
+    # A body without `areas` leaves them as they are; one with it replaces them.
+    areas = (
+        research_areas.validate_areas(value["areas"], [e["name"] for e in entries])
+        if "areas" in value
+        else None
+    )
     now = now or datetime.now(UTC)
     async with pool.acquire() as conn, conn.transaction():
         await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", _REGISTRY_LOCK)
         before = {slug(str(t.get("name") or "")) for t in await _raw_registry(conn)}
-        await _save_registry(conn, entries)
+        await _save_registry(conn, entries, areas)
     after = parse_topics({"topics": entries})
     for topic in after:
         if topic.slug not in before:
@@ -594,7 +615,12 @@ async def attach_items(
                 attached += 1
     tasks = 0
     cfg = await topics_config.get_topics_config(pool)
+    # A topic in an area reaches the user through the area digest, never as a
+    # task for how much was written about it (#674).
+    in_areas = research_areas.area_topic_slugs(await load_areas(pool))
     for topic_slug, pid in rounds.items():
+        if topic_slug in in_areas:
+            continue
         if await _check_attention(pool, pid, by_slug[topic_slug], now, cfg):
             tasks += 1
             if project:
