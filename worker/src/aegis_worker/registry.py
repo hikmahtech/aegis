@@ -110,6 +110,7 @@ from aegis_worker.flows.todoist_sync import TodoistSyncConfig, TodoistSyncFlow
 from aegis_worker.flows.trading_desk import TradingDeskConfig, TradingDeskFlow
 from aegis_worker.flows.wearable_ingest import WearableIngestFlow, WearableIngestInput
 from aegis_worker.flows.workspace_repo_sync import WorkspaceRepoSyncFlow, WorkspaceRepoSyncInput
+from aegis_worker.flows.world_watch import WorldWatchConfig, WorldWatchFlow
 
 logger = structlog.get_logger()
 
@@ -696,6 +697,12 @@ FLOWS: tuple[FlowSpec, ...] = (
         TradingDeskFlow,
         lambda act: TradingDeskConfig(agent_id=act["agent_id"]),
         feature_flag="money_hygiene_enabled",
+    ),
+    # Raphael's world watch (#676): its watch list and thresholds are the
+    # activities row's config, handed to the activity whole.
+    FlowSpec(
+        WorldWatchFlow,
+        lambda act: WorldWatchConfig(agent_id=act["agent_id"], watch=dict(act["config"] or {})),
     ),
     # Child of GmailIngestFlow (the `meeting` tag fan-out); never scheduled.
     FlowSpec(MeetingNotesFlow),

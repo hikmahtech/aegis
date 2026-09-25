@@ -276,6 +276,16 @@ CONFIG_REGISTRY: list[ConfigKey] = [
         help="ansaar-data's CLIENT_TOKEN_SECRET, exchanged for a 15-minute token on each run. "
         "Never the admin login.",
     ),
+    ConfigKey(
+        "quantamentry_url", "Quantamentry API URL", "World watch", False,
+        help="Where Raphael's world watch reads country credibility scores and the "
+        "central-bank calendar, e.g. http://credibility-monitor_api:8000 on the swarm "
+        "overlay. Empty = the watch does nothing. Applies on the next run.",
+    ),
+    ConfigKey(
+        "quantamentry_api_key", "Quantamentry API key", "World watch", True,
+        help="Sent as X-API-Key. The API's own QDP_API_KEY.",
+    ),
 ]
 _BY_KEY = {c.key: c for c in CONFIG_REGISTRY}
 

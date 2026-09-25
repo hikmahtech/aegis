@@ -383,6 +383,9 @@ class Settings(BaseSettings):
     # ansaar-data API serving the trading system's decisions. Either empty ⇒ off.
     ansaar_url: str = ""
     ansaar_service_secret: str = ""
+    # Raphael's world watch (#676): the Quantamentry API. Either empty ⇒ off.
+    quantamentry_url: str = ""
+    quantamentry_api_key: str = ""
 
     @model_validator(mode="after")
     def _require_admin_credentials(self) -> "Settings":

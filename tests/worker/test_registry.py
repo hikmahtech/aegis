@@ -456,9 +456,12 @@ def test_books_write_flow_is_gated_on_money_hygiene():
         # spec §12): RecordSeedFlow (hand-started, no seed row) and
         # `record_seed_general`, `record_seed_money`, `record_seed_interests`
         # on RecordActivities. Unflagged, so all three rows move.
-        (True, True, 53, 261),
-        (False, False, 42, 225),
-        (True, False, 46, 243),
+        # Then +1 flow and +1 activity from the world watch (#676):
+        # WorldWatchFlow and `world_watch_tick` on WorldWatchActivities.
+        # Unflagged, so all three rows move.
+        (True, True, 54, 262),
+        (False, False, 43, 226),
+        (True, False, 47, 244),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):

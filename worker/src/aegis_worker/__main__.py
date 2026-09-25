@@ -67,6 +67,7 @@ from aegis_worker.activities.statements import StatementActivities
 from aegis_worker.activities.todoist import TodoistActivities
 from aegis_worker.activities.trading_desk import TradingDeskActivities
 from aegis_worker.activities.wearable import WearableActivities
+from aegis_worker.activities.world_watch import WorldWatchActivities
 from aegis_worker.bootstrap import bootstrap
 from aegis_worker.interceptors import WorkflowRunRecorderInterceptor
 from aegis_worker.registry import (
@@ -323,6 +324,9 @@ async def main():
         desk_act = TradingDeskActivities(
             db_pool=deps.pool, settings=settings, finance=connectors.get("finance")
         )
+
+    # Raphael's world watch (#676): reads its connection on every run.
+    world_watch_act = WorldWatchActivities(db_pool=deps.pool, settings=settings)
 
     channel_act = ChannelActivities(db_pool=deps.pool)
     calendar_act = CalendarActivities(
@@ -663,6 +667,7 @@ async def main():
         drive_act,
         statement_act,
         desk_act,
+        world_watch_act,
         meeting_act,
         memory_act,
         profile_act,

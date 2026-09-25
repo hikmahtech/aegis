@@ -140,6 +140,33 @@ activities:
       silent: false
     active: false
 
+  # Raphael's world watch (#676): what changed in the countries and central
+  # banks you watch, from a Quantamentry API, filed under one tracked topic so
+  # the morning brief's area digest (#674) judges it with everything else.
+  # Ships INACTIVE: it needs quantamentry_url + quantamentry_api_key (admin
+  # Integrations page), and `topic` must be a tracked topic inside an area.
+  # Runs before the brief. The config below is an EXAMPLE watch list.
+  - slug: world-watch-daily
+    workflow_type: WorldWatchFlow
+    agent_id: raphael
+    schedule_cron: "CRON_TZ=Asia/Kolkata 30 9 * * *"
+    config:
+      # Scores to watch (ISO 3166 alpha-3): a regime shift, or a 7-day move
+      # of `move_points` or more.
+      countries: [IND, PAK, BGD, LKA, CHN]
+      # Central banks to watch, by country ISO: a meeting within
+      # `meeting_days`, or a stance move of `stance_delta` at a meeting held
+      # within `recent_days`.
+      banks: [USA, DEU, GBR]
+      topic: Country watch
+      move_points: 3
+      meeting_days: 7
+      recent_days: 7
+      stance_delta: 0.2
+      stale_days: 3
+      link: "https://quantamentry.com/countries/{iso}"
+    active: false
+
   # Maou's paper trading desk (spec 2026-09-12-maou-trading-desk-design.md).
   # Weekdays 02:30 UTC (08:00 at UTC+5:30), before the example market's 09:15 open. Ships INACTIVE: it
   # needs ansaar_url + ansaar_service_secret (admin Integrations page) and a
