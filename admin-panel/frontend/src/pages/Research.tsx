@@ -5,8 +5,11 @@ import { toast } from '../components/Toast';
 import {
   numbersPayload,
   splitList,
+  toAreaRow,
+  toAreasPayload,
   toTopicRow,
   toTopicsPayload,
+  type AreaRow,
   type TopicRow,
 } from '../lib/researchConfig';
 
@@ -75,6 +78,9 @@ export default function Research() {
   const [priorities, setPriorities] = useState<string[]>(['high', 'medium', 'low']);
   const [attention, setAttention] = useState<Numbers>({});
   const [digestItems, setDigestItems] = useState('');
+  const [areas, setAreas] = useState<AreaRow[]>([]);
+  const [cadences, setCadences] = useState<string[]>(['daily', 'weekly', 'vault']);
+  const [briefCfg, setBriefCfg] = useState<Numbers>({});
   const [feedCfg, setFeedCfg] = useState<Numbers>({});
   const [defaultIngest, setDefaultIngest] = useState('full');
   const [research, setResearch] = useState<Numbers>({});
@@ -87,11 +93,14 @@ export default function Research() {
     setTopics((r.topics || []).map(toTopicRow));
     setRounds(Object.fromEntries((r.topics || []).map((t: any) => [t.name, t])));
     setPriorities(r.priorities || ['high', 'medium', 'low']);
+    setAreas((r.areas || []).map(toAreaRow));
+    setCadences(r.cadences || ['daily', 'weekly', 'vault']);
     if (r.config) applyTopicsConfig(r.config);
   }
   function applyTopicsConfig(c: any) {
     setAttention(strs(c.attention || {}, ['high', 'medium', 'low']));
     setDigestItems(String(c.digest_items ?? ''));
+    setBriefCfg(strs(c, ['brief_items', 'weekly_day']));
   }
   function applyFeeds(c: any) {
     setFeedCfg(strs(c, FEED_KEYS));
@@ -130,9 +139,15 @@ export default function Research() {
     applyTopics(await api.saveResearchTopics(toTopicsPayload(topics)));
   }, 'Tracked topics saved — the next scan and feed run use them.');
 
+  // Areas ride the same registry row, so they save with the topics as shown.
+  const saveAreas = () => run('areas', async () => {
+    applyTopics(await api.saveResearchTopics({ ...toTopicsPayload(topics), areas: toAreasPayload(areas) }));
+  }, 'Areas saved — the next morning brief uses them.');
+
   const saveTopicsConfig = () => run('topics-config', async () => {
     const body: any = { attention: numbersPayload(attention, ['high', 'medium', 'low']) };
     const d = digestItems.trim(); if (d) body.digest_items = Number.isFinite(Number(d)) ? Number(d) : d;
+    Object.assign(body, numbersPayload(briefCfg, ['brief_items', 'weekly_day']));
     applyTopicsConfig(await api.saveResearchTopicsConfig(body));
   }, 'Topic thresholds saved — applies within ~30s.');
 
@@ -216,6 +231,52 @@ export default function Research() {
       </div>
 
       <div className="card" style={{ marginTop: 16 }}>
+        <h2 className="section-title">Areas</h2>
+        <p className="meta" style={{ marginBottom: 8 }}>
+          How news reaches you. Each area groups topics; every morning the brief shows what <em>changed</em> in its
+          daily areas — related articles folded into one story, judged against your "why", at most <code>cap</code> a
+          day. Weekly areas come on <code>weekly_day</code>; vault areas go to that week's journal note and never
+          interrupt. A topic in an area never becomes a Todoist task for how much was written about it.
+          With no areas, the brief lists topics and scan finds as before.
+        </p>
+        <div className="table-scroll">
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th style={{ width: 160 }}>Area</th><th>Why you care</th>
+                <th style={{ width: 110 }}>Cadence</th><th style={{ width: 70 }}>Cap</th>
+                <th>Topics (comma-separated)</th><th style={{ width: 50 }} />
+              </tr>
+            </thead>
+            <tbody>
+              {areas.map((a, i) => {
+                const set = (patch: Partial<AreaRow>) => setAreas(rows => rows.map((r, j) => (j === i ? { ...r, ...patch } : r)));
+                return (
+                  <tr key={i}>
+                    <td><input value={a.name} onChange={e => set({ name: e.target.value })} style={{ width: '100%' }} /></td>
+                    <td><input value={a.why} placeholder="one sentence, in your words" onChange={e => set({ why: e.target.value })} style={{ width: '100%' }} /></td>
+                    <td>
+                      <select value={a.cadence} onChange={e => set({ cadence: e.target.value })}>
+                        {cadences.map(c => <option key={c} value={c}>{c}</option>)}
+                      </select>
+                    </td>
+                    <td><input value={a.cap} placeholder="3" onChange={e => set({ cap: e.target.value })} className="mono" style={{ width: 50 }} /></td>
+                    <td><input value={a.topics} onChange={e => set({ topics: e.target.value })} style={{ width: '100%' }} /></td>
+                    <td><button className="btn btn-sm" onClick={() => setAreas(rows => rows.filter((_, j) => j !== i))}>✕</button></td>
+                  </tr>
+                );
+              })}
+              {areas.length === 0 && <tr><td colSpan={6} className="empty">No areas. The brief lists topics and scan finds the old way.</td></tr>}
+            </tbody>
+          </table>
+        </div>
+        <div style={{ marginTop: 8, display: 'flex', gap: 8 }}>
+          <button className="btn" onClick={() => setAreas(r => [...r, { name: '', why: '', cadence: 'daily', cap: '', topics: '' }])}>+ Add area</button>
+          <button className="btn btn-primary" disabled={saving === 'areas'} onClick={saveAreas}>{saving === 'areas' ? 'Saving…' : 'Save areas'}</button>
+        </div>
+      </div>
+
+      <div className="card" style={{ marginTop: 16 }}>
         <h2 className="section-title">Topic thresholds</h2>
         <p className="meta" style={{ marginBottom: 8 }}>
           Items a round must hold, per priority, before the topic interrupts you with a task
@@ -226,6 +287,8 @@ export default function Research() {
             <NumberField key={p} k={p} value={attention[p] || ''} onChange={v => setAttention(a => ({ ...a, [p]: v }))} />
           ))}
           <NumberField k="digest_items" value={digestItems} help="Items a round's task and briefing digest list, newest first." onChange={setDigestItems} />
+          <NumberField k="brief_items" value={briefCfg.brief_items || ''} help="Area stories in one morning brief, across all areas, spent in the areas' order." onChange={v => setBriefCfg(c => ({ ...c, brief_items: v }))} />
+          <NumberField k="weekly_day" value={briefCfg.weekly_day || ''} help="The day weekly and vault areas get their digest: 0 = Monday … 6 = Sunday, on your clock." onChange={v => setBriefCfg(c => ({ ...c, weekly_day: v }))} />
         </div>
         <button className="btn btn-primary" disabled={saving === 'topics-config'} onClick={saveTopicsConfig}>{saving === 'topics-config' ? 'Saving…' : 'Save thresholds'}</button>
       </div>

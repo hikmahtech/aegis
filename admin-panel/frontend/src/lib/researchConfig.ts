@@ -52,6 +52,38 @@ export function toTopicsPayload(rows: TopicRow[]): { topics: any[] } {
   };
 }
 
+export type AreaRow = {
+  name: string;
+  why: string;
+  cadence: string; // daily | weekly | vault
+  cap: string;
+  topics: string; // comma-separated topic names
+};
+
+/** One area (#674) as the form edits it. */
+export function toAreaRow(a: any): AreaRow {
+  return {
+    name: String(a?.name ?? ''),
+    why: String(a?.why ?? ''),
+    cadence: String(a?.cadence ?? 'daily'),
+    cap: a?.cap === undefined || a?.cap === null ? '' : String(a.cap),
+    topics: Array.isArray(a?.topics) ? a.topics.join(', ') : '',
+  };
+}
+
+/** The `areas` list for the topics PUT. A blank cap is left out, so the
+ *  server's default applies. */
+export function toAreasPayload(rows: AreaRow[]): any[] {
+  return rows
+    .filter(r => r.name.trim())
+    .map(r => {
+      const entry: any = { name: r.name.trim(), why: r.why.trim(), cadence: r.cadence, topics: splitList(r.topics) };
+      const cap = numberOrUndefined(r.cap);
+      if (cap !== undefined) entry.cap = cap;
+      return entry;
+    });
+}
+
 /** A form of numeric fields -> the config object, blanks dropped. */
 export function numbersPayload(form: Record<string, string>, keys: string[]): Record<string, unknown> {
   const out: Record<string, unknown> = {};

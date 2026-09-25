@@ -311,11 +311,34 @@ class BriefingActivities:
         seen_ref = set(prior_ref_ids)
         elapsed_h = int((now - cursor).total_seconds() // 3600) + 1
 
+        # areas (#674): with any configured, the news reaches the user as each
+        # area's judged stories, and the old per-item `intel` and per-topic
+        # `topics` sections step aside — they are the same items, counted.
+        areas_out: list[dict] = []
+        vault_digest: dict | None = None
+        # Carried over as-is when the areas cannot be read this run, so a
+        # failed morning does not forget what was already shown.
+        area_state: dict = {
+            k: prior[k] for k in ("seen_story_keys", "area_shown") if k in prior
+        }
+        areas: list = []
+        if self.db_pool:
+            with logged_failure("briefing_areas_failed", logger=activity.logger):
+                from aegis.services.research_topics import load_areas
+
+                areas = await load_areas(self.db_pool)
+                if areas:
+                    areas_out, vault_digest, area_state = await self._gather_areas(
+                        areas, prior, now, cursor
+                    )
+
         # intelligence: reuse the existing gather, then sig>=4 + dedup by id
         intel_out: list[dict] = []
         new_intel_ids: list[str] = []
         with logged_failure("briefing_intel_diff_failed", logger=activity.logger):
-            items = await self.gather_intelligence_summary(hours=max(24, min(elapsed_h, 72)))
+            items = [] if areas else await self.gather_intelligence_summary(
+                hours=max(24, min(elapsed_h, 72))
+            )
             for r in items:
                 meta = r.get("metadata") or {}
                 if int(meta.get("significance", 0) or 0) < 4:
@@ -362,6 +385,10 @@ class BriefingActivities:
                 cid = str(r.get("content_id") or r.get("id") or r.get("title") or "")
                 if not cid or cid in seen_ref or cid in seen_intel:
                     continue
+                # The scans' finds reach an area digest through their topics;
+                # listing them again here is the firehose the areas replace.
+                if areas and r.get("source_type") == "intelligence":
+                    continue
                 seen_ref.add(cid)
                 new_ref_ids.append(cid)
                 collected_out.append({
@@ -376,7 +403,7 @@ class BriefingActivities:
         # an Inbox task per item; a topic raises its own task only once its
         # round earns one, so this line is how the rest reach the user.
         topics_out: list[dict] = []
-        if self.db_pool:
+        if self.db_pool and not areas:
             with logged_failure("briefing_topics_failed", logger=activity.logger):
                 trows = await self.db_pool.fetch(
                     "SELECT COALESCE(p.metadata->>'topic', p.subject) AS topic, "
@@ -507,7 +534,7 @@ class BriefingActivities:
         # Health (B6) is deliberately NOT gathered here — see `_recent_health`.
         # It is read at render time, inside `frame_briefing`, so that no body
         # data ever enters this bundle.
-        quiet = not (
+        nothing_else = not (
             intel_out
             or collected_out
             or topics_out
@@ -516,6 +543,7 @@ class BriefingActivities:
             or new_drift
             or new_cal_ids
         )
+        quiet = nothing_else and not areas_out
         new_state = {
             "last_briefing_at": now.isoformat(),
             "seen_intel_ids": (prior_intel_ids + new_intel_ids)[-50:],
@@ -524,9 +552,14 @@ class BriefingActivities:
             # Wider than the others: this tier runs ~42 items/day, so a 100-id
             # window would roll over inside three days and re-report old mail.
             "seen_email_ids": (prior_email_ids + new_email_ids)[-300:],
+            **area_state,
         }
         return {
             "quiet": quiet,
+            # True when only area stories are new: the brief is their block alone.
+            "nothing_else": nothing_else,
+            "areas": areas_out,
+            "vault_digest": vault_digest,
             "intel": intel_out,
             "collected": collected_out,
             "topics": topics_out,
@@ -536,6 +569,77 @@ class BriefingActivities:
             "place": place,
             "_new_state": new_state,
         }
+
+    async def _gather_areas(
+        self, areas: list, prior: dict, now: datetime, cursor: datetime
+    ) -> tuple[list[dict], dict | None, dict]:
+        """Each due area's judged stories (#674): ``(brief, vault, state)``.
+
+        Daily areas run every morning over the items since the last brief;
+        weekly and vault areas run on the `weekly_day` over the past week.
+        The brief holds at most `brief_items` stories, spent in the areas'
+        order; vault areas go to the week's journal note instead, never the
+        brief. ``state`` is the story keys and titles already shown, so a
+        story is never shown twice and the judge knows what the user saw.
+
+        ponytail: a weekly digest whose brief fails to send on the weekly day
+        waits a week; carry a `weekly_done` marker if that ever matters.
+        """
+        from datetime import timedelta
+
+        from aegis.services import research_areas, topics_config
+        from aegis.services.user_time import user_now
+        from aegis.services.vault_layout import get_layout, week_bounds
+
+        cfg = await topics_config.get_topics_config(self.db_pool)
+        local = await user_now(self.db_pool)
+        weekly = local.weekday() == int(cfg["weekly_day"])
+        seen = list(prior.get("seen_story_keys") or [])
+        shown = dict(prior.get("area_shown") or {})
+        daily_since = max(cursor, now - timedelta(hours=72))
+        budget = int(cfg["brief_items"])
+        brief: list[dict] = []
+        vault_lines: list[str] = []
+        for area in areas:
+            if area.cadence != "daily" and not weekly:
+                continue
+            if area.cadence != "vault" and budget <= 0:
+                continue
+            digest = await research_areas.build_digest(
+                self.db_pool,
+                area,
+                since=daily_since if area.cadence == "daily" else now - timedelta(days=7),
+                seen_keys=set(seen),
+                shown_titles=list(shown.get(area.slug) or []),
+                llm=self.llm_client,
+                model=self.frame_model,
+                agent_id=self.agent_id or None,
+            )
+            stories = digest["stories"]
+            if area.cadence != "vault":
+                stories = stories[:budget]
+                budget -= len(stories)
+            if not stories:
+                continue
+            seen += [s["key"] for s in stories]
+            shown[area.slug] = (list(shown.get(area.slug) or []) + [s["title"] for s in stories])[-20:]
+            if area.cadence == "vault":
+                vault_lines.append(f"{area.name}:")
+                vault_lines += [
+                    f"  - [{s['title']}]({s['url']})" + (f" — {s['why']}" if s["why"] else "")
+                    for s in stories
+                ]
+            else:
+                brief.append({"area": area.name, "stories": stories})
+        vault = None
+        if vault_lines:
+            layout = await get_layout(self.db_pool)
+            start, _end, label = week_bounds(local.date(), layout.week_start, layout.week_numbering)
+            vault = {
+                "kind": "weekly", "day": start.isoformat(), "label": label,
+                "text": "\n".join(vault_lines), "slot": "reading",
+            }
+        return brief, vault, {"seen_story_keys": seen[-500:], "area_shown": shown}
 
     async def _recent_health(self) -> dict:
         """Newest reading of each metric the health push writes (B6).
@@ -592,6 +696,12 @@ class BriefingActivities:
         """
         if changes.get("quiet"):
             return "\U0001f7e2 Quiet overnight — nothing needs you."
+        # The area stories (#674) are a block of their own, like the failures:
+        # each was already judged worth a line, and a 2-5 sentence summary
+        # would drop some of them.
+        areas_block = self._format_areas_block(changes)
+        if areas_block and changes.get("nothing_else"):
+            return areas_block
         fallback = self._format_changes_fallback(changes)
         narrative = fallback
         if self.llm_client:
@@ -615,8 +725,25 @@ class BriefingActivities:
                 # quiet morning. The daily reader is the cheapest monitor there
                 # is; this line is what lets them do the job.
                 narrative = f"{fallback}\n\n_(fallback summary — the briefing model failed)_"
-        failures = self._format_failure_block(changes)
-        return f"{narrative}\n\n{failures}" if failures else narrative
+        blocks = [b for b in (narrative, areas_block, self._format_failure_block(changes)) if b]
+        return "\n\n".join(blocks)
+
+    def _format_areas_block(self, changes: dict) -> str:
+        """The judged area stories, one line each with a link and why it
+        matters. Empty when no area had anything."""
+        lines: list[str] = []
+        for area in changes.get("areas") or []:
+            stories = area.get("stories") or []
+            if not stories:
+                continue
+            lines.append(f"<b>{_esc(str(area.get('area', '')))}</b>")
+            for s in stories:
+                title = _esc(str(s.get("title", "")))
+                url = str(s.get("url") or "")
+                head = f'<a href="{_esc(url)}">{title}</a>' if url.startswith(("http://", "https://")) else title
+                why = f" — {_esc(str(s['why']))}" if s.get("why") else ""
+                lines.append(f"  • {head}{why}")
+        return "\n".join(lines)
 
     @activity.defn
     async def feed_review_line(self) -> str:
@@ -762,7 +889,13 @@ class BriefingActivities:
         # this filter is now the second lock rather than the only one — kept
         # because a caller could still hand-build a bundle that carries it, and
         # tested independently of the gather-side change.
-        payload = {k: v for k, v in changes.items() if k not in ("_new_state", "health")}
+        # The area stories are rendered as their own block (`_format_areas_block`),
+        # so the summary is not handed them to repeat.
+        payload = {
+            k: v
+            for k, v in changes.items()
+            if k not in ("_new_state", "health", "areas", "vault_digest", "nothing_else")
+        }
         return (
             "You are raphael writing a terse morning briefing. Given this JSON of "
             "what changed since the last briefing, write a 2-5 sentence plain-text "

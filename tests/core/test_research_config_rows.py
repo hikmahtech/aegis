@@ -72,6 +72,8 @@ def test_the_defaults_are_the_old_constants():
     assert topics_config.merge(None) == {
         "attention": {"high": 2, "medium": 3, "low": 5},
         "digest_items": 10,
+        "brief_items": 7,
+        "weekly_day": 6,
     }
 
 
@@ -89,8 +91,15 @@ def test_merge_keeps_the_default_for_every_bad_field_and_never_raises():
     assert r["academic_terms"] == ["thesis"]
     lib = library_config.merge({"passages": True, "stopwords": ["The", " and "]})
     assert lib["passages"] == 4 and lib["stopwords"] == ["the", "and"]
-    t = topics_config.merge({"attention": {"high": 1, "urgent": 9}, "digest_items": -1})
-    assert t == {"attention": {"high": 1, "medium": 3, "low": 5}, "digest_items": 10}
+    t = topics_config.merge(
+        {"attention": {"high": 1, "urgent": 9}, "digest_items": -1, "brief_items": "x", "weekly_day": 7}
+    )
+    assert t == {
+        "attention": {"high": 1, "medium": 3, "low": 5},
+        "digest_items": 10,
+        "brief_items": 7,
+        "weekly_day": 6,
+    }
 
 
 @pytest.mark.parametrize(
@@ -109,6 +118,8 @@ def test_merge_keeps_the_default_for_every_bad_field_and_never_raises():
         (topics_config.validate, {"attention": {"urgent": 1}}, "unknown priority"),
         (topics_config.validate, {"attention": {"high": 0}}, "high"),
         (topics_config.validate, {"digest_items": "ten"}, "digest_items"),
+        (topics_config.validate, {"brief_items": 0}, "brief_items"),
+        (topics_config.validate, {"weekly_day": 7}, "weekly_day"),
     ],
 )
 def test_validate_refuses_what_merge_would_silently_drop(validate, bad, message):

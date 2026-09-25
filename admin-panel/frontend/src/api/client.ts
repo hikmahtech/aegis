@@ -475,7 +475,7 @@ export const api = {
   // Email triage rules (user-owned sender verdicts + notification phrases)
   // Research (the research agent's DB-owned config rows)
   getResearchTopics: () => apiFetch<any>('/api/admin/research/topics'),
-  saveResearchTopics: (body: { topics: any[] }) =>
+  saveResearchTopics: (body: { topics: any[]; areas?: any[] }) =>
     apiFetch<any>('/api/admin/research/topics', { method: 'PUT', body: JSON.stringify(body) }),
   getResearchTopicsConfig: () => apiFetch<any>('/api/admin/research/topics-config'),
   saveResearchTopicsConfig: (body: any) =>

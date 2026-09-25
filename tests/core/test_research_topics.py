@@ -317,3 +317,101 @@ async def test_an_ordinary_problem_still_reaches_the_digest(world):
     )
     out = await digest(world, hours=1, now=NOW + timedelta(minutes=1))
     assert subject in {p["subject"] for p in out["problems"]}
+
+
+# --- areas (#674) ---------------------------------------------------------------
+
+
+async def _set_areas(pool, areas):
+    value = await pool.fetchval(
+        "SELECT value FROM settings WHERE key = $1", research_topics.TOPICS_SETTING
+    )
+    await pool.execute(
+        "UPDATE settings SET value = $2 WHERE key = $1",
+        research_topics.TOPICS_SETTING,
+        {**value, "areas": areas},
+    )
+
+
+async def test_a_topic_in_an_area_never_raises_a_task_for_volume(world, todoist):
+    name = _name()
+    pid = (await research_topics.track(world, name, ["alpha"], "high", now=NOW))["problem_id"]
+    await _set_areas(world, [{"name": "Area", "cadence": "daily", "topics": [name]}])
+    out = await research_topics.attach_items(
+        world, [_item(n, "alpha") for n in range(5)], origin="rss", now=NOW
+    )
+    assert (out["attached"], out["tasks"]) == (5, 0)
+    assert (await get_problem(world, pid))["todoist_task_id"] is None
+    assert not _item_adds(todoist)
+
+
+async def test_registry_writes_keep_the_areas_unless_the_body_replaces_them(world):
+    name = _name()
+    await research_topics.track(world, name, ["alpha"], now=NOW)
+    await _set_areas(world, [{"name": "Area", "topics": [name]}])
+
+    # track, and a PUT without `areas`, leave them alone
+    await research_topics.track(world, _name(), ["beta"], now=NOW)
+    registry = {"topics": [{"name": name, "queries": ["alpha"], "priority": "medium"}]}
+    await research_topics.save_registry(world, registry, now=NOW)
+    assert [a.name for a in await research_topics.load_areas(world)] == ["Area"]
+
+    # a PUT with `areas` validates and replaces them
+    with pytest.raises(ValueError, match="not a tracked topic"):
+        await research_topics.save_registry(
+            world, {**registry, "areas": [{"name": "X", "topics": ["gone"]}]}, now=NOW
+        )
+    await research_topics.save_registry(
+        world,
+        {**registry, "areas": [{"name": "World", "why": "w", "cap": 2, "topics": [name]}]},
+        now=NOW,
+    )
+    (area,) = await research_topics.load_areas(world)
+    assert (area.name, area.why, area.cap, area.topics) == ("World", "w", 2, (name,))
+
+
+async def test_build_digest_judges_new_stories_and_skips_shown_ones(world):
+    from aegis.services import research_areas
+
+    name = _name()
+    await research_topics.track(world, name, ["alpha"], now=NOW)
+    items = [
+        _item(1, "alpha", title="Alpha council approves metro line", url="https://n/1"),
+        _item(2, "alpha", title="Alpha council approves the metro line", url="https://n/2"),
+        _item(3, "alpha", title="Alpha festival draws crowds", url="https://n/3"),
+    ]
+    await research_topics.attach_items(world, items, origin="rss", now=NOW)
+    area = research_areas.Area("City", "I live in Alpha", cap=2, topics=(name,))
+    since = NOW - timedelta(hours=1)
+    prompts: list[str] = []
+
+    class Judge:
+        async def think(self, prompt, **kw):
+            prompts.append(prompt)
+            assert kw["purpose"] == "area_digest"
+            return {"response": '[{"n": 1, "why": "new metro near you"}]'}
+
+    out = await research_areas.build_digest(
+        world, area, since=since, seen_keys=set(), shown_titles=[], llm=Judge()
+    )
+    assert out["candidates"] == 2 and out["judged"] is True
+    assert [(s["url"], s["sources"], s["why"]) for s in out["stories"]] == [
+        ("https://n/1", 2, "new metro near you")
+    ]
+    assert "I live in Alpha" in prompts[0]
+
+    # A shown story is not offered again; a failing judge falls back.
+    class Broken:
+        async def think(self, prompt, **kw):
+            raise RuntimeError("down")
+
+    again = await research_areas.build_digest(
+        world,
+        area,
+        since=since,
+        seen_keys={out["stories"][0]["key"]},
+        shown_titles=[],
+        llm=Broken(),
+    )
+    assert again["judged"] is False
+    assert [s["url"] for s in again["stories"]] == ["https://n/3"]

@@ -1,5 +1,27 @@
 import { describe, expect, it } from 'vitest';
-import { numberOrUndefined, numbersPayload, splitList, toTopicRow, toTopicsPayload } from './researchConfig';
+import {
+  numberOrUndefined,
+  numbersPayload,
+  splitList,
+  toAreaRow,
+  toAreasPayload,
+  toTopicRow,
+  toTopicsPayload,
+} from './researchConfig';
+
+describe('areas', () => {
+  it('round-trips an area through the form', () => {
+    const row = toAreaRow({ name: 'India', why: 'I live here', cadence: 'weekly', cap: 2, topics: ['A', 'B'] });
+    expect(row).toEqual({ name: 'India', why: 'I live here', cadence: 'weekly', cap: '2', topics: 'A, B' });
+    expect(toAreasPayload([row])).toEqual([
+      { name: 'India', why: 'I live here', cadence: 'weekly', cap: 2, topics: ['A', 'B'] },
+    ]);
+  });
+  it('omits a blank cap and skips a nameless row', () => {
+    const rows = [toAreaRow({ name: 'World' }), { name: ' ', why: '', cadence: 'daily', cap: '', topics: '' }];
+    expect(toAreasPayload(rows)).toEqual([{ name: 'World', why: '', cadence: 'daily', topics: [] }]);
+  });
+});
 
 describe('splitList', () => {
   it('splits on commas and drops blanks', () => {

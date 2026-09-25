@@ -16,6 +16,8 @@ from datetime import timedelta
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
+    from aegis.services.notes_write import NOTES_WRITE_TIMEOUT_S
+
     from aegis_worker.activities.agent_registry import AgentRegistryActivities
     from aegis_worker.activities.briefing import BriefingActivities
     from aegis_worker.activities.delivery import DeliveryActivities
@@ -26,6 +28,9 @@ with workflow.unsafe.imports_passed_through():
         TIMEOUT_FAST,
         TIMEOUT_LLM,
     )
+
+
+PATCH_AREA_VAULT = "daily-briefing-area-vault"
 
 
 @dataclass
@@ -184,6 +189,23 @@ class DailyBriefingFlow:
                         )
             except Exception:
                 workflow.logger.warning("briefing_feed_review_failed")
+
+        # Vault areas (#674): the week's picks go to the week's journal note,
+        # never the brief. The note's marker is keyed on the week, so a second
+        # run in the same week writes nothing twice.
+        vault_digest = changes.get("vault_digest")
+        if vault_digest and workflow.patched(PATCH_AREA_VAULT):
+            try:
+                # By name, as WeeklyReviewFlow does: NotesActivities is not
+                # imported into the workflow sandbox.
+                await workflow.execute_activity(
+                    "notes_journal_write",
+                    {**vault_digest, "agent_id": config.agent_id},
+                    start_to_close_timeout=timedelta(seconds=NOTES_WRITE_TIMEOUT_S),
+                    retry_policy=RETRY_ONCE,
+                )
+            except Exception:
+                workflow.logger.warning("briefing_area_vault_failed")
 
         target_date = workflow.now().strftime("%Y-%m-%d")
         try:
