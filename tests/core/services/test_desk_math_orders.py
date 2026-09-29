@@ -200,3 +200,14 @@ def test_a_sell_fills_before_a_buy_numbered_ahead_of_it():
     res = {r.order_id: r for r in fill_orders(pending, bars, DAYS, book, Rules())}
     assert (res["sell"].status, res["sell"].qty) == ("filled", 10)
     assert (res["buy"].status, res["buy"].qty) == ("filled", 5)
+
+
+def test_a_kept_symbol_is_not_sold_and_still_counts_toward_the_portfolio():
+    """#699: the ETF is worth 40,000 of a 100,000 book, so TCS at 10% is sized on
+    100,000, not on the 60,000 left once the ETF is ignored."""
+    book = held("GOLDBEES", 400, 100.0, cls="etf", cash=60_000.0)
+    orders, skipped = plan_orders(
+        (d("TCS", 0.10),), book, {"TCS": 1000.0, "GOLDBEES": 100.0}, Rules(), keep=frozenset({"GOLDBEES"})
+    )
+    assert [(o.symbol, o.side, o.qty) for o in orders] == [("TCS", "buy", 10)]
+    assert skipped == ["GOLDBEES: class_missing"]

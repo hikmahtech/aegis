@@ -257,12 +257,14 @@ class Check:
     ``outcome`` is ``ok``, ``flatten``, ``held_stale`` or ``held_suspect``.
     ``rows`` is what may trade. ``problems`` are plain-English lines for
     ``desk_decisions_suspect``, and can be non-empty on an ``ok`` day: a bad row
-    was dropped and the rest traded.
+    was dropped and the rest traded. ``kept`` names held asset classes that came
+    with no decisions today and are being left as they are (#699).
     """
 
     outcome: str
     rows: tuple[Decision, ...]
     problems: tuple[str, ...]
+    kept: tuple[str, ...] = ()
 
 
 def market_days(index_bars: list[Bar], today: date) -> list[date]:
@@ -329,11 +331,38 @@ def idle_days(market_days: set[date], first: date, last: date) -> list[date]:
     return out
 
 
+# A class can leave the decisions for an ordinary reason: the ETF sleeve holds one
+# name, so every exit empties it. The desk leaves such a class alone for this many
+# decision days running, then treats it as the exit it is and sells (#699).
+MISSING_DAYS_BEFORE_EXIT = 3
+
+
+def exited(recent: list[set[str]], held_classes: set[str], n: int = MISSING_DAYS_BEFORE_EXIT) -> set[str]:
+    """Held classes absent from each of the last ``n`` decision days.
+
+    ``recent`` is the classes present on each day that had decisions, newest
+    first. A day with no rows is not in it, so it neither counts nor resets."""
+    if len(recent) < n:
+        return set()
+    return {c for c in held_classes if all(c not in day for day in recent[:n])}
+
+
 def check_decisions(
-    rows: list[Decision], held_classes: set[str], rules: Rules, *, halted: bool = False
+    rows: list[Decision],
+    held_classes: set[str],
+    rules: Rules,
+    *,
+    halted: bool = False,
+    exited: frozenset[str] | set[str] = frozenset(),
 ) -> Check:
-    """Spec §5. An empty day is stale; odd weights or a held class that vanished
-    for no stated reason hold the whole day; a non-halal or short row is dropped.
+    """Spec §5. An empty day is stale; odd weights hold the whole day; a
+    non-halal or short row is dropped.
+
+    A held class that vanished for no stated reason is left as it is while the
+    other rows trade (#699): one name leaving a one-seat sleeve looks exactly
+    like a broken run, and freezing seven good rows over it froze the desk daily.
+    A class in ``exited`` has been missing for ``MISSING_DAYS_BEFORE_EXIT`` days
+    running and is sold like any dropped name.
 
     ``halted`` is ansaar saying the pipeline's risk manager stopped trading that
     day. The pipeline is then flat, so the desk sells its whole book rather than
@@ -369,13 +398,22 @@ def check_decisions(
     explained = any(r.active_kill_conditions or r.recovery_state != "NORMAL" for r in rows)
     present = {r.asset_class for r in kept}
     vanished = sorted(c for c in held_classes if c in rules.asset_classes and c not in present)
+    kept_classes: tuple[str, ...] = ()
     if vanished and not explained:
-        problems.append(
-            f"The desk holds {', '.join(vanished)} but today's decisions have none, "
-            "and no kill switch or recovery state explains it."
-        )
-        return Check("held_suspect", (), tuple(problems))
-    return Check("ok", tuple(enabled), tuple(problems))
+        kept_classes = tuple(c for c in vanished if c not in exited)
+        gone = [c for c in vanished if c in exited]
+        if kept_classes:
+            problems.append(
+                f"The desk holds {', '.join(kept_classes)} but today's decisions have none, and no "
+                f"kill switch or recovery state explains it. Those positions are left as they are "
+                f"and sold after {MISSING_DAYS_BEFORE_EXIT} decision days without one."
+            )
+        if gone:
+            problems.append(
+                f"{', '.join(gone)} has had no decisions for {MISSING_DAYS_BEFORE_EXIT} decision "
+                "days running, so the desk treats it as an exit and sells it."
+            )
+    return Check("ok", tuple(enabled), tuple(problems), kept_classes)
 
 
 def scale_to_exposure(rows: tuple[Decision, ...], rules: Rules) -> tuple[Decision, ...]:
@@ -692,6 +730,7 @@ def plan_orders(
     rules: Rules,
     *,
     frozen: frozenset[str] = frozenset(),
+    keep: frozenset[str] = frozenset(),
     cash_reserved: float = 0.0,
 ) -> tuple[list[Order], list[str]]:
     """Orders that move ``book`` toward ``rows``, in the order they must fill (spec §4).
@@ -705,6 +744,10 @@ def plan_orders(
     as ``pending_order`` and still count toward the portfolio value, because the
     desk still owns them. ``cash_reserved`` is the money those pending buys will
     spend, which today's buys therefore may not.
+
+    ``keep`` names held symbols left as they are because their asset class came
+    with no decisions today (#699): not sold, skipped as ``class_missing``, and
+    still counted in the portfolio value.
     """
     held = book.held()
     port = book.cash + sum(q * closes.get(s, book.avg_cost(s)) for s, q in held.items())
@@ -714,6 +757,9 @@ def plan_orders(
     skipped: list[str] = []
     for symbol, qty in held.items():
         if symbol in wanted:
+            continue
+        if symbol in keep:
+            skipped.append(f"{symbol}: class_missing")
             continue
         if symbol in frozen:
             skipped.append(f"{symbol}: pending_order")

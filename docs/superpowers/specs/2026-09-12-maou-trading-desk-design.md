@@ -154,7 +154,7 @@ is the safe default. Dumping a portfolio because of a pipeline glitch is the fai
 | Check | Fails when | Outcome | Problem class |
 |---|---|---|---|
 | Fresh | ansaar returns no rows for the last trading day, and does not say it was halted | `held_stale` | `desk_decisions_stale` |
-| Complete | a class the desk holds now has no rows today, and no row carries a kill condition or a non-`NORMAL` recovery state | `held_suspect` | `desk_decisions_suspect` |
+| Complete | a class the desk holds now has no rows today, and no row carries a kill condition or a non-`NORMAL` recovery state | that class is left as it is and the other rows trade; sold once it has had no rows for 3 decision days running (#699) | `desk_decisions_suspect` |
 | Sane | enabled weights sum to more than 1.0 + 1e-6, or any weight is ≤ 0 or above `max_order_pct` | `held_suspect` | `desk_decisions_suspect` |
 | Halal | a row has `halal_status != 'COMPLIANT'` or `direction != 'LONG'` | the row is dropped and never bought; the rest trades | `desk_decisions_suspect` |
 | Reachable | the ansaar token or request fails | `held_stale` | `desk_source_error` |
@@ -539,8 +539,8 @@ Tests need a real Postgres and no DB mocks, the same as the rest of the repo.
   - Tax across 31 March.
   - Weekly statistics on a known series (mean, sd, t), every label including the negative ones,
     and the warning check on both sides of its boundary.
-- **Checks:** a stale date; an empty day; a held class that vanishes with no reason (suspect); a
-  vanished class with a kill condition (not suspect); weights summing above 1; a non-compliant row
+- **Checks:** a stale date; an empty day; a held class that vanishes with no reason (kept, the
+  rest trades, sold on the third day); a vanished class with a kill condition (no problem); weights summing above 1; a non-compliant row
   (dropped, and the rest trades).
 - **Connectors (respx):**
   - ansaar: token, decisions including the empty-day shape, prices returned newest first with a
