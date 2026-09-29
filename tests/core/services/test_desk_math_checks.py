@@ -8,6 +8,7 @@ from aegis.services.desk_math import (
     Decision,
     Rules,
     check_decisions,
+    exited,
     idle_days,
     last_expected_day,
     last_trading_day,
@@ -122,9 +123,23 @@ def test_a_zero_weight_is_suspect():
     assert check_decisions([d("TCS", 0.0)], set(), Rules()).outcome == "held_suspect"
 
 
-def test_a_held_class_that_vanishes_without_a_reason_is_suspect():
+def test_a_held_class_that_vanishes_without_a_reason_is_kept_and_the_rest_trades():
     c = check_decisions([d("GOLDBEES", 0.1, cls="etf")], {"equity"}, Rules())
-    assert c.outcome == "held_suspect" and "equity" in c.problems[0]
+    assert c.outcome == "ok" and [r.symbol for r in c.rows] == ["GOLDBEES"]
+    assert c.kept == ("equity",) and "equity" in c.problems[0] and "left as they are" in c.problems[0]
+
+
+def test_a_class_missing_for_three_decision_days_is_sold_not_kept():
+    c = check_decisions([d("GOLDBEES", 0.1, cls="etf")], {"equity"}, Rules(), exited={"equity"})
+    assert c.outcome == "ok" and c.kept == () and "treats it as an exit" in c.problems[0]
+
+
+def test_exited_needs_three_days_all_without_the_class():
+    eq, etf = {"equity"}, {"equity", "etf"}
+    assert exited([eq, eq], {"etf"}) == set()  # only two days of history
+    assert exited([eq, eq, eq], {"etf"}) == {"etf"}
+    assert exited([eq, etf, eq], {"etf"}) == set()  # it came back on day 2
+    assert exited([eq, eq, eq, etf], {"etf"}) == {"etf"}  # older days do not matter
 
 
 def test_a_vanished_class_is_fine_when_a_kill_switch_explains_it():

@@ -644,7 +644,21 @@ async def _tick(
         )
     elif not planned:
         book = dm.replay(fills, bars, rules.capital, day)
-        check = dm.check_decisions(decisions, book.held_classes(), rules, halted=halt is not None)
+        # The classes each of the last decision days had, newest first: a held
+        # class missing from all of them has left for good (#699).
+        recent = [
+            set(r["classes"])
+            for r in await pool.fetch(
+                "SELECT data_date, array_agg(DISTINCT asset_class) AS classes FROM finance.desk_decisions "
+                "WHERE data_date <= $1 AND halal_status = 'COMPLIANT' AND direction = 'LONG' "
+                "GROUP BY data_date ORDER BY data_date DESC LIMIT $2",
+                day, dm.MISSING_DAYS_BEFORE_EXIT,
+            )
+        ]
+        check = dm.check_decisions(
+            decisions, book.held_classes(), rules, halted=halt is not None,
+            exited=dm.exited(recent, book.held_classes()),
+        )
         plan_findings: list[dict] = []
         if check.outcome == "held_stale":
             plan_findings.append(
@@ -705,7 +719,9 @@ async def _tick(
                 )
             orders, skipped = dm.plan_orders(
                 rows, book, closes, rules,
-                frozen=frozenset(o["symbol"] for o in open_orders), cash_reserved=reserved,
+                frozen=frozenset(o["symbol"] for o in open_orders),
+                keep=frozenset(s for s in book.held() if book.classes[s] in check.kept),
+                cash_reserved=reserved,
             )
         if check.outcome == "flatten":
             outcome = "flattened"

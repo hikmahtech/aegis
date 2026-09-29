@@ -236,13 +236,36 @@ async def test_a_failed_morning_resolves_nothing_it_did_not_check(pool):
     ]
 
 
-async def test_a_vanished_holding_class_holds_the_portfolio(pool):
+async def test_a_vanished_holding_class_is_kept_and_the_rest_trades(pool):
+    """#699: an ETF sleeve of one name empties on every exit, so a class missing
+    from the decisions must not freeze the rows that did arrive."""
     await filled(pool, THU, "TCS", "buy", 3, 3000.0)
     finance = market({"TCS.NS": [bar(THU, 3000.0), bar(FRI, 3000.0)], "GOLDBEES.NS": [bar(FRI, 100.0)]})
     out = await run(pool, FakeAnsaar({FRI: [row("GOLDBEES", 0.10, cls="etf")]}), finance, MON)
-    assert out["planned"] == "held_suspect"
-    assert await pool.fetchval("SELECT count(*) FROM finance.desk_orders WHERE status = 'pending'") == 0
+    assert out["planned"] == "orders"
+    orders = await pool.fetch("SELECT symbol, side FROM finance.desk_orders WHERE status = 'pending'")
+    assert [(o["symbol"], o["side"]) for o in orders] == [("GOLDBEES", "buy")]
+    assert await pool.fetchval("SELECT skipped FROM finance.desk_plans WHERE data_date = $1", FRI) == ["TCS: class_missing"]
     assert await open_problems(pool) == [("desk_decisions_suspect", "decisions")]
+
+
+async def test_a_class_missing_three_decision_days_running_is_sold(pool):
+    await filled(pool, THU, "TCS", "buy", 3, 3000.0)
+    days = (FRI, MON, TUE)
+    finance = market({
+        "TCS.NS": [bar(d, 3000.0) for d in (THU, *days)],
+        "GOLDBEES.NS": [bar(d, 100.0) for d in days],
+    })
+    ansaar = FakeAnsaar({d: [row("GOLDBEES", 0.10, day=d, cls="etf")] for d in days})
+
+    async def tcs_sells():
+        return await pool.fetchval("SELECT count(*) FROM finance.desk_orders WHERE symbol = 'TCS' AND side = 'sell'")
+
+    await run(pool, ansaar, finance, MON)
+    await run(pool, ansaar, finance, TUE)
+    assert await tcs_sells() == 0  # two days without equity: still kept
+    out = await run(pool, ansaar, finance, WED)
+    assert out["planned"] == "orders" and await tcs_sells() == 1  # the third makes it an exit
 
 
 async def test_a_non_compliant_row_is_dropped_the_rest_trades_and_it_is_reported(pool):
@@ -423,9 +446,12 @@ async def test_a_holding_survives_a_split_and_a_trim(pool):
     ansaar = FakeAnsaar({MON: [row("GOLDBEES", 0.10, day=MON, cls="etf")]})
     out = await run(pool, ansaar, finance, TUE)
     # 10 bought, doubled by the split, 12 sold: 8 are still held, so equity
-    # vanishing from the decisions is suspect and nothing trades.
-    assert out["planned"] == "held_suspect"
-    assert await pool.fetchval("SELECT count(*) FROM finance.desk_orders WHERE status = 'pending'") == 0
+    # vanishing from the decisions is noticed and the 8 shares are left alone.
+    assert out["planned"] == "orders"
+    assert await pool.fetchval("SELECT skipped FROM finance.desk_plans WHERE data_date = $1", MON) == ["TCS: class_missing"]
+    assert await pool.fetchval(
+        "SELECT count(*) FROM finance.desk_orders WHERE status = 'pending' AND symbol = 'TCS'"
+    ) == 0
 
 
 async def test_a_holding_with_no_recent_price_raises_price_missing(pool):
