@@ -182,7 +182,7 @@ async def lifespan(app: FastAPI):
     try:
         from temporalio.client import Client as TemporalClient
 
-        temporal_client = await TemporalClient.connect(settings.temporal_host)
+        temporal_client = await TemporalClient.connect(settings.temporal_host, namespace=settings.temporal_namespace)
         logger.info("temporal_client_connected", host=settings.temporal_host)
     except Exception as exc:
         logger.warning("temporal_client_unavailable", host=settings.temporal_host, error=error_text(exc, 500))

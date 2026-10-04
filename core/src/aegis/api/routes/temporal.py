@@ -23,7 +23,7 @@ async def list_workflows(
 ) -> dict[str, Any]:
     """List recent workflow executions via Temporal UI HTTP API."""
     base = settings.temporal_api_url.rstrip("/")
-    url = f"{base}/api/v1/namespaces/default/workflows"
+    url = f"{base}/api/v1/namespaces/{settings.temporal_namespace}/workflows"
 
     try:
         async with httpx.AsyncClient(timeout=10) as client:
@@ -48,7 +48,7 @@ async def workflow_detail(
     never do); switch to a {workflow_id:path} route if that ever changes.
     """
     base = settings.temporal_api_url.rstrip("/")
-    root = f"{base}/api/v1/namespaces/default/workflows/{workflow_id}"
+    root = f"{base}/api/v1/namespaces/{settings.temporal_namespace}/workflows/{workflow_id}"
     params = {"execution.runId": run_id} if run_id else None
 
     try:
@@ -73,6 +73,7 @@ async def temporal_config(settings: Settings = Depends(get_settings)) -> dict[st
     """Return service UI URLs for frontend links."""
     return {
         "temporal_ui_url": settings.temporal_ui_url,
+        "temporal_namespace": settings.temporal_namespace,
         "knowledge_ui_url": settings.knowledge_ui_url,
         # Browser-facing Postiz URL (postiz_url is the server-side/internal one).
         "postiz_ui_url": settings.postiz_public_url,

@@ -121,7 +121,7 @@ export default function InteractionDetail() {
 
   const pending = interaction.status === 'pending';
   const temporalLink = temporalCfg?.temporal_ui_url
-    ? `${String(temporalCfg.temporal_ui_url).replace(/\/$/, '')}/namespaces/default/workflows/${interaction.flow_run_id}`
+    ? `${String(temporalCfg.temporal_ui_url).replace(/\/$/, '')}/namespaces/${temporalCfg?.temporal_namespace ?? 'default'}/workflows/${interaction.flow_run_id}`
     : null;
 
   return (

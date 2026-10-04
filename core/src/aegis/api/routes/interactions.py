@@ -41,7 +41,7 @@ router = APIRouter(
 
 async def get_workflow_client(settings: Settings = Depends(get_settings)) -> Client:
     """Temporal client dependency. Tests override this via app.dependency_overrides."""
-    return await Client.connect(settings.temporal_host)
+    return await Client.connect(settings.temporal_host, namespace=settings.temporal_namespace)
 
 
 class ResolveBody(BaseModel):

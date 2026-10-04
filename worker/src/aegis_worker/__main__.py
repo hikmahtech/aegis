@@ -152,8 +152,9 @@ async def main():
 
     # Connect to Temporal
     temporal_host = getattr(settings, "temporal_host", "localhost:7233")
-    client = await Client.connect(temporal_host)
-    logger.info("temporal_connected", host=temporal_host)
+    temporal_namespace = getattr(settings, "temporal_namespace", "default")
+    client = await Client.connect(temporal_host, namespace=temporal_namespace)
+    logger.info("temporal_connected", host=temporal_host, namespace=temporal_namespace)
 
     # Create activity instances with real dependencies + connectors
     connectors = deps.connectors
@@ -205,9 +206,7 @@ async def main():
         runbooks_dir=getattr(settings, "runbooks_dir", "/app/runbooks") or "",
         homelab_connector=connectors.get("homelab"),
         temporal_ui_url=getattr(settings, "temporal_ui_url", "") or "",
-        # temporal_namespace defaults to "default" on the dataclass — the worker
-        # client connects to the "default" namespace too (see Client.connect
-        # below). Wire a settings field here if a non-default namespace is added.
+        temporal_namespace=temporal_namespace,
         infra_cluster=getattr(settings, "infra_cluster", "") or "",
         slack_owner_member_id=getattr(settings, "slack_owner_member_id", "") or "",
     )
@@ -629,6 +628,7 @@ async def main():
     review_act = ReviewActivities(
         db_pool=deps.pool,
         temporal_host=getattr(settings, "temporal_host", None),
+        temporal_namespace=temporal_namespace,
         llm_client=deps.llm,
         todoist_connector=todoist_connector,
         # Tier-resolved, same reason as BriefingActivities above.

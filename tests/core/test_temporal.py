@@ -132,3 +132,20 @@ async def test_temporal_config_includes_knowledge(app, auth_headers):
     assert "knowledge_ui_url" in data
     # knowledge_ui_url defaults to "" when not configured
     assert isinstance(data["knowledge_ui_url"], str)
+
+
+@respx.mock
+async def test_list_workflows_uses_configured_namespace(test_settings, mock_db_pool, auth_headers):
+    application = create_app(run_lifespan=False)
+    settings = test_settings.model_copy(update={"temporal_namespace": "aegis"})
+    application.dependency_overrides[get_settings] = lambda: settings
+    application.state.db_pool = mock_db_pool
+    route = respx.get("http://localhost:8233/api/v1/namespaces/aegis/workflows").mock(
+        return_value=Response(200, json={"executions": []})
+    )
+    async with AsyncClient(transport=ASGITransport(app=application), base_url="http://test") as client:
+        resp = await client.get("/api/temporal/workflows", headers=auth_headers)
+        config = await client.get("/api/temporal/config", headers=auth_headers)
+    assert resp.status_code == 200
+    assert route.called
+    assert config.json()["temporal_namespace"] == "aegis"

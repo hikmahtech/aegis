@@ -89,7 +89,7 @@ async def client_and_state(settings, monkeypatch):
 
     class _StubTemporalClient:
         @staticmethod
-        async def connect(host):
+        async def connect(host, namespace="default"):
             return fake_client
 
     monkeypatch.setattr("temporalio.client.Client", _StubTemporalClient)

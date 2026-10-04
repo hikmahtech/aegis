@@ -121,7 +121,7 @@ def _make_client(settings, monkeypatch, *, session_row, fail_workflow="", querie
 
     class _StubTemporalClient:
         @staticmethod
-        async def connect(host):
+        async def connect(host, namespace="default"):
             return fake_client
 
     monkeypatch.setattr("temporalio.client.Client", _StubTemporalClient)

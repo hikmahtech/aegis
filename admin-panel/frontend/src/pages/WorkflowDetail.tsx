@@ -125,7 +125,7 @@ export default function WorkflowDetail() {
     ? String(temporalCfg.temporal_ui_url).replace(/\/$/, '')
     : null;
   const temporalLink = uiBase && workflowId
-    ? `${uiBase}/namespaces/default/workflows/${encodeURIComponent(workflowId)}/${encodeURIComponent(effRunId)}/history`
+    ? `${uiBase}/namespaces/${temporalCfg?.temporal_namespace ?? 'default'}/workflows/${encodeURIComponent(workflowId)}/${encodeURIComponent(effRunId)}/history`
     : null;
 
   return (

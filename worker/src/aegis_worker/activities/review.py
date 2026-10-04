@@ -104,6 +104,7 @@ class ReviewActivities:
     # apply_review_acknowledgement uses it to schedule a delayed
     # DailyReviewFlow re-fire on the 'need_time' / 'snooze' user choice.
     temporal_host: str | None = None
+    temporal_namespace: str = "default"
     task_queue: str = "aegis-main"
     llm_client: object | None = None
     frame_model: str = "gpt-oss:20b"
@@ -966,7 +967,7 @@ class ReviewActivities:
 
                 from temporalio.client import Client as _Client
 
-                client = await _Client.connect(self.temporal_host)
+                client = await _Client.connect(self.temporal_host, namespace=self.temporal_namespace)
                 # Use a different workflow_id so it doesn't collide with the
                 # scheduled one. Tagged 'snooze' so prod logs make sense.
                 await client.start_workflow(

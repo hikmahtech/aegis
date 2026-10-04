@@ -114,7 +114,7 @@ function LiveTab() {
             {
               header: 'Link',
               cell: e => uiBase && wfIdOf(e) !== '?' && (
-                <a href={`${uiBase}/namespaces/default/workflows/${wfIdOf(e)}/${runIdOf(e)}/history`}
+                <a href={`${uiBase}/namespaces/${temporalCfg?.temporal_namespace ?? 'default'}/workflows/${wfIdOf(e)}/${runIdOf(e)}/history`}
                    target="_blank" rel="noreferrer">Temporal →</a>
               ),
             },

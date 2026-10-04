@@ -463,7 +463,8 @@ async def test_apply_review_acknowledgement_snoozes_on_need_time(
 
     class _StubClient:
         @staticmethod
-        async def connect(host):
+        async def connect(host, namespace="default"):
+            started["namespace"] = namespace
             client = MagicMock()
             async def _start_workflow(*args, **kwargs):
                 started["args"] = args

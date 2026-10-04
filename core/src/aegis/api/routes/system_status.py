@@ -46,7 +46,7 @@ async def _probe_temporal(settings: Settings) -> dict[str, Any]:
     base = (settings.temporal_api_url or "").rstrip("/")
     if not base:
         return {"status": "unknown", "note": "temporal_api_url not configured"}
-    url = f"{base}/api/v1/namespaces/default/workflows"
+    url = f"{base}/api/v1/namespaces/{settings.temporal_namespace}/workflows"
     try:
         async with httpx.AsyncClient(timeout=8) as client:
             resp = await client.get(url, params={"pageSize": 1})
