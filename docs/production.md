@@ -55,7 +55,9 @@ The admin UI is the configuration surface; very little belongs in the environmen
 `AEGIS_ADMIN_PASSWORD` (required unless `AEGIS_AUTH_DISABLED=true` — proxy-fronted
 deployments only, see [`development.md`](development.md)), `AEGIS_SECRET_KEY`
 (**set it in production** — it encrypts every DB-stored secret), `AEGIS_COMMS_URL`,
-`AEGIS_TEMPORAL_HOST`, and your LLM gateway settings if not configured from the UI.
+`AEGIS_TEMPORAL_HOST`, `AEGIS_TEMPORAL_NAMESPACE` (default `default`; set it when AEGIS
+shares a Temporal cluster with other apps, since schedule sync prunes unknown schedules in
+its namespace), and your LLM gateway settings if not configured from the UI.
 
 **Admin UI / DB (everything else):** integration secrets (Slack, Todoist, GitHub,
 Postiz, finance), generated API keys, the LLM backend (Models & Providers page),

@@ -784,7 +784,7 @@ async def todoist_webhook(
                         str(item_id),
                     )
                     if sess and is_user_note(content):
-                        client = await _Client.connect(settings.temporal_host)
+                        client = await _Client.connect(settings.temporal_host, namespace=settings.temporal_namespace)
                         outcome = await dispatch_task_turn(
                             client,
                             task_id=str(item_id),
@@ -814,7 +814,7 @@ async def todoist_webhook(
                     if gtd_agent is None:
                         logger.warning("todoist_webhook_clarify_skipped_no_gtd_agent")
                     else:
-                        client = await _Client.connect(settings.temporal_host)
+                        client = await _Client.connect(settings.temporal_host, namespace=settings.temporal_namespace)
                         await client.start_workflow(
                             "ClarifyFlow",
                             {

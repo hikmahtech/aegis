@@ -55,6 +55,8 @@ class Settings(BaseSettings):
 
     # Temporal. temporal_ui_url is just the "open in Temporal UI" link target.
     temporal_host: str = "localhost:7233"
+    # One namespace per app on a shared cluster (AEGIS_TEMPORAL_NAMESPACE).
+    temporal_namespace: str = "default"
     temporal_api_url: str = "http://localhost:8233"
     temporal_ui_url: str = "http://localhost:8233"
 
