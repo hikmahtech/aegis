@@ -459,6 +459,20 @@ class GmailActivities:
     knowledge_connector: Any = None
 
     @activity.defn
+    async def money_fanout_enabled(self) -> bool:
+        """Whether triage should hand money mail to the money lane (`money_fanout_enabled`).
+
+        Read per run so the cutover switch needs no restart. Unset means on; only an explicit
+        false/0/no/off turns it off.
+        """
+        from aegis.services import integrations_config
+
+        if not self.db_pool:
+            return True
+        val = await integrations_config.read_integration(self.db_pool, None, "money_fanout_enabled")
+        return str(val).strip().lower() not in ("false", "0", "no", "off")
+
+    @activity.defn
     async def fetch_emails(self, input: FetchEmailsInput) -> FetchEmailsResult:
         """Fetch matching messages. Raises GmailAuthExpiredError on refresh failure."""
         token_path = Path(self.gmail_token_dir) / f"{input.account_label}.json"
