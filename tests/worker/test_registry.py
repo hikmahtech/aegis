@@ -468,9 +468,9 @@ def test_books_write_flow_is_gated_on_money_hygiene():
         # Then +1 flow and +1 activity from the tender watch (#673):
         # TenderWatchFlow and `tender_watch_tick` on TenderWatchActivities.
         # Unflagged, so all three rows move.
-        (True, True, 56, 266),
-        (False, False, 45, 230),
-        (True, False, 49, 248),
+        (True, True, 56, 267),
+        (False, False, 45, 231),
+        (True, False, 49, 249),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):

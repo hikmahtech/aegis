@@ -35,7 +35,11 @@ class _FakeMoneyProcessFlow:
 _TRIAGE_ARGS: list[list] = []
 
 
-def _stubs(resolve_map):
+def _stubs(resolve_map, fanout=True):
+    @activity.defn(name="money_fanout_enabled")
+    async def money_fanout_enabled():
+        return fanout
+
     @activity.defn(name="list_active_channels")
     async def list_channels(kind):
         return [
@@ -84,6 +88,7 @@ def _stubs(resolve_map):
         return {"ok": True}
 
     return [
+        money_fanout_enabled,
         list_channels,
         resolve_agents,
         fetch_emails,
@@ -95,7 +100,7 @@ def _stubs(resolve_map):
     ]
 
 
-async def _run(resolve_map, agent_id):
+async def _run(resolve_map, agent_id, fanout=True):
     """Run the flow over one financial email; return the fan-out child's
     received agent_id, or None if no MoneyProcessFlow child was spawned."""
     _TRIAGE_ARGS.clear()
@@ -105,7 +110,7 @@ async def _run(resolve_map, agent_id):
             client,
             task_queue=f"gmail-{uuid.uuid4()}",
             workflows=[GmailIngestFlow, _FakeMoneyProcessFlow],
-            activities=_stubs(resolve_map),
+            activities=_stubs(resolve_map, fanout),
         ) as w:
             await client.execute_workflow(
                 GmailIngestFlow.run,
@@ -146,3 +151,11 @@ async def test_triage_prediction_records_owning_account():
     no way to tell its own rows from another mailbox's."""
     await _run({"finance": "money-agent"}, agent_id="sebas")
     assert [a[3:] for a in _TRIAGE_ARGS] == [["acct"]]
+
+
+@pytest.mark.asyncio
+async def test_financial_fanout_skipped_when_the_cutover_switch_is_off():
+    """`money_fanout_enabled` false: money mail is no longer handed to the money lane, even
+    with a finance agent, so another service can own the books."""
+    spawned_agent = await _run({"finance": "money-agent"}, agent_id="sebas", fanout=False)
+    assert spawned_agent is None

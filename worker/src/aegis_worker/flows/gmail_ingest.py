@@ -63,6 +63,9 @@ class GmailIngestInput:
     link_only: bool = False
 
 
+PATCH_MONEY_FANOUT_FLAG = "money-fanout-flag"
+
+
 @workflow.defn(name="GmailIngestFlow")
 class GmailIngestFlow:
     @workflow.run
@@ -93,6 +96,20 @@ class GmailIngestFlow:
         except Exception:
             workflow.logger.warning("gmail_ingest_finance_resolve_failed")
             finance_agent = None
+
+        # The cutover switch: another service can take over the books while this lane keeps
+        # running for everything else. A failed read keeps the fan-out on (losing money mail is
+        # worse); the hard stop at cutover is revoking this service's journal deploy key.
+        fanout_enabled = True
+        if workflow.patched(PATCH_MONEY_FANOUT_FLAG):
+            try:
+                fanout_enabled = await workflow.execute_activity(
+                    "money_fanout_enabled",
+                    start_to_close_timeout=TIMEOUT_FAST,
+                    retry_policy=NO_RETRY,
+                )
+            except Exception:
+                workflow.logger.warning("gmail_ingest_money_fanout_flag_read_failed")
 
         for ch in channels:
             identifier = ch["identifier"]
@@ -183,7 +200,7 @@ class GmailIngestFlow:
                 # ParentClosePolicy.ABANDON so child failures don't bubble into
                 # the triage run.
                 tag_set = {t for t in (classification.get("tags") or []) if isinstance(t, str)}
-                if tag_set & {"financial", "payments"} and finance_agent:
+                if tag_set & {"financial", "payments"} and finance_agent and fanout_enabled:
                     try:
                         await workflow.start_child_workflow(
                             MoneyProcessFlow.run,

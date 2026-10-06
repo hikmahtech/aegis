@@ -193,6 +193,13 @@ CONFIG_REGISTRY: list[ConfigKey] = [
         "Restart the worker after enabling.",
     ),
     ConfigKey(
+        "money_fanout_enabled", "Book money mail found by email triage", "Features", False,
+        boolean=True,
+        help="On unless set to false. Turning it off stops triage handing money mail to the "
+        "money lane (the cutover switch when another service takes over the books); the "
+        "trading desk and statement lanes are not affected. Takes effect on the next triage run.",
+    ),
+    ConfigKey(
         "tts_enabled", "Voice notes (per-persona TTS)", "Features", False,
         boolean=True,
         help="Needs an ElevenLabs API key (Voice section above).",
