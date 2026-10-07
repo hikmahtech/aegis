@@ -359,6 +359,9 @@ class Settings(BaseSettings):
 
     # Money Hygiene (Maou)
     money_hygiene_enabled: bool = False
+    # The books cutover switch (#703); read per run from the DB by the worker. Declared so the
+    # boot overlay (integrations_config.apply_config_overrides) has a field to set.
+    money_fanout_enabled: bool = True
     # Currency the books report in; drives the money brief's symbol.
     home_currency: str = "INR"
 

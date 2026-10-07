@@ -115,3 +115,13 @@ async def test_infra_heartbeat_ping_url_is_secret():
     same as github_token."""
     spec = next(c for c in CONFIG_REGISTRY if c.key == "infra_heartbeat_ping_url")
     assert spec.secret is True
+
+
+def test_every_config_key_is_a_settings_field():
+    """Boot sets each stored config row onto Settings; a key with no field crashed core and
+    worker at startup once the row was stored (#703's money_fanout_enabled, 2026-10-07)."""
+    from aegis.config import Settings
+
+    missing = [c.key for c in CONFIG_REGISTRY if c.key not in Settings.model_fields]
+    assert missing == []
+
