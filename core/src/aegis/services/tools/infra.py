@@ -510,6 +510,17 @@ async def _exec_run_infra_script(
     err = _validate_infra_name(script_name, "script_name")
     if err:
         return json.dumps({"error": err})
+    # The same read_only refusal as `restart_service` (aegis#708): this tool must
+    # not be a way round it.
+    if script_name == "infra_restart_service" and await _swarm_context_read_only(
+        pool, context
+    ):
+        return json.dumps(
+            {
+                "error": f"context {context!r} is read-only — infra_restart_service is "
+                "disabled (infra registry read_only flag)"
+            }
+        )
 
     script_args = args or []
     if not isinstance(script_args, list):

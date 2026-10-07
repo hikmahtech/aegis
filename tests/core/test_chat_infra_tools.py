@@ -539,3 +539,40 @@ def test_k8s_tool_schemas_have_no_hardcoded_context_enum():
     for name in k8s_tools:
         context_schema = by_name[name]["parameters"]["properties"]["context"]
         assert "enum" not in context_schema, f"{name}'s context schema still has a hardcoded enum"
+
+
+@pytest.mark.asyncio
+async def test_exec_run_infra_script_refuses_restart_on_a_read_only_context(db_pool):
+    """aegis#708: run_infra_script must not get round the read_only flag that
+    stops restart_service. Read-only scripts still run on that context."""
+    await db_pool.execute("DELETE FROM infra WHERE slug = 'ro-swarm-708'")
+    await db_pool.execute(
+        "INSERT INTO infra (slug, name, kind, docker_context, read_only) "
+        "VALUES ('ro-swarm-708', 'ro swarm', 'swarm', 'swarm', true)"
+    )
+    try:
+        mock_connector = MagicMock()
+        mock_connector.run_script = AsyncMock(
+            return_value={"status": "succeeded", "exit_code": 0, "stdout": "[]", "stderr": ""}
+        )
+        ctx = ToolContext(remote_script_connector=mock_connector)
+
+        result = await _exec_run_infra_script(
+            db_pool,
+            {"context": "swarm", "script_name": "infra_restart_service", "args": ["web_web"]},
+            ctx,
+        )
+        assert json.loads(result) == {
+            "error": "context 'swarm' is read-only — infra_restart_service is disabled "
+            "(infra registry read_only flag)"
+        }
+        mock_connector.run_script.assert_not_awaited()
+
+        await _exec_run_infra_script(
+            db_pool, {"context": "swarm", "script_name": "infra_list_nodes"}, ctx
+        )
+        mock_connector.run_script.assert_awaited_once_with(
+            "infra/infra_list_nodes", ["swarm"], timeout=120
+        )
+    finally:
+        await db_pool.execute("DELETE FROM infra WHERE slug = 'ro-swarm-708'")
