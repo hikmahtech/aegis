@@ -193,6 +193,19 @@ async def restart_repeat_window_minutes(pool: Any) -> int:
     return _alert_remediation.merge(value)["repeat_window_minutes"]
 
 
+async def infra_remediation_enabled(pool: Any) -> bool:
+    """The `alert_remediation` row's `enabled` (aegis#705). Read leniently: no pool, no row or
+    a failed read mean on, as they always have; only a stored `false` turns remediation off."""
+    if pool is None:
+        return True
+    try:
+        value = await get_setting(pool, ALERT_REMEDIATION_SETTINGS_KEY)
+    except Exception as exc:  # noqa: BLE001 — a config read is never fatal
+        activity.logger.warning("alert_remediation_settings_read_failed err=%s", error_text(exc))
+        return True
+    return _alert_remediation.enabled(value)
+
+
 def _task_row(t: Any) -> dict | None:
     """One `service_ps` row, cut to what says why a task is not running."""
     if not isinstance(t, dict):
@@ -1353,6 +1366,10 @@ class AlertActivities:
         if not service:
             result["reason"] = "no_service_name"
             return result
+        if not await infra_remediation_enabled(self.db_pool):
+            # The infra lane's writes belong to a2-devops after its cutover (aegis#705).
+            result["reason"] = "disabled"
+            return result
         if not self.homelab_connector:
             result["reason"] = "no_homelab_connector"
             return result
@@ -1522,6 +1539,12 @@ class AlertActivities:
         ][:_MAX_REMEDIATION_COMMANDS]
         if not commands:
             result["refused"] = "no_commands"
+            return result
+        if not await infra_remediation_enabled(self.db_pool) and not all(
+            is_read_only_command(c) for c in commands
+        ):
+            # Checks still run; anything that changes the estate is a2-devops' now (aegis#705).
+            result["refused"] = "remediation_disabled"
             return result
         if self.db_pool:
             read_only = await self.db_pool.fetchval(

@@ -10,6 +10,11 @@ lives in the ``alert_remediation`` settings row::
 
 ``0`` turns the check off, which restarts every time (the pre-#501 behaviour).
 
+``"enabled": false`` switches infra remediation off altogether (hikmahtech/aegis#705): the
+automatic restart does nothing and a Gate-2 run refuses every command that changes something.
+It is the lever for the a2-devops cutover, which takes the infra lane's writes over: v1's
+writes go off before a2-devops' go on. Missing or not a bool reads as on.
+
 The same shape as ``hub_settle`` and ``email_rules``:
 
 * :func:`merge` is the READ and it is lenient. The worker reads the row through
@@ -37,6 +42,7 @@ DEFAULT_REPEAT_WINDOW_MINUTES = 60
 # restarted either", which is a mute on the auto-restart, not a window.
 MAX_MINUTES = 24 * 60
 DEFAULTS: dict[str, int] = {"repeat_window_minutes": DEFAULT_REPEAT_WINDOW_MINUTES}
+_KEYS = {"repeat_window_minutes", "enabled"}
 
 
 def _minutes(value: Any) -> int | None:
@@ -55,13 +61,22 @@ def merge(value: Any) -> dict[str, int]:
     }
 
 
-def validate(raw: Any) -> dict[str, int]:
+def enabled(value: Any) -> bool:
+    """Whether infra remediation is on. Lenient like `merge`: only a stored ``false`` is off."""
+    return not (isinstance(value, dict) and value.get("enabled") is False)
+
+
+def validate(raw: Any) -> dict[str, Any]:
     """Normalise a row for writing, or raise ValueError (the PUT answers 400)."""
     if not isinstance(raw, dict):
         raise ValueError("alert_remediation must be an object with repeat_window_minutes")
-    unknown = sorted(set(raw) - set(DEFAULTS))
+    unknown = sorted(set(raw) - _KEYS)
     if unknown:
-        raise ValueError(f"unknown key(s): {', '.join(unknown)} — only repeat_window_minutes")
+        raise ValueError(
+            f"unknown key(s): {', '.join(unknown)} — only repeat_window_minutes and enabled"
+        )
+    if "enabled" in raw and not isinstance(raw["enabled"], bool):
+        raise ValueError("enabled must be true or false")
     if "repeat_window_minutes" not in raw:
         raise ValueError("repeat_window_minutes is required (0 turns the check off)")
     value = raw["repeat_window_minutes"]
@@ -75,7 +90,10 @@ def validate(raw: Any) -> dict[str, int]:
             f"repeat_window_minutes: {minutes} is longer than the {MAX_MINUTES}-minute cap — "
             "a window that long stops the automatic restart, it does not pace it"
         )
-    return {"repeat_window_minutes": minutes}
+    out: dict[str, Any] = {"repeat_window_minutes": minutes}
+    if "enabled" in raw:
+        out["enabled"] = raw["enabled"]
+    return out
 
 
 ROW = SettingsRow(SETTINGS_KEY, merge, validate)
