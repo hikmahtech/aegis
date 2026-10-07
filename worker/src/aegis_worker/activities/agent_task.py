@@ -29,6 +29,8 @@ from aegis.services.project_repo_map import get_project_repo_map, lookup
 from aegis.services.settings_store import get_setting
 from temporalio import activity
 
+from aegis_worker.activities.alerts import infra_remediation_enabled
+
 # Assignee labels this flow will act on. @me is deliberately absent: a task the
 # user has claimed is theirs to handle.
 ADDRESSABLE_ASSIGNEES = ["@sebas", "@raphael", "@maou", "@pandora"]
@@ -700,6 +702,19 @@ class AgentTaskActivities:
                 choice,
             )
             return {"applied": "none"}
+
+        # The homelab moved to DevOps (a2-devops) on 2026-10-08 and v1 no longer
+        # writes to the swarm (aegis#708): with `alert_remediation.enabled` off,
+        # an approval restarts nothing.
+        if not await infra_remediation_enabled(self.db_pool):
+            await self.comment(
+                task_id,
+                agent_id,
+                f"Not restarting `{service}`: restarts moved to DevOps (a2-devops) "
+                "and AEGIS v1 no longer writes to the swarm.",
+            )
+            await self.park_task(task_id, "remediation_disabled")
+            return {"applied": "remediation_disabled"}
 
         # This activity has maximum_attempts=2 (flows/interaction.py's
         # _BEST_EFFORT_RETRY) and `restart_service` is a real write —

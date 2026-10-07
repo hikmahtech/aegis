@@ -183,3 +183,47 @@ async def test_attempt_greater_than_one_does_not_reissue_the_restart():
     # The rest of the hook must still run normally off the faked "already
     # issued" restart result — health gets polled and the task completes.
     assert rec.completed == ["tr-1"]
+
+
+async def test_approve_restarts_nothing_while_remediation_is_off(db_pool):
+    """aegis#708: the homelab moved to DevOps, so with `alert_remediation.enabled`
+    false an approved card must not write to the swarm. It says why and parks."""
+    from aegis.services import alert_remediation
+
+    await db_pool.execute("DELETE FROM settings WHERE key = 'alert_remediation'")
+    try:
+        await alert_remediation.save_alert_remediation(
+            db_pool, {"repeat_window_minutes": 60, "enabled": False}
+        )
+        rec = _Recorder(healthy_on_call=1)
+        act = _act(rec)
+        act.db_pool = db_pool
+        result = await act.apply_restart_approval("i1", {"value": "approve"}, _META)
+    finally:
+        await db_pool.execute("DELETE FROM settings WHERE key = 'alert_remediation'")
+    assert result == {"applied": "remediation_disabled"}
+    assert rec.restarted == []
+    assert rec.health_calls == 0
+    assert rec.completed == []
+    assert rec.parked == ["tr-1"]
+    assert "DevOps (a2-devops)" in rec.notes[-1]
+    assert not rec.notes[-1].startswith("Restarted")
+
+
+async def test_approve_still_restarts_when_remediation_is_on(db_pool):
+    """A stored `enabled: true` keeps the old behaviour."""
+    from aegis.services import alert_remediation
+
+    await db_pool.execute("DELETE FROM settings WHERE key = 'alert_remediation'")
+    try:
+        await alert_remediation.save_alert_remediation(
+            db_pool, {"repeat_window_minutes": 60, "enabled": True}
+        )
+        rec = _Recorder(healthy_on_call=1)
+        act = _act(rec)
+        act.db_pool = db_pool
+        result = await act.apply_restart_approval("i1", {"value": "approve"}, _META)
+    finally:
+        await db_pool.execute("DELETE FROM settings WHERE key = 'alert_remediation'")
+    assert result == {"applied": "approved"}
+    assert rec.restarted == ["redis_redis"]
