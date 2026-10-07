@@ -345,6 +345,12 @@ async def apply_config_overrides(settings: Any, pool: Any) -> Any:
         spec = _BY_KEY.get(field)
         if not spec or not r["value"]:
             continue
+        fields = getattr(type(settings), "model_fields", None)
+        if fields is not None and field not in fields:
+            # A config key with no Settings field (read straight from the DB elsewhere) must not
+            # stop boot: setattr on a pydantic model raises for an unknown field.
+            logger.warning("config_override_no_settings_field", field=field)
+            continue
         if spec.boolean:
             # Always set (even "false") so a DB toggle can override an env True.
             raw = str((r["value"] or {}).get("val") or "").lower()
