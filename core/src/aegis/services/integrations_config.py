@@ -193,6 +193,12 @@ CONFIG_REGISTRY: list[ConfigKey] = [
         "Restart the worker after enabling.",
     ),
     ConfigKey(
+        "trading_desk_enabled", "Trading desk (Maou: daily paper trades)", "Features", False,
+        boolean=True,
+        help="On unless set to false. Runs the daily paper trading desk and its activities. "
+        "Separate from Money Hygiene. Restart the worker after changing it.",
+    ),
+    ConfigKey(
         "money_fanout_enabled", "Book money mail found by email triage", "Features", False,
         boolean=True,
         help="On unless set to false. Turning it off stops triage handing money mail to the "

@@ -362,6 +362,9 @@ class Settings(BaseSettings):
     # The books cutover switch (#703); read per run from the DB by the worker. Declared so the
     # boot overlay (integrations_config.apply_config_overrides) has a field to set.
     money_fanout_enabled: bool = True
+    # Maou's paper trading desk. Its own flag, not money_hygiene_enabled: the desk
+    # stays in v1 when the books lane leaves it. On by default.
+    trading_desk_enabled: bool = True
     # Currency the books report in; drives the money brief's symbol.
     home_currency: str = "INR"
 

@@ -36,7 +36,8 @@ indent. Every function here takes a `layout`, defaulting to the shipped one, so
 a deployment with no row behaves as it always did. The rules above are not
 layout and are not configurable.
 
-The git plumbing is the books layer (`books.py`), reused rather than copied:
+The git plumbing is the shared checkout layer (`git_checkout.py`), also used by the
+books:
 the clone happens inside the flock, `.aegis.lock` lives in the checkout, and a
 failed write reverts only the paths it touched.
 """
@@ -57,7 +58,7 @@ from typing import Any
 import structlog
 
 from aegis.errors import error_text
-from aegis.services import books
+from aegis.services import git_checkout
 from aegis.services import vault_layout as vl
 from aegis.services.vault_layout import DEFAULT_LAYOUT, KINDS, Layout, moment_format
 
@@ -144,8 +145,7 @@ DEFAULT_AUTHOR = Author()
 @dataclass(frozen=True)
 class NotesConfig:
     """The vault checkout, and who commits to it. Same attribute names as
-    `books.BooksConfig`, which is what lets this module reuse the books git
-    layer."""
+    `books.BooksConfig`, which is what `git_checkout` reads."""
 
     path: Path
     repo_url: str = ""
@@ -179,9 +179,9 @@ def config_from_settings(settings: Any) -> NotesConfig:
 
 def install_deploy_key(settings: Any) -> Path | None:
     """Write `settings.notes_deploy_key` to `<gmail_token_dir>/notes_deploy_key`
-    with mode 0600 — the same writer the books key uses. Never logs the value."""
+    with mode 0600 — the same writer the books key uses (`git_checkout`). Never logs the value."""
     path = Path(getattr(settings, "gmail_token_dir", "config/") or "config/") / DEPLOY_KEY_NAME
-    return books.write_deploy_key(
+    return git_checkout.write_deploy_key(
         getattr(settings, "notes_deploy_key", "") or "", path, DEPLOY_KEY_NAME
     )
 
@@ -767,8 +767,8 @@ def _run(
     args: list[str], cfg: NotesConfig, *, timeout: int = 60, check: bool = True
 ) -> subprocess.CompletedProcess:
     try:
-        proc = books._spawn(args, cwd=str(cfg.path), timeout=timeout, env=_env(cfg))
-    except books.BooksError as exc:
+        proc = git_checkout.spawn(args, cwd=str(cfg.path), timeout=timeout, env=_env(cfg))
+    except git_checkout.CheckoutError as exc:
         raise NotesError(_scrub(str(exc))) from exc
     if check and proc.returncode != 0:
         raise NotesError(f"{' '.join(args[:2])} failed: {_scrub(proc.stderr.strip())[:500]}")
@@ -784,13 +784,13 @@ def _has_upstream(cfg: NotesConfig) -> bool:
 
 
 def _ensure_checkout(cfg: NotesConfig) -> None:
-    """Clone on first use (inside the flock, via the books layer), and keep the
+    """Clone on first use (inside the flock, via `git_checkout`), and keep the
     lock file out of `git status` for good."""
     try:
-        books.ensure_checkout_sync(cfg)  # type: ignore[arg-type] — same attribute names
-    except books.BooksDisabled as exc:
+        git_checkout.ensure_checkout_sync(cfg)
+    except git_checkout.CheckoutDisabled as exc:
         raise NotesDisabled("notes_repo_url is not configured and no checkout exists") from exc
-    except books.BooksError as exc:
+    except git_checkout.CheckoutError as exc:
         raise NotesError(str(exc)) from exc
     exclude = cfg.path / ".git" / "info" / "exclude"
     try:
@@ -811,8 +811,8 @@ def _drop_local(cfg: NotesConfig, paths: list[str]) -> None:
     if _has_upstream(cfg):
         _run(["git", "reset", "-q", "--hard", "@{u}"], cfg, check=False)
     try:
-        books._revert_sync(cfg, paths)  # type: ignore[arg-type]
-    except books.BooksError as exc:  # pragma: no cover — best effort
+        git_checkout.revert_sync(cfg, paths)
+    except git_checkout.CheckoutError as exc:  # pragma: no cover — best effort
         logger.warning("notes_revert_failed", error=error_text(exc))
 
 
@@ -865,7 +865,7 @@ def _apply(cfg: NotesConfig, ap: Append) -> tuple[str, bool]:
 
 
 def _commit(cfg: NotesConfig, summary: str, paths: list[str]) -> None:
-    scoped = books._git_paths(cfg, paths)  # type: ignore[arg-type]
+    scoped = git_checkout.git_paths(cfg, paths)
     if not scoped:
         return
     _run(["git", "add", "-A", "--", *scoped], cfg)
@@ -883,11 +883,11 @@ def _push(cfg: NotesConfig) -> None:
 
 
 class _Lock:
-    """The books flock, on `<vault>/.aegis.lock`: core and worker share the
+    """The checkout flock, on `<vault>/.aegis.lock`: core and worker share the
     checkout, so they must take turns."""
 
     def __init__(self, cfg: NotesConfig) -> None:
-        self._inner = books._FileLock(cfg)  # type: ignore[arg-type]
+        self._inner = git_checkout.FileLock(cfg)
 
     def __enter__(self):
         self._inner.__enter__()

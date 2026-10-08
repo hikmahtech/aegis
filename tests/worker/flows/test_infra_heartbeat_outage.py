@@ -107,15 +107,6 @@ async def test_an_empty_listing_does_not_end_an_outage():
     assert result["outage"] is True
 
 
-def test_outage_min_nodes_is_read_from_activities_config():
-    from aegis_worker.registry import FLOWS
-
-    spec = next(s for s in FLOWS if s.flow is InfraHeartbeatFlow)
-    row = {"agent_id": "pandoras-actor", "_settings": {}}
-    assert spec.schedule_config({**row, "config": {}}).outage_min_nodes == 2
-    assert spec.schedule_config({**row, "config": {"outage_min_nodes": 4}}).outage_min_nodes == 4
-
-
 async def test_a_tick_from_before_the_detector_replays(monkeypatch):
     """A heartbeat in flight across the deploy recorded no outage step; the
     new flow must replay it (the step is behind `workflow.patched`)."""

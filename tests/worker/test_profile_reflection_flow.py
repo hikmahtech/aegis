@@ -634,8 +634,8 @@ def test_flow_in_schedule_map():
 def test_every_agent_has_its_learning_rows():
     """Both learning flows are per-agent: a row is one schedule for one
     agent. Only Sebas ever had rows, so his was the only persona that
-    changed and the only memory anyone tidied, for months. Every seeded agent
-    but `system` (which never chats) gets one row of each; a new agent in
+    changed and the only memory anyone tidied, for months. Every active seeded
+    agent but `system` (which never chats) gets one row of each; a new agent in
     agents.yaml without them fails here. None may share a minute with
     another row or land on a stepper's minute."""
     from pathlib import Path
@@ -645,10 +645,14 @@ def test_every_agent_has_its_learning_rows():
     repo = Path(__file__).resolve().parents[2]
     seed = repo / "config" / "seed"
     rows = yaml.safe_load((seed / "activities.yaml").read_text())["activities"]
+    # Active agents only: the retired infra agent (054) learns nothing.
     agents = {
-        a["id"] for a in yaml.safe_load((seed / "agents.yaml").read_text())["agents"]
+        a["id"]
+        for a in yaml.safe_load((seed / "agents.yaml").read_text())["agents"]
+        if a.get("active", True)
     } - {"system"}
-    assert {"sebas", "maou", "raphael", "pandoras-actor"} <= agents
+    assert {"sebas", "maou", "raphael"} <= agents
+    assert "pandoras-actor" not in agents
 
     for flow in ("ProfileReflectionFlow", "MemoryReflectionFlow"):
         mine = [r for r in rows if r["workflow_type"] == flow]

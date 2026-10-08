@@ -1,4 +1,4 @@
-"""HomelabActivities.check_comms_inbound_health — the comms probe.
+"""WatchdogActivities.check_comms_inbound_health — the comms probe.
 
 The alert itself is the delivery watchdog's `comms_inbound_down` problem on
 the hub (`flows/delivery_watchdog.py`); this file covers only the probe."""
@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 import respx
-from aegis_worker.activities.homelab import HomelabActivities
+from aegis_worker.activities.watchdog import WatchdogActivities
 from httpx import Response
 from temporalio.testing import ActivityEnvironment
 
@@ -21,7 +21,7 @@ from temporalio.testing import ActivityEnvironment
 def _make_act(db_pool=None):
     delivery = AsyncMock()
     delivery.send_message = AsyncMock(return_value={"ok": True})
-    return HomelabActivities(db_pool=db_pool, homelab=None, delivery=delivery)
+    return WatchdogActivities(db_pool=db_pool, delivery=delivery)
 
 
 # ---------------------------------------------------------------------------

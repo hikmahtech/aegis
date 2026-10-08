@@ -97,19 +97,24 @@ class GmailIngestFlow:
             workflow.logger.warning("gmail_ingest_finance_resolve_failed")
             finance_agent = None
 
-        # The cutover switch: another service can take over the books while this lane keeps
-        # running for everything else. A failed read keeps the fan-out on (losing money mail is
-        # worse); the hard stop at cutover is revoking this service's journal deploy key.
+        # The money fan-out is off for good: the books moved to another service, and the
+        # money lane is leaving this one. A run that started before the patch (no marker)
+        # replays with the fan-out on, as it ran. A run with the marker never fans out.
+        #
+        # The flag read stays, its answer ignored: a run in flight when this shipped has
+        # the read in its history, and replay must issue the same command. Remove it the
+        # #614 way (deprecate_patch first) once no such run is open.
         fanout_enabled = True
         if workflow.patched(PATCH_MONEY_FANOUT_FLAG):
             try:
-                fanout_enabled = await workflow.execute_activity(
+                await workflow.execute_activity(
                     "money_fanout_enabled",
                     start_to_close_timeout=TIMEOUT_FAST,
                     retry_policy=NO_RETRY,
                 )
             except Exception:
                 workflow.logger.warning("gmail_ingest_money_fanout_flag_read_failed")
+            fanout_enabled = False
 
         for ch in channels:
             identifier = ch["identifier"]

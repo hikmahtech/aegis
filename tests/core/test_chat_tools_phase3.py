@@ -282,7 +282,7 @@ async def test_user_today_without_a_pool_is_utc() -> None:
 
 
 @pytest.mark.asyncio
-async def test_agent_assignee_sees_parked_waiting_tasks(db_pool) -> None:
+async def test_agent_assignee_sees_parked_waiting_tasks(db_pool, infra_agent_active) -> None:
     """@waiting is agent_task.PARK_LABEL — stamped at the END of every agent
     run. Filtering it as GTD "blocked" hid 9 of 11 open @pandora tasks and made
     chat report an empty queue (2026-08-11). An agent must see its own parked
@@ -323,7 +323,7 @@ async def test_agent_assignee_sees_parked_waiting_tasks(db_pool) -> None:
 
 
 @pytest.mark.asyncio
-async def test_agent_assignee_sees_inbox_tasks(db_pool) -> None:
+async def test_agent_assignee_sees_inbox_tasks(db_pool, infra_agent_active) -> None:
     """The Inbox is excluded for humans (an Inbox item is unclarified). For an
     agent it is the opposite: the @agent label IS clarify's output, and AEGIS's
     own triage parks #alert work in the Inbox — 10 of 11 open @pandora tasks

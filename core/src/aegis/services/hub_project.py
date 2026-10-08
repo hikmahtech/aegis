@@ -50,11 +50,12 @@ from typing import Any
 import asyncpg
 import structlog
 
+from aegis.agent_tags import GENERALIST_TAG
 from aegis.connectors.todoist import TodoistConnector
 from aegis.errors import error_text
 from aegis.services import work_sessions
 from aegis.services.agents import resolve_tag
-from aegis.services.books import parse_kv
+from aegis.services.git_checkout import parse_kv
 from aegis.services.hub import (
     LIVE_STATUSES,
     QUESTION_CLASS,
@@ -140,6 +141,14 @@ class _Owner:
 
 
 _INFRA_OWNER = _Owner(SOURCE_TAG, "infra")
+# The owner of a problem whose source has no entry in `_OWNER_BY_SOURCE`: the
+# generalist, who owns anything no other agent claims. It used to be the infra
+# owner; the infra agent is being retired from v1, and a task whose owner has no
+# holder gets no assignee label.
+_DEFAULT_OWNER = _Owner(SOURCE_TAG, GENERALIST_TAG)
+# The sources that raise infra or development problems keep the infra owner
+# until the lanes behind them are removed.
+_INFRA_SOURCES = ("alertmanager", "heartbeat", "drift", "sentry", "investigation", "github")
 # Problems another agent owns, by the source of their first occurrence. All 13
 # money problems in prod (2026-09-11) were projected as `#alert @pandora` in the
 # Inbox, and the agent sweep then ran Pandora's infra verb on them and parked
@@ -173,6 +182,7 @@ _OWNER_BY_SOURCE = {
     "money": _Owner(MONEY_SOURCE_TAG, "finance", ("@next",), "personal"),
     "research": _Owner(RESEARCH_SOURCE_TAG, "research", ("@next",)),
     "feeds": _Owner(FEEDS_SOURCE_TAG, "research", ("@next",)),
+    **dict.fromkeys(_INFRA_SOURCES, _INFRA_OWNER),
 }
 
 
@@ -444,7 +454,7 @@ async def _first_source(pool: asyncpg.Pool, problem_id: str) -> str:
 
 async def _owner(pool: asyncpg.Pool, problem_id: str) -> _Owner:
     """Who owns the problem, by the source that raised it."""
-    return _OWNER_BY_SOURCE.get(await _first_source(pool, problem_id), _INFRA_OWNER)
+    return _OWNER_BY_SOURCE.get(await _first_source(pool, problem_id), _DEFAULT_OWNER)
 
 
 async def _books_project(pool: asyncpg.Pool, entity: str) -> str | None:

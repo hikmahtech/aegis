@@ -40,10 +40,12 @@ def test_the_missing_key_still_takes_the_default():
 def test_the_repro_from_the_issue_no_longer_raises():
     """`{"max_per_account": ""}` on any row whose flow maps that key — the exact
     config in the issue, through the real mapper rather than a stand-in."""
-    mapper = _ACTIVITY_TYPE_MAP["ReceiptIngestFlow"]
+    # The issue's row was ReceiptIngestFlow, unscheduled since the v1 removal
+    # prep; GmailIngestFlow maps the same key the same way.
+    mapper = _ACTIVITY_TYPE_MAP["GmailIngestFlow"]
     _, config = mapper(
         {
-            "agent_id": "maou",
+            "agent_id": "sebas",
             "config": {"max_per_account": ""},
             "_settings": {"aegis_ui_url": "", "comms_url": ""},
         }

@@ -42,7 +42,6 @@ from typing import Any
 import structlog
 from temporalio import activity, workflow
 
-from aegis_worker.activities.jira import DEFAULT_KEY_PATTERN
 from aegis_worker.flows.agent_chat_reply import AgentChatReplyFlow
 from aegis_worker.flows.agent_run import AgentRunFlow
 from aegis_worker.flows.agent_task import (
@@ -54,7 +53,7 @@ from aegis_worker.flows.alert_investigation import AlertInvestigationFlow
 from aegis_worker.flows.books_write import BooksWriteFlow
 from aegis_worker.flows.calendar_ingest import CalendarIngestFlow, CalendarIngestInput
 from aegis_worker.flows.calibre_sync import CalibreSyncConfig, CalibreSyncFlow
-from aegis_worker.flows.cert_radar import CertRadarConfig, CertRadarFlow
+from aegis_worker.flows.cert_radar import CertRadarFlow
 from aegis_worker.flows.clarify import ClarifyConfig, ClarifyFlow
 from aegis_worker.flows.cleanup import CleanupConfig, CleanupFlow
 from aegis_worker.flows.curiosity import CuriosityCardFlow, CuriosityConfig
@@ -68,27 +67,25 @@ from aegis_worker.flows.github_alert import GitHubAlertFlow
 from aegis_worker.flows.github_rising import GithubRisingConfig, GithubRisingFlow
 from aegis_worker.flows.gmail_ingest import GmailIngestFlow, GmailIngestInput
 from aegis_worker.flows.hub_sweep import HubSweepConfig, HubSweepFlow
-from aegis_worker.flows.infra_heartbeat import InfraHeartbeatConfig, InfraHeartbeatFlow
+from aegis_worker.flows.infra_heartbeat import InfraHeartbeatFlow
 from aegis_worker.flows.intelligence_scan import IntelligenceScanFlow, IntelligenceScanInput
 from aegis_worker.flows.interaction import InteractionFlow
-from aegis_worker.flows.jira_sync import JiraSyncConfig, JiraSyncFlow
+from aegis_worker.flows.jira_sync import JiraSyncFlow
 from aegis_worker.flows.journal_prompt import JournalPromptConfig, JournalPromptFlow
 from aegis_worker.flows.llm_spend_guard import LLMSpendGuardConfig, LLMSpendGuardFlow
 from aegis_worker.flows.meeting_notes import MeetingNotesFlow
 from aegis_worker.flows.meeting_sweep import MeetingSweepFlow, MeetingSweepInput
 from aegis_worker.flows.memory_reflection import MemoryReflectionFlow, MemoryReflectionInput
-from aegis_worker.flows.money_brief import MoneyBriefConfig, MoneyBriefFlow
+from aegis_worker.flows.money_brief import MoneyBriefFlow
 from aegis_worker.flows.money_process import MoneyProcessFlow
-from aegis_worker.flows.month_close import MonthCloseConfig, MonthCloseFlow
+from aegis_worker.flows.month_close import MonthCloseFlow
 from aegis_worker.flows.notes_backfill import NotesBackfillConfig, NotesBackfillFlow
 from aegis_worker.flows.notes_sync import NotesSyncConfig, NotesSyncFlow
 from aegis_worker.flows.notes_write import NotesWriteFlow
 from aegis_worker.flows.profile_reflection import ProfileReflectionConfig, ProfileReflectionFlow
 from aegis_worker.flows.raindrop_ingest import RaindropIngestFlow, RaindropIngestInput
 from aegis_worker.flows.receipt_ingest import (
-    DEFAULT_SENDER_FILTER,
     ReceiptIngestFlow,
-    ReceiptIngestInput,
 )
 from aegis_worker.flows.record_seed import RecordSeedFlow
 from aegis_worker.flows.research import ResearchFlow
@@ -99,19 +96,18 @@ from aegis_worker.flows.review import (
     WeeklyReviewFlow,
 )
 from aegis_worker.flows.rss_ingest import RssIngestFlow, RssIngestInput
-from aegis_worker.flows.sentry_poll import SentryPollFlow, SentryPollInput
-from aegis_worker.flows.service_drift import ServiceDriftConfig, ServiceDriftFlow
+from aegis_worker.flows.sentry_poll import SentryPollFlow
+from aegis_worker.flows.service_drift import ServiceDriftFlow
 from aegis_worker.flows.social_metrics import SocialMetricsConfig, SocialMetricsFlow
 from aegis_worker.flows.social_publish import SocialPublishConfig, SocialPublishFlow
 from aegis_worker.flows.statement_reconcile import (
-    StatementReconcileConfig,
     StatementReconcileFlow,
 )
 from aegis_worker.flows.tender_watch import TenderWatchConfig, TenderWatchFlow
 from aegis_worker.flows.todoist_sync import TodoistSyncConfig, TodoistSyncFlow
 from aegis_worker.flows.trading_desk import TradingDeskConfig, TradingDeskFlow
 from aegis_worker.flows.wearable_ingest import WearableIngestFlow, WearableIngestInput
-from aegis_worker.flows.workspace_repo_sync import WorkspaceRepoSyncFlow, WorkspaceRepoSyncInput
+from aegis_worker.flows.workspace_repo_sync import WorkspaceRepoSyncFlow
 from aegis_worker.flows.world_watch import WorldWatchConfig, WorldWatchFlow
 
 logger = structlog.get_logger()
@@ -417,23 +413,9 @@ FLOWS: tuple[FlowSpec, ...] = (
             query_template=str(act["config"].get("query_template") or ""),
         ),
     ),
-    FlowSpec(
-        JiraSyncFlow,
-        lambda act: JiraSyncConfig(
-            agent_id=act["agent_id"],
-            key_pattern=str(act["config"].get("key_pattern", DEFAULT_KEY_PATTERN)),
-            max_tasks=_int(act["config"], "max_tasks", 100),
-            dry_run=bool(act["config"].get("dry_run", False)),
-        ),
-    ),
-    FlowSpec(
-        SentryPollFlow,
-        lambda act: SentryPollInput(
-            agent_id=act["agent_id"],
-            mode=act["config"].get("mode", "poll"),
-            limit=_int(act["config"], "limit", 25),
-        ),
-    ),
+    # Unscheduled since the v1 removal prep (see the homelab_enabled block below).
+    FlowSpec(JiraSyncFlow),
+    FlowSpec(SentryPollFlow),
     FlowSpec(
         TodoistSyncFlow,
         lambda act: TodoistSyncConfig(
@@ -459,13 +441,8 @@ FLOWS: tuple[FlowSpec, ...] = (
             agent_id=act["agent_id"],
         ),
     ),
-    FlowSpec(
-        WorkspaceRepoSyncFlow,
-        lambda act: WorkspaceRepoSyncInput(
-            agent_id=act["agent_id"],
-            min_repos=_int(act["config"], "min_repos", 5),
-        ),
-    ),
+    # Unscheduled since the v1 removal prep (see the homelab_enabled block below).
+    FlowSpec(WorkspaceRepoSyncFlow),
     FlowSpec(
         SocialPublishFlow,
         lambda act: SocialPublishConfig(
@@ -592,23 +569,9 @@ FLOWS: tuple[FlowSpec, ...] = (
             silent=bool((act["config"] or {}).get("silent", False)),
         ),
     ),
-    # --- homelab_enabled ---------------------------------------------------
-    FlowSpec(
-        ServiceDriftFlow,
-        lambda act: ServiceDriftConfig(
-            silent=bool(act["config"].get("silent", False)),
-            recheck_delay_seconds=_int(act["config"], "recheck_delay_seconds", 120),
-        ),
-        feature_flag="homelab_enabled",
-    ),
-    FlowSpec(
-        CertRadarFlow,
-        lambda act: CertRadarConfig(
-            silent=bool(act["config"].get("silent", False)),
-            domains=act["config"].get("domains", []),
-        ),
-        feature_flag="homelab_enabled",
-    ),
+    # Watches AEGIS's own card delivery and comms inbound channel. Not behind
+    # homelab_enabled: every install has interactions and a comms service, and
+    # its activities live on WatchdogActivities, which is always built.
     FlowSpec(
         DeliveryWatchdogFlow,
         lambda act: DeliveryWatchdogConfig(
@@ -617,88 +580,29 @@ FLOWS: tuple[FlowSpec, ...] = (
             window_hours=_int(act["config"], "window_hours", 24),
             comms_url=act["_settings"].get("comms_url", ""),
         ),
-        feature_flag="homelab_enabled",
     ),
-    FlowSpec(
-        InfraHeartbeatFlow,
-        lambda act: InfraHeartbeatConfig(
-            agent_id=act["agent_id"],
-            fail_threshold=_int(act["config"], "fail_threshold", 3),
-            quiet_nodes=[str(n) for n in (act["config"].get("quiet_nodes") or [])],
-            restuck_hours=_int(act["config"], "restuck_hours", 24),
-            outage_min_nodes=_int(
-                act["config"], "outage_min_nodes", InfraHeartbeatConfig.outage_min_nodes
-            ),
-            outage_recent_hours=_int(
-                act["config"], "outage_recent_hours", InfraHeartbeatConfig.outage_recent_hours
-            ),
-            ingress_url=str(act["config"].get("ingress_url") or "").strip(),
-            ingress_fail_threshold=_int(
-                act["config"],
-                "ingress_fail_threshold",
-                InfraHeartbeatConfig.ingress_fail_threshold,
-            ),
-            ingress_expect_status=_int(
-                act["config"],
-                "ingress_expect_status",
-                InfraHeartbeatConfig.ingress_expect_status,
-            ),
-        ),
-        feature_flag="homelab_enabled",
-    ),
+    # --- homelab_enabled ---------------------------------------------------
+    # These and the money flows below are unscheduled since the v1 removal prep:
+    # migration 054 deletes their activities rows (so do Jira, Sentry and the
+    # workspace repo sync above). Still registered so a run in flight can finish
+    # and a manual start still works, until the removal PRs delete them.
+    FlowSpec(ServiceDriftFlow, feature_flag="homelab_enabled"),
+    FlowSpec(CertRadarFlow, feature_flag="homelab_enabled"),
+    FlowSpec(InfraHeartbeatFlow, feature_flag="homelab_enabled"),
     # --- money_hygiene_enabled ---------------------------------------------
-    FlowSpec(
-        ReceiptIngestFlow,
-        lambda act: ReceiptIngestInput(
-            agent_id=act["agent_id"],
-            max_per_account=_int(act["config"], "max_per_account", 50),
-            # `or`, not a .get default: a key present but blank must fall back
-            # too. An empty sender_filter is a whole-mailbox query, and every
-            # message it returns is fanned out to MoneyProcessFlow's LLM call.
-            query_window=act["config"].get("query_window") or "newer_than:14d",
-            aegis_ui_url=act["_settings"].get("aegis_ui_url", ""),
-            sender_filter=act["config"].get("sender_filter") or DEFAULT_SENDER_FILTER,
-            sweep_limit=_int(act["config"], "sweep_limit", 20),
-        ),
-        feature_flag="money_hygiene_enabled",
-    ),
+    FlowSpec(ReceiptIngestFlow, feature_flag="money_hygiene_enabled"),
     FlowSpec(MoneyProcessFlow, feature_flag="money_hygiene_enabled"),
-    FlowSpec(
-        MoneyBriefFlow,
-        lambda act: MoneyBriefConfig(
-            agent_id=act["agent_id"],
-            days=_int(act["config"], "days", 7),
-            silent=bool(act["config"].get("silent", False)),
-        ),
-        feature_flag="money_hygiene_enabled",
-    ),
-    FlowSpec(
-        MonthCloseFlow,
-        lambda act: MonthCloseConfig(
-            agent_id=act["agent_id"],
-            silent=bool(act["config"].get("silent", False)),
-        ),
-        feature_flag="money_hygiene_enabled",
-    ),
-    # The statement lane's tick (spec §14 step 7). `post` ships FALSE: a
-    # schedule must not write to the books before an operator has read a dry
-    # run of what it would write.
-    FlowSpec(
-        StatementReconcileFlow,
-        lambda act: StatementReconcileConfig(
-            agent_id=act["agent_id"],
-            post=bool(act["config"].get("post", False)),
-            since=str(act["config"].get("since", "") or ""),
-            silent=bool(act["config"].get("silent", False)),
-        ),
-        feature_flag="money_hygiene_enabled",
-    ),
+    FlowSpec(MoneyBriefFlow, feature_flag="money_hygiene_enabled"),
+    FlowSpec(MonthCloseFlow, feature_flag="money_hygiene_enabled"),
+    FlowSpec(StatementReconcileFlow, feature_flag="money_hygiene_enabled"),
+    # --- trading_desk_enabled ----------------------------------------------
     # Maou's paper trading desk (spec 2026-09-12). Its rules are read from the
-    # activities row by the activity itself, so only agent_id travels here.
+    # activities row by the activity itself, so only agent_id travels here. Its
+    # own flag, not the money lane's: the desk stays when the books leave v1.
     FlowSpec(
         TradingDeskFlow,
         lambda act: TradingDeskConfig(agent_id=act["agent_id"]),
-        feature_flag="money_hygiene_enabled",
+        feature_flag="trading_desk_enabled",
     ),
     # Raphael's world watch (#676): its watch list and thresholds are the
     # activities row's config, handed to the activity whole.
@@ -741,7 +645,7 @@ ACTIVITY_CLASS_FLAGS: dict[str, str] = {
     # to the same books through the same flock, and a money-off install must
     # not serve their task queue either.
     "StatementActivities": "money_hygiene_enabled",
-    "TradingDeskActivities": "money_hygiene_enabled",
+    "TradingDeskActivities": "trading_desk_enabled",
 }
 
 

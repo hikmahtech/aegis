@@ -531,7 +531,7 @@ async def test_stale_stuck_problems_only_answers_about_the_classes_asked_for(db_
     assert memory.problem_id in wide
 
 
-async def test_a_merged_fix_pr_is_announced_in_the_channel(db_pool):
+async def test_a_merged_fix_pr_is_announced_in_the_channel(db_pool, infra_agent_active):
     """#639: the owner opens a fix PR from a card in the channel, so the
     channel hears the merge. The task note alone (`posted: false`) left a
     merge the owner never saw AEGIS acknowledge."""

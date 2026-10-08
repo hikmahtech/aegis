@@ -258,6 +258,7 @@ def create_app(run_lifespan: bool = True, settings: Settings | None = None) -> F
         capture,
         channels,
         chat,
+        desk,
         email_admin,
         expiring_items_admin,
         gmail_reauth,
@@ -365,6 +366,8 @@ def create_app(run_lifespan: bool = True, settings: Settings | None = None) -> F
     app.include_router(hub.router)
     app.include_router(problems_admin.router)
     app.include_router(money.router)
+    # The trading desk: same /api/admin/money prefix, its own module.
+    app.include_router(desk.router)
     app.include_router(infra.router)
     app.include_router(infra_admin.router)
     app.include_router(system_status.router)

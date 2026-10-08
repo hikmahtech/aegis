@@ -1621,17 +1621,14 @@ def test_tools_are_registered_and_gated():
     assert "ledger_query" not in _UNSERVED_TOOLS
 
 
-def test_seed_grants_match_the_code_defaults():
-    """`config/seed/agents.yaml` seeds the DB `metadata.tool_set`, which WINS
-    over the Python dict at runtime — a grant added only in code never reaches
-    a fresh deployment."""
+def test_the_seed_grants_no_ledger_tool():
+    """v1 removal prep (migration 054): the books left v1, so no seeded agent
+    is granted a ledger tool. The tools stay registered until the removal PRs
+    delete them."""
     import yaml
 
     root = Path(__file__).resolve().parents[2]
     agents = yaml.safe_load((root / "config" / "seed" / "agents.yaml").read_text())["agents"]
-    by_id = {a["id"]: a for a in agents}
-    maou = set(by_id["maou"]["metadata"]["tool_set"])
-    assert {"ledger_query", "ledger_post", "ledger_reclassify", "ledger_add_rule"} <= maou
-    assert "ledger_query" in set(by_id["sebas"]["metadata"]["tool_set"])
-    for writer in ("ledger_post", "ledger_reclassify", "ledger_add_rule"):
-        assert writer not in set(by_id["sebas"]["metadata"]["tool_set"])
+    ledger = {"ledger_query", "ledger_post", "ledger_reclassify", "ledger_add_rule"}
+    for agent in agents:
+        assert not ledger & set((agent.get("metadata") or {}).get("tool_set") or []), agent["id"]

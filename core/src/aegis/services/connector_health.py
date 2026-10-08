@@ -42,8 +42,8 @@ logger = structlog.get_logger()
 
 _KEY_PREFIX = "connector_health:"
 # The hub identity of a dead connector. `source` is not in
-# `hub_project._OWNER_BY_SOURCE`, so the task falls to the infra owner, which is
-# who fixes an integration; and it is not in `hub_project._SELF_CLEARING_SOURCES`,
+# `hub_project._OWNER_BY_SOURCE`, so the task falls to the default owner, the
+# generalist; and it is not in `hub_project._SELF_CLEARING_SOURCES`,
 # so there is no settle delay — the consecutive-failure threshold already IS the
 # settle window.
 _SOURCE = "connector"

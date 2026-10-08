@@ -25,8 +25,8 @@ from temporalio import workflow
 with workflow.unsafe.imports_passed_through():
     from aegis.errors import error_text
 
-    from aegis_worker.activities.homelab import HomelabActivities
     from aegis_worker.activities.hub import HubActivities
+    from aegis_worker.activities.watchdog import WatchdogActivities
     from aegis_worker.shared.retry import FAST, NO_RETRY, TIMEOUT_FAST, TIMEOUT_STANDARD
 
 
@@ -43,7 +43,7 @@ class DeliveryWatchdogFlow:
     @workflow.run
     async def run(self, config: DeliveryWatchdogConfig) -> dict:
         rows = await workflow.execute_activity_method(
-            HomelabActivities.find_undelivered_interactions,
+            WatchdogActivities.find_undelivered_interactions,
             args=[config.threshold_seconds, config.window_hours],
             start_to_close_timeout=TIMEOUT_FAST,
             retry_policy=FAST,
@@ -56,7 +56,7 @@ class DeliveryWatchdogFlow:
         health: dict = {"status": "unknown"}
         try:
             health = await workflow.execute_activity_method(
-                HomelabActivities.check_comms_inbound_health,
+                WatchdogActivities.check_comms_inbound_health,
                 args=[config.comms_url],
                 start_to_close_timeout=TIMEOUT_FAST,
                 retry_policy=NO_RETRY,
@@ -126,7 +126,7 @@ class DeliveryWatchdogFlow:
         resolved = {r.get("klass") for r in outcome.get("resolved") or []}
         if "undelivered_cards" in fresh and not config.silent:
             await workflow.execute_activity_method(
-                HomelabActivities.notify_undelivered_interactions,
+                WatchdogActivities.notify_undelivered_interactions,
                 args=[rows],
                 start_to_close_timeout=TIMEOUT_FAST,
                 retry_policy=NO_RETRY,

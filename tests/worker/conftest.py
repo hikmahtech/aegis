@@ -40,3 +40,4 @@ async def seed_app_route(db_pool):
     async with db_pool.acquire() as conn:
         await conn.execute("DELETE FROM settings WHERE key='content_routes'")
     _cl._routes_cache.update(routes=None, ts=0.0)
+
