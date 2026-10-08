@@ -6,6 +6,18 @@
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/)
 [![Project home](https://img.shields.io/badge/home-hikmahtechnologies.com%2Faegis-b87333)](https://hikmahtechnologies.com/aegis/)
 
+> [!IMPORTANT]
+> **This repository is archived (October 2026).** The code stays public and MIT-licensed:
+> read it, fork it, learn from it. It gets no more fixes, releases or answers to issues,
+> including for security problems, so review anything you run.
+>
+> AEGIS continues as **v2**: separate products on a shared SDK, each with its own database
+> and deployment. v2 is not open source. Why it split, and what runs on it:
+> [hikmahtechnologies.com/blog/aegis-v1-is-archived](https://hikmahtechnologies.com/blog/aegis-v1-is-archived/).
+>
+> [v0.1.0](https://github.com/hikmahtech/aegis/releases/tag/v0.1.0) is the clean first public
+> release. `main` shows v1 shrinking as each area moved to v2.
+
 **Autonomous Executive Guild Intelligence System** — a flow-first, self-hosted
 personal AI orchestration platform. A small fleet
 of named agents run scheduled and event-driven workflows over your own data —
