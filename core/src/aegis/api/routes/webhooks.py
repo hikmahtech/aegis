@@ -1,14 +1,8 @@
-"""Source-specific signed webhooks.
+"""Source-specific signed webhooks: life-data pushes, Todoist, and the
+ingress canary's ping.
 
-Phase 2 ships the GitHub handler with HMAC verification; the sentry
-handler is scaffolded but returns 503 until its secret is configured.
-Each secret is a separate env var (see config.py):
-
-- AEGIS_GITHUB_WEBHOOK_SECRET — validates X-Hub-Signature-256
-- AEGIS_SENTRY_WEBHOOK_SECRET — validates Sentry-Hook-Signature
-
-Phase 3 wires GitHub and Sentry to Temporal flows (GitHubAlertFlow,
-SentryPollFlow) with delivery-id/fingerprint idempotency via ingest_idempotency.
+The GitHub, Sentry and Alertmanager/Grafana intakes left v1: they moved to the
+v2 verticals (DevOps for alerts, Development for Sentry and GitHub).
 """
 
 from __future__ import annotations
@@ -19,23 +13,19 @@ import hmac
 import json as _json
 import time as _time
 import uuid as _uuid
-from datetime import UTC, datetime
 
 import structlog
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from temporalio.client import Client
 
-from aegis.api.auth import alert_token_ok
 from aegis.api.deps import get_settings
 from aegis.api.routes.interactions import get_workflow_client
 from aegis.clarify_note import AGENT_REPLY_PREFIX, CLARIFY_NOTE_PREFIX
 from aegis.config import Settings
 from aegis.errors import error_text
 from aegis.observability import log_audit
-from aegis.services import hub_project
 from aegis.services.agents import resolve_tag
 from aegis.services.health import record_health_push
-from aegis.services.hub import event_from_alert, ingest_event
 from aegis.services.observations import record_observation
 from aegis.services.places import record_location_push
 from aegis.services.work_sessions import dispatch_task_turn, is_user_note
@@ -60,8 +50,6 @@ def verify_hmac(
     scheme.
 
     Schemes:
-    - GitHub ``X-Hub-Signature-256``: hex, ``prefix="sha256="``.
-    - Sentry ``Sentry-Hook-Signature``: hex, ``prefix=""``.
     - Todoist ``X-Todoist-Hmac-SHA256``: **base64** (not hex — Todoist's own
       docs specify base64-encoding the digest), ``prefix=""``.
 
@@ -141,27 +129,6 @@ LIFE_MAX_BODY_BYTES = 64 * 1024
 
 # Replay window for X-Aegis-Timestamp, in seconds, either direction.
 LIFE_TIMESTAMP_WINDOW_SECONDS = 300
-
-# Same treatment for /alert, which is the one webhook that can be left
-# unauthenticated (blank `alert_webhook_secret` is a documented legacy default),
-# and whose work per request is unbounded: every element of the posted array can
-# spawn an AlertInvestigationFlow, i.e. LLM spend plus Todoist/Slack writes.
-#
-# These are ABUSE ceilings, deliberately far above real traffic — not a way to
-# shape it. Sizing matters in both directions:
-#
-#   * Too high and a small body of minimal alerts (~22 bytes each) mints
-#     thousands of workflows.
-#   * Too LOW and a genuine incident loses alerts, permanently. Truncation keeps
-#     the FIRST N, and every kept alert claims `ingest_idempotency`; on
-#     Alertmanager's `group_interval` resend the same first N are claimed and
-#     skipped, so the dropped tail is never reached on a later attempt. A
-#     whole-cluster outage is precisely when the group is largest and when
-#     losing alerts costs most, so the ceiling has to clear that case with room
-#     to spare: alertmanager groups by (alertname, cluster, service), so one
-#     `DockerServiceDown` event can carry an entry per swarm service at once.
-ALERT_MAX_BODY_BYTES = 1024 * 1024
-ALERT_MAX_ALERTS_PER_REQUEST = 500
 
 # One opaque failure for every authentication outcome — a missing header, a
 # malformed one, a stale timestamp and a wrong signature are indistinguishable
@@ -430,260 +397,6 @@ async def ping() -> None:
     and the canary only needs to know that core answered.
     """
     return None
-
-
-@router.post("/github")
-async def github_webhook(
-    request: Request,
-    x_hub_signature_256: str | None = Header(default=None),
-    x_github_event: str | None = Header(default=None),
-    x_github_delivery: str | None = Header(default=None),
-    settings: Settings = Depends(get_settings),
-    temporal: Client = Depends(get_workflow_client),
-):
-    if not settings.github_webhook_secret:
-        logger.error("github_webhook_secret_missing")
-        raise HTTPException(status_code=503, detail="github_webhook_secret_not_configured")
-    body = await request.body()
-    if not verify_hmac(settings.github_webhook_secret, body, x_hub_signature_256):
-        logger.warning("github_webhook_bad_signature", gh_event=x_github_event)
-        raise HTTPException(status_code=401, detail="bad_signature")
-
-    delivery_id = x_github_delivery or str(_uuid.uuid4())
-
-    pool = request.app.state.db_pool
-    if not await claim_idempotency(pool, "github", delivery_id):
-        logger.info("github_webhook_duplicate_skipped", delivery_id=delivery_id)
-        return {"accepted": True, "duplicate": True, "delivery_id": delivery_id}
-
-    payload = _safe_json(body)
-
-    agent_id = await resolve_tag(pool, "infra")
-    if agent_id is None:
-        logger.warning("github_webhook_no_infra_agent", delivery_id=delivery_id)
-        return {"accepted": True, "skipped": "no_infra_agent", "delivery_id": delivery_id}
-
-    handle = await temporal.start_workflow(
-        "GitHubAlertFlow",
-        {
-            "agent_id": agent_id,
-            "event": x_github_event or "",
-            "delivery_id": delivery_id,
-            "payload": payload,
-        },
-        id=f"github-{delivery_id}",
-        task_queue="aegis-main",
-    )
-    logger.info(
-        "github_webhook_flow_started",
-        workflow_id=handle.id,
-        gh_event=x_github_event,
-        delivery_id=delivery_id,
-    )
-    return {
-        "accepted": True,
-        "event": x_github_event,
-        "delivery_id": delivery_id,
-        "workflow_id": handle.id,
-    }
-
-
-@router.post("/sentry")
-async def sentry_webhook(
-    request: Request,
-    settings: Settings = Depends(get_settings),
-    temporal: Client = Depends(get_workflow_client),
-):
-    if not settings.sentry_webhook_secret:
-        raise HTTPException(status_code=503, detail="sentry_webhook_not_configured")
-    body = await request.body()
-    signature = request.headers.get("Sentry-Hook-Signature")
-    if not verify_hmac(settings.sentry_webhook_secret, body, signature, prefix=""):
-        raise HTTPException(status_code=401, detail="bad_signature")
-
-    payload = _safe_json(body)
-
-    issue = (payload.get("data") or {}).get("issue") or payload.get("issue") or {}
-    issue_id = str(issue.get("id", "")) or str(payload.get("event_id", ""))
-    if not issue_id:
-        logger.warning("sentry_webhook_no_issue_id", keys=list(payload.keys()))
-        return {"accepted": True, "skipped": "no_issue_id"}
-
-    pool = request.app.state.db_pool
-    if not await claim_idempotency(pool, "sentry", f"sentry:{issue_id}"):
-        logger.info("sentry_webhook_duplicate_skipped", issue_id=issue_id)
-        return {"accepted": True, "duplicate": True, "issue_id": issue_id}
-
-    agent_id = await resolve_tag(pool, "infra")
-    if agent_id is None:
-        logger.warning("sentry_webhook_no_infra_agent", issue_id=issue_id)
-        return {"accepted": True, "skipped": "no_infra_agent", "issue_id": issue_id}
-
-    handle = await temporal.start_workflow(
-        "SentryPollFlow",
-        {
-            "agent_id": agent_id,
-            "mode": "webhook",
-            "issue": issue,
-        },
-        id=f"sentry-alert-{issue_id}",
-        task_queue="aegis-main",
-    )
-    logger.info("sentry_webhook_flow_started", workflow_id=handle.id, issue_id=issue_id)
-    return {
-        "accepted": True,
-        "issue_id": issue_id,
-        "workflow_id": handle.id,
-    }
-
-
-@router.post("/alert")
-async def alert_webhook(
-    request: Request,
-    settings: Settings = Depends(get_settings),
-    temporal: Client = Depends(get_workflow_client),
-):
-    """Generic alert webhook (Alertmanager/Grafana).
-
-    Alertmanager and Grafana don't sign their payloads, so there is no vendor
-    HMAC to verify here. Set ``AEGIS_ALERT_WEBHOOK_SECRET`` and the caller must
-    present it, in **either** of two headers:
-
-    * ``X-Alert-Token: <secret>`` — the original scheme.
-    * ``Authorization: Bearer <secret>`` — because neither sender can set an
-      arbitrary header on the version pinned here, but both speak Bearer:
-      alertmanager via ``http_config.authorization`` and grafana via the webhook
-      contact point's ``authorization_scheme``/``authorization_credentials``.
-      Without this the secret is unsettable without breaking alerting, which is
-      why it stayed blank (#304).
-
-    Leaving the secret empty keeps the endpoint unauthenticated — the legacy
-    default, kept for backward compatibility, and a footgun: it lets anyone who
-    can reach the port mint fake alerts, each spawning an AlertInvestigationFlow
-    that burns LLM budget and posts to Todoist/Slack. Worse than the cost, alert
-    labels and annotations are caller-controlled text handed to an autonomous LLM
-    flow holding write tools, and they all share the ``aegis-main`` task queue, so
-    a flood starves every other flow. Set the secret whenever this endpoint is
-    reachable by anything you don't trust (#88, #304).
-
-    Body: Alertmanager v2 or Grafana Unified Alerting JSON. Every alert —
-    firing or resolved — is recorded on the problem hub
-    (`services/hub.py`), which decides whether it is a new problem, a
-    repeat, suppressed by a deploy window, or muted. Only a new (or
-    returning) problem starts an AlertInvestigationFlow; a resolved one
-    resolves its problem, and the projector closes the task.
-    """
-    # Blank secret = open, the legacy default: the `and` short-circuits before
-    # alert_token_ok, so an unconfigured deployment never rejects.
-    if settings.alert_webhook_secret and not alert_token_ok(
-        request, settings.alert_webhook_secret
-    ):
-        logger.warning("alert_webhook_bad_token")
-        raise HTTPException(status_code=401, detail="bad_token")
-
-    # Bounded + streamed, like /life/: `await request.body()` would buffer an
-    # arbitrarily large body into memory before any check ran, and this endpoint
-    # is reachable unauthenticated whenever the secret is unset.
-    body = await _read_bounded_body(request, ALERT_MAX_BODY_BYTES)
-    try:
-        payload = _json.loads(body)
-    except Exception as exc:
-        logger.warning("alert_webhook_bad_json", size=len(body))
-        raise HTTPException(status_code=400, detail="invalid_json") from exc
-
-    # Normalise: alertmanager {alerts: [...]} OR bare list OR single-alert dict
-    alerts_raw: list[dict]
-    if isinstance(payload, list):
-        alerts_raw = payload
-    elif isinstance(payload, dict):
-        alerts_raw = payload.get("alerts") or [payload]
-    else:
-        alerts_raw = []
-
-    # Cap the fan-out. Each surviving alert spawns a child workflow that costs
-    # LLM budget and writes to Todoist/Slack, so an oversized array is an
-    # amplification vector rather than a big-but-harmless request. Truncate
-    # loudly instead of silently: a genuine group this large is itself a signal
-    # worth seeing in the logs.
-    dropped = 0
-    if len(alerts_raw) > ALERT_MAX_ALERTS_PER_REQUEST:
-        dropped = len(alerts_raw) - ALERT_MAX_ALERTS_PER_REQUEST
-        logger.warning(
-            "alert_webhook_truncated",
-            received=len(alerts_raw),
-            cap=ALERT_MAX_ALERTS_PER_REQUEST,
-            dropped=dropped,
-        )
-        alerts_raw = alerts_raw[:ALERT_MAX_ALERTS_PER_REQUEST]
-
-    pool = request.app.state.db_pool
-    started = 0
-    skipped = 0
-
-    for a in alerts_raw:
-        if not isinstance(a, dict):
-            continue
-        labels = a.get("labels") or {}
-        annotations = a.get("annotations") or {}
-        fingerprint = a.get("fingerprint") or ""
-        alertname = labels.get("alertname", "")
-        instance = labels.get("instance", "")
-
-        # Synthesize fingerprint if missing
-        if not fingerprint:
-            fingerprint = f"alertmanager:{alertname}:{instance}"
-
-        alert = {
-            "source": "alertmanager",
-            "title": annotations.get("summary") or alertname or "Alert",
-            "fingerprint": fingerprint,
-            "severity": labels.get("severity", "warning"),
-            "service": instance or labels.get("job", ""),
-            "description": annotations.get("description", ""),
-            "labels": labels,
-            "raw_payload": a,
-        }
-
-        status = a.get("status", "firing")
-        now = datetime.now(UTC)
-        try:
-            result = await ingest_event(
-                pool,
-                event_from_alert(alert, occurred_at=now, resolved=(status == "resolved")),
-                now=now,
-            )
-        except Exception as exc:  # noqa: BLE001 — never 500 the sender; alertmanager retries
-            logger.warning(
-                "alert_webhook_ingest_failed", fingerprint=fingerprint, error=error_text(exc)
-            )
-            skipped += 1
-            continue
-        task_id = None
-        if result.problem_id:
-            # Best-effort: the sweep re-projects anything this misses.
-            try:
-                projected = await hub_project.project(
-                    pool, result.problem_id, settings=settings, now=now
-                )
-                task_id = projected.get("task_id")
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "alert_webhook_project_failed", problem_id=result.problem_id, error=error_text(exc)
-                )
-        if status == "resolved" or not result.investigate:
-            skipped += 1
-            continue
-
-        await temporal.start_workflow(
-            "AlertInvestigationFlow",
-            {**alert, "problem_id": result.problem_id, "todoist_task_id": task_id},
-            id=f"investigate-{result.problem_id}-{result.occurrences}",
-            task_queue="aegis-main",
-        )
-        started += 1
-
-    logger.info("alert_webhook_processed", started=started, skipped=skipped, dropped=dropped)
-    return {"accepted": True, "started": started, "skipped": skipped, "dropped": dropped}
 
 
 @router.post("/todoist")

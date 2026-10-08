@@ -752,14 +752,13 @@
     "type": "function",
     "function": {
       "name": "configure_triage",
-      "description": "Read or update triage configuration: ignored Sentry projects, ignored email domains, notification mode, burst threshold.",
+      "description": "Read or update triage configuration: ignored email domains, notification mode, burst threshold.",
       "parameters": {
         "type": "object",
         "properties": {
           "setting": {
             "type": "string",
             "enum": [
-              "sentry_ignored_projects",
               "email_ignored_domains",
               "notification_mode",
               "burst_threshold"

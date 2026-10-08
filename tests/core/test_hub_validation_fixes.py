@@ -195,7 +195,7 @@ async def test_a_subject_less_event_is_not_promoted_out_of_a_live_window(db_pool
         r = await ingest_event(
             db_pool,
             Event(
-                source="sentry",
+                source="manual",
                 external_id=f"nosubject-{uuid.uuid4().hex[:8]}",
                 kind="occurrence",
                 title="ValueError in a service nobody named",

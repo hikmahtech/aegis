@@ -600,13 +600,9 @@ activities:
 
   # Problem hub housekeeping (spec 2026-09-07 §5): opens every `suppressed`
   # problem whose deploy/maintenance window passed without a resolution,
-  # reads completed tasks back, settles merged fixes, projects, and folds
-  # clusters into groups. 3-58/5 dodges the */5 stepper other schedules sit on.
-  # Optional config (#502): `fix_verify_hours` (24) — how long a merged fix's
-  # alert must stay clear before its problem resolves; `fix_grace_hours` (1) —
-  # how long after the merge an occurrence is put down to the old code still
-  # running. Raise the grace if your deploys land hours after a merge.
-  # `alertmanager_url` (#551) turns on the reconciliation that closes a problem
+  # reads completed tasks back, projects, and folds clusters into groups.
+  # 3-58/5 dodges the */5 stepper other schedules sit on.
+  # Optional config: `alertmanager_url` (#551) turns on the reconciliation that closes a problem
   # whose alert alertmanager no longer lists. Alertmanager keeps its alerts in
   # memory, so a restart loses every `resolved` webhook it owed, and that lane
   # is the only one with no other way back — the problem and its Todoist task

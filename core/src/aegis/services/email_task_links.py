@@ -1,8 +1,8 @@
 """Email → existing-task links.
 
 Email triage only ever *created* Todoist tasks. These rules let an incoming
-email change the state of a task AEGIS already tracks — the Jira case being the
-obvious one: the ticket is closed, the mail says so, and the Todoist row lives on
+email change the state of a task AEGIS already tracks — an issue tracker's ticket
+being the obvious case: the ticket is closed, the mail says so, and the Todoist row lives on
 forever because nothing was listening.
 
 Stored in ``settings.email_task_links`` as an ordered, first-match-wins list.
@@ -10,19 +10,19 @@ Ships EMPTY — each deployment adds its own rules. A rule matches the SUBJECT t
 find a task key and (optionally) the BODY for a discriminator, then applies one
 action to the open task whose title contains that key::
 
-    {"key": "jira-done",
+    {"key": "ticket-done",
      "subject_re": "\\\\((APP-\\\\d+)\\\\)",
      "body_re": "resolution\\\\s*:\\\\s*(?:Done|Fixed|Completed|Duplicate|Declined)",
      "action": "complete"}
 
 Group 1 of ``subject_re`` is the task key (the whole match if the pattern has no
-group). ``body_re`` is optional but you almost always want one: Jira sends the
+group). ``body_re`` is optional but you almost always want one: a tracker sends the
 same subject for *every* event on an issue, so subject-only matching would close
 a ticket because somebody commented on it.
 
 **Write ``body_re`` against a real message, not a guess.** Machine-generated mail
 is not prose, and two things that look obviously right are wrong in practice.
-Jira's plain-text part renders the field table with no separator between fields,
+Jira's plain-text part, for one, renders the field table with no separator between fields,
 so a resolution reads ``Resolution : DoneStatus : Deployed`` — a trailing ``\\b``
 after ``Done`` never matches, because ``Done`` is glued to ``Status``. And that
 table sits ~2400 chars into a body that reaches 15k, well past the classifier's

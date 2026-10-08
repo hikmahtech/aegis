@@ -309,10 +309,9 @@ did not make it go away. `degraded` is information only; `ok` clears the row.
 
 Three writers, all of which land on the same row:
 
-- **The deploy job.** `POST /api/hub/service-state`, authenticated like the
-  alert webhook (`X-Alert-Token` or `Authorization: Bearer`, the
-  `alert_webhook_secret`). The Ansible role that deploys AEGIS posts
-  `deploying` for `aegis_core`, `aegis_worker` and `aegis_comms` before the
+- **The deploy job.** `POST /api/hub/service-state`, authenticated by the
+  `alert_webhook_secret` (`X-Alert-Token` or `Authorization: Bearer`). The
+  Ansible role that deploys AEGIS posts `deploying` for `aegis_core`, `aegis_worker` and `aegis_comms` before the
   stack deploy and `ok` after the services are up. A hand-run
   `docker service update` deserves the same two calls:
 
@@ -811,15 +810,12 @@ key is pasted.)
        block's `engines.claude.config_dirs`; the claude run for this repo uses
        that profile. Wins over org routing. **Kimi ignores it** (no profile).
      - **Sentry project slug** — maps a Sentry issue (by its project slug)
-       straight to this repo, deterministically, before any LLM guess.
+       straight to this repo. Unused since the Sentry intake left v1; the
+       field goes with the alert investigation lane.
 
    The fixed checkouts under the repo base are provisioned/mirrored by
    `WorkspaceRepoSyncFlow`, never cloned per-run — a missing path is a hard
-   error, not a silent clone. Sentry alerts are additionally narrowed at fetch
-   time by the `sentry_projects` setting (**Integrations → Sentry**,
-   comma-separated project ids; blank = all) — that controls which issues are
-   *pulled*; the per-resource **Sentry project slug** controls which repo an
-   issue *routes to*.
+   error, not a silent clone.
 
    > Upgrading an existing deployment: mark your active repos
    > **Enable alert / Sentry investigation**, or alert investigation resolves
@@ -1080,79 +1076,19 @@ is audited. The worker reads the row on every restart, so a change applies to
 the next alert; no restart. A stored value that is not a whole number of
 minutes counts as 60.
 
-### After Open PR: following the fix to a verified fix
+### After Open PR
 
-**Pandora follows the PRs it opens (#502).** When you pick **Open PR(s)** on a
-card, the flow pushes the fix branch, opens a draft PR, links it to the problem
-(`problem_links`, kind `github_pr`) and leaves the problem in `fixing`. The
-task comment says it is being followed. From there:
+When you pick **Open PR(s)** on a card, the flow pushes the fix branch, opens a
+draft PR and leaves the problem in `fixing`. v1 no longer follows the PR: the
+GitHub webhook, `GitHubAlertFlow` and the hub sweep's fix verification (#502)
+were removed when the GitHub intake moved to the v2 Development vertical.
+Complete the task once the PR merges and the alert stays clear; that resolves
+the problem.
 
-| What happens | Problem moves to | What the task says |
-|---|---|---|
-| The PR merges | `verifying` | Fix PR merged, and the alert is now being watched |
-| The PR is closed without merging | `waiting_human` | The fix was not taken, so it is back with you |
-| No occurrence for `fix_verify_hours` after the merge | `resolved` (the task closes) | The alert stayed clear for that long |
-| The alert comes back later than `fix_grace_hours` after the merge | `open` | It came back, how long after the merge, and which PR |
-
-- **What is followed.** Only a PR an investigation opened: the problem
-  carries an `investigation` event naming it in `pr_urls`. A PR a coding
-  session links with `report_progress` is not followed — its merge says
-  nothing about whether an alert is fixed, and a `@code` task has no alert to
-  stay clear.
-- **Several PRs.** While any of the problem's fix PRs is open, it stays
-  `fixing`. Once none is, one merge is enough for `verifying`; none merged
-  means `waiting_human`.
-- **The alert cleared first.** A problem the alert already resolved stays
-  resolved (#488's rule: the alert source owns whether a problem is live). The
-  merge is written on its timeline, and a return inside the 24-hour reopen
-  window reopens it the usual way, with a fresh investigation.
-- **The grace.** Right after a merge the old code is usually still running,
-  so an occurrence inside `fix_grace_hours` is put down to it, not to the fix.
-  An occurrence inside a deploy or maintenance window never counts. If your
-  deploys land hours after a merge, raise the grace.
-- **You still decide.** Completing the task resolves the problem at any point,
-  as always.
-
-How it gets there: GitHub's `pull_request` webhook (`/api/webhooks/github`)
-starts `GitHubAlertFlow`, which hands a `closed` PR to
-`HubActivities.follow_fix_pr` (`hub_fix.record_pr_closed`). The problem hub's
-five-minute `HubSweepFlow` settles `verifying` problems
-(`HubActivities.verify_fixes`). The webhook must be set up and reachable
-(it already is if you get PR-opened pings in chat); without it nothing moves
-past `fixing`, which is how it behaved before.
-
-Both windows live on the `hub-sweep-5m` activity row, with generic defaults of
-24 hours and 1 hour. `schedule_sync` picks a change up within five minutes; no
-restart.
-
-```sql
-UPDATE activities
-SET config = config || '{"fix_verify_hours": 24, "fix_grace_hours": 1}'::jsonb
-WHERE workflow_type = 'HubSweepFlow';
-```
-
-To see fixes in flight and how they ended:
-
-```sql
-SELECT p.id, p.status, p.title, l.ref AS pr
-FROM problems p JOIN problem_links l ON l.problem_id = p.id AND l.link_kind = 'github_pr'
-WHERE p.closed_at IS NULL AND p.status IN ('fixing', 'verifying')
-ORDER BY p.last_seen_at DESC;
-
-SELECT e.occurred_at, e.source, e.payload->>'text'
-FROM problem_events e
-WHERE e.problem_id = '<problem id>' AND e.source IN ('github', 'hub') AND e.kind = 'investigation'
-ORDER BY e.id;
-```
-
-`pending_prs` is not part of this. It is the hand-off between the two
-activities that open a PR (`stage_pending_pr` writes the title, body and
-branch; `create_github_pr` reads them back and marks the row `opened` or
-`failed`), written only when someone picks Open PR, and pruned after 30 days
-by `CleanupFlow`. That is why it is usually empty: in prod, Open PR was picked
-twice (2026-07-31 and 2026-08-10), and the one row those left was pruned on
-2026-08-31. A PR can stay open longer than 30 days, so the follow-up reads
-the problem's own link and events instead.
+`pending_prs` is the hand-off between the two activities that open a PR
+(`stage_pending_pr` writes the title, body and branch; `create_github_pr` reads
+them back and marks the row `opened` or `failed`), pruned after 30 days by
+`CleanupFlow`.
 
 ### What Pandora remembers from your decisions
 

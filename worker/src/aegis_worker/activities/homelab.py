@@ -90,41 +90,6 @@ class HomelabActivities:
         )
 
     @activity.defn
-    async def notify_pr_event(self, pr: dict) -> dict:
-        """Notify (Slack) about a pull-request event — but only for repositories
-        the user tracks in `resources` (kind='repository'), so the feed stays
-        scoped to repos that involve them rather than every-repo noise.
-
-        pr = {repo, number, title, author, action, url}. Untracked repos are
-        skipped. Returns {notified: bool, reason?, repo}.
-        """
-        repo = (pr.get("repo") or "").strip()
-        if not repo:
-            return {"notified": False, "reason": "no_repo"}
-        basename = repo.rsplit("/", 1)[-1]
-        async with self.db_pool.acquire() as conn:
-            tracked = await conn.fetchval(
-                """
-                SELECT 1 FROM resources
-                WHERE kind = 'repository'
-                  AND (
-                    lower(metadata->>'github_repo') = lower($1)
-                    OR lower(split_part(metadata->>'github_repo', '/', 2)) = lower($2)
-                  )
-                LIMIT 1
-                """,
-                repo,
-                basename,
-            )
-        if not tracked:
-            return {"notified": False, "reason": "untracked_repo", "repo": repo}
-        action = pr.get("action", "updated")
-        title = f"PR {action}: {repo} #{pr.get('number', '?')}"
-        body = f"{pr.get('title', '')}\nby {pr.get('author', '?')}\n{pr.get('url', '')}".strip()
-        await self._notify_card(self.agent_id, title, body, "github_pr_notify_failed")
-        return {"notified": True, "repo": repo}
-
-    @activity.defn
     async def persist_drifts(self, drifts: list[dict]) -> int:
         """Upsert drift rows keyed on alert_key (partial unique index).
         Returns number of NEW rows (not touched if already open)."""

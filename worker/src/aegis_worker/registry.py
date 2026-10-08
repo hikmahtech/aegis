@@ -63,14 +63,12 @@ from aegis_worker.flows.delivery_watchdog import DeliveryWatchdogConfig, Deliver
 from aegis_worker.flows.drive_sync import DriveSyncFlow, DriveSyncInput
 from aegis_worker.flows.expiry_radar import ExpiryRadarConfig, ExpiryRadarFlow
 from aegis_worker.flows.flow_health import FlowHealthConfig, FlowHealthWatchdogFlow
-from aegis_worker.flows.github_alert import GitHubAlertFlow
 from aegis_worker.flows.github_rising import GithubRisingConfig, GithubRisingFlow
 from aegis_worker.flows.gmail_ingest import GmailIngestFlow, GmailIngestInput
 from aegis_worker.flows.hub_sweep import HubSweepConfig, HubSweepFlow
 from aegis_worker.flows.infra_heartbeat import InfraHeartbeatFlow
 from aegis_worker.flows.intelligence_scan import IntelligenceScanFlow, IntelligenceScanInput
 from aegis_worker.flows.interaction import InteractionFlow
-from aegis_worker.flows.jira_sync import JiraSyncFlow
 from aegis_worker.flows.journal_prompt import JournalPromptConfig, JournalPromptFlow
 from aegis_worker.flows.llm_spend_guard import LLMSpendGuardConfig, LLMSpendGuardFlow
 from aegis_worker.flows.meeting_notes import MeetingNotesFlow
@@ -96,7 +94,6 @@ from aegis_worker.flows.review import (
     WeeklyReviewFlow,
 )
 from aegis_worker.flows.rss_ingest import RssIngestFlow, RssIngestInput
-from aegis_worker.flows.sentry_poll import SentryPollFlow
 from aegis_worker.flows.service_drift import ServiceDriftFlow
 from aegis_worker.flows.social_metrics import SocialMetricsConfig, SocialMetricsFlow
 from aegis_worker.flows.social_publish import SocialPublishConfig, SocialPublishFlow
@@ -288,7 +285,6 @@ FLOWS: tuple[FlowSpec, ...] = (
             aegis_ui_url=act["_settings"].get("aegis_ui_url", ""),
         ),
     ),
-    FlowSpec(GitHubAlertFlow),
     FlowSpec(
         RaindropIngestFlow,
         lambda act: RaindropIngestInput(agent_id=act["agent_id"]),
@@ -413,9 +409,6 @@ FLOWS: tuple[FlowSpec, ...] = (
             query_template=str(act["config"].get("query_template") or ""),
         ),
     ),
-    # Unscheduled since the v1 removal prep (see the homelab_enabled block below).
-    FlowSpec(JiraSyncFlow),
-    FlowSpec(SentryPollFlow),
     FlowSpec(
         TodoistSyncFlow,
         lambda act: TodoistSyncConfig(
@@ -541,10 +534,6 @@ FLOWS: tuple[FlowSpec, ...] = (
                 0.0,
                 _float(act["config"], "group_window_hours", HubSweepConfig.group_window_hours),
             ),
-            fix_verify_hours=_float(
-                act["config"], "fix_verify_hours", HubSweepConfig.fix_verify_hours
-            ),
-            fix_grace_hours=_float(act["config"], "fix_grace_hours", HubSweepConfig.fix_grace_hours),
             # Empty disables the alertmanager reconciliation entirely (#551).
             alertmanager_url=str(act["config"].get("alertmanager_url") or "").strip(),
             alertmanager_min_uptime_seconds=_int(
@@ -583,8 +572,8 @@ FLOWS: tuple[FlowSpec, ...] = (
     ),
     # --- homelab_enabled ---------------------------------------------------
     # These and the money flows below are unscheduled since the v1 removal prep:
-    # migration 054 deletes their activities rows (so do Jira, Sentry and the
-    # workspace repo sync above). Still registered so a run in flight can finish
+    # migration 054 deletes their activities rows (so does the workspace repo
+    # sync above). Still registered so a run in flight can finish
     # and a manual start still works, until the removal PRs delete them.
     FlowSpec(ServiceDriftFlow, feature_flag="homelab_enabled"),
     FlowSpec(CertRadarFlow, feature_flag="homelab_enabled"),

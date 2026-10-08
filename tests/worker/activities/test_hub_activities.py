@@ -94,10 +94,7 @@ async def test_no_pool_is_a_quiet_noop():
         {"source": "drift", "subject_kind": "service", "classes": ["replicas"], "findings": [{"klass": "replicas", "subject": "s", "title": "t"}]},
     )
     assert out["fresh"][0]["problem_id"] is None and out["resolved"] == []
-    assert await env.run(act.follow_fix_pr, {"url": "https://github.com/o/r/pull/1", "merged": True}) == {
-        "followed": 0,
-        "problems": [],
-    }
+    # Retired (the GitHub intake left v1): a no-op kept for replays.
     assert await env.run(act.verify_fixes, 24.0, 1.0) == {
         "resolved": 0,
         "reopened": 0,
@@ -132,7 +129,7 @@ async def test_ingest_alert_adopts_the_callers_task(db_pool):
     assert (await get_problem(db_pool, out["problem_id"]))["todoist_task_id"] == "T_CLARIFY"
 
 
-async def test_record_investigation_moves_status_and_links_prs(db_pool):
+async def test_record_investigation_moves_status(db_pool):
     env = ActivityEnvironment()
     act = HubActivities(db_pool=db_pool)
     s = f"svc_{uuid.uuid4().hex[:8]}"
@@ -153,74 +150,10 @@ async def test_record_investigation_moves_status_and_links_prs(db_pool):
     assert p["status"] == "fixing"
     ev = [e for e in await list_events(db_pool, pid) if e["kind"] == "investigation"][0]
     assert ev["payload"]["posted"] is True and ev["payload"]["status"] == "fixing"
-    link = await db_pool.fetchval(
-        "SELECT ref FROM problem_links WHERE problem_id = $1::uuid AND link_kind = 'github_pr'", pid
-    )
-    assert link == "https://github.com/o/r/pull/5"
+    assert ev["payload"]["pr_urls"] == ["https://github.com/o/r/pull/5"]
     # idempotent on the external id
     again = await env.run(act.record_investigation, {"problem_id": pid, "status": "fixing", "text": "PR opened", "external_id": "wf-1:prs_opened"})
     assert again["status_changed"] is False
-
-
-async def test_a_fix_pr_is_followed_from_merge_to_resolved(db_pool):
-    """#502 at the seams the flows cross: the Gate-2 step records the PR
-    (`record_investigation`), the GitHub webhook reports the merge
-    (`follow_fix_pr`), and the hub sweep settles it (`verify_fixes`)."""
-    env = ActivityEnvironment()
-    act = HubActivities(db_pool=db_pool)
-    s = f"svc_{uuid.uuid4().hex[:8]}"
-    url = f"https://github.com/o/r/pull/{uuid.uuid4().int % 100000}"
-    pid = (await env.run(act.ingest_alert, _alert(s), False))["problem_id"]
-    await env.run(
-        act.record_investigation,
-        {
-            "problem_id": pid,
-            "status": "fixing",
-            "text": f"1 PR(s) opened: {url}",
-            "external_id": f"wf-{s}:prs_opened",
-            "payload": {"pr_urls": [url]},
-        },
-    )
-
-    out = await env.run(
-        act.follow_fix_pr,
-        {"url": url, "merged": True, "merged_at": "2026-09-12T10:00:00Z", "closed_at": "2026-09-12T10:00:00Z"},
-    )
-
-    assert out["followed"] == 1
-    [row] = out["problems"]
-    assert {k: v for k, v in row.items() if k != "text"} == {
-        "problem_id": pid,
-        "state": "merged",
-        "status": "verifying",
-        "moved": True,
-    }
-    assert (await get_problem(db_pool, pid))["status"] == "verifying"
-    # No window left to wait out: the next sweep resolves it.
-    settled = await env.run(act.verify_fixes, 0.0, 1.0)
-    assert pid in settled["problem_ids"] and settled["resolved"] >= 1
-    assert (await get_problem(db_pool, pid))["status"] == "resolved"
-
-
-async def test_a_fix_pr_closed_unmerged_uses_its_closed_at(db_pool):
-    env = ActivityEnvironment()
-    act = HubActivities(db_pool=db_pool)
-    s = f"svc_{uuid.uuid4().hex[:8]}"
-    url = f"https://github.com/o/r/pull/{uuid.uuid4().int % 100000}"
-    pid = (await env.run(act.ingest_alert, _alert(s), False))["problem_id"]
-    await env.run(
-        act.record_investigation,
-        {"problem_id": pid, "status": "fixing", "text": "PR", "external_id": f"wf-{s}:prs_opened", "payload": {"pr_urls": [url]}},
-    )
-
-    pr = {"url": url, "merged": False, "merged_at": None, "closed_at": "2026-09-12T11:00:00Z"}
-    first = await env.run(act.follow_fix_pr, pr)
-    again = await env.run(act.follow_fix_pr, pr)
-
-    assert [p["status"] for p in first["problems"]] == ["waiting_human"]
-    assert [p["moved"] for p in again["problems"]] == [False]
-    closes = [e for e in await list_events(db_pool, pid) if e["source"] == "github"]
-    assert len(closes) == 1 and closes[0]["payload"]["pr"]["at"] == "2026-09-12T11:00:00Z"
 
 
 async def test_record_investigation_after_the_alert_cleared_annotates_and_holds(db_pool):
@@ -529,34 +462,6 @@ async def test_stale_stuck_problems_only_answers_about_the_classes_asked_for(db_
     # No class list is still the old, wide question — for a caller that means it.
     wide = [r["id"] for r in await env.run(act.stale_stuck_problems, [s], 1.0, None)]
     assert memory.problem_id in wide
-
-
-async def test_a_merged_fix_pr_is_announced_in_the_channel(db_pool, infra_agent_active):
-    """#639: the owner opens a fix PR from a card in the channel, so the
-    channel hears the merge. The task note alone (`posted: false`) left a
-    merge the owner never saw AEGIS acknowledge."""
-    from unittest.mock import AsyncMock
-
-    delivery = AsyncMock()
-    delivery.channel = "slack"
-    delivery.db_pool = None
-    delivery.send_message.return_value = {"ok": True}
-    env = ActivityEnvironment()
-    act = HubActivities(db_pool=db_pool, delivery=delivery)
-    s = f"svc_{uuid.uuid4().hex[:8]}"
-    url = f"https://github.com/o/r/pull/{uuid.uuid4().int % 100000}"
-    pid = (await env.run(act.ingest_alert, _alert(s), False))["problem_id"]
-    await env.run(
-        act.record_investigation,
-        {"problem_id": pid, "status": "fixing", "text": "PR", "external_id": f"wf-{s}:prs_opened", "payload": {"pr_urls": [url]}},
-    )
-
-    await env.run(act.follow_fix_pr, {"url": url, "merged": True, "merged_at": "2026-09-21T21:28:00Z"})
-
-    delivery.send_message.assert_awaited_once()
-    kwargs = delivery.send_message.await_args.kwargs
-    assert kwargs["message"].startswith(f"Fix PR merged: {url}.")
-    assert kwargs["agent_id"]  # the `infra` holder, whoever that is
 
 
 async def test_claim_investigation_leaves_a_live_run_alone(db_pool):

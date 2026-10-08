@@ -218,8 +218,7 @@ class InventoryActivities:
     async def check_github_webhooks(self) -> dict:
         """Report tracked GitHub repos whose AEGIS webhook is missing/dead.
 
-        "Tracked" mirrors `HomelabActivities.notify_pr_event`'s definition:
-        a `resources` row of kind='repository' with `metadata.github_repo`
+        "Tracked" means a `resources` row of kind='repository' with `metadata.github_repo`
         set. For each one, runs `gh api repos/<repo>/hooks` on the workspace
         host (the same SSH exec path `scan_workspace_repos` uses) and checks
         whether any hook URL points at our `/api/webhooks/github` endpoint.

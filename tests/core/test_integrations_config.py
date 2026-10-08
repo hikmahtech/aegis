@@ -45,18 +45,18 @@ async def test_env_fallback_when_no_db(clean_int):
 
 async def test_get_integrations_secret_never_returns_value(clean_int):
     s = _settings(secret_key="k")
-    await save_integration(clean_int, s, "sentry_token", "sk-secret")
+    await save_integration(clean_int, s, "github_token", "sk-secret")
     items = await get_integrations(clean_int, s)
-    tok = next(i for i in items if i["key"] == "sentry_token")
+    tok = next(i for i in items if i["key"] == "github_token")
     assert tok["secret"] and tok["set"] and tok["value"] is None and tok["source"] == "db"
 
 
 async def test_non_secret_value_shown(clean_int):
     s = _settings()
-    await save_integration(clean_int, s, "sentry_org", "myorg")
+    await save_integration(clean_int, s, "searxng_url", "http://searx.example")
     items = await get_integrations(clean_int, s)
-    org = next(i for i in items if i["key"] == "sentry_org")
-    assert org["value"] == "myorg" and not org["secret"] and org["source"] == "db"
+    org = next(i for i in items if i["key"] == "searxng_url")
+    assert org["value"] == "http://searx.example" and not org["secret"] and org["source"] == "db"
 
 
 async def test_unknown_key_raises(clean_int):

@@ -987,8 +987,6 @@ class AgentTaskActivities:
             return await self._plan_node(problem, facts, subject)
         if facts["url"]:
             return await self._plan_endpoint(problem, facts, facts["url"])
-        if facts["sources"] and facts["sources"] <= {"sentry"}:
-            return self._plan_exception(problem, facts)
         if kind == "service" and subject:
             return await self._plan_service(subject, problem, facts)
         if kind in ("", hub.TASK_SUBJECT_KIND, "repo") or problem.get("class") == "manual":
@@ -1146,27 +1144,6 @@ class AgentTaskActivities:
             str(problem.get("subject_kind") or ""),
             [seen, _verdict_line(problem, facts), todo, _timeline_line(problem)],
             reason,
-        )
-
-    def _plan_exception(self, problem: dict, facts: dict) -> dict:
-        """An error Sentry reported. A restart does not fix code or data, and a
-        project that happens to share a swarm service's name would otherwise be
-        found "healthy" and have its task closed."""
-        subject = str(problem.get("subject") or "")
-        return _report(
-            "exception",
-            str(problem.get("subject_kind") or ""),
-            [
-                f"This is an application error Sentry reported for `{subject}`, not a "
-                "service that is down. A restart would not fix it, so I have not checked "
-                "or offered one.",
-                _alert_says(facts),
-                _verdict_line(problem, facts),
-                "What to do: fix the code or data the investigation points at, then "
-                "complete this task.",
-                _timeline_line(problem),
-            ],
-            "an application error; the fix is in the code or data",
         )
 
     async def _plan_group(self, problem: dict, facts: dict) -> dict:

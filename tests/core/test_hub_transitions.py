@@ -30,7 +30,6 @@ def _p(status: str, resolved_ago: timedelta | None = None) -> dict:
         (_p("investigating"), "occurrence", "attach", None),
         (_p("waiting_human"), "occurrence", "attach", None),
         (_p("fixing"), "occurrence", "attach", None),
-        (_p("verifying"), "occurrence", "attach", None),
         (_p("resolved", timedelta(hours=1)), "occurrence", "reopen", "open"),
         (_p("resolved", timedelta(hours=24)), "occurrence", "reopen", "open"),
         (_p("resolved", timedelta(hours=25)), "occurrence", "rollover", "open"),

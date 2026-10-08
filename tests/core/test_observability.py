@@ -154,7 +154,7 @@ async def test_list_workflow_runs(app, auth_headers, mock_db_pool):
         {
             "run_id": "run-2",
             "workflow_id": "wf-2",
-            "workflow_type": "SentryPollFlow",
+            "workflow_type": "HubSweepFlow",
             "agent_id": "pandoras-actor",
             "parent_run_id": None,
             "status": "running",

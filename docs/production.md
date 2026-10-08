@@ -177,12 +177,15 @@ a dead token.
 
 ## Alert routing (inbound webhooks)
 
-Point your alert sources at Core (all HMAC/secret-verified, auth-exempt):
+The Sentry, Jira, GitHub and Alertmanager/Grafana intakes left v1: alert
+intake moved to the v2 DevOps vertical, and Sentry, Jira and GitHub pull
+requests to the v2 Development vertical. `/api/webhooks/sentry`,
+`/api/webhooks/alert` and `/api/webhooks/github` no longer exist; a sender
+still pointed at them gets a 404. What v1 still takes in:
 
-- `POST /api/webhooks/sentry` — Sentry (plus the scheduled `SentryPollFlow`)
-- `POST /api/webhooks/alert` — Grafana / Alertmanager-shaped payloads
-- `POST /api/webhooks/github` — PR notifications, and the merge or close of a fix PR an investigation opened (`GitHubAlertFlow`, #502). Subscribe the webhook to **Pull requests** on every repo Pandora can open a fix PR in; without it a problem stays `fixing` after its PR merges
 - `POST /api/webhooks/todoist` — Todoist sync events
+- `POST /api/hub/events` and `POST /api/hub/service-state` — hub events and
+  deploy windows, gated by `AEGIS_ALERT_WEBHOOK_SECRET`
 - **AEGIS heartbeat (2-min poll)** → `InfraHeartbeatFlow` → `AlertInvestigationFlow` on
   node/service transitions (source `aegis-heartbeat`)
 
@@ -363,9 +366,8 @@ health alone is not expressible today.
 `docker node ls` + `docker service ls` every 2 min and records state transitions on the
 problem hub (`ingest_alert`): a node or service going down is an occurrence, one coming back
 is a `resolved` event on the same problem, and only a new or returning problem starts an
-investigation. The `/api/webhooks/alert` handler does the same for alertmanager `firing`
-and `resolved` payloads, so a heartbeat-detected and an alertmanager-pushed outage of the
-same service are one problem (`dockerservicedown:service:<name>`) with one task. A service
+investigation. (The `/api/webhooks/alert` handler that did the same for alertmanager
+payloads is gone: alert intake moved to the v2 DevOps vertical.) A service
 still stuck after `restuck_hours` is re-investigated on that same problem, once per
 `restuck_hours` (`stale_stuck_problems`).
 

@@ -12,7 +12,7 @@ import RestartWindowPanel from '../components/RestartWindowPanel';
 // this page changes.
 
 const STATUSES = [
-  'open', 'investigating', 'waiting_human', 'fixing', 'verifying', 'suppressed', 'resolved',
+  'open', 'investigating', 'waiting_human', 'fixing', 'suppressed', 'resolved',
 ];
 
 const SEVERITY_ORDER: Record<string, number> = {

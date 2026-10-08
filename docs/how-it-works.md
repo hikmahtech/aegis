@@ -130,12 +130,11 @@ The shipped schedule set (`config/seed/activities.yaml` — all crons UTC):
 |---|---|---|---|---|
 | `infra-heartbeat-2m` | `*/2 * * * *` | `InfraHeartbeatFlow` | Pandora's Actor | Polls swarm nodes + services; spawns an investigation on **state transitions only**, so steady state costs nothing |
 | `todoist-sync-5min` | `*/5 * * * *` | `TodoistSyncFlow` | Sebas | Incremental Todoist Sync API pull + drains the `todoist_outbox` write queue |
-| `hub-sweep-5m` | `3-58/5 * * * *` | `HubSweepFlow` | Pandora's Actor | The problem hub's housekeeping: opens a `suppressed` problem once its deploy or maintenance window passes, resolves a problem whose task you completed, settles merged fixes (resolves a `verifying` problem once its alert has stayed clear for `fix_verify_hours`, reopens one it came back to), brings every task up to date with its problem, and folds three or more problems of one class into a group when a model call agrees they are one condition |
+| `hub-sweep-5m` | `3-58/5 * * * *` | `HubSweepFlow` | Pandora's Actor | The problem hub's housekeeping: opens a `suppressed` problem once its deploy or maintenance window passes, resolves a problem whose task you completed, brings every task up to date with its problem, and folds three or more problems of one class into a group when a model call agrees they are one condition |
 | `social-publish-5min` | `*/5 * * * *` | `SocialPublishFlow` | Sebas | `@publish`-labelled tasks due now → approval card → post. Ships **inert**: `social_publishing_enabled` defaults to false |
 | `gtd-clarify-15min` | `*/15 * * * *` | `ClarifyFlow` | Sebas | Classifies unprocessed Inbox tasks (≤ 20 per tick) |
 | `llm-spend-guard-15min` | `*/15 * * * *` | `LLMSpendGuardFlow` | Pandora's Actor | Rolling-24h token **or dollar** budget → flips the LLM kill switch. **Inert** until one is set (both default to 0) |
 | `agent-task-15min` | `*/15 * * * *` | `AgentTaskSweepFlow` | Pandora's Actor | Executes agent-assigned Todoist tasks — see [§5](#5-the-agent-task-executor) |
-| `sentry-poll-30m` | `*/30 * * * *` | `SentryPollFlow` | Pandora's Actor | Sentry issue poll — safety net behind the webhook fast path |
 
 **Hourly / few-hourly**
 
@@ -189,7 +188,8 @@ Not in this table because they're **event-driven, not scheduled**:
 `AgentChatReplyFlow` (Todoist comment replies), `AgentTaskFlow` (per-task child
 of the sweep), `ResearchFlow` (one research question, from `research_topic` or
 a `#research` task), `NotesWriteFlow` (one vault write from `note_write` /
-`note_link`), and `GitHubAlertFlow` (GitHub PR webhook: notifies on opened PRs, and hands a closed one to the hub, which follows a fix PR an investigation opened).
+`note_link`). (`SentryPollFlow`, `JiraSyncFlow` and `GitHubAlertFlow` are gone:
+the Sentry, Jira and GitHub intakes moved to the v2 Development vertical.)
 
 Note the **ship-active-but-inert** pattern: `social-publish-5min`,
 `llm-spend-guard-15min`, `drive-sync-raphael`, `wearable-ingest-6h`,
@@ -255,8 +255,8 @@ Most agent-assigned tasks in Todoist are AEGIS's *own* triage output — alert
 tasks, receipt anomalies, email actions. The executor is what finally acts on
 them, instead of letting them accumulate.
 
-Two flows in `worker/src/aegis_worker/flows/agent_task.py`, mirroring the
-`SentryPollFlow` → `AlertInvestigationFlow` split:
+Two flows in `worker/src/aegis_worker/flows/agent_task.py`, a sweep and a
+per-item child:
 
 - **`AgentTaskSweepFlow`** (`agent-task-15min`) selects eligible tasks and
   spawns one **abandoned** child per task. It never awaits them — a child can
@@ -316,7 +316,6 @@ the hub has none. Every branch below is read-only:
 | a node | the heartbeat's last sample of it, from its own settings row, and the alert's runbook. No Docker or SSH command against the node |
 | an alert whose `instance` label is a URL | one GET against it, and what it answered |
 | a group (subject `*`) | the members, from the hub's `grouped` events and absorbed occurrences |
-| an error Sentry reported | the investigation's finding; a restart does not fix code or data |
 | a flow, the comms probe, a post, or another kind | the finding and where a person looks next |
 | a money problem | unchanged: Maou owns these |
 
@@ -466,11 +465,11 @@ learning loop).
 
 Every alert source converges on one flow — `AlertInvestigationFlow` — so
 dedup, muting, approval gates, and the audit trail behave identically
-regardless of where the alert came from:
+regardless of where the alert came from. The Alertmanager/Grafana webhook
+(`/api/webhooks/alert`), the Sentry intake and the GitHub PR webhook left v1:
+alert intake moved to the v2 DevOps vertical, Sentry and GitHub to the v2
+Development vertical. What is left:
 
-- `POST /api/webhooks/alert` — Grafana / Alertmanager-shaped payloads
-- `POST /api/webhooks/sentry` — Sentry's webhook (fast path), backed by
-  `sentry-poll-30m` (safety net)
 - `infra-heartbeat-2m` — AEGIS's own 2-minute swarm poll; investigates on
   node/service **state transitions** only, and catches outages that also take
   your alerting stack down. It also carries the **ingress canary**: set
@@ -497,15 +496,8 @@ regardless of where the alert came from:
 - Hand-captured Todoist tasks routed via a content route with
   `alert_overrides` (e.g. "X is down" → a synthetic `NodeDown`)
 
-(`POST /api/webhooks/github` is separate: `GitHubAlertFlow` posts PR
-notification cards for repos tracked in `resources`, and hands a closed PR
-to the hub so a fix PR an investigation opened is followed to a verified
-fix (#502) — it does not investigate.)
-
 ```mermaid
 flowchart TD
-    AM["Alertmanager / Grafana<br/>POST /api/webhooks/alert"] --> HUB
-    SN["Sentry webhook<br/>+ sentry-poll-30m"] --> HUB
     HB["infra-heartbeat-2m<br/>(state transitions)"] --> HUB
     TT["Todoist task<br/>(content route)"] --> HUB
     HUB["problem hub: ingest_event<br/>key = class:subject_kind:subject"] --> DEC{"new or returning?"}
@@ -529,10 +521,7 @@ flowchart TD
     G2 --> NO
     NO --> KG["verdict stored with the outcome<br/>(opened_pr, run_fix, discarded, no_card …)"]
     G2 -- "Open PR" --> PR["draft PR, linked to the problem;<br/>problem: fixing"]
-    PR -- "merged (GitHub webhook)" --> VF["verifying"]
-    PR -- "closed unmerged" --> WH["waiting_human"]
-    VF -- "clear for 24h<br/>(hub sweep)" --> OK["resolved; task closes"]
-    VF -- "back after the grace" --> RO["open again;<br/>the task says so"]
+    PR -- "you complete the task" --> OK["resolved"]
 ```
 
 The flow no longer decides whether an alert is new — the hub does, before the
@@ -542,7 +531,7 @@ the flow is handed a `problem_id` it records against.
 The steps that make it trustworthy:
 
 - **The problem hub decides what is new.** Every alert — firing or resolved,
-  from Alertmanager, Sentry, the heartbeat, or a hand-captured task — is
+  from the heartbeat or a hand-captured task — is
   recorded on a `problems` row (`services/hub.py`, spec
   `docs/superpowers/specs/2026-09-07-problem-hub-design.md`), keyed by one
   correlation function, never by a task. A repeat of an open problem is
@@ -641,11 +630,9 @@ The steps that make it trustworthy:
 - **After the decision.** The verdict goes to the knowledge store only once
   you have answered, tagged with the answer (or `no_card`), so the next
   investigation learns from what you did rather than from what was proposed.
-  An opened PR is followed (#502): its merge moves the problem to `verifying`,
-  and the hub sweep resolves it once the alert has stayed clear for 24 hours,
-  or reopens it and says so on the task if the alert comes back. A PR closed
-  without merging hands the problem back to you. See
-  [`infrastructure.md`](infrastructure.md#after-open-pr-following-the-fix-to-a-verified-fix).
+  An opened PR leaves the problem `fixing` until you complete its task; v1 no
+  longer follows the merge (the GitHub intake moved to the v2 Development
+  vertical).
 
 Everything lands on the problem's timeline (`problem_events`) and, projected
 from it, as a comment trail on a `@pandora`-labelled Todoist task — so the
