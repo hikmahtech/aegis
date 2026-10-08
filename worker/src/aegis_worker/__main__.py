@@ -49,7 +49,6 @@ from aegis_worker.activities.intel_scan import IntelScanActivities
 from aegis_worker.activities.intelligence import IntelligenceActivities
 from aegis_worker.activities.interactions import InteractionActivities
 from aegis_worker.activities.inventory import InventoryActivities
-from aegis_worker.activities.jira import JiraActivities
 from aegis_worker.activities.llm_governor import LLMGovernorActivities
 from aegis_worker.activities.meeting import MeetingActivities
 from aegis_worker.activities.memory import MemoryActivities
@@ -63,7 +62,6 @@ from aegis_worker.activities.research import ResearchActivities
 from aegis_worker.activities.review import ReviewActivities
 from aegis_worker.activities.rss import RssActivities
 from aegis_worker.activities.runs_v3 import RunRecorderActivities
-from aegis_worker.activities.sentry_ingest import SentryIngestActivities
 from aegis_worker.activities.social import SocialActivities
 from aegis_worker.activities.statements import StatementActivities
 from aegis_worker.activities.tender_watch import TenderWatchActivities
@@ -492,22 +490,6 @@ async def main():
         db_pool=deps.pool,
     )
     intel_scan_act = IntelScanActivities(searxng_url=getattr(settings, "searxng_url", ""))
-    sentry_project_ids: list[int] = []
-    for _p in (getattr(settings, "sentry_projects", "") or "").split(","):
-        _p = _p.strip()
-        if not _p:
-            continue
-        if _p.isdigit():
-            sentry_project_ids.append(int(_p))
-        else:
-            logger.warning("sentry_projects_invalid_entry", value=_p)
-    sentry_ingest_act = SentryIngestActivities(
-        db_pool=deps.pool,
-        sentry_url=getattr(settings, "sentry_url", ""),
-        sentry_token=getattr(settings, "sentry_token", ""),
-        sentry_org=getattr(settings, "sentry_org", ""),
-        sentry_projects=sentry_project_ids,
-    )
     inventory_act = InventoryActivities(
         db_pool=deps.pool,
         remote_script=connectors.get("remote_script"),
@@ -570,13 +552,6 @@ async def main():
     # the link is made here rather than at construction.
     if money_act is not None:
         money_act.capture = capture_act
-    jira_act = JiraActivities(
-        db_pool=deps.pool,
-        connector=todoist_connector,
-        base_url=getattr(settings, "jira_base_url", ""),
-        email=getattr(settings, "jira_email", ""),
-        api_token=getattr(settings, "jira_api_token", ""),
-    )
     social_act = SocialActivities(
         db_pool=deps.pool,
         connector=connectors.get("social"),
@@ -697,10 +672,8 @@ async def main():
         record_act,
         wearable_act,
         intel_scan_act,
-        sentry_ingest_act,
         todoist_act,
         capture_act,
-        jira_act,
         social_act,
         clarify_act,
         chat_act,

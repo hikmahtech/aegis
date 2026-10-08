@@ -165,8 +165,6 @@ async def test_sweep_promotes_then_projects_and_reports():
         "cards_finished": 1,
         "task_completed": 1,
         "task_reopened": 1,
-        "fix_resolved": 1,
-        "fix_reopened": 1,
         "projected": 3,
         "created": 1,
         "errors": 0,
@@ -182,8 +180,8 @@ async def test_sweep_promotes_then_projects_and_reports():
         "alertmanager_checked": -1,
     }
     # Promotion first, so a just-promoted problem gets its task in the same
-    # tick; completed tasks and merged fixes next, so what they resolve or
-    # reopen is projected in the same tick too; grouping last, on problems
+    # tick; completed tasks next, so what they resolve or reopen is projected
+    # in the same tick too; grouping last, on problems
     # that already have their tasks.
     # The promoted problems are offered for investigation at once (#630), and
     # retired cards are finished after every step that can resolve and before
@@ -192,42 +190,14 @@ async def test_sweep_promotes_then_projects_and_reports():
         "promote",
         "promoted_investigations",
         "reconcile",
-        "verify",
         "retire_cards",
         "project",
         "find",
     ]
     assert _retire_inputs[-1] == {}
-    # The generic defaults when the hub sweep row sets nothing.
-    assert _verify_args == [(24.0, 1.0)]
-
-
-@pytest.mark.asyncio
-async def test_sweep_verifies_fixes_with_the_rows_windows():
-    _calls.clear()
-    _verify_args.clear()
-    await _run(
-        [_promote, _reconcile, _verify, _project, _finder([]), _judge(True), _apply],
-        config=HubSweepConfig(agent_id="pandoras-actor", fix_verify_hours=48.0, fix_grace_hours=6.0),
-    )
-    assert _verify_args == [(48.0, 6.0)]
-
-
-def test_the_fix_windows_are_read_from_activities_config():
-    from aegis_worker.registry import FLOWS
-
-    spec = next(s for s in FLOWS if s.flow is HubSweepFlow)
-    row = {"agent_id": "pandoras-actor", "_settings": {}}
-    cfg = spec.schedule_config({**row, "config": {"fix_verify_hours": 12, "fix_grace_hours": "0.5"}})
-    assert (cfg.fix_verify_hours, cfg.fix_grace_hours) == (12.0, 0.5)
-    # A blank field on the admin page is "not set": the flow's own defaults.
-    default = HubSweepConfig()
-    for config in ({}, {"fix_verify_hours": "", "fix_grace_hours": None}):
-        cfg = spec.schedule_config({**row, "config": config})
-        assert (cfg.fix_verify_hours, cfg.fix_grace_hours) == (
-            default.fix_verify_hours,
-            default.fix_grace_hours,
-        )
+    # The fix verification is retired (the GitHub intake left v1): a new tick
+    # never schedules it. Only a replayed history does (test_deprecated_patches).
+    assert _verify_args == []
 
 
 @pytest.mark.asyncio
@@ -240,7 +210,7 @@ async def test_sweep_groups_a_cluster_the_judge_agrees_on():
     assert out["folded"] == 2
     assert out["group_candidates"] == 1
     assert [c for c in _calls if c not in {"promoted_investigations", "retire_cards"}] == [
-        "promote", "reconcile", "verify", "project", "find", "judge", "apply"
+        "promote", "reconcile", "project", "find", "judge", "apply"
     ]
 
 

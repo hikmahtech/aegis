@@ -1,5 +1,5 @@
 # tests/worker/activities/test_homelab.py
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 from aegis_worker.activities.homelab import HomelabActivities
@@ -87,45 +87,6 @@ async def test_notify_payloads_validate_against_delivery_request_schema():
     assert len(captured_bodies) == 2
     for body in captured_bodies:
         DeliveryRequest.model_validate(body)
-
-
-def _audit_pool(prev_size=None):
-    """Mock db_pool whose `async with .acquire() as conn` yields a conn with
-    fetchval (previous size) + execute (health insert)."""
-    conn = AsyncMock()
-    conn.fetchval.return_value = prev_size
-    conn.execute.return_value = None
-    ctx = MagicMock()
-    ctx.__aenter__ = AsyncMock(return_value=conn)
-    ctx.__aexit__ = AsyncMock(return_value=False)
-    pool = MagicMock()
-    pool.acquire = MagicMock(return_value=ctx)  # asyncpg: acquire() sync-returns an async CM
-    return pool, conn
-
-
-@pytest.mark.asyncio
-async def test_notify_pr_event_tracked_repo_notifies():
-    pool, conn = _audit_pool()
-    conn.fetchval.return_value = 1  # repo found in resources
-    delivery = AsyncMock()
-    delivery.channel = "slack"
-    act = HomelabActivities(db_pool=pool, homelab=None, delivery=delivery)
-    out = await act.notify_pr_event(
-        {"repo": "youruser/aegis", "number": 42, "title": "x", "author": "a",
-         "action": "opened", "url": "u"}
-    )
-    assert out["notified"] is True
-    assert out["repo"] == "youruser/aegis"
-
-
-@pytest.mark.asyncio
-async def test_notify_pr_event_untracked_repo_skipped():
-    pool, conn = _audit_pool()
-    conn.fetchval.return_value = None  # not in resources
-    act = HomelabActivities(db_pool=pool, homelab=None, delivery=AsyncMock())
-    out = await act.notify_pr_event({"repo": "stranger/repo", "action": "opened"})
-    assert out["notified"] is False
-    assert out["reason"] == "untracked_repo"
 
 
 def test_compute_drift_detects_replica_shortfall_and_oom():

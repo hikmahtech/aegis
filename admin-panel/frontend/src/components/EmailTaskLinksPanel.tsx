@@ -54,7 +54,7 @@ export default function EmailTaskLinksPanel() {
               header: 'Key',
               th: { style: { textAlign: 'left', width: 140 } },
               cell: (_r, i) => (
-                <input style={{ width: '100%' }} value={links[i].key} placeholder="jira-done"
+                <input style={{ width: '100%' }} value={links[i].key} placeholder="ticket-done"
                   onChange={e => setRow(i, { key: e.target.value })} />
               ),
             },

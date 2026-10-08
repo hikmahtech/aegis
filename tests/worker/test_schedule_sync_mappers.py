@@ -91,7 +91,8 @@ def test_hub_sweep_mapper_reads_the_grouping_thresholds():
     assert isinstance(cfg, HubSweepConfig)
     assert cfg.group_min_members == 5
     assert cfg.group_window_hours == 24.0
-    assert cfg.fix_grace_hours == 3.0
+    # A row still carrying the retired fix-verification knob maps cleanly.
+    assert not hasattr(cfg, "fix_grace_hours")
 
 
 def test_hub_sweep_mapper_reads_the_alertmanager_url():
@@ -132,7 +133,6 @@ def test_hub_sweep_mapper_leaves_the_service_defaults_alone():
     _, cfg = mapper(_act("hub-sweep-5m", "HubSweepFlow", {}))
     assert cfg.group_min_members == 0
     assert cfg.group_window_hours == 0.0
-    assert cfg.fix_verify_hours == 24.0
 
     # A negative number means the same thing, loudly instead of silently: a
     # window of -1 hours reaches backwards from now, matches nothing, and would

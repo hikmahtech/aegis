@@ -38,8 +38,8 @@ Pipeline:
 Every transition the flow makes is recorded on the problem
 (investigating → waiting_human / fixing / resolved) so the timeline, the
 digest and the next session read one record. An opened fix PR leaves the
-problem in `fixing`; the GitHub webhook and the hub sweep follow it from there
-(`hub_fix`: `verifying` on merge, resolved once the alert stays clear).
+problem in `fixing` until a person completes its task (v1 no longer follows a
+PR's merge: the GitHub intake moved to the v2 Development vertical).
 """
 
 from __future__ import annotations
@@ -2030,14 +2030,12 @@ class AlertInvestigationFlow:
                     # spawned the investigation, not only in chat.
                     if track_task_id and not track_task_id.startswith("item-"):
                         links_plain = "\n".join(f"  • {u}" for u in pr_urls)
-                        # The webhook and the hub sweep follow it from here
-                        # (#502, `hub_fix`).
+                        # Nothing follows the PR any more (the GitHub intake
+                        # left v1): completing the task resolves the problem.
                         await self._safe_post_note(
                             track_task_id,
                             f"{voice_head}\n\n{links_plain}\n\n"
-                            "I'm following it: when it merges I watch the alert, and I "
-                            "resolve this once the alert stays clear, or reopen it if "
-                            "it comes back. Closed without merging, it comes back to you.",
+                            "Complete this task once it merges and the alert stays clear.",
                         )
                     await self._record(
                         problem_id,
@@ -2243,8 +2241,8 @@ class AlertInvestigationFlow:
         # ── Step 10: Record the outcome on the problem ──
         # `resolved` closes the problem; an opened fix PR keeps it `fixing`
         # (#502: this step used to hand it back to `waiting_human` a moment
-        # after `prs_opened` moved it, so nothing said a fix was on its way,
-        # and the PR's merge is what moves it on now); anything else leaves it
+        # after `prs_opened` moved it, so nothing said a fix was on its way;
+        # completing the task resolves it); anything else leaves it
         # with the human, who has the full report on the task — with no card
         # too, which is the state an `ack` used to leave it in.
         decision_card = not gate_skipped

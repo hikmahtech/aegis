@@ -55,8 +55,7 @@ before you trust *any* LLM workflow in production, run the free
 - **Agents that write code.** Register your repos and a coding host in the UI —
   SSH identity plus **Claude Code / Kimi** engines, named Claude accounts, and
   per-GitHub-org routing. The ops agent SSHes in and runs the CLI on the right
-  repo, on the right account, to investigate alerts and propose fixes; Sentry /
-  alertmanager issues resolve to the matching repo automatically.
+  repo, on the right account, to investigate alerts and propose fixes.
 - **Market data without a vendor contract.** A provider-agnostic finance
   connector (keyless Yahoo / Stooq) backs the money agent's quotes, market
   overview, and finance news.

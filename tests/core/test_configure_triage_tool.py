@@ -23,61 +23,61 @@ def ctx():
     return ctx
 
 
-async def test_get_sentry_ignored_empty(mock_pool, ctx):
+async def test_get_email_ignored_empty(mock_pool, ctx):
     result = json.loads(
         await _exec_configure_triage(
-            mock_pool, {"setting": "sentry_ignored_projects", "action": "get"}, ctx
+            mock_pool, {"setting": "email_ignored_domains", "action": "get"}, ctx
         )
     )
     assert result["current"] == []
 
 
-async def test_add_sentry_project(mock_pool, ctx):
+async def test_add_email_domain_first(mock_pool, ctx):
     result = json.loads(
         await _exec_configure_triage(
             mock_pool,
-            {"setting": "sentry_ignored_projects", "action": "add", "value": "php_core_api"},
+            {"setting": "email_ignored_domains", "action": "add", "value": "example.com"},
             ctx,
         )
     )
     assert result["ok"] is True
-    assert result["current"] == ["php_core_api"]
+    assert result["current"] == ["example.com"]
     mock_pool.execute.assert_called_once()
     call_args = mock_pool.execute.call_args[0]
     stored = call_args[2]
-    assert stored == ["php_core_api"]
+    assert stored == ["example.com"]
 
 
-async def test_add_sentry_project_existing(mock_pool, ctx):
-    mock_pool.fetchval = AsyncMock(return_value=["php_core_api"])
+async def test_add_email_domain_existing(mock_pool, ctx):
+    mock_pool.fetchval = AsyncMock(return_value=["example.com"])
     result = json.loads(
         await _exec_configure_triage(
             mock_pool,
-            {"setting": "sentry_ignored_projects", "action": "add", "value": "another_project"},
+            {"setting": "email_ignored_domains", "action": "add", "value": "example.org"},
             ctx,
         )
     )
-    assert result["current"] == ["php_core_api", "another_project"]
+    assert result["current"] == ["example.com", "example.org"]
 
 
-async def test_add_sentry_project_dedup(mock_pool, ctx):
-    mock_pool.fetchval = AsyncMock(return_value=["php_core_api"])
+async def test_add_email_domain_dedup(mock_pool, ctx):
+    mock_pool.fetchval = AsyncMock(return_value=["example.com"])
     result = json.loads(
         await _exec_configure_triage(
             mock_pool,
-            {"setting": "sentry_ignored_projects", "action": "add", "value": "php_core_api"},
+            {"setting": "email_ignored_domains", "action": "add", "value": "example.com"},
             ctx,
         )
     )
-    assert result["current"] == ["php_core_api"]  # no duplicate
+    assert result["current"] == ["example.com"]  # no duplicate
 
 
-async def test_remove_sentry_project(mock_pool, ctx):
-    mock_pool.fetchval = AsyncMock(return_value=["php_core_api", "other"])
+async def test_remove_email_domain(mock_pool, ctx):
+    mock_pool.fetchval = AsyncMock(return_value=["example.com", "other"])
     result = json.loads(
         await _exec_configure_triage(
             mock_pool,
-            {"setting": "sentry_ignored_projects", "action": "remove", "value": "php_core_api"},
+            {"setting": "email_ignored_domains", "action": "remove", "value": "example.com"},
             ctx,
         )
     )
@@ -126,7 +126,7 @@ async def test_add_email_domain(mock_pool, ctx):
 async def test_wrong_action_for_list(mock_pool, ctx):
     result = json.loads(
         await _exec_configure_triage(
-            mock_pool, {"setting": "sentry_ignored_projects", "action": "set", "value": "x"}, ctx
+            mock_pool, {"setting": "email_ignored_domains", "action": "set", "value": "x"}, ctx
         )
     )
     assert "error" in result

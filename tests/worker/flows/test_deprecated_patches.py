@@ -30,6 +30,7 @@ from temporalio.worker import Replayer
 
 from tests.worker.flows.test_hub_sweep import (
     _apply,
+    _calls,
     _finder,
     _judge,
     _project,
@@ -37,6 +38,7 @@ from tests.worker.flows.test_hub_sweep import (
     _reconcile,
     _run,
     _verify,
+    _verify_args,
 )
 
 with workflow.unsafe.imports_passed_through():
@@ -44,6 +46,8 @@ with workflow.unsafe.imports_passed_through():
         PATCH_ALERTMANAGER_RECONCILE,
         PATCH_COMPLETED_TASKS,
         PATCH_FIX_VERIFICATION,
+        PATCH_PROMOTE_INVESTIGATES,
+        PATCH_RETIRE_CARDS,
         HubSweepConfig,
         HubSweepFlow,
     )
@@ -114,4 +118,56 @@ async def test_the_flow_still_replays_its_own_history():
     _, history = await _run(
         [_promote, _reconcile, _verify, _project, _finder([]), _judge(True), _apply]
     )
+    await Replayer(workflows=[HubSweepFlow]).replay_workflow(history)
+
+
+@workflow.defn(name="HubSweepFlow")
+class _SweepBeforeTheFixStepWent:
+    """The sweep as the worker before `PATCH_DROP_FIX_VERIFICATION` ran it:
+    `verify_fixes` unconditionally, between the completed-task read-back and the
+    card retirement. Every run in flight at that deploy has this history."""
+
+    @workflow.run
+    async def run(self, config: HubSweepConfig) -> dict:
+        promoted = await workflow.execute_activity(
+            "promote_expired_suppressions", start_to_close_timeout=_SHORT
+        )
+        if workflow.patched(PATCH_PROMOTE_INVESTIGATES) and promoted.get("problem_ids"):
+            await workflow.execute_activity(
+                "promoted_investigations",
+                args=[list(promoted["problem_ids"])],
+                start_to_close_timeout=_SHORT,
+            )
+        workflow.deprecate_patch(PATCH_COMPLETED_TASKS)
+        await workflow.execute_activity(
+            "reconcile_completed_tasks", start_to_close_timeout=_SHORT
+        )
+        workflow.deprecate_patch(PATCH_FIX_VERIFICATION)
+        await workflow.execute_activity(
+            "verify_fixes", args=[24.0, 1.0], start_to_close_timeout=_SHORT
+        )
+        workflow.deprecate_patch(PATCH_ALERTMANAGER_RECONCILE)
+        if workflow.patched(PATCH_RETIRE_CARDS):
+            await workflow.execute_activity("retire_cards", args=[{}], start_to_close_timeout=_SHORT)
+        await workflow.execute_activity("project_pending", start_to_close_timeout=_SHORT)
+        await workflow.execute_activity(
+            "find_group_candidates", args=[0, 0.0], start_to_close_timeout=_SHORT
+        )
+        return {}
+
+
+async def test_a_sweep_that_ran_verify_fixes_replays_after_the_step_went():
+    """The fix verification left the sweep behind `workflow.patched`. A history
+    with `verify_fixes` in it must still replay: falsifiable by deleting the
+    `if not workflow.patched(PATCH_DROP_FIX_VERIFICATION)` branch, which fails
+    this with a nondeterminism error (the history schedules an activity the
+    code no longer does)."""
+    _calls.clear()
+    _verify_args.clear()
+    _, history = await _run(
+        [_promote, _reconcile, _verify, _project, _finder([])],
+        workflows=(_SweepBeforeTheFixStepWent,),
+        flow=_SweepBeforeTheFixStepWent,
+    )
+    assert "verify" in _calls  # the premise: the old shape really ran it
     await Replayer(workflows=[HubSweepFlow]).replay_workflow(history)

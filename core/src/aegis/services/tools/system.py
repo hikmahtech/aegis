@@ -209,12 +209,11 @@ async def _exec_system_status(pool: asyncpg.Pool, ctx: ToolContext, *, hours: in
 
 
 _TRIAGE_SETTING_KEYS = {
-    "sentry_ignored_projects": "triage_sentry_ignored_projects",
     "email_ignored_domains": "triage_ignored_email_domains",
     "notification_mode": "triage_notification_mode",
     "burst_threshold": "triage_burst_threshold",
 }
-_TRIAGE_LIST_SETTINGS = {"sentry_ignored_projects", "email_ignored_domains"}
+_TRIAGE_LIST_SETTINGS = {"email_ignored_domains"}
 
 
 @aegis_tool
@@ -223,7 +222,6 @@ async def _exec_configure_triage(
     ctx: ToolContext,
     *,
     setting: Literal[
-        "sentry_ignored_projects",
         "email_ignored_domains",
         "notification_mode",
         "burst_threshold",
@@ -231,7 +229,7 @@ async def _exec_configure_triage(
     action: Literal["add", "remove", "set", "get"],
     value: str | float | None = None,
 ) -> str:
-    """Read or update triage configuration: ignored Sentry projects, ignored email domains, notification mode, burst threshold.
+    """Read or update triage configuration: ignored email domains, notification mode, burst threshold.
 
     Args:
         setting: Which triage setting to read or modify.

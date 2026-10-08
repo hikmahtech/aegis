@@ -4,9 +4,8 @@ Thin by design: the logic lives in core's `services/hub.py` and
 `services/hub_project.py`, which both packages import, so a workflow reaches
 the hub through these and never carries SQL of its own.
 
-`ingest_alert` is the seam every alert producer crosses (heartbeat, Sentry,
-clarify's content routes; the alertmanager webhook calls the same core
-functions from core). It records the event, links a caller-supplied Todoist
+`ingest_alert` is the seam every alert producer crosses (heartbeat and
+clarify's content routes). It records the event, links a caller-supplied Todoist
 task, projects, and reports whether the hub wants an investigation — the
 *producer* then starts `AlertInvestigationFlow`, because only a workflow can
 start a child workflow.
@@ -21,7 +20,7 @@ from typing import Any
 import asyncpg
 import httpx
 from aegis.errors import error_text, logged_failure
-from aegis.services import hub, hub_cards, hub_fix, hub_group, hub_project, hub_watch
+from aegis.services import hub, hub_cards, hub_group, hub_project, hub_watch
 from temporalio import activity
 from temporalio.client import WorkflowExecutionStatus
 from temporalio.service import RPCError, RPCStatusCode
@@ -314,8 +313,7 @@ class HubActivities:
 
         Keys: `problem_id`, `status`, `text`, `external_id` (idempotency),
         `posted` (True = the flow already put this text on the task, so the
-        projector must not repeat it), `payload` (extra; `pr_urls` become
-        `github_pr` links)."""
+        projector must not repeat it), `payload` (extra, kept on the event)."""
         problem_id = str(inp.get("problem_id") or "")
         if self.db_pool is None or not problem_id:
             return {"recorded": False}
@@ -341,13 +339,6 @@ class HubActivities:
             ),
             now=now,
         )
-        for url in payload.get("pr_urls") or []:
-            await self.db_pool.execute(
-                "INSERT INTO problem_links (problem_id, link_kind, ref) "
-                "VALUES ($1::uuid, 'github_pr', $2) ON CONFLICT DO NOTHING",
-                problem_id,
-                str(url)[:300],
-            )
         moved = False
         if status:
             moved = await hub.set_status(
@@ -370,68 +361,13 @@ class HubActivities:
         return {"recorded": True, "status_changed": moved, "task_id": task_id}
 
     @activity.defn
-    async def follow_fix_pr(self, pr: dict) -> dict:
-        """A pull request closed, merged or not (`GitHubAlertFlow`). When an
-        investigation opened it, the close lands on its problem and the
-        problem moves: `verifying` on a merge, `waiting_human` when it was
-        closed unmerged (`hub_fix.record_pr_closed`). Any other PR is nobody's
-        fix and changes nothing. Then projects, so the task hears it now
-        rather than at the next sweep.
-
-        `pr` is `GitHubAlertFlow._pr_from_payload`: `url`, `merged`,
-        `merged_at`, `closed_at`. Safe to retry: GitHub's timestamp is in the
-        event's id."""
-        if self.db_pool is None:
-            return {"followed": 0, "problems": []}
-        merged = bool(pr.get("merged"))
-        rows = await hub_fix.record_pr_closed(
-            self.db_pool,
-            url=str(pr.get("url") or ""),
-            merged=merged,
-            at=str((pr.get("merged_at") if merged else pr.get("closed_at")) or ""),
-        )
-        agent_id = await self._infra_agent() if rows else ""
-        for row in rows:
-            try:
-                await hub_project.project(self.db_pool, row["problem_id"])
-            except Exception as exc:  # noqa: BLE001 — the sweep retries projection
-                activity.logger.warning(
-                    "follow_fix_pr_project_failed problem=%s err=%s",
-                    row["problem_id"],
-                    error_text(exc),
-                )
-            # The owner opened this PR from a decision card in the channel, so
-            # the channel hears how it ended, not only the task (#639): the
-            # task note alone left a merge nobody saw AEGIS acknowledge.
-            if agent_id and row.get("text"):
-                await safe_send_message(
-                    self.delivery,
-                    agent_id=agent_id,
-                    message=str(row["text"]),
-                    log_event="follow_fix_pr_notify_failed",
-                )
-        return {"followed": len(rows), "problems": rows}
-
-    @activity.defn
-    async def verify_fixes(
-        self,
-        window_hours: float = hub_fix.VERIFY_HOURS_DEFAULT,
-        grace_hours: float = hub_fix.GRACE_HOURS_DEFAULT,
-    ) -> dict:
-        """Settle the `verifying` problems (`hub_fix.verify_fixes`): resolve
-        one whose alert stayed clear for `window_hours` after its fix merged,
-        reopen one it came back to. Run by `HubSweepFlow` before projection,
-        which posts what this wrote in the same tick."""
-        if self.db_pool is None:
-            return {"resolved": 0, "reopened": 0, "problem_ids": []}
-        rows = await hub_fix.verify_fixes(
-            self.db_pool, window_hours=window_hours, grace_hours=grace_hours
-        )
-        return {
-            "resolved": sum(1 for r in rows if r["action"] == "resolved"),
-            "reopened": sum(1 for r in rows if r["action"] == "reopened"),
-            "problem_ids": [r["problem_id"] for r in rows],
-        }
+    async def verify_fixes(self, window_hours: float = 0.0, grace_hours: float = 0.0) -> dict:
+        """Retired: v1 no longer follows fix PRs (the GitHub intake moved to the
+        v2 Development vertical), so there is nothing to verify. Kept as a no-op
+        for one release: a `HubSweepFlow` in flight across the deploy still
+        schedules it (`hub_sweep.PATCH_DROP_FIX_VERIFICATION`). Remove it with
+        that patch."""
+        return {"resolved": 0, "reopened": 0, "problem_ids": []}
 
     @activity.defn
     async def record_plan(self, inp: dict) -> dict:

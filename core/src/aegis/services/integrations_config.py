@@ -39,18 +39,12 @@ class ConfigKey:
 # The user-facing integration config. Infra/bootstrap fields (db/temporal/admin/
 # paths/homelab/remote-script) are deliberately NOT here — they're env-only.
 CONFIG_REGISTRY: list[ConfigKey] = [
-    ConfigKey("github_webhook_secret", "Webhook secret", "GitHub", True),
     ConfigKey(
         "github_token", "Read-only API token (optional)", "GitHub", True,
         help="Used by the github_issues tool and the weekly rising-repos run (#677). "
         "Unset = unauthenticated, which GitHub limits to 10 searches a minute. "
         "A fine-grained token with no permissions is enough.",
     ),
-    ConfigKey("sentry_url", "Base URL", "Sentry", False),
-    ConfigKey("sentry_token", "API token", "Sentry", True),
-    ConfigKey("sentry_org", "Org slug", "Sentry", False),
-    ConfigKey("sentry_projects", "Project ids (comma-sep, blank = all)", "Sentry", False),
-    ConfigKey("sentry_webhook_secret", "Webhook secret", "Sentry", True),
     ConfigKey("todoist_webhook_secret", "Webhook secret", "Todoist", True),
     ConfigKey(
         "life_webhook_secret", "Webhook secret", "Life data", True,
@@ -108,24 +102,6 @@ CONFIG_REGISTRY: list[ConfigKey] = [
     ConfigKey(
         "calibre_max_books", "Most books in the catalogue", "Calibre (library)", False,
         help="The paging cap when the catalogue is read (default 3000).",
-    ),
-    ConfigKey(
-        "jira_base_url", "Site URL (https://yours.atlassian.net)", "Jira", False,
-        help="JiraSyncFlow closes a Todoist task once its issue has a resolution. "
-        "It exists because Jira sends NO notification for a transition you make "
-        "yourself — email triage can only ever close tickets somebody else "
-        "resolved. Worker restart required.",
-    ),
-    ConfigKey(
-        "jira_email", "Atlassian account email", "Jira", False,
-        help="The email half of Basic auth — your Atlassian account, not a "
-        "team alias.",
-    ),
-    ConfigKey(
-        "jira_api_token", "API token", "Jira", True,
-        help="Create at id.atlassian.com/manage-profile/security/api-tokens. "
-        "A password will not work. Any of the three fields blank = the flow "
-        "reports not_configured and makes no request.",
     ),
     ConfigKey(
         "oura_api_token", "Oura personal access token", "Wearables", True,

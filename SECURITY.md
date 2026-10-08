@@ -90,16 +90,17 @@ curl -s -o /dev/null -w '%{http_code}\n' http://<host>:8080/api/agents   # expec
 
 ## Webhooks
 
-`/api/webhooks/{github,sentry,todoist}` are unauthenticated by design and verify
-a per-source HMAC signature instead. Keep those signing secrets secret; rotate
+`/api/webhooks/{todoist,life/*}` are unauthenticated by design and verify a
+per-source HMAC signature instead. Keep those signing secrets secret; rotate
 them if leaked.
 
-`/api/webhooks/alert` (Alertmanager/Grafana) is the exception: neither tool signs
-its payloads, so there is nothing to verify. Set `AEGIS_ALERT_WEBHOOK_SECRET` to
-require a matching `X-Alert-Token` header (add it to the sender's headers config,
-e.g. Alertmanager's `webhook_configs.http_config.headers`). Left unset, the
-endpoint accepts anything that reaches it, and each forged alert spawns an
-investigation flow that consumes LLM budget and posts to Todoist/Slack.
+`/api/hub/{events,service-state}` (the problem hub's ingress) is the exception:
+its senders do not sign. Set `AEGIS_ALERT_WEBHOOK_SECRET` to require a matching
+`X-Alert-Token` or `Authorization: Bearer` header. Left unset, the endpoint
+accepts anything that reaches it.
+
+The Sentry, GitHub and Alertmanager/Grafana webhooks were removed from v1; those
+intakes live in the v2 verticals.
 
 ## Operator hardening notes
 

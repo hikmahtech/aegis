@@ -78,7 +78,6 @@ TASK_SUBJECT_KIND = "task"
 SOURCES = frozenset(
     {
         "alertmanager",
-        "sentry",
         "heartbeat",
         "flow_health",
         "delivery",
@@ -97,11 +96,7 @@ SOURCES = frozenset(
         # own dedupe, its own noise guards and no alert path at all — see §15
         # of the statement-reconciliation spec, which puts it back here.
         "money",
-        # A fix PR an investigation opened was merged or closed: the GitHub
-        # webhook, through `hub_fix.record_pr_closed` (#502).
-        "github",
-        # The hub's own state_change rows, and the sweep's verdict on a
-        # merged fix (`hub_fix.verify_fixes`).
+        # The hub's own state_change rows.
         "hub",
         # An RSS feed that stopped fetching (`feed_failing`, three fetches in
         # a row) or stopped publishing (`feed_stale`): RssIngestFlow's
@@ -139,8 +134,8 @@ OUTAGE_STATE = "outage"
 # heartbeat, and AEGIS's own watchdogs whose findings an outage produces by
 # the dozen (flows failing, cards undelivered, services drifting, connectors
 # unreachable). Every other source is a judgement an outage does not explain
-# — money, research, feeds, a person's report, a Sentry issue, an expiring
-# certificate — and is raised as usual.
+# — money, research, feeds, a person's report, an expiring certificate — and
+# is raised as usual.
 OUTAGE_SOURCES = frozenset(
     {"alertmanager", "heartbeat", "flow_health", "delivery", "drift", "connector"}
 )
@@ -163,7 +158,7 @@ SEVERITIES = frozenset({"critical", "error", "warning", "info"})
 # maintenance, or during a cluster outage (see `service_state`); it is live,
 # counted, and not projected.
 LIVE_STATUSES = frozenset(
-    {"open", "investigating", "waiting_human", "fixing", "verifying", "suppressed"}
+    {"open", "investigating", "waiting_human", "fixing", "suppressed"}
 )
 STATUSES = LIVE_STATUSES | {"resolved", "closed"}
 # `service_state.state`. `deploying`, `maintenance` and `outage` suppress;
@@ -1414,8 +1409,8 @@ def event_from_alert(
     resolved: bool = False,
     occurrence_key: str = "",
 ) -> Event:
-    """Translate the alert dict every current producer builds (alertmanager,
-    grafana, sentry, heartbeat, clarify's synthetic alerts) into an
+    """Translate the alert dict every current producer builds (heartbeat,
+    clarify's synthetic alerts) into an
     :class:`Event`. This is the seam PR 3 swaps the producers over at.
 
     The occurrence id is the fingerprint **plus** the occurrence time, because
@@ -1440,14 +1435,7 @@ def event_from_alert(
     klass = str(labels.get("aegis_class") or "").strip() or alertname
     subject = str(labels.get("service_name") or labels.get("service") or "").strip()
     subject_kind = "service" if subject else ""
-    if source == "sentry":
-        meta = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
-        klass = str(meta.get("type") or "").strip() or (
-            f"sentry-{raw.get('id')}" if raw.get("id") else ""
-        )
-        subject = str(alert.get("service") or "").strip()
-        subject_kind = "service" if subject else ""
-    elif source == "heartbeat":
+    if source == "heartbeat":
         m = _HEARTBEAT_FP_RE.match(fingerprint)
         if m:
             klass = klass or m.group(1)
@@ -1477,25 +1465,19 @@ def event_from_alert(
         # subject it was keyed `nodedown::`, so every such report attached to
         # the first one and the hub answered "a repeat, don't investigate"
         # (#472). The task is the one thing it is certainly about. Only this
-        # shape moves: an alertmanager rule or a Sentry issue with no subject
-        # carries no task and keeps its one key per class.
+        # shape moves: an alertmanager rule with no subject carries no task and
+        # keeps its one key per class.
         subject, subject_kind = task_id, TASK_SUBJECT_KIND
     if _slug(klass) == OUTAGE_CLASS:
         # An outage is the cluster's, never one service's or node's. Whatever
         # labels a rule carries, both producers must land on the one key.
         subject, subject_kind = "", ""
 
-    if source == "sentry":
-        # An issue reaches the hub twice — webhook and the 30-min poll — with
-        # the same `lastSeen`; that is one occurrence, not two.
-        stamp = str(raw.get("lastSeen") or raw.get("firstSeen") or occurred_at.isoformat())
-    else:
-        stamp = str(raw.get("endsAt" if resolved else "startsAt") or occurred_at.isoformat())
+    stamp = str(raw.get("endsAt" if resolved else "startsAt") or occurred_at.isoformat())
     # `occurrence_key` is for a caller that has a stamp of its own which
-    # survives a retry. Alertmanager and Sentry payloads carry one
-    # (`startsAt`, `lastSeen`); a heartbeat or a synthetic alert does not, so
-    # without this the wall clock went into the id and a RETRIED ingest minted
-    # a second occurrence — which attaches instead of creating, answers
+    # survives a retry. Alertmanager payloads carry one (`startsAt`); a
+    # heartbeat or a synthetic alert does not, so without this the wall clock
+    # went into the id and a RETRIED ingest minted a second occurrence — which attaches instead of creating, answers
     # `investigate=False`, and silently costs the alert its investigation.
     external_id = f"{fingerprint or _slug(str(alert.get('title') or 'alert'))}@{occurrence_key or stamp}"
     if resolved:

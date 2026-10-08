@@ -1,9 +1,7 @@
 """Submit Todoist commands, staging retryable failures in the outbox.
 
-Extracted so the two writers that close a task AEGIS did not create —
-`CaptureActivities.link_email_to_task` (an email said so) and
-`JiraActivities.close_resolved_jira_tasks` (the issue tracker said so) — share
-one behaviour instead of two copies that drift.
+Used by `CaptureActivities.link_email_to_task`, which closes a task AEGIS did
+not create because an email said so.
 
 The distinction that matters and is easy to get wrong: a **transient** failure
 (5xx, timeout, rate limit) goes to `todoist_outbox` for `drain_outbox` to retry,

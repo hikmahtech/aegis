@@ -270,7 +270,6 @@ async def test_an_outage_never_holds_back_what_it_does_not_explain(db_pool):
     for source, klass in (
         ("money", "statement_mismatch"),
         ("research", "question"),
-        ("sentry", "TypeError"),
         ("expiry", "cert_expiring"),
         ("manual", "report"),
     ):

@@ -509,10 +509,16 @@ def test_trading_desk_flag_is_a_settings_field_on_by_default():
         # off). TradingDeskFlow and TradingDeskActivities.desk_tick move from
         # the money flag to trading_desk_enabled, on in every row here (+1
         # flow, +1 activity with money off). The fourth row is all three off.
-        (True, True, True, 56, 267),
-        (False, False, True, 47, 235),
-        (True, False, True, 50, 250),
-        (False, False, False, 46, 234),
+        # Then the intake removal: MINUS 3 flows (SentryPollFlow, JiraSyncFlow,
+        # GitHubAlertFlow) and MINUS 7 unflagged activities (the
+        # SentryIngestActivities and JiraActivities classes, and
+        # HubActivities.follow_fix_pr; `verify_fixes` stays as a no-op for
+        # replays), plus `notify_pr_event` on the homelab-flagged
+        # HomelabActivities, so the homelab rows lose 8.
+        (True, True, True, 53, 259),
+        (False, False, True, 44, 228),
+        (True, False, True, 47, 242),
+        (False, False, False, 43, 227),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, desk, flows, activities):

@@ -11,12 +11,11 @@ from __future__ import annotations
 
 import json
 import os
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from aegis.api.app import create_app
 from aegis.api.deps import get_settings
-from aegis.api.routes.interactions import get_workflow_client
 from aegis.config import Settings
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
@@ -62,18 +61,15 @@ def test_webhook_hmac_still_enforced_when_auth_disabled():
     settings = Settings(
         **_BASE,
         auth_disabled=True,
-        github_webhook_secret="test-secret-abc",
+        todoist_webhook_secret="test-secret-abc",
     )
     app = _make_app(settings)
-    # Temporal client resolves as a dependency even on bad-signature requests.
-    app.dependency_overrides[get_workflow_client] = lambda: MagicMock()
     client = TestClient(app)
     resp = client.post(
-        "/api/webhooks/github",
-        content=json.dumps({"action": "opened"}).encode(),
+        "/api/webhooks/todoist",
+        content=json.dumps({"event_name": "item:added"}).encode(),
         headers={
-            "X-Hub-Signature-256": "sha256=" + "0" * 64,
-            "X-GitHub-Event": "pull_request",
+            "X-Todoist-Hmac-SHA256": "A" * 44,
             "Content-Type": "application/json",
         },
     )

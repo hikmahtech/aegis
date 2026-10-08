@@ -82,7 +82,7 @@ MONEY_SOURCE_TAG = "#money"
 COLLAPSE_WINDOW = timedelta(minutes=30)
 # Statuses that earn a task. `suppressed` and `closed` never do.
 PROJECTED_STATUSES = frozenset(
-    {"open", "investigating", "waiting_human", "fixing", "verifying", "resolved"}
+    {"open", "investigating", "waiting_human", "fixing", "resolved"}
 )
 # The two producers OUTSIDE AEGIS that send their own resolution: a monitoring
 # stack and the swarm heartbeat both re-check on a scale of seconds, so what
@@ -148,7 +148,7 @@ _INFRA_OWNER = _Owner(SOURCE_TAG, "infra")
 _DEFAULT_OWNER = _Owner(SOURCE_TAG, GENERALIST_TAG)
 # The sources that raise infra or development problems keep the infra owner
 # until the lanes behind them are removed.
-_INFRA_SOURCES = ("alertmanager", "heartbeat", "drift", "sentry", "investigation", "github")
+_INFRA_SOURCES = ("alertmanager", "heartbeat", "drift", "investigation")
 # Problems another agent owns, by the source of their first occurrence. All 13
 # money problems in prod (2026-09-11) were projected as `#alert @pandora` in the
 # Inbox, and the agent sweep then ran Pandora's infra verb on them and parked

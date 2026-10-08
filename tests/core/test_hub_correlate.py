@@ -3,9 +3,9 @@ producers build today.
 
 Every pair the spec's Problem section calls a duplicate must produce one key
 here, and every pair it calls distinct must not. These payloads are copied
-from the real builders: `routes/webhooks.py::alert_webhook`,
-`flows/infra_heartbeat.py::build_heartbeat_alert`,
-`activities/sentry_ingest.py::issue_to_alert`.
+from the real builders: the alertmanager webhook (gone from v1, its shape kept
+here because alertmanager events still reach the hub until the infra lane
+leaves) and `flows/infra_heartbeat.py::build_heartbeat_alert`.
 """
 
 from __future__ import annotations
@@ -46,19 +46,6 @@ def _heartbeat(alertname: str, subject: str, service_name: str = "") -> dict:
     }
 
 
-def _sentry(issue_id: str, error_type: str, slug: str = "koyracloud-api") -> dict:
-    return {
-        "source": "sentry",
-        "title": f"{error_type}: boom",
-        "fingerprint": f"sentry:{issue_id}",
-        "severity": "error",
-        "service": slug,
-        "description": "",
-        "labels": {"environment": "prod", "platform": "python"},
-        "raw_payload": {"id": issue_id, "metadata": {"type": error_type}},
-    }
-
-
 def _key(alert: dict) -> str:
     return correlation_key(event_from_alert(alert, occurred_at=T0))
 
@@ -76,14 +63,6 @@ def test_alertmanager_and_heartbeat_node_down_share_a_key():
     am = _alertmanager("NodeDown", node="wow", instance="10.20.0.30:9100")
     hb = _heartbeat("NodeDown", "wow")
     assert _key(am) == _key(hb) == "nodedown:node:wow"
-
-
-def test_sentry_webhook_and_poll_share_a_key():
-    # Both paths build the same alert dict; the class is the error type, so
-    # stack-frame variations (fresh issue ids) still meet.
-    a = _sentry("4711", "IncompatiblePeer")
-    b = _sentry("4712", "IncompatiblePeer")
-    assert _key(a) == _key(b) == "incompatiblepeer:service:koyracloud-api"
 
 
 def test_repeated_comms_probe_failures_share_a_key():
@@ -171,13 +150,6 @@ def test_heartbeat_source_is_normalised_and_subject_read_from_fingerprint():
     assert e.external_id == f"aegis-heartbeat:NodeDown:noon@{T0.isoformat()}"
 
 
-def test_sentry_without_error_type_falls_back_to_issue_id():
-    a = _sentry("4711", "")
-    e = event_from_alert(a, occurred_at=T0)
-    assert e.klass == "sentry-4711"
-    assert e.subject == "koyracloud-api"
-
-
 def test_alert_with_no_fingerprint_gets_a_title_slug_id():
     a = {"source": "chat", "title": "Koyracloud redis seems down", "labels": {}}
     e = event_from_alert(a, occurred_at=T0)
@@ -232,11 +204,10 @@ def test_a_task_never_replaces_a_real_subject():
 
 
 def test_a_subject_less_alert_with_no_task_keeps_one_key_per_class():
-    """A class with genuinely no subject — an aggregate alertmanager rule, a
-    Sentry issue with no project — must keep sharing one key. Giving it the
+    """A class with genuinely no subject — an aggregate alertmanager rule —
+    must keep sharing one key. Giving it the
     empty key would open a new problem, and a new task, on every firing."""
     assert _key(_alertmanager("WatchdogAggregate")) == "watchdogaggregate::"
-    assert _key(_sentry("4711", "IncompatiblePeer", slug="")) == "incompatiblepeer::"
 
 
 def test_alert_payload_is_bounded():

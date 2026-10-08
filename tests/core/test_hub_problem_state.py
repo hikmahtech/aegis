@@ -171,7 +171,7 @@ async def _queued(pool, temp_id: str) -> dict | None:
 # --- #484: an investigation annotates; the alert source decides liveness --------
 
 
-@pytest.mark.parametrize("verdict", ["investigating", "waiting_human", "fixing", "verifying"])
+@pytest.mark.parametrize("verdict", ["investigating", "waiting_human", "fixing"])
 async def test_a_late_verdict_leaves_a_resolved_problem_resolved(db_pool, verdict):
     """Prod 2140a366: the alert cleared at 10:17 and resolved the problem; at
     10:20 the investigation posted a "not actionable" card and moved the

@@ -104,10 +104,6 @@ class Settings(BaseSettings):
     # Connectors
     vercel_token: str = ""
     vercel_team_id: str = ""
-    sentry_url: str = ""
-    sentry_token: str = ""
-    sentry_org: str = ""
-    sentry_projects: str = ""  # comma-separated Sentry project IDs; empty = all
     searxng_url: str = "http://localhost:8888"
     gmail_accounts: str = ""  # "name1:email1,name2:email2"
     gmail_credentials_file: str = "config/google_credentials.json"
@@ -249,14 +245,12 @@ class Settings(BaseSettings):
 
     # v3 per-source webhook signing secrets. Each source verifies its own HMAC.
     # Kept as env vars (not settings table) per spec §15 resolution.
-    github_webhook_secret: str = ""  # X-Hub-Signature-256
     # Optional read-only token for GitHub search (#677). Empty = unauthenticated.
     github_token: str = ""
-    sentry_webhook_secret: str = ""  # Sentry's HMAC header
-    # /api/webhooks/alert has no vendor HMAC to verify (Alertmanager/Grafana
-    # don't sign). Set this to require an X-Alert-Token header matching it;
-    # empty = unauthenticated (legacy default — anyone who can reach the port
-    # can mint alerts and spawn investigation flows).
+    # The problem hub's ingress (/api/hub/events, /api/hub/service-state) has no
+    # vendor HMAC to verify. Set this to require an X-Alert-Token (or Bearer)
+    # header matching it; empty = unauthenticated (legacy default — anyone who
+    # can reach the port can post hub events).
     alert_webhook_secret: str = ""  # X-Alert-Token
     # /api/webhooks/life/{source} — signed push from phones/watches/home
     # automation. Empty = the endpoint rejects EVERYTHING (503). Never treat
@@ -315,14 +309,6 @@ class Settings(BaseSettings):
     # (`services/user_agent.py`), falling back to aegis_ui_url. Both DB-first.
     semantic_scholar_api_key: str = ""
     bot_contact_url: str = ""
-
-    # Jira (JiraSyncFlow). Any of the three blank = the flow reports
-    # `not_configured` and issues no request. Basic auth: the Atlassian ACCOUNT
-    # EMAIL plus an API token from id.atlassian.com/manage-profile/security/
-    # api-tokens — not a password, and not the login you use for SSO.
-    jira_base_url: str = ""
-    jira_email: str = ""
-    jira_api_token: str = ""
 
     # Wearables (B7). Blank = WearableIngestFlow reports `token_missing` and
     # never issues a request. Oura personal access token.

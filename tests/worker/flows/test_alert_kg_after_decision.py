@@ -59,7 +59,8 @@ async def test_an_opened_fix_pr_is_stored_as_approved_and_the_problem_stays_fixi
     assert by_step["final"]["status"] == "fixing"
     assert result["status"] == "logged"
     note = next(text for _, text in h.S.notes if h.S.pr_url in text)
-    assert "when it merges" in note
+    # Nothing follows the PR any more: the note hands the close to the person.
+    assert "Complete this task once it merges" in note
 
 
 async def test_an_approved_pr_that_could_not_open_is_stored_as_pr_failed():

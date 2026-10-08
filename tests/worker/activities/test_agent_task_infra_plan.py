@@ -326,27 +326,6 @@ async def test_a_group_summarises_its_members(db_pool, made):
     assert "3" in plan["comment"]
 
 
-# --- an application error: the investigation's, not a restart ------------------------------
-
-
-async def test_a_sentry_error_is_not_offered_a_service_check(db_pool, made):
-    """An exception on a project whose name happens to match a swarm service
-    would otherwise be "healthy" and have its task closed."""
-    name = f"app{uuid.uuid4().hex[:6]}"
-    homelab = _Homelab([_svc(f"{name}_{name}", 1, 1)])
-    pid = await _problem(db_pool, made, source="sentry", klass="numericvalueoutofrange",
-                         subject=name, kind="service",
-                         payload={"description": "numeric field overflow"})
-    await _verdict(db_pool, pid, "logged: the column was never widened in that database")
-    tid = await _task(db_pool, made, pid)
-
-    plan = await _act(db_pool, homelab).plan_infra_task(tid, "NumericValueOutOfRange")
-
-    assert plan["action"] == "report" and plan["handler"] == "exception"
-    assert "the column was never widened" in plan["comment"]
-    assert homelab.calls == []
-
-
 # --- AEGIS's own kinds: what a person does -----------------------------------------------------
 
 

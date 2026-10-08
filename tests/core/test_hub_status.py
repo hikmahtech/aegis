@@ -96,13 +96,6 @@ def test_synthetic_alert_sources_map_onto_the_vocabulary():
         assert e.source == expect, src
 
 
-def test_sentry_occurrence_id_uses_last_seen_so_webhook_and_poll_meet():
-    raw = {"id": "4711", "metadata": {"type": "ValueError"}, "lastSeen": "2026-09-07T10:00:00Z"}
-    a = event_from_alert({"source": "sentry", "title": "t", "fingerprint": "sentry:4711", "service": "api", "raw_payload": raw}, occurred_at=NOW)
-    b = event_from_alert({"source": "sentry", "title": "t", "fingerprint": "sentry:4711", "service": "api", "raw_payload": raw}, occurred_at=NOW + timedelta(hours=1))
-    assert a.external_id == b.external_id == "sentry:4711@2026-09-07T10:00:00Z"
-
-
 # --- set_status ---------------------------------------------------------------
 
 
