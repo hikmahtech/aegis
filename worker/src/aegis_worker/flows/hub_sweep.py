@@ -1,24 +1,14 @@
 """HubSweepFlow — the problem hub's housekeeping tick.
 
-Four things, in order:
+Three things, in order:
 
-1. Open every `suppressed` problem whose deploy, maintenance or outage
-   window has passed without a `resolved` event. The heartbeat only emits on
-   transitions, so a service that broke during a deploy and stayed broken
-   would otherwise surface only at the 24h re-investigation. One raised by
-   alertmanager or the heartbeat also gets the investigation the window held
-   back (#630): a cluster outage that ends leaves one card for each thing
-   still broken, instead of forty for everything that went down with it.
-2. Read completed tasks back: a live problem whose Todoist task a person
+1. Read completed tasks back: a live problem whose Todoist task a person
    completed resolves, and a task the hub closed before the problem came
    back is reopened. Nothing else reads a completion back, so without this
    the problem stayed live for good while its task sat closed (#473).
-3. Retire decision cards (#629): a resolve anywhere in the hub already moved
-   its problem's pending cards out of `pending`; here each one's Slack message
-   is edited to say so and its waiting run is ended.
-   Then project: bring each problem's Todoist task up to date with its
-   events, and create the task for anything promoted a moment ago.
-4. Group: when several live problems share a class and a kind of subject, ask
+2. Project: bring each problem's Todoist task up to date with its events, and
+   create the task for anything new.
+3. Group: when several live problems share a class and a kind of subject, ask
    the model whether they are one condition, and fold them into a single
    problem when they are. Six posts wedged in one Postiz queue were six
    problems and six tasks; grouped, they are one task, and the seventh stuck
@@ -27,6 +17,13 @@ Four things, in order:
 The grouping step costs a model call, so it only runs when a cluster is both
 big enough and has not already been judged (`hub_group.recent_verdict`). Most
 ticks make no call at all.
+
+The infra steps are gone: promoting expired deploy/outage windows (and
+investigating what they held back), the alertmanager reconciliation and the
+retirement of investigation decision cards. The infra lane moved to the DevOps
+vertical (a2-devops). A sweep recorded before that change replays through
+`_run_legacy` (`PATCH_DROP_INFRA_STEPS`), whose activities stay registered as
+no-ops for one release. Retire it the #614 way.
 """
 
 from __future__ import annotations
@@ -39,7 +36,6 @@ with workflow.unsafe.imports_passed_through():
     from aegis.errors import error_text, logged_failure
 
     from aegis_worker.activities.hub import HubActivities
-    from aegis_worker.flows.alert_investigation import AlertInvestigationFlow
     from aegis_worker.shared.retry import (
         FAST,
         NO_RETRY,
@@ -78,32 +74,111 @@ PATCH_RETIRE_CARDS = "hub-sweep-retire-cards"
 # its replay and it schedules the step as recorded (`HubActivities.verify_fixes`
 # is a no-op kept for that); every new tick skips it. Retire it the #614 way.
 PATCH_DROP_FIX_VERIFICATION = "hub-sweep-drop-fix-verification"
+# The infra steps are gone (the lane moved to a2-devops): window promotion and
+# its investigations, the alertmanager reconcile and the card retirement. A
+# sweep recorded before this has none of this marker, so `patched` answers
+# False on its replay and it runs `_run_legacy` as recorded; every new tick
+# runs `_run_current`.
+PATCH_DROP_INFRA_STEPS = "hub-sweep-drop-infra-steps"
 
 @dataclass
 class HubSweepConfig:
-    agent_id: str = "pandoras-actor"
+    agent_id: str = ""
     # Both 0 mean "the service defaults" (3 members, seen in the last 72h).
     group_min_members: int = 0
     group_window_hours: float = 0.0
-    # Alertmanager's base URL, for resolving problems whose alert it no longer
-    # lists (#551). The INTERNAL address — the public host is behind an identity
-    # proxy — and empty, the default, disables the step: a fork ships nobody's
-    # monitoring host. `alertmanager_min_uptime_seconds` is the guard that
-    # matters: a freshly restarted alertmanager holds nothing until Prometheus
-    # re-sends, and reconciling against that empty set would resolve the estate.
+    # Retired with the alertmanager reconcile. Kept one release so a sweep
+    # recorded before PATCH_DROP_INFRA_STEPS replays with the input it had; the
+    # schedule builder no longer sets them. Remove with `_run_legacy`.
     alertmanager_url: str = ""
     alertmanager_min_uptime_seconds: int = 900
 
 
 @workflow.defn
 class HubSweepFlow:
+    @workflow.run
+    async def run(self, config: HubSweepConfig) -> dict:
+        if workflow.patched(PATCH_DROP_INFRA_STEPS):
+            return await self._run_current(config)
+        return await self._run_legacy(config)
+
+    async def _run_current(self, config: HubSweepConfig) -> dict:
+        # Read completions back first: a task a person ticked off resolves its
+        # problem, before projection, so the resolve reaches the task in this
+        # tick. FAST retries are safe — nothing is touched twice.
+        completed = await workflow.execute_activity_method(
+            HubActivities.reconcile_completed_tasks,
+            start_to_close_timeout=TIMEOUT_FAST,
+            retry_policy=FAST,
+        )
+        projected = await self._project()
+        candidates, grouped = await self._group(config)
+        return {
+            "task_completed": int(completed.get("resolved") or 0),
+            "task_reopened": int(completed.get("tasks_reopened") or 0),
+            "projected": int(projected.get("projected") or 0),
+            "created": int(projected.get("created") or 0),
+            "errors": int(projected.get("errors") or 0),
+            "group_candidates": len(candidates),
+            "grouped": len(grouped),
+            "folded": sum(int(g.get("folded") or 0) for g in grouped),
+        }
+
+    async def _project(self) -> dict:
+        return await workflow.execute_activity_method(
+            HubActivities.project_pending,
+            # LONG, not STANDARD: a sweep can project up to 50 problems, each
+            # one or more Todoist calls with a 10s connector timeout, so a slow
+            # Todoist used to time the activity out — and with NO_RETRY that
+            # failed the whole sweep every five minutes.
+            start_to_close_timeout=TIMEOUT_LONG,
+            retry_policy=NO_RETRY,
+        )
+
+    async def _group(self, config: HubSweepConfig) -> tuple[list[dict], list[dict]]:
+        # Candidates are cheap (one query); the judge is a billed call, so it
+        # runs only on a cluster nothing has ruled on yet.
+        candidates = await workflow.execute_activity_method(
+            HubActivities.find_group_candidates,
+            args=[config.group_min_members, config.group_window_hours],
+            start_to_close_timeout=TIMEOUT_FAST,
+            retry_policy=FAST,
+        )
+        grouped: list[dict] = []
+        for candidate in candidates[:_MAX_JUDGED_PER_TICK]:
+            verdict = await workflow.execute_activity_method(
+                HubActivities.judge_group,
+                args=[candidate],
+                start_to_close_timeout=TIMEOUT_LLM,
+                # NO_RETRY: billed, and a second opinion on the same cluster
+                # is worth less than what it costs. A failed judge leaves the
+                # problems separate, which is the safe direction.
+                retry_policy=NO_RETRY,
+            )
+            if not verdict.get("group"):
+                continue
+            result = await workflow.execute_activity_method(
+                HubActivities.apply_group,
+                args=[candidate, verdict],
+                # NO_RETRY: it merges problems, closes tasks and posts a card.
+                start_to_close_timeout=TIMEOUT_LONG,
+                retry_policy=NO_RETRY,
+            )
+            if result.get("grouped"):
+                grouped.append(result)
+        return candidates, grouped
+
+    # --- legacy: replays a sweep recorded before PATCH_DROP_INFRA_STEPS ------
+    # Activities are named by string: their methods are one-release no-op
+    # stubs on HubActivities, and AlertInvestigationFlow is gone.
+
     async def _investigate_promoted(self, problem_ids: list[str]) -> int:
         """Start an investigation for each promoted problem that should have
         one. Returns how many started."""
         alerts: list[dict] = []
         with logged_failure("hub_sweep_promoted_lookup_failed", logger=workflow.logger):
-            alerts = await workflow.execute_activity_method(
-                HubActivities.promoted_investigations,
+            alerts = await workflow.execute_activity(
+                "promoted_investigations",
                 args=[problem_ids],
                 start_to_close_timeout=TIMEOUT_FAST,
                 retry_policy=FAST,
@@ -116,7 +191,7 @@ class HubSweepFlow:
             child_id = f"investigate-{alert['problem_id']}-pr{stamp}"
             try:
                 await workflow.start_child_workflow(
-                    AlertInvestigationFlow.run,
+                    "AlertInvestigationFlow",
                     alert,
                     id=child_id,
                     parent_close_policy=workflow.ParentClosePolicy.ABANDON,
@@ -128,10 +203,9 @@ class HubSweepFlow:
                 )
         return started
 
-    @workflow.run
-    async def run(self, config: HubSweepConfig) -> dict:
-        promoted = await workflow.execute_activity_method(
-            HubActivities.promote_expired_suppressions,
+    async def _run_legacy(self, config: HubSweepConfig) -> dict:
+        promoted = await workflow.execute_activity(
+            "promote_expired_suppressions",
             start_to_close_timeout=TIMEOUT_FAST,
             retry_policy=FAST,
         )
@@ -181,8 +255,8 @@ class HubSweepFlow:
         workflow.deprecate_patch(PATCH_ALERTMANAGER_RECONCILE)
         if config.alertmanager_url:
             with logged_failure("hub_sweep_alertmanager_reconcile_failed", logger=workflow.logger):
-                reconciled = await workflow.execute_activity_method(
-                    HubActivities.reconcile_alertmanager,
+                reconciled = await workflow.execute_activity(
+                    "reconcile_alertmanager",
                     args=[config.alertmanager_url, config.alertmanager_min_uptime_seconds],
                     start_to_close_timeout=TIMEOUT_STANDARD,
                     retry_policy=FAST,
@@ -194,8 +268,8 @@ class HubSweepFlow:
         cards: dict = {}
         if workflow.patched(PATCH_RETIRE_CARDS):
             with logged_failure("hub_sweep_retire_cards_failed", logger=workflow.logger):
-                cards = await workflow.execute_activity_method(
-                    HubActivities.retire_cards,
+                cards = await workflow.execute_activity(
+                    "retire_cards",
                     args=[{}],
                     start_to_close_timeout=TIMEOUT_STANDARD,
                     retry_policy=FAST,

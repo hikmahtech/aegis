@@ -15,7 +15,7 @@ from aegis.clarify_note import AGENT_REPLY_PREFIX, CLARIFY_NOTE_PREFIX
 from aegis.services.settings_store import get_setting
 from temporalio import activity
 
-_ASSIGNEE_LABELS = {"@me", "@sebas", "@raphael", "@maou", "@pandora"}
+_ASSIGNEE_LABELS = {"@me", "@sebas", "@raphael", "@maou"}
 
 # A transient outbox failure is retried until the row is this old: a count of
 # 5 drains (~30 min) was shorter than a homelab outage and lost writes (#661).
@@ -454,14 +454,11 @@ class TodoistActivities:
                 # filtered to user-authored comments. AEGIS-authored notes
                 # must NOT trigger re-classification — otherwise ClarifyFlow
                 # loops on its own output (ClarifyFlow's `[ClarifyFlow @ `
-                # tag) and on Pandora's investigation comments
-                # (which include `Workflow run: ` as a stable footer in
-                # every shape — start-comment, verdict-comment, PR-opened,
-                # fix-discarded, transcript-attached, etc.). Caught
-                # 2026-05-21 when ClarifyFlow's 12:00 tick re-spawned 5
-                # pandora-jira investigations 15 min after they were first
-                # spawned — because the start-comments from those very
-                # spawns bumped last_note_at and re-surfaced the tasks.
+                # tag) and on workflow comments (which carry
+                # `Workflow run: ` as a stable footer). Caught 2026-05-21
+                # when a tick re-spawned work 15 min after it first spawned,
+                # because that work's own start-comments bumped last_note_at
+                # and re-surfaced the tasks.
                 deleted_note_ids: list[str] = []
                 for n in notes:
                     if not n.get("id"):

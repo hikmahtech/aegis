@@ -14,7 +14,7 @@ import datetime as dt
 import pytest
 import structlog
 from aegis.db import run_migrations
-from aegis.services.hub import get_problem, mute_problem
+from aegis.services.hub import get_problem
 from aegis_worker.activities.flow_health import (
     LLM_SUBJECT_PREFIX,
     FlowHealthActivities,
@@ -23,6 +23,17 @@ from aegis_worker.activities.flow_health import (
 from temporalio.testing import ActivityEnvironment
 
 from tests.delivery_stub import FakeDelivery
+
+
+async def mute_problem(pool, problem_id: str, *, hours: float, by: str) -> None:
+    """A mute set before the infra lane left (its endpoint went with it):
+    `muted_until` is still honoured on ingest until it runs out."""
+    await pool.execute(
+        "UPDATE problems SET muted_until = now() + make_interval(hours => $2) "
+        "WHERE id = $1::uuid",
+        problem_id,
+        int(hours),
+    )
 
 UTC = dt.UTC
 TYPE_A = "zzwd-type-a"
@@ -932,13 +943,13 @@ async def test_report_without_pool_degrades(db_pool):
 
 
 @pytest.mark.asyncio
-async def test_the_card_carries_the_mute_hint_and_the_task_side_gets_a_problem(db_pool):
+async def test_the_task_side_gets_a_problem(db_pool):
     await _prep(db_pool)
     env = ActivityEnvironment()
     delivery = FakeDelivery()
     act = _acts(db_pool, delivery)
     await env.run(act.report_flow_health, [_finding()], "a")
-    assert "Silence: admin Problems page" in delivery.sent[0]
+    assert "Silence:" not in delivery.sent[0]  # the mute endpoint left with the infra lane
     async with db_pool.acquire() as conn:
         p = await conn.fetchrow(
             "SELECT class, subject_kind, title FROM problems WHERE subject = $1 AND closed_at IS NULL",

@@ -1,3 +1,0 @@
-# RabbitMQHighConnections
-
-TODO: fill in

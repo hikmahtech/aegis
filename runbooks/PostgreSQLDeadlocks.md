@@ -1,3 +1,0 @@
-# PostgreSQLDeadlocks
-
-TODO: fill in

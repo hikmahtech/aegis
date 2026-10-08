@@ -58,7 +58,7 @@ class BriefingActivities:
     # LLM spend is attributable; "" (nobody holds the tag) records no agent.
     agent_id: str = ""
     # DeliveryActivities, wired in `__main__.py` after it is constructed (the
-    # same pattern HomelabActivities/MoneyActivities use). Needed because the
+    # same pattern MoneyActivities uses). Needed because the
     # health block is rendered and sent inside ONE activity — see
     # `deliver_briefing`.
     delivery: Any = None
@@ -453,9 +453,8 @@ class BriefingActivities:
                 if len(emails_out) >= 12:
                     break
 
-        # what broke: failed runs + new open drift since cursor
+        # what broke: failed runs since cursor
         failed_runs: list[dict] = []
-        new_drift: list[dict] = []
         if self.db_pool:
             with logged_failure("briefing_failed_runs_failed", logger=activity.logger):
                 # Also catch runs that ran to completion but whose own return
@@ -484,14 +483,6 @@ class BriefingActivities:
                         "error": str(err)[:160],
                         "completed_at": r["completed_at"].isoformat() if r["completed_at"] else None,
                     })
-            with logged_failure("briefing_drift_failed", logger=activity.logger):
-                drows = await self.db_pool.fetch(
-                    "SELECT service_name, severity FROM pandoras_actor.homelab_drift "
-                    "WHERE detected_at > $1 AND resolved_at IS NULL "
-                    "ORDER BY detected_at DESC LIMIT 10",
-                    cursor,
-                )
-                new_drift = [{"service": r["service_name"], "severity": r["severity"]} for r in drows]
 
         # calendar: today's events, flag ids not seen before
         cal_today: list[dict] = []
@@ -540,7 +531,6 @@ class BriefingActivities:
             or topics_out
             or emails_out
             or failed_runs
-            or new_drift
             or new_cal_ids
         )
         quiet = nothing_else and not areas_out
@@ -564,7 +554,7 @@ class BriefingActivities:
             "collected": collected_out,
             "topics": topics_out,
             "emails": emails_out,
-            "broke": {"failed_runs": failed_runs, "new_drift": new_drift},
+            "broke": {"failed_runs": failed_runs},
             "calendar": {"today": cal_today, "new_ids": new_cal_ids},
             "place": place,
             "_new_state": new_state,
@@ -887,13 +877,11 @@ class BriefingActivities:
                 frm = f" — {_esc(sender)}" if sender else ""
                 lines.append(f"  • {mark}{_esc(str(it.get('title', '')))}{frm}")
         broke = changes.get("broke") or {}
-        fr, dr = broke.get("failed_runs") or [], broke.get("new_drift") or []
-        if fr or dr:
+        fr = broke.get("failed_runs") or []
+        if fr:
             lines.append("<b>Needs a look</b>")
             for r in fr[:5]:
                 lines.append(f"  • {_esc(str(r.get('workflow_type')))} failed")
-            for d in dr[:5]:
-                lines.append(f"  • drift: {_esc(str(d.get('service')))} ({_esc(str(d.get('severity')))})")
         cal = changes.get("calendar") or {}
         if cal.get("new_ids"):
             lines.append("<b>Calendar</b>")

@@ -18,38 +18,33 @@ Five base GTD outcomes from `classify_one`:
 - ``next_action`` — label update (optional `due.string="tomorrow"` from defer).
                   Multi-step work uses Todoist subtasks, not sub-projects.
 
-Content-route short-circuits (added 2026-05-20; config-driven 2026-07):
+Content-route short-circuits (config-driven since 2026-07):
 
-- ``pandora_gate``          — fresh task matching a `gate:true` content route
-                            (no @pandora yet): spawn a choice card instead of
-                            auto-investigating. Resolution stamps @pandora (→
-                            investigation next tick) or @me (hands off).
-- ``route_apply``           — task matching a `gate:false` content route: apply
-                            the route's assignee + contexts directly, no card.
-- ``pandora_owned``         — task already labelled `@pandora`; no-op apply
-- ``pandora_investigation`` — @pandora content-route task with no completed run
-                            (gate-approved or a crashed prior attempt)
-- ``pandora_followup``      — user comment on existing `@pandora` content-route
-                            task triggers a fresh investigation with the comment
-                            appended as alert context
+- ``route_apply``           — task matching a content route: apply the
+                            route's assignee + contexts directly, no card.
+- ``hub_owned``             — a task the problem hub owns: stamp the GTD
+                            state only.
 
 ## Interaction spawn (Phase 4)
 
 When apply_outcome returns ``interaction_spawned=True``:
 
-- ``spawn_kind != "pandora_investigation"`` (low_conf / 2_min) — start
-  `InteractionFlow` as an abandoned child; the child's post_resolve_activity
-  (`apply_clarify_resolution`) applies the chosen action when the user
-  responds.
-- ``spawn_kind == "pandora_investigation"`` — start `AlertInvestigationFlow`
-  bound to the existing task via `todoist_task_id`. Skip spawn when
-  ``applied=False`` so a stale-projection rejection doesn't double-fire.
+- ``spawn_kind == "agent_chat_reply"`` — start `AgentChatReplyFlow` as an
+  abandoned child; the agent posts its own reply.
+- otherwise (low_conf / 2_min) — start `InteractionFlow` as an abandoned
+  child; the child's post_resolve_activity (`apply_clarify_resolution`)
+  applies the chosen action when the user responds.
+
+The infra lane's `pandora_investigation` spawn (an `AlertInvestigationFlow`
+child) is gone: the lane moved to the DevOps vertical (a2-devops). Its branch
+stays behind ``PATCH_DROP_PANDORA_SPAWN`` so a tick recorded before the change
+replays; the activities no longer return that spawn kind.
 
 ## Watermark invariant (added 2026-05-21, refined 2026-05-23)
 
 `log_classification(bump_watermark=…)` controls `todoist_tasks.last_clarified_at`.
-Bump only when: `applied=True` OR `outbox_queued > 0` OR (non-pandora
-interaction spawned AND apply landed). Otherwise keep watermark NULL so the
+Bump only when: `applied=True` OR `outbox_queued > 0` OR an interaction
+was spawned (the legacy investigation spawn also needed `applied`). Otherwise keep watermark NULL so the
 task re-enters `find_unclassified_items` once the projection catches up.
 Migration 016 was added to repair watermarks poisoned by the original
 unconditional bump.
@@ -66,7 +61,6 @@ with workflow.unsafe.imports_passed_through():
 
     from aegis_worker.activities.clarify import ClarifyActivities
     from aegis_worker.flows.agent_chat_reply import AgentChatReplyFlow, AgentChatReplyInput
-    from aegis_worker.flows.alert_investigation import AlertInvestigationFlow
     from aegis_worker.flows.interaction import InteractionFlow, InteractionFlowInput
     from aegis_worker.shared.retry import (
         NO_RETRY,
@@ -75,6 +69,14 @@ with workflow.unsafe.imports_passed_through():
         TIMEOUT_LLM,
         TIMEOUT_STANDARD,
     )
+
+# The infra lane moved to the DevOps vertical (a2-devops). A tick recorded
+# before this change may have started an `AlertInvestigationFlow` child from
+# the `pandora_investigation` spawn below, so that branch stays for its replay
+# (the child is started by type name; the class is gone). A new tick never
+# reaches it: the activities no longer return that spawn kind, and if one
+# ever did, the patch skips it. Retire the branch the #614 way.
+PATCH_DROP_PANDORA_SPAWN = "clarify-drop-pandora-investigation"
 
 
 async def _dispatch_reference_verdict(task: dict, verdict: dict) -> None:
@@ -198,17 +200,10 @@ class ClarifyFlow:
                 #   - apply succeeded (terminal), OR
                 #   - apply failed BUT outbox compensation was queued
                 #     (drain_outbox will retry), OR
-                #   - a NON-pandora interaction was spawned (low_conf /
-                #     2_min: the chat card is the authoritative state,
-                #     so we bump even if the paper-trail note failed).
-                #
-                # Pandora interactions are different: the spawn is gated on
-                # `applied=True` at lines 147-151 below. If applied=False
-                # (typically a non-retryable rejection from a stale
-                # projection), we don't spawn the investigation — bumping
-                # the watermark would lose the user's followup comment.
-                # Keep the watermark NULL so the next tick re-classifies
-                # once the projection catches up.
+                #   - an interaction was spawned (low_conf / 2_min: the
+                #     chat card is the authoritative state, so we bump
+                #     even if the paper-trail note failed). The legacy
+                #     investigation spawn also needed `applied`.
                 payload = outcome.get("interaction_payload") or {}
                 spawn_kind = payload.get("spawn_kind")
                 interaction_will_spawn = bool(
@@ -277,17 +272,20 @@ class ClarifyFlow:
                 # outlives this ClarifyFlow tick (24h timeout). The child's
                 # post_resolve_activity will apply the chosen action.
                 #
-                # Pandora branch (2026-05-20): if the payload's spawn_kind
-                # is pandora_investigation, fire AlertInvestigationFlow
-                # instead of InteractionFlow — the alert dict carries the
-                # existing todoist_task_id so the investigation attaches
-                # to the current task rather than creating a new one.
+                # The legacy `pandora_investigation` branch replays a tick
+                # recorded before PATCH_DROP_PANDORA_SPAWN; see that constant.
                 if outcome.get("interaction_spawned") and outcome.get("interaction_payload"):
                     payload = outcome["interaction_payload"]
                     safe_task_id = str(task["id"]).replace("/", "_")
                     spawn_kind = payload.get("spawn_kind")
-                    if spawn_kind == "pandora_investigation":
-                        # Only spawn the alert flow when the @pandora label
+                    if spawn_kind == "pandora_investigation" and workflow.patched(
+                        PATCH_DROP_PANDORA_SPAWN
+                    ):
+                        workflow.logger.warning(
+                            "clarify_flow_pandora_spawn_dropped task_id=%s", task.get("id")
+                        )
+                    elif spawn_kind == "pandora_investigation":
+                        # Legacy replay only. Only spawn the alert flow when the @pandora label
                         # actually landed on the Todoist task. Spawning on a
                         # non-retryably-failed apply leaves the task without
                         # the @pandora short-circuit label, so the next tick
@@ -303,7 +301,7 @@ class ClarifyFlow:
                             child_id = f"investigation-{safe_task_id}-{workflow.info().workflow_id}"
                             try:
                                 await workflow.start_child_workflow(
-                                    AlertInvestigationFlow.run,
+                                    "AlertInvestigationFlow",
                                     alert_dict,
                                     id=child_id,
                                     parent_close_policy=workflow.ParentClosePolicy.ABANDON,

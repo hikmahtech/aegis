@@ -25,7 +25,7 @@ Operational protocol every Todoist Sync API caller in AEGIS must follow. This do
 
 The split between retryable and non-retryable rejections is load-bearing for the outbox (see §3). Reference impls:
 
-- `worker/.../activities/alerts.py::post_task_note`
+- `worker/.../activities/agent_task.py::comment`
 - `worker/.../activities/clarify.py::apply_outcome`
 - `worker/.../activities/capture.py::capture_to_inbox`
 - `core/.../services/chat.py::_exec_*` (the user-facing chat tools)
@@ -72,7 +72,7 @@ ClarifyFlow posts machine-generated notes back to Todoist tasks to record its cl
 
 The prefix is centralised at **`core/src/aegis/clarify_note.py::CLARIFY_NOTE_PREFIX`** (`"[ClarifyFlow @ "`) so a producer-side rename can't drift from the consumer filters. Producers in `worker/.../activities/clarify.py::_format_apply_note` + `_format_review_note`. Sub-suffix patterns (`ref-complete`, `ref-demote`, `pass N`, `NEEDS REVIEW`) use the same prefix.
 
-Pandora's `AlertInvestigationFlow` comments use a different convention — they include `Workflow run: <id>` as a stable footer marker. `apply_sync_diff` and `find_unclassified_items` filter both prefixes.
+The problem hub's task comments (`hub_project`) use a different convention — they end with the footer `Workflow run: problem-hub`. `apply_sync_diff` and `find_unclassified_items` filter both prefixes.
 
 ## 5. Watermark invariant
 
@@ -92,7 +92,7 @@ bump_watermark = bool(
 )
 ```
 
-The pandora carve-out: when `spawn_kind == "pandora_investigation"` and `applied=False` (typically a non-retryable rejection from a stale projection), the spawn is skipped in `flows/clarify.py:147-151`. Bumping the watermark there would silently consume the user's followup comment and never re-investigate. A one-time watermark repair (folded into `001_baseline.sql`) fixed watermarks poisoned by the original unconditional bump.
+The `pandora_investigation` carve-out guarded an investigation spawn that a stale projection could skip; that spawn kind went with the infra lane (moved to the DevOps vertical), so a replayed run is the only thing that still takes it. A one-time watermark repair (folded into `001_baseline.sql`) fixed watermarks poisoned by the original unconditional bump.
 
 ## 6. Settings invariants
 

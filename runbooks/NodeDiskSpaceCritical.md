@@ -1,3 +1,0 @@
-# NodeDiskSpaceCritical
-
-TODO: fill in

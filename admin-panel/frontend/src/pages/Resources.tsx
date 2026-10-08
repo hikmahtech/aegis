@@ -23,7 +23,6 @@ interface ResourceFormData {
   coding_enabled: boolean;
   engine: string;
   claude_account: string;
-  sentry_project: string;
   metadata: string;
   infra_id: string;
 }
@@ -40,7 +39,6 @@ const emptyForm: ResourceFormData = {
   coding_enabled: false,
   engine: '',
   claude_account: '',
-  sentry_project: '',
   metadata: '{}',
   infra_id: '',
 };
@@ -90,7 +88,7 @@ export default function Resources() {
     setEditingId(r.id);
     // path + github_repo are edited via their own fields; keep the rest in the
     // raw "additional metadata" box so both aren't editable in two places.
-    const { path, github_repo, coding_enabled, engine, claude_account, sentry_project, ...restMeta } = r.metadata || {};
+    const { path, github_repo, coding_enabled, engine, claude_account, ...restMeta } = r.metadata || {};
     setForm({
       kind: r.kind || 'repository',
       slug: r.slug || '',
@@ -103,7 +101,6 @@ export default function Resources() {
       coding_enabled: coding_enabled === true || coding_enabled === 'true',
       engine: engine || '',
       claude_account: claude_account || '',
-      sentry_project: sentry_project || '',
       metadata: JSON.stringify(restMeta, null, 2),
       infra_id: r.infra_id || '',
     });
@@ -121,16 +118,15 @@ export default function Resources() {
     if (form.workspace_path.trim()) meta.path = form.workspace_path.trim();
     if (form.github_repo.trim()) meta.github_repo = form.github_repo.trim();
     if (form.kind === 'repository') {
-      meta.coding_enabled = form.coding_enabled;  // allow-list gate for alert/sentry investigation
+      meta.coding_enabled = form.coding_enabled;  // allow-list gate for coding runs
       if (form.engine) meta.engine = form.engine; else delete meta.engine;
       if (form.claude_account.trim()) meta.claude_account = form.claude_account.trim(); else delete meta.claude_account;
-      if (form.sentry_project.trim()) meta.sentry_project = form.sentry_project.trim(); else delete meta.sentry_project;
     }
     tags = form.tags.split(',').map(t => t.trim()).filter(Boolean);
     setSaving(true);
     setError('');
     try {
-      const { workspace_path, github_repo, coding_enabled, engine, claude_account, sentry_project, ...rest } = form;
+      const { workspace_path, github_repo, coding_enabled, engine, claude_account, ...rest } = form;
       const payload = { ...rest, tags, metadata: meta, infra_id: form.infra_id || null };
       if (editingId) {
         await api.updateResource(editingId, payload);
@@ -257,16 +253,11 @@ export default function Resources() {
                       <p className="meta" style={{ margin: '0.25rem 0 0' }}>CLAUDE_CONFIG_DIR account label from the coding host&apos;s config. Ignored for kimi.</p>
                     </div>
                   </div>
-                  <div className="form-group">
-                    <label>Sentry project slug</label>
-                    <input value={form.sentry_project} onChange={e => setForm({ ...form, sentry_project: e.target.value })} placeholder="e.g. my-app" className="mono" />
-                    <p className="meta" style={{ margin: '0.25rem 0 0' }}>Maps a Sentry issue (its project slug) straight to this repo — deterministic, no LLM guess.</p>
-                  </div>
                 </fieldset>
               )}
               <div className="form-group">
                 <label>Tags (comma-separated)</label>
-                <input value={form.tags} onChange={e => setForm({ ...form, tags: e.target.value })} placeholder="aegis, python, pandoras-actor" />
+                <input value={form.tags} onChange={e => setForm({ ...form, tags: e.target.value })} placeholder="aegis, python" />
               </div>
               <div className="form-group">
                 <label>Content / Runbook</label>

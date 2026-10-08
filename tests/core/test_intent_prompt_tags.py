@@ -16,15 +16,16 @@ from aegis.services.chat import (
 )
 
 
-async def test_intent_prompt_lists_seeded_agents_generalist_last(db_pool, infra_agent_active):
+async def test_intent_prompt_lists_seeded_agents_generalist_last(db_pool):
     """The seeded agents' own descriptions, specific agents first and the `gtd`
     holder last — the order the old hardcoded precedence list gave."""
     agents = await _routing_agents(db_pool)
     descriptions = await _agent_intent_descriptions(db_pool)
     prompt = _build_intent_prompt("hello", descriptions, _generalists_of(agents))
-    for aid in ("maou", "pandoras-actor", "raphael", "sebas"):
+    for aid in ("maou", "raphael", "sebas"):
         assert f"- {aid}: {descriptions[aid]}" in prompt
-    order = [prompt.index(f"- {aid}:") for aid in ("maou", "pandoras-actor", "raphael", "sebas")]
+    order = [prompt.index(f"- {aid}:") for aid in ("maou", "raphael", "sebas")]
+    assert "- pandoras-actor:" not in prompt
     assert order == sorted(order)
 
 

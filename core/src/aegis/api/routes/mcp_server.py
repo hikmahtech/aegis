@@ -117,8 +117,8 @@ _ERROR_CHARS = 300
 
 # Chat tools that are NEVER served here, however the agent's `tool_set` reads.
 #
-# Each of the first three START ANOTHER CLI RUN — and a run's mount carries the
-# same tool set, so a mounted run calling one of them spawns a run that can
+# The first one STARTS ANOTHER CLI RUN — and a run's mount carries the
+# same tool set, so a mounted run calling it spawns a run that can
 # spawn a run. There is no depth counter anywhere in that loop: the only brake
 # is the coding host's tmux window cap (10), past which launches fall through
 # to detached `nohup` and stop being bounded at all. Each level is a billed
@@ -130,17 +130,12 @@ _ERROR_CHARS = 300
 _UNSERVED_TOOLS = frozenset(
     {
         "dispatch_agent_run",
-        "aegis_self_diagnose",
-        "investigate_resource",
         # Not a recursion risk — the opposite. A run that can stop runs can kill
         # its siblings, or the very run a human is waiting on. Stopping is an
         # operator action, so it lives only on the operator mount.
         "stop_agent_run",
         # A run commenting on its own task would trigger its own next turn.
         "comment_on_task",
-        # A run that can open a maintenance window can silence the alert
-        # about itself. Declaring one is an operator action.
-        "set_service_state",
         # An AEGIS turn reports through its own activity; a run that could
         # register a session on its task could mark that task done. And a
         # merge hides a problem — a person's call.
@@ -237,7 +232,7 @@ _APPROVAL_TOOL_DESCRIPTOR = {
 # "reads":
 #   * `youtube_transcript` / `pdf_to_text` — both end in `_deliver_documents`,
 #     which POSTS a file into the operator's channel. Harmless, but not a read.
-#   * every infra / cloud / vercel tool — `list_nodes` and friends run a shell
+#   * every infra / cloud tool — `list_nodes` and friends run a shell
 #     script on the script host through the same `_INFRA_SPECS` pipeline as
 #     `restart_service`, so "read-only" there is a property of the remote
 #     script, not of this process. v1 keeps that whole domain gated.
@@ -1005,7 +1000,6 @@ def _tool_context(request: Request, agent_id: str, settings: Settings) -> ToolCo
         search_connector=getattr(state, "search_connector", None),
         llm_client=getattr(state, "llm", None),
         remote_script_connector=getattr(state, "remote_script_connector", None),
-        vercel_connector=getattr(state, "vercel_connector", None),
         model_light=tier_to_model_or("fast", getattr(settings, "model_fast", "gemma4:e2b")),
     )
 

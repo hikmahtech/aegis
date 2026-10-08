@@ -1,3 +1,0 @@
-# RabbitMQHighMemory
-
-TODO: fill in

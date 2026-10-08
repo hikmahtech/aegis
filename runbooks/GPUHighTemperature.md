@@ -1,3 +1,0 @@
-# GPUHighTemperature
-
-TODO: fill in

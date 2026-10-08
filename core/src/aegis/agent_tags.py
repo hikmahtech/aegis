@@ -18,5 +18,4 @@ BEHAVIOR_TAGS: dict[str, str] = {
     "gtd": "Owns the GTD layer — task clarify, reviews, Todoist sync and captures.",
     "finance": "Owns money — receipts, subscriptions, budgets and market data.",
     "research": "Owns knowledge — research, RSS/article ingest and lookups.",
-    "infra": "Owns infrastructure — homelab/k8s alerts and slow async operations.",
 }

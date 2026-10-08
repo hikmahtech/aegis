@@ -1,4 +1,4 @@
-"""Infrastructure ops endpoints — mirror pandoras-actor's chat tools.
+"""Infrastructure ops endpoints — mirror the infra chat tools.
 
 Each route delegates to the same executor function used by the chat tool,
 so the UI and chat share one implementation. Context defaults to ``swarm``

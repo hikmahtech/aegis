@@ -38,7 +38,7 @@ def _stubs(sent, committed, fail_send=False, resolve_map=None, market_calls=None
         return {
             "quiet": False,
             "intel": [],
-            "broke": {"failed_runs": [], "new_drift": []},
+            "broke": {"failed_runs": []},
             "knowledge": {"contradictions_delta": 0, "contradictions_total": 0, "top": []},
             "calendar": {"today": [], "new_ids": []},
             "_new_state": {"last_briefing_at": "2026-06-23T00:00:00+00:00"},

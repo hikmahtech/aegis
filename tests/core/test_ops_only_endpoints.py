@@ -40,7 +40,7 @@ def mock_knowledge():
 def mock_temporal():
     client = AsyncMock()
     handle = AsyncMock()
-    handle.id = "manual-cert_radar-deadbeef"
+    handle.id = "manual-flow-deadbeef"
     client.start_workflow = AsyncMock(return_value=handle)
     return client
 
@@ -70,7 +70,7 @@ async def client(app):
 
 
 def _ops_only_handlers():
-    from aegis.api.routes import homelab, integrations, knowledge, observability, settings
+    from aegis.api.routes import integrations, knowledge, observability, settings
 
     return {
         "GET /api/observability/llm-calls": observability.list_llm_calls,
@@ -79,8 +79,6 @@ def _ops_only_handlers():
         "POST /api/knowledge/ingest-drive": knowledge.ingest_drive,
         "GET /api/knowledge/health": knowledge.knowledge_health,
         "GET /api/settings/{key}": settings.get_setting,
-        "GET /api/admin/homelab/state": homelab.homelab_state,
-        "POST /api/admin/homelab/{flow}/run": homelab.trigger_flow,
     }
 
 
@@ -208,48 +206,6 @@ async def test_ingest_drive_returns_the_documented_reauth_error(client):
     assert f"{missing}.json" in detail
 
 
-async def test_homelab_state_returns_drift_and_cert_rows(client, db_pool):
-    service = f"ops-only-{uuid.uuid4().hex[:8]}"
-    domain = f"{uuid.uuid4().hex[:8]}.ops-only.test"
-    await db_pool.execute(
-        "INSERT INTO pandoras_actor.homelab_drift (service_name, stack_name, "
-        "drift_type, expected, actual, severity, alert_key) "
-        "VALUES ($1,'stack_a','image','{}'::jsonb,'{\"tag\":\"v9\"}'::jsonb,'warning',$1)",
-        service,
-    )
-    await db_pool.execute(
-        "INSERT INTO pandoras_actor.cert_expiry (domain, cert_serial, not_after, "
-        "days_until_expiry) VALUES ($1,'SER1', now() + interval '9 days', 9)",
-        domain,
-    )
-
-    resp = await client.get("/api/admin/homelab/state", headers=AUTH_HEADERS)
-    assert resp.status_code == 200
-    body = resp.json()
-
-    drift = next(d for d in body["drift"] if d["service_name"] == service)
-    assert drift["drift_type"] == "image"
-    assert drift["severity"] == "warning"
-    assert drift["actual"] == {"tag": "v9"}
-
-    cert = next(c for c in body["certs"] if c["domain"] == domain)
-    assert cert["cert_serial"] == "SER1"
-    assert cert["days_until_expiry"] == 9
-
-
-async def test_homelab_flow_run_starts_the_mapped_workflow(client, mock_temporal):
-    resp = await client.post("/api/admin/homelab/cert_radar/run", headers=AUTH_HEADERS)
-    assert resp.status_code == 200
-    assert resp.json() == {"ok": True, "workflow_id": "manual-cert_radar-deadbeef"}
-    assert mock_temporal.start_workflow.await_args.args[0] == "CertRadarFlow"
-
-
-async def test_homelab_flow_run_rejects_an_unknown_flow(client):
-    resp = await client.post("/api/admin/homelab/not_a_flow/run", headers=AUTH_HEADERS)
-    assert resp.status_code == 400
-    assert resp.json()["detail"] == "unknown flow: not_a_flow"
-
-
 # --------------------------------------------------------------------------
 # The four routes deleted by #101 must stay gone — each duplicated a surface
 # the SPA already calls, so a re-added twin is drift, not a feature.
@@ -268,3 +224,24 @@ async def test_homelab_flow_run_rejects_an_unknown_flow(client):
 async def test_duplicate_routes_removed(client, path):
     resp = await client.get(path, headers=AUTH_HEADERS)
     assert resp.status_code == 404, f"{path} is back — see issue #101"
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("get", "/api/admin/homelab/state"),
+        ("post", "/api/admin/homelab/cert_radar/run"),
+        ("get", "/api/admin/runbooks"),
+        ("post", "/api/hub/events"),
+        ("post", "/api/hub/service-state"),
+        ("get", "/api/admin/service-state"),
+        ("get", "/api/admin/infra-alert-routing"),
+        ("get", "/api/admin/hub-settle-seconds"),
+        ("get", "/api/admin/alert-remediation"),
+    ],
+)
+async def test_the_infra_lane_routes_are_gone(client, method, path):
+    """The infra lane moved to the DevOps vertical (a2-devops). Its routes must
+    not come back: a POST or a GET is answered by nothing in v1."""
+    resp = await getattr(client, method)(path, headers=AUTH_HEADERS)
+    assert resp.status_code in (404, 405), f"{path} is back"

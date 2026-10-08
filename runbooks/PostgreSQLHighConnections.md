@@ -1,3 +1,0 @@
-# PostgreSQLHighConnections
-
-TODO: fill in

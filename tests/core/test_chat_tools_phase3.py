@@ -282,15 +282,15 @@ async def test_user_today_without_a_pool_is_utc() -> None:
 
 
 @pytest.mark.asyncio
-async def test_agent_assignee_sees_parked_waiting_tasks(db_pool, infra_agent_active) -> None:
+async def test_agent_assignee_sees_parked_waiting_tasks(db_pool) -> None:
     """@waiting is agent_task.PARK_LABEL — stamped at the END of every agent
-    run. Filtering it as GTD "blocked" hid 9 of 11 open @pandora tasks and made
+    run. Filtering it as GTD "blocked" hid 9 of 11 open @maou tasks and made
     chat report an empty queue (2026-08-11). An agent must see its own parked
     work; @me must NOT (there @waiting really does mean blocked)."""
     from aegis.services.chat import ToolContext, _exec_list_next_actions
 
-    # pandoras-actor is seeded with mention_aliases [pandora], so @pandora
-    # resolves through the real roster — no fixture agent needed.
+    # maou is seeded with mention_aliases [maou], so @maou resolves through
+    # the real roster — no fixture agent needed.
     async with db_pool.acquire() as conn:
         await conn.execute(
             "INSERT INTO todoist_projects (id, name, is_managed, raw) "
@@ -300,14 +300,14 @@ async def test_agent_assignee_sees_parked_waiting_tasks(db_pool, infra_agent_act
         await conn.execute(
             "INSERT INTO todoist_tasks "
             "(id, project_id, content, labels, assignee_label, is_completed, raw) VALUES "
-            "('T_PARK','P_PRJ','restart redis',ARRAY['@pandora','@waiting'],"
-            "  '@pandora',false,'{}'::jsonb), "
+            "('T_PARK','P_PRJ','restart redis',ARRAY['@maou','@waiting'],"
+            "  '@maou',false,'{}'::jsonb), "
             "('T_HUMAN','P_PRJ','blocked on bank',ARRAY['@nobody','@waiting'],"
             "  '@nobody',false,'{}'::jsonb)"
         )
 
     agent_out = await _exec_list_next_actions(
-        pool=db_pool, args={"assignee": "@pandora", "limit": 50}, ctx=ToolContext(agent_id="x")
+        pool=db_pool, args={"assignee": "@maou", "limit": 50}, ctx=ToolContext(agent_id="x")
     )
     assert "T_PARK" in agent_out, "agent must see its own parked queue"
     assert "[parked]" in agent_out, "parked rows must be flagged, not silently mixed in"
@@ -323,10 +323,10 @@ async def test_agent_assignee_sees_parked_waiting_tasks(db_pool, infra_agent_act
 
 
 @pytest.mark.asyncio
-async def test_agent_assignee_sees_inbox_tasks(db_pool, infra_agent_active) -> None:
+async def test_agent_assignee_sees_inbox_tasks(db_pool) -> None:
     """The Inbox is excluded for humans (an Inbox item is unclarified). For an
     agent it is the opposite: the @agent label IS clarify's output, and AEGIS's
-    own triage parks #alert work in the Inbox — 10 of 11 open @pandora tasks
+    own triage parks #alert work in the Inbox — 10 of 11 open @maou tasks
     lived there. agent_task.find_actionable_tasks already works them with no
     inbox filter, so hiding them here hid work the worker was actively doing."""
     from aegis.services.chat import ToolContext, _exec_list_next_actions
@@ -346,14 +346,14 @@ async def test_agent_assignee_sees_inbox_tasks(db_pool, infra_agent_active) -> N
         await conn.execute(
             "INSERT INTO todoist_tasks "
             "(id, project_id, content, labels, assignee_label, is_completed, raw) VALUES "
-            "('T_IN_AG','P_INBOX','koyracloud redis down',ARRAY['@pandora','#alert'],"
-            "  '@pandora',false,'{}'::jsonb), "
+            "('T_IN_AG','P_INBOX','koyracloud redis down',ARRAY['@maou','#alert'],"
+            "  '@maou',false,'{}'::jsonb), "
             "('T_IN_HU','P_INBOX','unsorted thought',ARRAY['@nobody'],"
             "  '@nobody',false,'{}'::jsonb)"
         )
 
     agent_out = await _exec_list_next_actions(
-        pool=db_pool, args={"assignee": "@pandora", "limit": 50}, ctx=ToolContext(agent_id="x")
+        pool=db_pool, args={"assignee": "@maou", "limit": 50}, ctx=ToolContext(agent_id="x")
     )
     assert "T_IN_AG" in agent_out, "agent must see its Inbox-resident triage work"
 
@@ -500,9 +500,6 @@ ALLOW_MATRIX = {
     "maou":           {"capture_to_inbox", "list_next_actions", "list_projects",
                        "complete_task", "defer_task",
                        "mark_waiting", "handoff_task"},
-    "pandoras-actor": {"capture_to_inbox", "list_next_actions", "list_projects",
-                       "complete_task", "defer_task",
-                       "handoff_task"},
 }
 
 

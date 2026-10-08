@@ -9,17 +9,14 @@ tool (services/chat.py) and the Slack `/status` command (via
 GET /api/observability/status-digest — comms has no aegis-core dependency so
 it reaches this over HTTP).
 
-No new tables/columns: reuses workflow_runs, llm_calls, interactions, and the
-settings row keyed 'infra_heartbeat_state' (written by
-worker/activities/homelab.py's infra-heartbeat flow) exactly as they exist.
+No new tables/columns: reuses workflow_runs, llm_calls and interactions
+exactly as they exist.
 """
 
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from typing import Any
-
-from aegis.services.settings_store import get_setting
 
 # Matches the "*_failed" / "error" / "permanent_error" convention flows use in
 # result_summary->>'status' when they finish WITHOUT raising (workflow_runs.
@@ -77,10 +74,6 @@ async def get_status_digest(pool: Any, hours: int = 24) -> dict[str, Any]:
         "SELECT COUNT(*) FROM interactions WHERE status = 'pending'"
     )
 
-    heartbeat = await get_setting(pool, "infra_heartbeat_state")
-    if not isinstance(heartbeat, dict):
-        heartbeat = {}
-
     return {
         "window_hours": hours,
         "runs_by_type_status": [dict(r) for r in runs_by_type_status],
@@ -104,6 +97,4 @@ async def get_status_digest(pool: Any, hours: int = 24) -> dict[str, Any]:
         "llm_calls": int(token_row["calls"]) if token_row else 0,
         "llm_tokens": int(token_row["total_tokens"]) if token_row else 0,
         "pending_interactions": int(pending_interactions or 0),
-        "infra_stuck": heartbeat.get("stuck") or [],
-        "infra_confirmed": heartbeat.get("confirmed") or [],
     }

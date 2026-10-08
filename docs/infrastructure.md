@@ -7,6 +7,18 @@ Kubernetes clusters. Everything an entry needs — including its secrets — is
 entered in the UI and stored in the database, so registering new infrastructure
 never requires mounting files into containers or redeploying.
 
+## The infra lane moved to DevOps
+
+On 2026-10-08 the homelab lane left v1 for the DevOps vertical (a2-devops).
+v1 no longer takes alerts, investigates them, watches the swarm, checks
+certificates or service drift, restarts services, or keeps runbooks.
+Alertmanager, Grafana and the deploy role post to DevOps. The infra agent
+(`pandoras-actor`) and the `infra` capability tag are gone; the agent's
+database row stays, inactive.
+
+What stays in v1 for now is this registry and the coding lane that reads it
+(the remote-script host below). Both leave in a later change.
+
 | Kind | What it is | Executable ops |
 |------|------------|----------------|
 | `ssh_host` | Any machine reachable over SSH | Provisioning (push files, run a setup command) |
@@ -285,7 +297,7 @@ front.
 
 ### Chat
 
-Pandora gets two read-only tools:
+Two read-only chat tools cover them:
 
 - `list_cloud_accounts` — slugs, provider, status, default profile / project,
   and the identity recorded at the last provision.
@@ -294,164 +306,20 @@ Pandora gets two read-only tools:
   profile?". Errors (missing CLI, bad credentials, unknown slug) come back as
   plain tool errors, never crashes.
 
-## Service state (deploy and maintenance windows)
+## The problem hub
 
 The problem hub (`services/hub.py`, spec
-`docs/superpowers/specs/2026-09-07-problem-hub-design.md`) keeps a
-`service_state` row per subject saying what is happening to it right now.
-While a subject is `deploying` or in `maintenance`, every occurrence the hub
-ingests for it is stored and counted but raises nothing; the problem it
-creates sits in status `suppressed`. When the window passes without a
-`resolved` event, `HubSweepFlow` (every 5 min) opens the problem: the deploy
-did not make it go away. `degraded` is information only; `ok` clears the row.
-`subject: "*"` is a wildcard for a whole kind (`subject_kind: node`) or, with
-`subject_kind: "*"`, everything — a planned power cut.
+`docs/superpowers/specs/2026-09-07-problem-hub-design.md`) keeps one record per
+problem for v1's own producers: the flow-health and delivery watchdogs, expiry,
+social, the LLM spend guard, connectors, money, feeds, research, chat, sessions
+and manual reports. `HubSweepFlow` runs every five minutes: it reads completed
+tasks back, projects each problem onto its Todoist task, and groups clusters.
+The admin **Problems** page shows the live list and each problem's timeline.
 
-Three writers, all of which land on the same row:
-
-- **The deploy job.** `POST /api/hub/service-state`, authenticated by the
-  `alert_webhook_secret` (`X-Alert-Token` or `Authorization: Bearer`). The
-  Ansible role that deploys AEGIS posts `deploying` for `aegis_core`, `aegis_worker` and `aegis_comms` before the
-  stack deploy and `ok` after the services are up. A hand-run
-  `docker service update` deserves the same two calls:
-
-  ```bash
-  curl -sS -X POST "$AEGIS_URL/api/hub/service-state" \
-    -H "X-Alert-Token: $AEGIS_ALERT_WEBHOOK_SECRET" -H 'Content-Type: application/json' \
-    -d '{"subject": "chatapp_app", "state": "deploying", "minutes": 15, "set_by": "operator", "note": "rolling latest"}'
-  # ... docker --context swarm-baa service update --image ... --force chatapp_app ...
-  curl -sS -X POST "$AEGIS_URL/api/hub/service-state" \
-    -H "X-Alert-Token: $AEGIS_ALERT_WEBHOOK_SECRET" -H 'Content-Type: application/json' \
-    -d '{"subject": "chatapp_app", "state": "ok", "set_by": "operator"}'
-  ```
-
-  `minutes` bounds the window; omit it for open-ended and rely on `ok`.
-- **Chat.** `set_service_state(subject, state, minutes, note)`, granted to
-  the `infra` capability holder (seeded for `pandoras-actor`; a running
-  deployment adds it to `agents.metadata.tool_set`). Withheld from coding
-  runs on the MCP mount: a run that could open a window could silence the
-  alert about itself.
-- **The heartbeat.** A `deploying` service row older than two ticks whose
-  service is no longer below its desired replicas is cleared automatically —
-  the safety net for a deploy job that crashed before posting `ok`.
-  `maintenance` rows are never auto-cleared.
-
-### Backfilling the hub from the open alert tasks
-
-Once, after the PR that moved the alert producers onto the hub deploys, turn
-every open `#alert` task AEGIS created before it into a problem that owns that
-task — otherwise the next occurrence of a known alert creates a second task:
-
-Run it in the **worker** container, not core: it imports `aegis_worker` for
-the same `extract_service_name` the coding lane uses, and the core image does
-not carry that package. It reads the database URL from the container's own
-environment.
-
-```bash
-# on the node running the worker
-W=$(docker ps --filter name=aegis_worker -q | head -1)
-docker cp scripts/hub_backfill.py $W:/tmp/hub_backfill.py
-docker exec $W python /tmp/hub_backfill.py            # dry run
-docker exec $W python /tmp/hub_backfill.py --apply    # writes
-```
-
-Read the dry run before applying. A task whose class and subject it cannot
-read gets an empty key and therefore its own problem — check that the ones it
-DID key match what the producer computes, because a task keyed differently
-from its producer will be duplicated by the next occurrence rather than
-attached to.
-
-It read the retired `alert_dedup_index` for recurrence counts while that table
-existed. Migration 037 dropped it after the 2026-09-08 backfill, so a later run
-seeds every problem it creates at one occurrence.
-
-### Rolling the problem hub out
-
-The hub replaces the old alert dedupe machinery in place, so the order matters.
-
-1. **Deploy the images.** Migrations 030-035 apply on Core startup: the
-   `problems` / `problem_events` / `problem_links` tables, `service_state`, the
-   `work_sessions` widening, and the drops of `alert_mutes` and the digest
-   buffer. Nothing else is needed for alerts to start flowing onto the hub.
-2. **Merge the Ansible hook** (homelab-gitops) that posts
-   `POST /api/hub/service-state` at the top and bottom of a rollout. Held back
-   until now on purpose: merging it can trigger a deploy, and the endpoint has
-   to exist first.
-3. **Run the backfill** (see above), dry run then `--apply`, in the worker
-   container. Read the dry run first: a task it keys differently from its
-   producer will be duplicated by the next occurrence rather than attached to.
-4. **Grant the tools.** `config/seed/agents.yaml` only seeds an agent with no
-   `metadata.tool_set`, so a running deployment needs the SQL below.
-5. **Check it.** The admin **Problems** page is the fastest look: the live
-   list, what each problem's timeline says, and the windows in force. The
-   queries below answer the same questions in SQL.
-
-```sql
--- 4. grant the hub's operator tools to every agent whose tool set is an array
-UPDATE agents SET metadata = jsonb_set(metadata,'{tool_set}',
-  (metadata->'tool_set') || '["task_context","report_progress","merge_problems"]'::jsonb)
-WHERE active AND jsonb_typeof(metadata->'tool_set') = 'array'
-  AND NOT (metadata->'tool_set' @> '["task_context"]'::jsonb);
-
--- 5a. every open alert task should belong to exactly one problem
-SELECT t.id, t.content FROM todoist_tasks t
-LEFT JOIN problems p ON p.todoist_task_id = t.id
-WHERE t.source_tag = '#alert' AND NOT t.is_completed AND p.id IS NULL;
-
--- 5b. no live problem should hold two tasks
-SELECT problem_id, count(*) FROM problem_links
-WHERE link_kind = 'todoist_task' GROUP BY 1 HAVING count(*) > 1;
-
--- 5e. no task should be owned by two live problems (#472). A closed problem
--- is history, so a task may have one closed problem and one live one.
-SELECT o.task_id, count(*) AS problems,
-       string_agg(p.id::text || ' ' || p.correlation_key || ' ' || p.status, ' ; '
-                  ORDER BY p.first_seen_at) AS which
-FROM (SELECT problem_id, ref AS task_id FROM problem_links WHERE link_kind = 'todoist_task'
-      UNION SELECT id, todoist_task_id FROM problems WHERE todoist_task_id IS NOT NULL) o
-JOIN problems p ON p.id = o.problem_id
-WHERE p.closed_at IS NULL
-GROUP BY 1 HAVING count(*) > 1;
-
--- 5c. what the hub has seen since the deploy
-SELECT status, count(*), sum(occurrences) FROM problems
-WHERE last_seen_at > now() - interval '24 hours' GROUP BY 1 ORDER BY 2 DESC;
-
--- 5d. windows in force (should be empty outside a deploy)
-SELECT subject, state, until_at, set_by FROM service_state ORDER BY updated_at DESC;
-```
-
-`alert_dedup_index` was dropped by migration 037 after the 2026-09-08
-backfill, which was its last reader. The recurrence history it held is now
-`problems.occurrences` and one `problem_events` row per occurrence.
-
-### What can change a problem's status and severity
-
-- **Only the alert source makes a problem live again.** An investigation
-  adds notes; it does not decide. If the alert clears while an investigation
-  is still running, the verdict (and its decision card, if it has one) still
-  arrive and the
-  verdict is on the problem's timeline, but the problem stays `resolved` and
-  its task stays closed. The worker logs `hub_status_held` when this happens.
-  If the thing breaks again within a day, the next occurrence reopens the
-  problem and its task; later than that, it opens a new problem. Either way a
-  fresh investigation starts (#484).
-- **Severity only goes up.** Each occurrence keeps its own severity, and the
-  problem takes the worst one it has seen. That is what the status block on
-  the task shows. A milder occurrence later never lowers it (#486). Hub tasks
-  get no Todoist priority from severity, so nothing else changes on the task.
-
-Before #484 a late verdict reopened the problem. To find any still live from
-that time, run the query below. Resolve each one from the admin **Problems**
-page, unless its timeline shows an occurrence after the reopen.
-
-```sql
-SELECT p.id, p.status, p.class, p.subject, e.occurred_at AS reopened_at
-FROM problem_events e JOIN problems p ON p.id = e.problem_id
-WHERE e.source = 'hub' AND e.kind = 'state_change' AND e.payload->>'action' = 'reopen'
-  AND e.external_id LIKE 'investigation:%'
-  AND p.closed_at IS NULL AND p.status NOT IN ('resolved', 'closed');
-```
+Homelab alerts, deploy and maintenance windows (`service_state`), settle
+windows and alert investigations are not part of v1 any more. They moved to
+the DevOps vertical (a2-devops) on 2026-10-08; see
+[the note at the top](#the-infra-lane-moved-to-devops).
 
 ### Groups: one problem for the same failure on many things
 
@@ -482,13 +350,14 @@ swarmoverlayblackhole:service grouped=false n=3
    independent network partitioning issues requiring separate investigation."
 ```
 
-Both judgements cost $0.0009 together.
+Both judgements cost $0.0009 together. (The second cluster came from a homelab
+alert source that has since moved to DevOps.)
 
 **What you see.** The surviving task is renamed for what it now covers ("5
 posts stuck in Postiz QUEUE"), gets a comment naming the members folded in,
 and its status block gains a `Group:` line and a `problem:` link per member.
 Each swallowed task is completed with a note pointing at the survivor. A card
-goes to the infra agent's channel saying what was grouped and why.
+goes to chat saying what was grouped and why.
 
 **Strays.** A later post of the same class joins the group as it comes in.
 One whose own problem was still live when the group formed — it recovered
@@ -498,25 +367,13 @@ its task for good, because a single stray is never three of a kind again
 new clusters, with no model call: the group already stands for the class. The
 stray's task is completed through the outbox with a note pointing at the
 group, and the group's timeline gets a `grouped` event whose `reason` says it
-was a stray. It folds only into a group that is live and not suppressed, and
-only a stray seen in the last 72 hours.
+was a stray. It folds only into a group that is live, and only a stray seen in the last 72 hours.
 
 **What it will never do**, enforced in code rather than left to the judge:
 group across classes; group the `manual` class (those problems ARE hand-written
 `@code` tasks, and folding two would move one task's sessions and PR links onto
 another); group the `task` subject kind (a report keyed on the Todoist task it
-came from — see below); group a money finding; or group on the count alone.
-
-**Reports keyed on a task.** Clarify's content-route investigations carry a
-class from the route (`alert_overrides`) and often no service. Such an event
-used to be keyed `{class}::`, so every later one of that class attached to the
-first problem and was never investigated (#472). `event_from_alert` now keys
-an alert that names a Todoist task and nothing else on that task:
-`nodedown:task:<task id>`. An alert with no subject and no task — an aggregate
-alertmanager rule, a Sentry issue with no project — keeps its one key per
-class. Clarify also no longer starts an investigation for a task the hub owns
-(`#alert`, or any problem holds it): it records `hub_owned` and stamps `@next`.
-A user's comment on such a task still starts one, on the task's own problem.
+came from: one person's report); group a money finding; or group on the count alone.
 
 **Recovery.** `hub_watch.reconcile_findings` resolves a group only when its
 watchdog stops finding *any* member of the class — a group's `*` subject is
@@ -541,7 +398,7 @@ GROUP BY 1,2 HAVING count(*) >= 3;
 SELECT g.group_key, p.id, p.subject, p.status, p.todoist_task_id FROM problems g
 JOIN problems p ON p.class = g.class AND p.subject_kind = g.subject_kind AND p.id <> g.id
 WHERE g.group_key IS NOT NULL AND g.closed_at IS NULL
-  AND g.status NOT IN ('resolved', 'closed', 'suppressed')
+  AND g.status NOT IN ('resolved', 'closed')
   AND p.group_key IS NULL AND p.closed_at IS NULL AND p.status NOT IN ('resolved', 'closed')
   AND p.class <> 'manual' AND p.subject_kind <> 'task' AND p.subject <> ''
   AND p.last_seen_at >= now() - interval '72 hours'
@@ -597,71 +454,12 @@ WHERE workflow_type = 'HubSweepFlow';
 
 Raising the bar is not the same control as the verdict cache above: the
 threshold decides what is ever *asked*, the cache decides what the answer was.
-Turning the whole sweep off is not an alternative to either — it also stops
-suppression promotion and projection.
-
-### When a resolve never arrives
-
-Every producer on the hub has a way back except one, and the exception cost a
-problem 15 hours and a chore that could never end (#551).
-
-Alertmanager resolves a problem **only** when its `resolved` webhook arrives,
-and it keeps its firing alerts in memory. So a restart — a monitoring redeploy,
-a config reload, an OOM, a node move — makes it forget every alert it was
-holding, and those webhooks are never sent. The same hole swallows a resolve
-sent during an ingress outage, which is the outage the ingress canary above
-exists to catch. Every other lane recovers on its own: the heartbeat re-checks
-the swarm each tick, and the watchdogs resolve what they stop finding.
-
-`HubSweepFlow` now asks alertmanager what it is still holding and resolves the
-live problems it no longer lists. Set the internal address on the sweep's
-`activities.config` row — the public host is behind an identity proxy:
-
-```sql
-UPDATE activities SET config = config || '{"alertmanager_url": "http://alertmanager:9093"}'::jsonb,
-  updated_at = now()
-WHERE workflow_type = 'HubSweepFlow';
-```
-
-Empty, the default, disables it; a fork ships nobody's monitoring host.
-
-**Every part of it fails closed**, because the cost of getting this wrong is
-resolving a live estate in one tick:
-
-- unreachable, timed out, or a non-200 → nothing is resolved, because a
-  monitoring stack that cannot answer must never read as "everything
-  recovered";
-- **alertmanager up for less than `alertmanager_min_uptime_seconds` (900) →
-  nothing is resolved.** This is the guard the original defect taught: a
-  freshly restarted alertmanager holds no alerts at all until Prometheus
-  re-sends them, so reconciling against that empty set would close every open
-  problem. Prometheus re-sends on the order of a minute, so the default leaves
-  a wide margin;
-- a problem whose **last** occurrence is younger than ten minutes is left
-  alone: an alert that just fired is firing now, whatever alertmanager has
-  managed to group. (Bounding the FIRST occurrence instead, as the first version
-  did, let a four-day-old problem that fired thirty seconds ago straight
-  through — #561.);
-- a problem is judged on **every fingerprint it has ever had**, and resolved
-  only if alertmanager lists none of them. A fingerprint hashes the label set,
-  so a recurring fault arrives under a new one each time — one problem here had
-  26 across 27 occurrences — and judging on the first meant comparing against a
-  hash that could never be active again, which closed a live problem within a
-  minute of every legitimate reopen;
-- a **group** problem is left alone: its subject is `*`, it stands for a class
-  rather than one alert, and no single fingerprint speaks for it.
-
-A silenced or inhibited alert counts as still firing — someone has only asked
-not to be told — so its problem stays live.
-
-The timeline says what is actually known: *alertmanager no longer lists this
-alert*. Not that the alert cleared. Only the first of those is evidenced, and
-a hub that overstates its evidence is how you end up trusting a closed problem
-that is still broken.
+Turning the whole sweep off is not an alternative to either: it also stops
+projection and the completed-task read-back.
 
 ### A problem and its task stay in step
 
-The task is a view of the problem, and four rules keep the two agreeing
+The task is a view of the problem, and two rules keep the two agreeing
 (#473):
 
 - **Completing the task resolves the problem.** Every five minutes
@@ -679,21 +477,9 @@ The task is a view of the problem, and four rules keep the two agreeing
   reopens the task instead. That happens because TodoistSyncFlow applies
   Todoist's changes before it drains the outbox, so the mirror can be a tick
   stale when the projector reads it (prod problem 2140a366 kept a closed task
-  for three days this way). A return the task has **not been told about yet**
-  — under a mute, or inside a deploy window — is left alone until the
-  projector may tell it.
-- **A mute silences occurrences and returns, not recovery.** A muted problem
-  that resolves still closes its task, within one sweep, with one comment.
-  Occurrences under a mute are counted on the problem and never commented.
-  A problem that comes back under a mute stays quiet — the Problems page and
-  the digest still show it open — and its task reopens, with one comment,
-  when the mute ends.
-- **A problem that is over before it has a task never gets one.** Something
-  that failed inside a deploy window and recovered before it ended is
-  recorded and counted, and creates nothing. If it comes back, it gets its
-  task then.
+  for three days this way).
 - **A backlog is told once.** When several resolves and returns wait for one
-  projection (a long mute, Todoist down), the task gets one comment for where
+  projection (Todoist down, say), the task gets one comment for where
   things ended up — "Resolved … It came back 4 times since the last update" —
   not one per turn. Occurrences were already collapsed to one "N more"
   comment per 30 minutes.
@@ -717,7 +503,7 @@ WHERE p.closed_at IS NULL AND p.status NOT IN ('resolved','closed') AND t.is_com
 
 -- a resolved problem whose task is still open: expected only for a task
 -- somebody claimed with @me
-SELECT p.id, p.class, p.subject, p.resolved_at, t.assignee_label, p.muted_until
+SELECT p.id, p.class, p.subject, p.resolved_at, t.assignee_label
 FROM problems p JOIN todoist_tasks t ON t.id = p.todoist_task_id
 WHERE p.closed_at IS NULL AND p.status = 'resolved' AND NOT t.is_completed;
 ```
@@ -782,11 +568,9 @@ key is pasted.)
      whose machine runs kimi jobs (the canonical workspace host). It is
      probed before each run and **fails closed** to the base host when
      unreachable. Leave empty to run kimi on the base host.
-   - **AEGIS self-repo path** / **Runbooks dir** — used by the
-     `aegis_self_diagnose` chat tool and the built-in alert runbook files;
-     usually fine left empty (env/image defaults apply). Runbooks you write
-     yourself go in the database instead: see "The runbook an investigation
-     reads" below.
+   - **AEGIS self-repo path** — AEGIS's own checkout on the host; a claude
+     run's worktree is seeded with its `config/skills`. Usually fine left
+     empty (the env default applies). **Runbooks dir** is no longer read.
 3. Save. The entry shows a **coding host** badge; runs pick the config up
    within ~30 s.
 4. **Register the repos the agent works on.** On the **Resources** page add a
@@ -797,341 +581,27 @@ key is pasted.)
      is the directory the CLI `cd`s into and runs.
    - **GitHub repo** — `owner/repo`. Its **org** is the default engine/account
      selector (matched against the coding block's **Org routing**) and what
-     alert investigation matches an incoming issue to.
+     a coding task is matched to.
    - **Coding-agent routing** (repository resources only):
-     - **Enable alert / Sentry investigation** — the **allow-list gate**. Alert
-       investigation only ever runs a coding agent on repos with this checked;
-       everything else is ignored (an unknown GitHub repo seen in an alert is
-       auto-added here *disabled*, for you to review and opt in). This is what
-       "only the listed repos are included" means.
+     - **Coding enabled** (`metadata.coding_enabled`) — the **allow-list
+       gate**. A coding task is only ever matched to repos with this checked;
+       everything else is ignored. This is what "only the listed repos are
+       included" means.
      - **Engine override** — pin this repo to `claude` or `kimi`, regardless of
        org routing. Blank = decide by org.
      - **Claude account** — a `CLAUDE_CONFIG_DIR` account label from the coding
        block's `engines.claude.config_dirs`; the claude run for this repo uses
        that profile. Wins over org routing. **Kimi ignores it** (no profile).
-     - **Sentry project slug** — maps a Sentry issue (by its project slug)
-       straight to this repo. Unused since the Sentry intake left v1; the
-       field goes with the alert investigation lane.
 
    The fixed checkouts under the repo base are provisioned/mirrored by
    `WorkspaceRepoSyncFlow`, never cloned per-run — a missing path is a hard
    error, not a silent clone.
 
    > Upgrading an existing deployment: mark your active repos
-   > **Enable alert / Sentry investigation**, or alert investigation resolves
+   > as coding enabled, or a coding task matches
    > nothing (the allow-list starts closed). One-shot for the repos that already
    > have a workspace checkout:
    > `UPDATE resources SET metadata = jsonb_set(metadata,'{coding_enabled}','true') WHERE kind='repository' AND metadata->>'path' IS NOT NULL;`
-
-### Which repo an alert is investigated in
-
-`AlertInvestigationFlow` picks the repo in this order:
-
-1. **A label claim.** A repository with **Enable alert / Sentry
-   investigation** on can claim alerts by label. Put it in the resource's
-   **Additional metadata (JSON)** box:
-
-   ```json
-   {"alert_labels": {"code_location": ["analytics"]}}
-   ```
-
-   That claims every alert whose `code_location` label is `analytics`. List
-   more labels to claim on any of them. Label names match exactly; values
-   match case-insensitively. A claimed alert is investigated in that repo as
-   application code: the run may stage a fix branch, it is not told it is
-   looking at a swarm problem, and Gate-0 is skipped because the mapping is
-   yours. This holds even when the alertname is on the infra list below. If
-   two repos claim one alert, neither gets it, and the worker logs
-   `alert_label_claim_ambiguous`.
-2. **Infra alerts** go to the infra repo, investigate-only, after the one safe
-   force-restart (once per problem per hour; see
-   [below](#when-pandora-asks-you-and-the-automatic-restart)).
-3. **Everything else** goes down the ladder: Sentry project slug, service
-   name, token match, then the LLM, with Gate-0 confirming the pick.
-
-#### The infra list and the infra repo
-
-Both live in the `infra_alert_routing` settings row, editable on the admin
-**Problems** page under *Hub configuration* — the infra repo, the extra
-alertnames, and what to tell an investigation about this cluster. The same row
-over the admin API, for a script:
-
-```bash
-curl -sS -H "X-API-Key: $AEGIS_API_KEY" "$AEGIS_URL/api/admin/infra-alert-routing"
-curl -sS -X PUT "$AEGIS_URL/api/admin/infra-alert-routing" \
-  -H "X-API-Key: $AEGIS_API_KEY" -H 'Content-Type: application/json' \
-  -d '{"extra_alertnames": ["Dagster Pipeline Failure", "ClickHouseDown"],
-       "repo": "acme/infra-gitops",
-       "platform_hint": "This cluster is Docker Swarm, three managers. Read it with `docker --context swarm node ls` and `docker --context swarm service ps <service>`; a stuck service usually takes `docker --context swarm service update --force <service>`."}'
-```
-
-- `extra_alertnames` are added to the built-in list, which `GET` returns as
-  `default_alertnames`: the alerts AEGIS's heartbeat raises (`NodeDown`,
-  `DockerServiceDown`, `ServiceDownProlonged`, `HeartbeatCollectFailed`) plus
-  common host, container and monitoring-stack alerts. Anything specific to
-  your setup goes here. Names are compared lowercased.
-- `repo` is the `owner/name` (the resource's GitHub repo) that infra alerts
-  are investigated in. Unset means infra alerts get an LLM-only investigation.
-  There is no expansion to it from an application alert: the candidate query
-  admits only coding-enabled repositories (#35), so a connector or a service is
-  never among the picks. A rule that claimed otherwise was deleted in #505 —
-  it had been unreachable since that allow-list landed.
-- `platform_hint` is one or two sentences saying what the cluster IS and how to
-  read it. The instructions AEGIS puts in front of an infra investigation name
-  no orchestrator, because it has no way to know whether you run Swarm, k8s,
-  Nomad or a few systemd units — this is where you tell it. Up to 1000
-  characters; it goes in front of everything else the agent reads. Leave it
-  empty and the agent works it out from the infra repo.
-- `PUT` replaces the whole row and answers 400 on a bad value. The worker
-  picks a change up within 30 seconds; no restart.
-
-#### Example: Dagster pipeline failures
-
-Every Dagster job in every code location raises the same alertname, so the
-alertname cannot say which repo broke. Keep it on the infra list, because a
-run that dies before any step runs (user code unreachable, run worker killed)
-is an infra problem. Then let each pipeline repo claim its own failures.
-
-The label to claim on is the code location. Dagster records it on every run
-as the `.dagster/repository` tag (`__repository__@<location>`). Have your
-alert rule export it, but only when a step failed, so a run-level failure
-keeps going to the infra repo. For a Grafana rule that selects from `runs r`
-with the `STEP_FAILURE` event joined as `e`, add to the `SELECT`:
-
-```sql
-COALESCE(
-  CASE WHEN e.step_key IS NOT NULL THEN
-    (SELECT split_part(rt.value, '@', 2) FROM run_tags rt
-      WHERE rt.run_id = r.run_id AND rt.key = '.dagster/repository' LIMIT 1)
-  END,
-  '-'
-) AS code_location
-```
-
-Then claim each location on its repo:
-
-```sql
-UPDATE resources
-SET metadata = metadata || '{"alert_labels": {"code_location": ["analytics"]}}'::jsonb
-WHERE kind = 'repository' AND metadata->>'github_repo' = 'acme/analytics-pipeline';
-```
-
-Before the rule exports the location, a repo can claim by job name instead,
-`{"alert_labels": {"pipeline_name": ["etl_daily", "etl_weekly"]}}`. That list
-needs updating as jobs are added, and it cannot claim `__ASSET_JOB`, which
-has the same name in every code location.
-
-### The runbook an investigation reads
-
-Every alert investigation starts with the runbook for its alert name, put in
-front of the prompt, followed by past verdicts on similar alerts
-(`AlertActivities.gather_alert_knowledge`; see
-[what Pandora remembers](#what-pandora-remembers-from-your-decisions)). The
-worker looks for the runbook in this order:
-
-1. **The `runbooks` table.** Runbooks you write about your own setup: which
-   machines share a power supply, which service is pinned to which node, what
-   must never be restarted. Edit them on the admin **Runbooks** page or over
-   the API below.
-2. **`runbooks/<AlertName>.md`** from this repo, baked into the worker image
-   at `/app/runbooks` (or the coding host's **Runbooks dir**). These are
-   generic and host-free. A file that still says `TODO: fill in` is a stub
-   and counts as no runbook.
-
-A database error, or a read that takes longer than 5 seconds, falls through
-to the file, with a `runbook_db_read_failed` warning in the worker log. A
-runbook is context for an investigation, never a gate on it.
-
-**Setup-specific runbooks belong in the table, not in `runbooks/`.** This repo
-is public, and a fork should not inherit your machine names or topology. A
-stored runbook replaces the file for that alert completely, so copy in any
-generic steps you want to keep.
-
-- **Names.** A runbook is keyed on its alert name with case and punctuation
-  removed, so `NodeDown`, `node-down`, `Node Down` and `node_down` are one
-  runbook. Use the alertname Prometheus sends, or the rule title for a Grafana
-  alert (`Dagster Pipeline Failure`).
-- **Limits.** A save answers 400 when the body is blank, still contains
-  `TODO: fill in`, or is longer than 16,000 characters. Every runbook is
-  prepended to a prompt, so keep it short: what the alert usually means on
-  your setup, the first few read-only checks, what not to do, and when to hand
-  it to a human.
-- **When it applies.** The worker reads the table on every investigation, so
-  a change applies to the next one; no restart. Saves and deletes are in the
-  audit log (`runbook_saved`, `runbook_deleted`).
-
-```bash
-# List them (names and sizes, no bodies)
-curl -sS -H "X-API-Key: $AEGIS_API_KEY" "$AEGIS_URL/api/admin/runbooks"
-
-# Read one. URL-encode the name: "Dagster Pipeline Failure" is Dagster%20Pipeline%20Failure
-curl -sS -H "X-API-Key: $AEGIS_API_KEY" "$AEGIS_URL/api/admin/runbooks/NodeDown"
-
-# Create or replace one from a Markdown file
-jq -Rs '{body: ., updated_by: "me"}' NodeDown.md |
-  curl -sS -X PUT "$AEGIS_URL/api/admin/runbooks/NodeDown" \
-    -H "X-API-Key: $AEGIS_API_KEY" -H 'Content-Type: application/json' --data-binary @-
-
-# Delete one. The built-in file, if there is one, applies again
-curl -sS -X DELETE -H "X-API-Key: $AEGIS_API_KEY" "$AEGIS_URL/api/admin/runbooks/NodeDown"
-```
-
-To load several at once from a file shaped `[{"name": "...", "body": "..."}]`:
-
-```bash
-jq -c '.[]' runbooks.json | while IFS= read -r rb; do
-  name=$(jq -r .name <<<"$rb")
-  code=$(jq '{body, updated_by: "runbooks.json"}' <<<"$rb" |
-    curl -sS -o /tmp/runbook-resp.json -w '%{http_code}' -X PUT \
-      "$AEGIS_URL/api/admin/runbooks/$(jq -rn --arg n "$name" '$n|@uri')" \
-      -H "X-API-Key: $AEGIS_API_KEY" -H 'Content-Type: application/json' --data-binary @-)
-  echo "$code $name"; [ "$code" = 200 ] || cat /tmp/runbook-resp.json
-done
-```
-
-Two things with similar names are not this. The `update_runbook` chat tool
-stores text in the knowledge store, where an investigation may find it through
-the prior-incident search, but it is never the runbook. And resources of kind
-`runbook` are not read by investigations at all.
-
-### When Pandora asks you, and the automatic restart
-
-**A decision card only when there is a decision (#500).** After a verdict,
-`AlertInvestigationFlow` posts a Gate-2 card only when the card can do
-something:
-
-- the investigation staged a fix branch (**Open PR**),
-- the verdict is `actionable` and the investigation proposed commands that
-  change something (**Run fix**),
-- the alert escalates (a node down, the heartbeat unable to reach the swarm),
-  which nags until you ack it, or
-- the problem came back right after an automatic restart (below).
-
-Any other verdict is told, not asked. It goes on the problem's task as a
-comment, on the problem's timeline, and to chat as the usual verdict ping,
-and the problem waits for you the way it did after an **Acknowledge**. The
-task comment says no card was sent. To silence a problem that keeps coming
-back, use **Mute** on the admin **Problems** page, the same 24-hour mute the
-card had; for a longer window use `set_service_state`.
-
-Commands earn a card only on an `actionable` verdict (#518). On an
-`inconclusive` verdict they are a guess, and on a "no action needed" one they
-contradict it: in the two weeks before this rule, 22 such cards drew 17 bare
-acks and one **Run fix**. They go on the task comment instead, marked as not
-run, so you can still run them by hand. Without commands the status earns no
-card at all: an `actionable` verdict with no branch is work for you, but
-nothing a card could approve.
-
-**Checks are not fixes (#641).** An infra investigation ends with two lists:
-`CHECK_COMMANDS:` (read-only: ping, `node ls`, `service ps`, inspect, logs)
-and `FIX_COMMANDS:` (commands that change state). The list a command came in
-does not decide where it goes; `is_read_only_command` does. It knows a short
-list of read-only commands, and anything it does not know counts as a fix,
-so **Run checks** can never change anything. Only fixes earn a card. Checks
-ride on a card sent for another reason, as **Run checks**, and otherwise go on
-the task comment. On the card that prompted this, the "fix" was a ping to a
-node that was off, three inspects, and no fix at all.
-
-- A read-only command that exits non-zero does not stop the run. A ping to a
-  dead host failing is the answer. A failed fix still stops it.
-- A typed note overrides the commands on **Run fix** only. On **Run checks** it
-  is ignored, because it could run a change under the name of a check.
-- The run's status in `workflow_runs.result_summary`: `remediated` only when
-  a fix ran, every fix exited 0, and the hub then saw the problem resolve.
-  `waiting_human` when the fix ran and the problem is still there,
-  `remediation_failed` when a fix exited non-zero, `checked` when only
-  read-only commands ran (Run checks, or a note of checks), and
-  `remediation_refused` when nothing ran.
-
-`workflow_runs.result_summary` says what happened: `decision_card` (true or
-false) and `restart_repeat`. To count cards per investigation:
-
-```sql
-SELECT result_summary->>'decision_card' AS card, count(*)
-FROM workflow_runs
-WHERE workflow_type = 'AlertInvestigationFlow' AND started_at > now() - interval '14 days'
-  AND result_summary ? 'decision_card'
-GROUP BY 1;
-```
-
-**One automatic restart per problem per window (#501).** A `DockerServiceDown`
-or `ServiceDownProlonged` alert gets one `docker service update --force`
-before anyone is asked. The flow records each attempt on the problem, with
-what `docker service ps` said straight after it, recovered or not. If the
-same problem comes back inside the window, it is not restarted again: a
-restart that did not hold will not hold the second time either. Instead the
-task gets a comment with the first restart's evidence and what changed since
-(the tasks that are new, such as one the scheduler could not place), the
-investigation is told not to propose the same restart, and one card goes out
-whatever the verdict says. The problem is the identity, not the service
-name, except that a restart of one service in a group problem does not count
-against another.
-
-The window is 60 minutes. Change it, or set `0` to restart every time as
-before, on the admin **Problems** page → *Hub configuration* → *Automatic
-restart* (the `alert_remediation` settings row, `GET/PUT
-/api/admin/alert-remediation`, `services/alert_remediation.py`). The page
-refuses anything but a whole number of minutes from 0 to 1440, and every save
-is audited. The worker reads the row on every restart, so a change applies to
-the next alert; no restart. A stored value that is not a whole number of
-minutes counts as 60.
-
-### After Open PR
-
-When you pick **Open PR(s)** on a card, the flow pushes the fix branch, opens a
-draft PR and leaves the problem in `fixing`. v1 no longer follows the PR: the
-GitHub webhook, `GitHubAlertFlow` and the hub sweep's fix verification (#502)
-were removed when the GitHub intake moved to the v2 Development vertical.
-Complete the task once the PR merges and the alert stays clear; that resolves
-the problem.
-
-`pending_prs` is the hand-off between the two activities that open a PR
-(`stage_pending_pr` writes the title, body and branch; `create_github_pr` reads
-them back and marks the row `opened` or `failed`), pruned after 30 days by
-`CleanupFlow`.
-
-### What Pandora remembers from your decisions
-
-**The verdict is stored after you decide, tagged with what you did (#502).**
-Each investigation's verdict and transcript go to the knowledge store as an
-`alert_investigation` document, so the next investigation of a similar alert
-can read how the last one ended. The document carries an outcome, in its
-metadata and as an `outcome:<x>` tag:
-
-| Outcome | Meaning |
-|---|---|
-| `opened_pr` | you picked Open PR(s) and a PR opened |
-| `pr_failed` | you picked Open PR(s), but none could be opened |
-| `run_fix` | you picked Run fix |
-| `run_checks` | you picked Run checks (read-only, not a fix you took) |
-| `discarded` | you picked Discard |
-| `muted` | you picked Mute 24h |
-| `acknowledged` | you picked Acknowledge |
-| `expired` | nobody answered the card in 48 hours |
-| `self_resolved` | the alert cleared while the card was open |
-| `no_card` | nothing to decide, so no card was sent |
-
-When an investigation starts, `gather_alert_knowledge` searches these
-documents for verdicts on similar alerts and puts the best three in front of
-it, each with its outcome. A fix you took (`opened_pr`, `pr_failed`,
-`run_fix`) comes first. A fix you discarded is never recalled. Each past alert
-is one line: its verdicts are one document per outcome, under the alert's own
-address, so a discard today does not overwrite the fix you took last week.
-Verdicts stored before #502 have no outcome; they are recalled, after the
-taken ones.
-
-Before #502 the verdict was stored before the card went out, so a discarded
-fix was recalled next time exactly like one you acted on. The move is behind
-the `kg-verdict-after-decision` patch id, so a run that was waiting on its card
-across the deploy stores its verdict the old way.
-
-To see what was stored and how it ended:
-
-```sql
-SELECT metadata->>'outcome' AS outcome, count(*)
-FROM knowledge_content WHERE source_type = 'alert_investigation'
-GROUP BY 1 ORDER BY 2 DESC;
-```
 
 ### Session inventory
 
@@ -1363,7 +833,7 @@ body=$(jq -nc --arg t "$task" --arg s "$summary" --arg st "$status" --arg sid "$
 # The key goes to curl on stdin (-K -), not on the command line, where any
 # local user could read it from the process list.
 printf 'header = "X-API-Key: %s"\n' "$AEGIS_API_KEY" |
-  curl -fsS -m 5 -K - -X POST "$AEGIS_URL/api/mcp-server/pandoras-actor/operator" \
+  curl -fsS -m 5 -K - -X POST "$AEGIS_URL/api/mcp-server/sebas/operator" \
     -H "Content-Type: application/json" -d "$body" >/dev/null || true
 ```
 
@@ -1707,7 +1177,7 @@ WHERE id = 'maou' AND jsonb_typeof(metadata->'tool_set') = 'array' AND NOT (meta
 
 ## Chat
 
-Pandora's infra tools work against registry clusters by slug:
+The infra chat tools work against registry clusters by slug:
 
 - `list_pods` / `list_deployments` / `get_pod_logs` — pass a registry entry's
   slug as `context` (script-host contexts keep working unchanged; those run on
@@ -1948,7 +1418,7 @@ or `paper_read`.
   could not be written keeps the problem open without adding an occurrence
   (`hub_watch.reconcile_findings`, `record: False`). The problem's subject is
   the feed URL, and the research agent owns the `feeds` source, so these stay
-  out of the infra digest (`hub.DIGEST_SKIPPED_SOURCES`).
+  out of the hub digest (`hub.DIGEST_SKIPPED_SOURCES`).
 
 A `process_content` that returns `status: error` now counts as a failure. The
 entry's claim is released and the cursor is fenced, so the next run retries it

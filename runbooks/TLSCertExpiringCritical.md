@@ -1,3 +1,0 @@
-# TLSCertExpiringCritical
-
-TODO: fill in

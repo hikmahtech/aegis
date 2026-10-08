@@ -30,10 +30,10 @@ _TASK = {
     "id": "tf-1",
     "content": "PROLONGED: redis_redis degraded for over 2 hours",
     "description": "",
-    "labels": ["@pandora"],
+    "labels": ["@maou"],
     "source_tag": "#unmapped",  # deliberately a tag no table knows
     "project_id": "p1",
-    "assignee_label": "@pandora",
+    "assignee_label": "@maou",
 }
 
 
@@ -66,7 +66,7 @@ async def test_unknown_verb_parks_the_task_and_never_leaves_it_in_the_pool():
             result = await env.client.execute_workflow(
                 AgentTaskFlow.run,
                 AgentTaskFlowInput(
-                    agent_id="pandoras-actor", todoist_task_id="tf-1", task=_TASK
+                    agent_id="maou", todoist_task_id="tf-1", task=_TASK
                 ),
                 id=f"agent-task-tf-1-{uuid.uuid4()}",
                 task_queue=queue,
@@ -114,7 +114,7 @@ async def test_activity_failure_still_parks_the_task_before_the_flow_fails():
                 await env.client.execute_workflow(
                     AgentTaskFlow.run,
                     AgentTaskFlowInput(
-                        agent_id="pandoras-actor", todoist_task_id="tf-1", task=_TASK
+                        agent_id="maou", todoist_task_id="tf-1", task=_TASK
                     ),
                     id=f"agent-task-tf-1-{uuid.uuid4()}",
                     task_queue=queue,
@@ -146,7 +146,7 @@ async def test_sweep_spawns_one_child_per_task_and_does_not_await_them():
         ):
             result = await env.client.execute_workflow(
                 AgentTaskSweepFlow.run,
-                AgentTaskSweepConfig(agent_id="pandoras-actor"),
+                AgentTaskSweepConfig(agent_id="maou"),
                 id=f"sweep-{uuid.uuid4()}",
                 task_queue=queue,
             )
@@ -159,10 +159,12 @@ async def test_sweep_spawns_one_child_per_task_and_does_not_await_them():
 # `find_actionable_tasks` excludes @waiting, so every exit MUST complete or
 # park the task — otherwise the 6h cooldown re-picks (and re-fails) it
 # forever. This is the single mechanical proof of that invariant: one case
-# per terminal return/raise statement a run can reach today (18 total — 3 in
-# run(), 2 in _run_ask, 3 in the infra verb (the plan's report, and
-# _run_service's resolved and carded), 2 in _run_email, 2 in _run_finance, 6
-# in _run_coding; see issue #154 for the original enumeration. PR 5 of the
+# per terminal return/raise statement a run can reach today (15 total — 3 in
+# run(), 2 in _run_ask, 2 in _run_email, 2 in _run_finance, 6 in _run_coding;
+# see issue #154 for the original enumeration. The infra verb's three exits
+# left with the infra lane (a2-devops); a `#alert` task now parks as decided
+# — nothing in AEGIS works it — and `test_agent_task_infra.py` pins the
+# legacy branch's replay. PR 5 of the
 # problem hub deleted the "handed to operator" exit: an operator who wants
 # AEGIS out of a task says so with `report_progress`, which is what the
 # `you_are_in_it` exit below reads. #344 added the two `ask` exits and
@@ -191,8 +193,8 @@ async def test_sweep_spawns_one_child_per_task_and_does_not_await_them():
 
 # Module-level stub — Temporal does not allow @workflow.defn on local classes
 # (see tests/worker/test_clarify_flow_agent_spawn.py:14). One shape covers
-# every remaining card: only the infra and finance verbs raise one, and both
-# park immediately afterwards whatever the answer is. The coding verb no
+# every remaining card: only the finance verb raises one, and it parks
+# immediately afterwards whatever the answer is. The coding verb no
 # longer cards anything — it comments and waits for the user's reply instead.
 @workflow.defn(name="InteractionFlow")
 class _StubInteractionApprove:
@@ -210,24 +212,17 @@ class _StubAgentChatReply:
         return {"status": "ok", "reason": None, "message_id": None, "agent_id": inp.target_agent}
 
 
-_ALERT_TASK = dict(_TASK, source_tag="#alert", content="PROLONGED: redis_redis degraded for over 2 hours")
-_NO_SVC_TASK = dict(_TASK, source_tag="#alert", content="Something went wrong today")
+_ALERT_TASK = dict(_TASK, source_tag="#alert", content="Flow TodoistSyncFlow keeps failing")
 _EMAIL_TASK = dict(_TASK, source_tag="#email", content="a note")
 _FINANCE_TASK = dict(_TASK, source_tag="#receipt", content="Anomaly: something weird")
 _CODE_TASK = dict(_TASK, source_tag=None, labels=["@code"], content="Fix the bug")
 _CHAT_TASK = dict(_TASK, source_tag="#chat", content="Why is the cache slow?")
 
-_SERVICE_PLAN = {"action": "service", "service": "redis_redis"}
-_REPORT_PLAN = {
-    "action": "report", "handler": "manual", "kind": "",
-    "comment": "Nothing on this task names a service, node or URL I can check. What to do: ...",
-    "reason": "nothing to check",
-}
 _ASK = {"agent_id": "agent-x", "message": "m", "thread_id": "todoist-task-x", "comment": "",
         "reason": ""}
 
 _SESSION = {
-    "task_id": "x", "agent_id": "pandoras-actor", "session_id": "sess-1",
+    "task_id": "x", "agent_id": "maou", "session_id": "sess-1",
     "repo": "repo", "github_repo": "org/repo", "branch": "aegis-task/x",
     "worktree_path": "/srv/repo-aegis-wt/task-x", "host": "h",
     "slack_ref": "", "turns": 0, "last_turn_at": "", "created_at": "",
@@ -270,20 +265,7 @@ _CASES = [
                                "reason": "no active agent answers to @x"}},
         expect_status="parked",
     ),
-    _ExitCase("infra_report", _NO_SVC_TASK, {"plan_infra_task": _REPORT_PLAN},
-              expect_status="parked"),
-    _ExitCase(
-        "infra_healthy", _ALERT_TASK,
-        {"plan_infra_task": {**_SERVICE_PLAN,
-                             "health": {"found": True, "healthy": True, "detail": "1/1"}}},
-        expect_status="resolved",
-    ),
-    _ExitCase(
-        "infra_unhealthy_carded", _ALERT_TASK,
-        {"plan_infra_task": {**_SERVICE_PLAN,
-                             "health": {"found": True, "healthy": False, "detail": "0/1"}}},
-        expect_status="carded",
-    ),
+    _ExitCase("alert_left_to_the_user", _ALERT_TASK, expect_status="parked"),
     _ExitCase(
         "email_archived", _EMAIL_TASK,
         {"triage_email": {"action": "archived", "account": "acct1"}},
@@ -357,7 +339,9 @@ _CASES = [
               expect_status="unknown_task", expect_terminal="none", load_from_id=True),
 ]
 
-assert len(_CASES) == 18, "one case per AgentTaskFlow exit — see issue #154"
+# 15 exits, plus `alert_left_to_the_user`: the `none` decision reaching
+# run()'s unrouted park, which `run_unknown_verb` reaches as `unknown`.
+assert len(_CASES) == 16, "one case per AgentTaskFlow exit — see issue #154"
 
 
 def _exit_case_activities(events: list, case: _ExitCase):
@@ -369,10 +353,6 @@ def _exit_case_activities(events: list, case: _ExitCase):
         # change it, and the flow cannot read the database).
         return {"external_id": "", "gmail_message_id": "", "subject": "", "subject_kind": "",
                 "verb": resolve_verb(case.task)}
-
-    @activity.defn(name="plan_infra_task")
-    async def plan_infra_task(task_id: str, title: str) -> dict:
-        return r["plan_infra_task"]
 
     @activity.defn(name="prepare_agent_ask")
     async def prepare_agent_ask(task_id: str) -> dict:
@@ -394,10 +374,6 @@ def _exit_case_activities(events: list, case: _ExitCase):
     async def complete_task(task_id: str) -> dict:
         events.append(("complete", task_id))
         return {"completed": True}
-
-    @activity.defn(name="service_logs")
-    async def service_logs(service_name: str, lines: int = 50) -> dict:
-        return {"logs": "boot loop"}
 
     @activity.defn(name="triage_email")
     async def triage_email(task_id: str, title: str, gmail_message_id: str) -> dict:
@@ -459,7 +435,7 @@ def _exit_case_activities(events: list, case: _ExitCase):
 
     return [
         load_task, load_task_context, comment, park_task, complete_task,
-        plan_infra_task, prepare_agent_ask, service_logs, triage_email, merchant_history,
+        prepare_agent_ask, triage_email, merchant_history,
         ensure_task_session, check_task_collision, record_task_turn,
         launch_task_turn, check_agent_run, kill_task_turn, send_message,
         set_task_slack_ref,
@@ -484,7 +460,7 @@ async def test_every_exit_path_ends_completed_or_parked(case: _ExitCase):
             activities=_exit_case_activities(events, case),
         ):
             wf_input = AgentTaskFlowInput(
-                agent_id="pandoras-actor",
+                agent_id="maou",
                 todoist_task_id=f"{case.id}-1",
                 task={} if case.load_from_id else dict(case.task, id=f"{case.id}-1"),
             )

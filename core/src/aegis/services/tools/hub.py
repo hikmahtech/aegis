@@ -1,8 +1,7 @@
 """Chat tools over the problem hub (`services/hub.py`, `services/work_sessions.py`).
 
-Four tools, all on the operator MCP mount and in chat:
+Three tools, all on the operator MCP mount and in chat:
 
-* `set_service_state` — declare a deploy / maintenance window.
 * `task_context` — what a session should read first: the problem, its recent
   events, every session on it, and the take-over command.
 * `report_progress` — the operator's session registering itself on the task,
@@ -11,11 +10,9 @@ Four tools, all on the operator MCP mount and in chat:
 * `merge_problems` — fold a duplicate problem into the one to keep.
 
 Two are withheld from coding runs (`routes/mcp_server.py::_UNSERVED_TOOLS`):
-`set_service_state`, because a run that could open a maintenance window could
-silence the alert about itself, and `report_progress`, because an AEGIS turn
-reports through its own activity and a run must not be able to mark its own
-task done. `merge_problems` is withheld too — a merge hides a problem, and
-that is a person's call.
+`report_progress`, because an AEGIS turn reports through its own activity and
+a run must not be able to mark its own task done, and `merge_problems`,
+because a merge hides a problem, and that is a person's call.
 """
 
 from __future__ import annotations
@@ -35,9 +32,7 @@ from aegis.services.hub import (
     get_problem,
     ingest_event,
     list_events,
-    list_service_states,
     merge_problems,
-    set_service_state,
 )
 from aegis.services.hub_project import ensure_problem_for_task
 from aegis.services.tools.base import ToolContext
@@ -48,63 +43,11 @@ logger = structlog.get_logger()
 _EVENT_LIMIT = 20
 
 
-def _fmt_until(row: dict) -> str:
-    until = row.get("until_at")
-    return f"until {until:%Y-%m-%d %H:%M} UTC" if until else "until cleared"
-
-
 def _uuid(value: str) -> str:
     try:
         return str(uuid.UUID(str(value or "").strip()))
     except ValueError:
         return ""
-
-
-@aegis_tool
-async def _exec_set_service_state(
-    pool: asyncpg.Pool,
-    ctx: ToolContext,
-    *,
-    subject: str,
-    state: Literal["deploying", "maintenance", "degraded", "ok"],
-    minutes: int = 30,
-    note: str = "",
-) -> str:
-    """Declare a swarm service or node deploying, in maintenance, degraded, or ok again. While a subject is deploying or in maintenance the problem hub records what it sees there but raises nothing; `ok` ends the window early.
-
-    Args:
-        subject: the swarm service (`stack_service`) or node name, or `*` for everything.
-        state: deploying | maintenance | degraded | ok.
-        minutes: how long the window lasts; ignored for ok.
-        note: why — shown on every problem the window suppresses.
-    """
-    subject = (subject or "").strip()
-    kind = "*" if subject == "*" else "service"
-    try:
-        row = await set_service_state(
-            pool,
-            subject,
-            state,
-            subject_kind=kind,
-            minutes=minutes if state != "ok" else None,
-            set_by=f"chat:{ctx.agent_id or 'unknown'}",
-            note=note,
-        )
-    except ValueError as exc:
-        return f"Refused: {exc}"
-    if state == "ok":
-        head = (
-            f"{row['subject']}: window cleared."
-            if row.get("cleared")
-            else f"{row['subject']}: no window was set."
-        )
-    else:
-        head = f"{row['subject']}: {row['state']} {_fmt_until(row)} (set by {row['set_by']})."
-    active = await list_service_states(pool)
-    if not active:
-        return head + " No windows in force."
-    lines = [f"- {r['subject']} ({r['subject_kind']}): {r['state']} {_fmt_until(r)}" for r in active]
-    return head + " Windows in force:\n" + "\n".join(lines)
 
 
 def _event_line(e: dict[str, Any]) -> str:
@@ -145,7 +88,7 @@ async def _exec_task_context(
     task_id: str = "",
     problem_id: str = "",
 ) -> str:
-    """What to read first when picking up a task: the problem behind it, its recent events, every session on it (AEGIS's and yours) with their summaries, its links and any deploy window, plus the command that takes AEGIS's session over. Give the Todoist task id or the problem id.
+    """What to read first when picking up a task: the problem behind it, its recent events, every session on it (AEGIS's and yours) with their summaries and its links, plus the command that takes AEGIS's session over. Give the Todoist task id or the problem id.
 
     Args:
         task_id: the Todoist task id (the number in the task's URL, or `task-<id>` in a worktree path).
@@ -176,13 +119,6 @@ async def _exec_task_context(
         lines.append("No problem on the hub for this task (a plain @code task).")
     else:
         lines.append(f"Problem {problem['id']}: {problem['title']}")
-        window = None
-        async with pool.acquire() as conn:
-            from aegis.services.hub import _active_suppression, _utcnow
-
-            window = await _active_suppression(
-                conn, problem["subject"], problem["subject_kind"], _utcnow()
-            )
         links = [
             dict(r)
             for r in await pool.fetch(
@@ -191,9 +127,7 @@ async def _exec_task_context(
                 problem["id"],
             )
         ]
-        block = hub_project.render_block(
-            problem, window=dict(window) if window else None, links=links
-        )
+        block = hub_project.render_block(problem, links=links)
         lines.extend(block.splitlines()[1:-1])
 
     sessions = await work_sessions.list_for_task(pool, task_id) if task_id else []

@@ -47,7 +47,7 @@ async def _capture_to_inbox_impl(
 
     `extra_labels` are appended to the `[source_tag]` label set (dedup-
     preserving) — used to assign a captured task to an agent (e.g.
-    `@pandora`) so it anchors that agent's downstream workflows.
+    `@maou`) so it anchors that agent's downstream workflows.
 
     `project_id` files the task in that project instead of the Inbox — the
     problem hub's money tasks, which clarify must never see.
@@ -268,7 +268,7 @@ async def _exec_list_next_actions(
 ) -> str:
     """Read open (incomplete), actionable tasks from the Todoist projection.
     Excludes @reference/@someday/@to-read, and excludes @waiting for @me. When
-    assignee is an agent label (e.g. @pandora), @waiting tasks ARE included and
+    assignee is an agent label (e.g. @maou), @waiting tasks ARE included and
     marked [parked] — for an agent @waiting means 'a run finished a pass', not
     'blocked', so this is that agent's own working queue. Optional filters:
     assignee label, context label, due window.
@@ -608,7 +608,7 @@ async def _exec_handoff_task(
     pool: asyncpg.Pool, ctx: ToolContext, *, task_id: str, to_assignee: str
 ) -> str:
     """Reassign a task to a different personality assignee, given as an @label
-    (e.g. @me, @raphael, @pandora). Valid labels are the active agents' mention
+    (e.g. @me, @raphael, @maou). Valid labels are the active agents' mention
     aliases plus @me; an invalid one is rejected with the list of valid labels.
     """
     from aegis.config import Settings

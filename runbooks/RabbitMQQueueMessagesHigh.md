@@ -1,3 +1,0 @@
-# RabbitMQQueueMessagesHigh
-
-TODO: fill in

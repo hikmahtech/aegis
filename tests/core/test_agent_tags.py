@@ -150,18 +150,17 @@ async def test_seed_fills_empty_capabilities(db_pool, tmp_path):
 
 
 def test_shipped_seeds_carry_behavior_tags():
-    """The four example personalities each hold their canonical behavior tag
-    (pure yaml check — independent of shared-DB state)."""
+    """The three example personalities each hold their canonical behavior tag
+    (pure yaml check — independent of shared-DB state). The retired infra agent
+    stays as an inactive row with no tag."""
     seeds = yaml.safe_load((SEED_DIR / "agents.yaml").read_text())["agents"]
     by_id = {a["id"]: a for a in seeds}
     assert "gtd" in by_id["sebas"]["capabilities"]
     assert "research" in by_id["raphael"]["capabilities"]
     assert "finance" in by_id["maou"]["capabilities"]
-    assert "infra" in by_id["pandoras-actor"]["capabilities"]
-    pandora_meta = by_id["pandoras-actor"]["metadata"]
-    assert pandora_meta["mention_aliases"] == ["pandora"]
-    assert pandora_meta["async_dispatch"] is True
-    for agent_id in ("sebas", "raphael", "maou", "pandoras-actor"):
+    assert by_id["pandoras-actor"]["capabilities"] == []
+    assert by_id["pandoras-actor"]["active"] is False
+    for agent_id in ("sebas", "raphael", "maou"):
         assert by_id[agent_id]["metadata"]["intent_description"]
 
 

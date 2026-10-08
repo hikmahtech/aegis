@@ -33,7 +33,6 @@ import AgentDetail from './pages/AgentDetail';
 import Agents from './pages/Agents';
 import References from './pages/References';
 import Resources from './pages/Resources';
-import Runbooks from './pages/Runbooks';
 import Settings from './pages/Settings';
 import SlackConfig from './pages/SlackConfig';
 import Workflows from './pages/Workflows';
@@ -58,7 +57,6 @@ export default function App() {
           <Route path="/channels" element={<Channels />} />
           <Route path="/slack" element={<SlackConfig />} />
           <Route path="/resources" element={<Resources />} />
-          <Route path="/runbooks" element={<Runbooks />} />
           <Route path="/agents" element={<Agents />} />
           <Route path="/agents/:id" element={<AgentDetail />} />
           <Route path="/market" element={<Market />} />

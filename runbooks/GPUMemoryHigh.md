@@ -1,3 +1,0 @@
-# GPUMemoryHigh
-
-TODO: fill in

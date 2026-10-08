@@ -98,6 +98,15 @@ _TURN_TIMEOUT_TAIL = 3000
 # id per run, and the first site is on every path that reached the second.
 _PATCH_344 = "agent-task-344-verbs-by-kind"
 
+# The `infra` verb is gone: the infra lane moved to the DevOps vertical
+# (a2-devops), and `agent_task_verbs` no longer offers it (`#alert` maps to
+# null). A run recorded before this change may have taken the infra branch, so
+# `_run_infra_by_kind` and `_run_service` stay for its replay; a new run that
+# still reads `infra` (it cannot, the verb table refuses it) parks as
+# unrouted. `plan_infra_task` stays registered as a stub for the same release.
+# Retire the branch, the stub and these methods the #614 way.
+PATCH_DROP_INFRA_VERB = "agent-task-drop-infra-verb"
+
 
 def _cut(text: str, cap: int = _FIELD_CAP) -> str:
     """`text`, cut to `cap` characters with a visible mark when it was cut."""
@@ -539,7 +548,8 @@ class AgentTaskFlow:
                 step = "run_research"
                 return await self._run_research(input, task_id)
 
-            if verb == "infra":
+            if verb == "infra" and not workflow.patched(PATCH_DROP_INFRA_VERB):
+                # Legacy replay only; see PATCH_DROP_INFRA_VERB.
                 step = "run_infra"
                 return await self._run_infra_by_kind(input, task_id)
 
@@ -766,7 +776,7 @@ class AgentTaskFlow:
         return {"task_id": task_id, "verb": verb, "status": "parked"}
 
     async def _run_infra_by_kind(self, input: AgentTaskFlowInput, task_id: str) -> dict:
-        """The #344 infra verb: the plan first, then the check or the report."""
+        """The retired #344 infra verb, kept for replay (PATCH_DROP_INFRA_VERB)."""
         plan = await workflow.execute_activity(
             "plan_infra_task",
             args=[task_id, str(input.task.get("content") or "")],

@@ -85,52 +85,11 @@ async def test_apply_outcome_agent_followup_returns_spawn_payload(
 
 
 @pytest.mark.asyncio
-async def test_apply_outcome_pandora_chat_followup_returns_spawn_payload(
-    db_pool, infra_agent_active
-):
-    """pandora_chat_followup routes through the shared agent_chat_reply
-    spawn but maps to the personality id `pandoras-actor` (not `pandora`,
-    which is just a label prefix). The label on the task stays @pandora
-    — only the spawn payload's target_agent differs.
-    """
-    todoist = _connector()
-    acts = ClarifyActivities(db_pool=db_pool, todoist_connector=todoist)
-    decision = {
-        "classification": "pandora_chat_followup",
-        "confidence": 1.0,
-        "assignee": "@pandora",
-        "contexts": ["@deep"],
-        "reason": "user comment on @pandora non-APP task",
-        "llm_model": "rules",
-    }
-
-    outcome = await acts.apply_outcome(_task(["@pandora", "#manual"]), decision)
-
-    assert outcome["applied"] is True
-    assert outcome["interaction_spawned"] is True
-    payload = outcome["interaction_payload"]
-    assert payload["spawn_kind"] == "agent_chat_reply"
-    assert payload["target_agent"] == "pandoras-actor"
-    assert payload["task_id"] == "task-z"
-    assert payload["thread_id"] == "todoist-task-task-z"
-    assert "Comment from user." in payload["synthetic_input"]
-    assert "Title here" in payload["synthetic_input"]
-    assert outcome["outbox_queued"] == 0
-    assert outcome["commands_sent"] == 1
-    sent = todoist.commands.await_args.args[0]
-    assert [c["type"] for c in sent] == ["item_update"]
-    # The task's label stays @pandora — only the state label is added.
-    assert set(sent[0]["args"]["labels"]) == {"@pandora", "#manual", "@next"}
-
-
-@pytest.mark.asyncio
-async def test_apply_outcome_threads_recent_comments_into_synthetic_input(
-    db_pool, infra_agent_active
-):
+async def test_apply_outcome_threads_recent_comments_into_synthetic_input(db_pool):
     """Pin (2026-05-27): synthetic_input must include the recent comment
     thread on the Todoist task — both user notes AND prior agent
     replies — so the spawned chat reply can see what it already said
-    and avoid repeating itself. Without this, pandora generated
+    and avoid repeating itself. Without this, the agent generated
     near-duplicate replies every clarify tick.
     """
     import datetime as _dt
@@ -139,12 +98,12 @@ async def test_apply_outcome_threads_recent_comments_into_synthetic_input(
     fetched = [
         {
             "posted_at": _dt.datetime(2026, 5, 27, 9, 40, tzinfo=_dt.UTC),
-            "content": "Look into the bcp double-suffix bug @pandora",
+            "content": "Look into the bcp double-suffix bug @maou",
         },
         {
             "posted_at": _dt.datetime(2026, 5, 27, 16, 15, tzinfo=_dt.UTC),
             "content": (
-                "[Agent reply @ 16:15 UTC agent=pandoras-actor]\n"
+                "[Agent reply @ 16:15 UTC agent=maou]\n"
                 "Looked at the code; the fix is in repo_screener/models.py "
                 "— let me try via remote kimi."
             ),
@@ -157,11 +116,11 @@ async def test_apply_outcome_threads_recent_comments_into_synthetic_input(
 
     acts = ClarifyActivities(db_pool=db_pool, todoist_connector=_connector())
     decision = {
-        "classification": "pandora_chat_followup",
+        "classification": "maou_followup",
         "confidence": 1.0,
-        "assignee": "@pandora",
+        "assignee": "@maou",
         "contexts": ["@deep"],
-        "reason": "user comment on @pandora non-APP task",
+        "reason": "user comment on @maou-addressed task",
         "llm_model": "rules",
     }
 
@@ -170,7 +129,7 @@ async def test_apply_outcome_threads_recent_comments_into_synthetic_input(
         return fetched
 
     with patch.object(ClarifyActivities, "_fetch_recent_task_notes", new=fake_fetch):
-        outcome = await acts.apply_outcome(_task(["@pandora", "#manual"]), decision)
+        outcome = await acts.apply_outcome(_task(["@maou", "#manual"]), decision)
 
     synthetic = outcome["interaction_payload"]["synthetic_input"]
     # Header still present
@@ -180,12 +139,12 @@ async def test_apply_outcome_threads_recent_comments_into_synthetic_input(
     assert "Look into the bcp double-suffix bug" in synthetic
     # Prior agent reply visible to the agent (with its prefix preserved
     # so it can identify its own past turns)
-    assert "agent=pandoras-actor" in synthetic
+    assert "agent=maou" in synthetic
     assert "let me try via remote kimi" in synthetic
     # Latest user comment still highlighted at the end
     assert synthetic.rstrip().endswith("Comment from user.")
     # Oldest comes before newest in the transcript
-    assert synthetic.index("Look into the bcp") < synthetic.index("agent=pandoras-actor")
+    assert synthetic.index("Look into the bcp") < synthetic.index("agent=maou")
 
 
 @pytest.mark.asyncio

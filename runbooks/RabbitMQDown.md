@@ -1,3 +1,0 @@
-# RabbitMQDown
-
-TODO: fill in

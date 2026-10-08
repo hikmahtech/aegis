@@ -1,3 +1,0 @@
-# RabbitMQUnackedMessagesHigh
-
-TODO: fill in

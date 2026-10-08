@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
+from datetime import timedelta
 
 import pytest
 from aegis_worker.flows.clarify import ClarifyConfig, ClarifyFlow
+from temporalio import workflow
 from temporalio.client import Client
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
@@ -379,114 +381,156 @@ async def test_clarify_flow_no_spawn_when_applied_true() -> None:
             assert spawn_counter["n"] == 0
 
 
-@pytest.mark.asyncio
-async def test_clarify_flow_spawns_alert_investigation_for_pandora_path() -> None:
-    """APP-<n>: detection path: apply_outcome returns spawn_kind=
-    pandora_investigation; ClarifyFlow fires AlertInvestigationFlow as
-    an abandoned child instead of InteractionFlow.
+def _pandora_stubs(spawned: list):
+    """Activities that walk one task down the retired `pandora_investigation`
+    spawn: the shape a ClarifyFlow tick recorded before the infra lane left."""
+    from temporalio import activity
 
-    The child's `ingest_alert` (its step-0 call to the problem hub) is
-    stubbed to answer investigate=False so AlertInvestigationFlow returns
-    early — we only care that the spawn issued successfully (counter
-    increment).
-    """
-    async with await WorkflowEnvironment.start_time_skipping() as env:
-        client: Client = env.client
-        from aegis_worker.flows.alert_investigation import AlertInvestigationFlow
-        from temporalio import activity
-
-        spawned_alerts: list[dict] = []
-
-        @activity.defn(name="ingest_alert")
-        async def ingest_alert(alert: dict, resolved: bool = False) -> dict:
-            # Short-circuit the child workflow so we don't need to register
-            # every activity: the hub says this is a repeat.
-            spawned_alerts.append(alert)
-            return {"problem_id": "prob-c", "action": "attached", "investigate": False}
-
-        @activity.defn(name="send_system_event")
-        async def send_system_event(msg: str):
-            return None
-
-        @activity.defn(name="find_unclassified_items")
-        async def find_unclassified_items(max_items: int = 20):
-            return [
-                {
-                    "id": "T_APP_JIRA",
-                    "content": "APP-12345: Portfolio valuation off by 0.05",
-                    "source_tag": "#manual",
-                    "labels": ["#manual"],
-                    "description": "Spotted on 2026-05-20",
-                    "latest_user_note": None,
-                    "last_note_at": None,
-                }
-            ]
-
-        @activity.defn(name="classify_one")
-        async def classify_one(task: dict, agent_id: str | None = None):
-            return {
-                "classification": "pandora_investigation",
-                "confidence": 1.0,
-                "assignee": "@pandora",
-                "contexts": ["@deep", "@code"],
-                "reason": "APP- prefix",
-                "llm_model": "rules",
+    @activity.defn(name="find_unclassified_items")
+    async def find_unclassified_items(max_items: int = 20):
+        return [
+            {
+                "id": "T_APP_JIRA",
+                "content": "APP-12345: Portfolio valuation off by 0.05",
                 "source_tag": "#manual",
+                "labels": ["#manual"],
+                "description": "Spotted on 2026-05-20",
+                "latest_user_note": None,
+                "last_note_at": None,
             }
+        ]
 
-        @activity.defn(name="apply_outcome")
-        async def apply_outcome(task: dict, decision: dict, pass_n: int = 1):
-            spawned_alerts.append(task)
-            return {
-                "applied": True,
-                "interaction_spawned": True,
-                "interaction_payload": {
-                    "spawn_kind": "pandora_investigation",
-                    "alert": {
-                        "title": task["content"],
-                        "description": task.get("description") or "",
-                        "source": "todoist-jira",
-                        "service": "acme",
-                        "severity": "normal",
-                        "fingerprint": f"jira-{task['id']}",
-                        "labels": {"alertname": task["content"], "service": "acme"},
-                        "requires_approval": False,
-                        "todoist_task_id": task["id"],
-                        "resource_tag_filter": ["acme"],
-                    },
-                },
-                "commands_sent": 1,
-                "outbox_queued": 0,
-            }
+    @activity.defn(name="classify_one")
+    async def classify_one(task: dict, agent_id: str | None = None):
+        return {
+            "classification": "pandora_investigation",
+            "confidence": 1.0,
+            "assignee": "@pandora",
+            "contexts": ["@deep", "@code"],
+            "reason": "APP- prefix",
+            "llm_model": "rules",
+            "source_tag": "#manual",
+        }
 
-        @activity.defn(name="log_classification")
-        async def log_classification(*a, **kw):
-            return None
+    @activity.defn(name="apply_outcome")
+    async def apply_outcome(task: dict, decision: dict, pass_n: int = 1):
+        spawned.append(task)
+        return {
+            "applied": True,
+            "interaction_spawned": True,
+            "interaction_payload": {
+                "spawn_kind": "pandora_investigation",
+                "alert": {"title": task["content"], "todoist_task_id": task["id"]},
+            },
+            "commands_sent": 1,
+            "outbox_queued": 0,
+        }
 
-        async with Worker(
-            client,
+    @activity.defn(name="log_classification")
+    async def log_classification(*a, **kw):
+        return None
+
+    return [find_unclassified_items, classify_one, apply_outcome, log_classification]
+
+
+def _child_types(history) -> list[str]:
+    return [
+        e.start_child_workflow_execution_initiated_event_attributes.workflow_type.name
+        for e in history.events
+        if e.HasField("start_child_workflow_execution_initiated_event_attributes")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_clarify_flow_no_longer_spawns_an_investigation() -> None:
+    """The infra lane moved to the DevOps vertical. A `pandora_investigation`
+    payload (the activities no longer return one) starts nothing on a new tick:
+    `PATCH_DROP_PANDORA_SPAWN` skips it, and the run replays."""
+    from temporalio.worker import Replayer
+
+    spawned: list = []
+    async with await WorkflowEnvironment.start_time_skipping() as env, Worker(
+        env.client,
+        task_queue="aegis-clarify-pandora-test",
+        workflows=[ClarifyFlow],
+        activities=_pandora_stubs(spawned),
+    ):
+        handle = await env.client.start_workflow(
+            ClarifyFlow.run,
+            ClarifyConfig(agent_id="sebas", max_items=10),
+            id=f"clarify-pandora-spawn-{uuid.uuid4()}",
             task_queue="aegis-clarify-pandora-test",
-            workflows=[ClarifyFlow, AlertInvestigationFlow],
-            activities=[
-                find_unclassified_items,
-                classify_one,
-                apply_outcome,
-                log_classification,
-                ingest_alert,
-                send_system_event,
-            ],
-        ):
-            result = await client.execute_workflow(
-                ClarifyFlow.run,
-                ClarifyConfig(agent_id="sebas", max_items=10),
-                id=f"clarify-pandora-spawn-{uuid.uuid4()}",
-                task_queue="aegis-clarify-pandora-test",
+        )
+        result = await handle.result()
+        history = await handle.fetch_history()
+    assert result == {"found": 1, "applied": 1, "interactions": 0}
+    assert _child_types(history) == []
+    await Replayer(workflows=[ClarifyFlow]).replay_workflow(history)
+
+
+@workflow.defn(name="AlertInvestigationFlow", sandboxed=False)
+class _NoInvestigation:
+    @workflow.run
+    async def run(self, alert: dict) -> dict:
+        return {"status": "stub"}
+
+@workflow.defn(name="ClarifyFlow", sandboxed=False)
+class _ClarifyBeforeTheSpawnWent:
+    """The old tick's commands for one `pandora_investigation` task."""
+
+    @workflow.run
+    async def run(self, config: ClarifyConfig) -> dict:
+        short = timedelta(seconds=30)
+        tasks = await workflow.execute_activity(
+            "find_unclassified_items", args=[config.max_items], start_to_close_timeout=short
+        )
+        for task in tasks:
+            decision = await workflow.execute_activity(
+                "classify_one", args=[task, config.agent_id], start_to_close_timeout=short
             )
-            assert result["found"] == 1
-            assert result["applied"] == 1
-            # The pandora spawn issued — counter increments.
-            assert result["interactions"] == 1
-            assert spawned_alerts[0]["id"] == "T_APP_JIRA"
+            outcome = await workflow.execute_activity(
+                "apply_outcome", args=[task, decision, 1], start_to_close_timeout=short
+            )
+            await workflow.execute_activity(
+                "log_classification",
+                args=[task["id"], decision, True, 1, None, True],
+                start_to_close_timeout=short,
+            )
+            safe_task_id = str(task["id"]).replace("/", "_")
+            await workflow.start_child_workflow(
+                "AlertInvestigationFlow",
+                outcome["interaction_payload"]["alert"],
+                id=f"investigation-{safe_task_id}-{workflow.info().workflow_id}",
+                parent_close_policy=workflow.ParentClosePolicy.ABANDON,
+            )
+        return {}
+
+
+@pytest.mark.asyncio
+async def test_a_tick_that_spawned_an_investigation_replays_after_it_went() -> None:
+    """A ClarifyFlow tick recorded before `PATCH_DROP_PANDORA_SPAWN` started an
+    `AlertInvestigationFlow` child. That history must still replay on the new
+    flow. Falsifiable: drop the legacy `elif spawn_kind == "pandora_investigation"`
+    branch and the replay fails with a nondeterminism error."""
+    from temporalio.worker import Replayer
+
+    spawned: list = []
+    async with await WorkflowEnvironment.start_time_skipping() as env, Worker(
+        env.client,
+        task_queue="aegis-clarify-legacy-test",
+        workflows=[_ClarifyBeforeTheSpawnWent, _NoInvestigation],
+        activities=_pandora_stubs(spawned),
+    ):
+        handle = await env.client.start_workflow(
+            "ClarifyFlow",
+            ClarifyConfig(agent_id="sebas", max_items=10),
+            id=f"clarify-legacy-{uuid.uuid4()}",
+            task_queue="aegis-clarify-legacy-test",
+        )
+        await handle.result()
+        history = await handle.fetch_history()
+    assert _child_types(history) == ["AlertInvestigationFlow"]  # the premise
+    await Replayer(workflows=[ClarifyFlow]).replay_workflow(history)
 
 
 @pytest.mark.asyncio

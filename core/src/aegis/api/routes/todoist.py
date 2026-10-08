@@ -79,7 +79,7 @@ settings_row_routes(
     },
     doc=(
         "Content-routing rules: regex/prefix/contains on the task title → assignee / contexts "
-        "/ gate. Complements gtd-rules, which routes by source_tag. The PUT replaces the "
+        "/ area label. Complements gtd-rules, which routes by source_tag. The PUT replaces the "
         "ordered list; 400 on a malformed rule or regex."
     ),
 )

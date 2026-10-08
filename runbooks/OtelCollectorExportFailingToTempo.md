@@ -1,3 +1,0 @@
-# OtelCollectorExportFailingToTempo
-
-TODO: fill in

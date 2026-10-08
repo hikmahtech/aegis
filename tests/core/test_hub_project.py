@@ -20,20 +20,19 @@ from aegis.services.hub import (
     ingest_event,
     list_events,
     merge_problems,
-    mute_problem,
-    set_service_state,
     set_status,
 )
 from aegis.services.hub_group import upgrade
 from aegis.services.hub_project import (
     COLLAPSE_WINDOW,
     FOOTER,
-    MONEY_SOURCE_TAG,
     merge_block,
     project,
     project_pending,
     render_block,
 )
+
+from tests.hub_helpers import mute_problem
 
 pytestmark = pytest.mark.asyncio
 
@@ -46,7 +45,7 @@ def _subject() -> str:
 
 def _occ(subject: str, n: int, **kw) -> Event:
     return Event(
-        source="heartbeat",
+        source="flow_health",
         external_id=f"{subject}@{n}",
         kind="occurrence",
         title=f"Service {subject} down",
@@ -60,7 +59,7 @@ def _occ(subject: str, n: int, **kw) -> Event:
 
 def _resolved(subject: str, n: int) -> Event:
     return Event(
-        source="heartbeat",
+        source="flow_health",
         external_id=f"{subject}@{n}@resolved",
         kind="resolved",
         title="recovered",
@@ -121,22 +120,13 @@ async def inbox(db_pool):
         "INSERT INTO todoist_projects (id, name, is_managed, raw) "
         "VALUES ('P_INBOX','Inbox',true,'{}'::jsonb) ON CONFLICT (id) DO NOTHING"
     )
-    # This file is about what a task looks like, not about whether a blip has
-    # earned one, and every problem here is minted seconds before it is
-    # projected. So the settle window is off (#537); the four tests at the
-    # bottom of the file turn it back on and own that behaviour.
-    await db_pool.execute(
-        "INSERT INTO settings (key, value) VALUES ('hub_settle_seconds', $1) "
-        "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-        {"*": 0},
-    )
 
 
 def _cmds(todoist, kind: str) -> list[dict]:
     return [c for batch in todoist["batches"] for c in batch if c["type"] == kind]
 
 
-async def _mirror_task(db_pool, task_id: str, *, assignee: str = "@pandora", completed=False):
+async def _mirror_task(db_pool, task_id: str, *, assignee: str = "@sebas", completed=False):
     """The sync mirror row TodoistSyncFlow would have written."""
     await db_pool.execute(
         "INSERT INTO todoist_tasks (id, project_id, content, labels, assignee_label, source_tag, "
@@ -166,17 +156,16 @@ def test_render_and_merge_block_replace_whole_and_keep_user_text():
     }
     block = render_block(
         p,
-        window={"state": "deploying", "until_at": NOW + timedelta(minutes=20), "set_by": "ansible"},
         links=[{"link_kind": "todoist_task", "ref": "T1"}, {"link_kind": "github_pr", "ref": "o/r#5"}],
     )
     assert block.startswith("<!-- aegis:problem abc -->")
     assert "seen 3× since 2026-09-07 12:00 UTC · last 2026-09-07 13:00 UTC" in block
-    assert "Window: deploying until 2026-09-07 12:20 UTC (set by ansible)" in block
+    assert "Window:" not in block  # the deploy windows left with the infra lane
     assert "Links: github_pr:o/r#5" in block and "todoist_task" not in block
     merged = merge_block("user notes\n\nmore", block)
     assert merged.startswith("user notes\n\nmore\n\n<!-- aegis:problem")
-    again = merge_block(merged + "\ntrailing", block.replace("open", "fixing"))
-    assert again.count("<!-- aegis:problem") == 1 and "Status: fixing" in again
+    again = merge_block(merged + "\ntrailing", block.replace("open", "waiting_human"))
+    assert again.count("<!-- aegis:problem") == 1 and "Status: waiting_human" in again
     assert again.startswith("user notes") and again.endswith("trailing")
     assert merge_block(None, block) == block
 
@@ -193,9 +182,8 @@ async def test_first_projection_creates_the_task_with_block_and_label(db_pool, i
     assert len(adds) == 1
     args = adds[0]["args"]
     assert args["content"] == f"Service {s} down"
-    # A heartbeat problem keeps the infra owner, whose agent is retired since
-    # migration 054: no assignee label, never a crash.
-    assert args["labels"] == ["#alert"]
+    # A watchdog's problem belongs to the generalist (the `gtd` holder).
+    assert args["labels"] == ["#alert", "@sebas"]
     assert "Heartbeat saw" in args["description"] and "<!-- aegis:problem" in args["description"]
     p = await get_problem(db_pool, r.problem_id)
     assert p["todoist_task_id"] == out["task_id"]
@@ -214,7 +202,7 @@ async def test_first_projection_creates_the_task_with_block_and_label(db_pool, i
 async def test_a_source_with_no_owner_falls_to_the_generalist(db_pool, inbox, todoist):
     """v1 removal prep: a source missing from `_OWNER_BY_SOURCE` (the delivery
     watchdog here) belongs to the generalist, the `gtd` holder, not the infra
-    agent, so its task keeps an assignee once Pandora is gone.
+    agent, so its task keeps an assignee now the infra lane is gone.
 
     Falsifiable: put the infra owner back as the fallback and the label is gone.
     """
@@ -223,7 +211,9 @@ async def test_a_source_with_no_owner_falls_to_the_generalist(db_pool, inbox, to
 
     assert hub_project._DEFAULT_OWNER.agent_tag == GENERALIST_TAG
     assert "delivery" not in hub_project._OWNER_BY_SOURCE
-    assert hub_project._OWNER_BY_SOURCE["heartbeat"] is hub_project._INFRA_OWNER
+    # The infra sources and their owner left with the infra lane (a2-devops).
+    assert "heartbeat" not in hub_project._OWNER_BY_SOURCE
+    assert not hasattr(hub_project, "_INFRA_OWNER")
 
     ev = Event(
         source="delivery",
@@ -276,13 +266,13 @@ async def books_projects(db_pool):
 async def test_a_money_problem_is_maous_task_in_the_personal_books_project(
     db_pool, inbox, todoist, books_projects
 ):
-    """All 13 money problems in prod (2026-09-11) were projected as
-    `#alert @pandora` in the Inbox, and the agent sweep then ran Pandora's
-    infra verb on them. A problem first raised by the money lane belongs to
-    the finance agent; an infra source keeps the infra owner and the Inbox.
+    """All 13 money problems in prod (2026-09-11) were projected as `#alert`
+    tasks in the Inbox, and the agent sweep then ran the infra verb on them. A
+    problem first raised by the money lane belongs to the finance agent; any
+    other source goes to the generalist and the Inbox.
 
-    Falsifiable: route every problem to the infra owner and the money task is
-    `#alert @pandora` in the Inbox again.
+    Falsifiable: route every problem to the default owner and the money task
+    is `#alert @sebas` in the Inbox again.
     """
     inst = f"zz-acct-{uuid.uuid4().hex[:8]}"
     r = await ingest_event(db_pool, _money(inst), now=NOW)
@@ -305,8 +295,7 @@ async def test_a_money_problem_is_maous_task_in_the_personal_books_project(
     alert = await ingest_event(db_pool, _occ(s, 1), now=NOW)
     await project(db_pool, alert.problem_id, now=NOW)
     alert_args = _cmds(todoist, "item_add")[1]["args"]
-    # The infra owner, retired since migration 054, so no assignee label.
-    assert alert_args["labels"] == ["#alert"]
+    assert alert_args["labels"] == ["#alert", "@sebas"]
     assert alert_args["project_id"] == "P_INBOX"
 
 
@@ -372,11 +361,9 @@ async def test_a_money_task_in_the_outbox_is_found_under_its_own_tag(db_pool, in
     assert (await get_problem(db_pool, r.problem_id))["todoist_task_id"] == "T_MONEY_REAL"
 
 
-@pytest.mark.parametrize("status", ["suppressed", "closed"])
+@pytest.mark.parametrize("status", ["closed"])
 async def test_unprojected_statuses_get_no_task(db_pool, inbox, todoist, status):
     s = _subject()
-    if status == "suppressed":
-        await set_service_state(db_pool, s, "deploying", minutes=30, set_by="ansible", now=NOW)
     r = await ingest_event(db_pool, _occ(s, 1), now=NOW)
     if status == "closed":
         await db_pool.execute(
@@ -479,19 +466,6 @@ async def test_reopen_comments_and_uncompletes_the_task(db_pool, inbox, todoist)
     assert cmd["type"] == "item_uncomplete"
 
 
-async def test_promotion_after_a_deploy_window_is_explained(db_pool, inbox, todoist):
-    s = _subject()
-    await set_service_state(db_pool, s, "deploying", minutes=10, set_by="ansible", now=NOW)
-    r = await ingest_event(db_pool, _occ(s, 1), now=NOW)
-    assert (await project(db_pool, r.problem_id, now=NOW))["skipped"] == "suppressed"
-    later = NOW + timedelta(minutes=30)
-    await ingest_event(db_pool, _occ(s, 2, occurred_at=later), now=later)
-    out = await project(db_pool, r.problem_id, now=later)
-    # promoted → first projection creates the task; history before it is in the block, not comments
-    assert out["created"] is True
-    assert _cmds(todoist, "note_add") == []
-
-
 async def test_history_events_comment_unless_already_posted(db_pool, inbox, todoist):
     s = _subject()
     r = await ingest_event(db_pool, _occ(s, 1), now=NOW)
@@ -499,7 +473,7 @@ async def test_history_events_comment_unless_already_posted(db_pool, inbox, todo
     await _mirror_task(db_pool, task)
     await ingest_event(
         db_pool,
-        Event(source="investigation", external_id=f"inv-{s}", kind="investigation", title="x",
+        Event(source="session", external_id=f"inv-{s}", kind="investigation", title="x",
               payload={"text": "Root cause: disk full", "posted": True}, problem_id=r.problem_id),
         now=NOW,
     )
@@ -1087,9 +1061,9 @@ async def test_a_task_the_hub_closed_is_never_taken_for_a_person(db_pool, inbox,
     Falsifiable: drop the pending-reopen clause from the predicate and both
     problems are resolved.
     """
-    muted, windowed = _subject(), _subject()
+    muted = _subject()
     ids, tasks = {}, {}
-    for s in (muted, windowed):
+    for s in (muted,):
         r = await ingest_event(db_pool, _occ(s, 1), now=NOW)
         task = (await project(db_pool, r.problem_id, now=NOW))["task_id"]
         await _mirror_task(db_pool, task)
@@ -1103,9 +1077,6 @@ async def test_a_task_the_hub_closed_is_never_taken_for_a_person(db_pool, inbox,
     await ingest_event(db_pool, _occ(muted, 3, occurred_at=back), now=back)
     assert (await project(db_pool, ids[muted], now=back))["skipped"] == "muted"
 
-    await set_service_state(db_pool, windowed, "deploying", minutes=30, set_by="ansible", now=back)
-    await ingest_event(db_pool, _occ(windowed, 3, occurred_at=back), now=back)
-    assert (await get_problem(db_pool, ids[windowed]))["status"] == "suppressed"
 
     touched = {
         r["problem_id"]
@@ -1113,13 +1084,11 @@ async def test_a_task_the_hub_closed_is_never_taken_for_a_person(db_pool, inbox,
             db_pool, now=back + timedelta(minutes=5)
         )
     }
-    assert ids[muted] not in touched and ids[windowed] not in touched
+    assert ids[muted] not in touched
     assert (await get_problem(db_pool, ids[muted]))["status"] == "open"
-    assert (await get_problem(db_pool, ids[windowed]))["status"] == "suppressed"
-    # Nor are the tasks reopened behind the mute's or the window's back: the
-    # projector does that when it may.
+    # Nor is the task reopened behind the mute's back: the projector does that
+    # when it may.
     assert await _is_completed(db_pool, tasks[muted])
-    assert await _is_completed(db_pool, tasks[windowed])
 
 
 async def test_the_hubs_own_close_from_before_a_return_is_undone_not_resolved(
@@ -1438,18 +1407,15 @@ async def test_a_task_created_through_the_outbox_is_found_once_the_drain_commits
 
 
 async def test_a_problem_that_resolved_before_it_had_a_task_never_gets_one(db_pool, inbox, todoist):
-    """A service that failed inside its deploy window and recovered before the
-    window ended is `suppressed`, then `resolved`, and never had a task. The
-    sweep used to create one anyway — for a problem that was already over —
+    """A problem that recovered before it was ever projected never had a task.
+    The sweep used to create one anyway — for a problem that was already over —
     and move the watermark past the resolve, so that task never closed.
 
     Falsifiable: drop the resolved-without-task branch and the sweep creates
     the task.
     """
     s = _subject()
-    await set_service_state(db_pool, s, "deploying", minutes=15, set_by="ansible", now=NOW)
     r = await ingest_event(db_pool, _occ(s, 1), now=NOW)
-    assert (await get_problem(db_pool, r.problem_id))["status"] == "suppressed"
     await ingest_event(db_pool, _resolved(s, 5), now=NOW + timedelta(minutes=5))
     assert (await get_problem(db_pool, r.problem_id))["status"] == "resolved"
 
@@ -1466,163 +1432,6 @@ async def test_a_problem_that_resolved_before_it_had_a_task_never_gets_one(db_po
     again = await ingest_event(db_pool, _occ(s, 6, occurred_at=back), now=back)
     assert again.action == "reopened"
     assert (await project(db_pool, r.problem_id, now=back))["created"] is True
-
-
-# --- the settle window (#537) -------------------------------------------------
-# These four turn the window back on; the `inbox` fixture switches it off for
-# every other test in this file.
-
-
-async def _settle(db_pool, value: dict) -> None:
-    await db_pool.execute(
-        "INSERT INTO settings (key, value) VALUES ('hub_settle_seconds', $1) "
-        "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-        value,
-    )
-
-
-async def test_a_blip_earns_no_task_until_it_outlives_its_window(db_pool, inbox, todoist):
-    """A crash-loop that heals in five minutes used to earn a task, get
-    clarified and auto-complete — a quarter of the hub's first month of tasks
-    were that. An alert now waits out its class's verification window before it
-    is believed, and the sweep is what comes back for it.
-
-    Falsifiable: drop the settling branch in `project` and the first call
-    creates the task.
-    """
-    await _settle(db_pool, {})  # code defaults: 300s for DockerServiceDown
-    s = _subject()
-    r = await ingest_event(db_pool, _occ(s, 0, occurred_at=NOW), now=NOW)
-
-    early = await project(db_pool, r.problem_id, now=NOW + timedelta(minutes=2))
-    assert early["skipped"] == "settling"
-    assert early["settle_seconds"] == 300
-    assert (await get_problem(db_pool, r.problem_id))["todoist_task_id"] is None
-    assert not _cmds(todoist, "item_add")
-    # The sweep still holds it: an open untasked problem is a candidate
-    # outright, whatever its watermark.
-    waiting = await project_pending(db_pool, now=NOW + timedelta(minutes=2))
-    assert r.problem_id in {x["problem_id"] for x in waiting}
-
-    assert (await project(db_pool, r.problem_id, now=NOW + timedelta(minutes=6)))["created"] is True
-    # The occurrence it sat on is what describes the task.
-    assert f"Heartbeat saw {s}" in _cmds(todoist, "item_add")[0]["args"]["description"]
-
-
-async def test_a_blip_that_heals_inside_its_window_never_earns_a_task(db_pool, inbox, todoist):
-    """The whole point: no task is ever created, not even one born closed."""
-    await _settle(db_pool, {})
-    s = _subject()
-    r = await ingest_event(db_pool, _occ(s, 0, occurred_at=NOW), now=NOW)
-    early = await project(db_pool, r.problem_id, now=NOW + timedelta(minutes=1))
-    assert early["skipped"] == "settling"
-    await ingest_event(db_pool, _resolved(s, 4), now=NOW + timedelta(minutes=4))
-
-    after = NOW + timedelta(minutes=30)
-    assert (await project(db_pool, r.problem_id, now=after))["skipped"] == "resolved_without_task"
-    assert not _cmds(todoist, "item_add")
-    assert r.problem_id not in {x["problem_id"] for x in await project_pending(db_pool, now=after)}
-
-
-async def test_a_recurrence_is_not_held_back(db_pool, inbox, todoist):
-    """A blip that comes back is not a blip. `reopen` leaves `first_seen_at`
-    alone, so the second episode is already past the window and projects at
-    once — deliberately: one 20-second outage is noise, the same one again is
-    a pattern, and the first episode's silence is what makes the second worth
-    saying. It is also the rule the resolved-without-task branch has always
-    stated ("a later occurrence reopens the problem, and THAT projects").
-    """
-    await _settle(db_pool, {})
-    s = _subject()
-    r = await ingest_event(db_pool, _occ(s, 0, occurred_at=NOW), now=NOW)
-    early = await project(db_pool, r.problem_id, now=NOW + timedelta(minutes=1))
-    assert early["skipped"] == "settling"
-    await ingest_event(db_pool, _resolved(s, 2), now=NOW + timedelta(minutes=2))
-    gone = await project(db_pool, r.problem_id, now=NOW + timedelta(minutes=3))
-    assert gone["skipped"] == "resolved_without_task"
-
-    back = NOW + timedelta(hours=2)
-    again = await ingest_event(db_pool, _occ(s, 10, occurred_at=back), now=back)
-    assert again.action == "reopened"
-    assert (await project(db_pool, r.problem_id, now=back))["created"] is True
-
-
-async def test_a_watchdog_finding_does_not_wait(db_pool, inbox, todoist):
-    """`flow_health` resolves its own findings, and was in the settle set for
-    that reason — which was wrong. Its sweep runs every 30 minutes, so a
-    three-minute window cannot observe a blip it would clear; the window could
-    only delay the task. The producers that wait are the two outside AEGIS that
-    re-check on a scale of seconds.
-
-    Falsifiable: put `flow_health` back in `_SELF_CLEARING_SOURCES` and this
-    task arrives three minutes late.
-    """
-    await _settle(db_pool, {})
-    s = _subject()
-    r = await ingest_event(
-        db_pool,
-        Event(
-            source="flow_health",
-            external_id=f"{s}@stale",
-            kind="occurrence",
-            title=f"{s} has not succeeded in 3 hours",
-            klass="flow_stale",
-            subject=s,
-            subject_kind="flow",
-            severity="warning",
-            payload={"description": "The watchdog found no successful run."},
-            occurred_at=NOW,
-        ),
-        now=NOW,
-    )
-
-    assert (await project(db_pool, r.problem_id, now=NOW + timedelta(seconds=1)))["created"] is True
-
-
-async def test_only_a_signal_that_can_clear_itself_waits(db_pool, inbox, todoist):
-    """A money finding is a judgement, not an alert: nothing will send its
-    resolution, and no amount of waiting makes it truer. So the window is
-    scoped to the producers that clear themselves, and a finding still projects
-    on sight.
-
-    Falsifiable: widen `_SELF_CLEARING_SOURCES` to every source and this task
-    is three minutes late.
-    """
-    await _settle(db_pool, {})
-    s = _subject()
-    r = await ingest_event(
-        db_pool,
-        Event(
-            source="money",
-            external_id=f"{s}@stmt",
-            kind="occurrence",
-            title=f"12 rows on {s} match nothing in the books",
-            klass="statement_unmatched",
-            subject=s,
-            subject_kind="account",
-            severity="warning",
-            payload={"description": "Reconciliation found rows with no journal entry."},
-            occurred_at=NOW,
-        ),
-        now=NOW,
-    )
-
-    assert (await project(db_pool, r.problem_id, now=NOW + timedelta(seconds=1)))["created"] is True
-    assert _cmds(todoist, "item_add")[0]["args"]["labels"][0] == MONEY_SOURCE_TAG
-
-
-async def test_the_settle_window_is_db_configurable(db_pool, inbox, todoist):
-    """How long a class takes to prove itself belongs to the operator's homelab,
-    so it is a settings row over generic defaults — and a malformed value must
-    never stop a problem being handled."""
-    await _settle(db_pool, {"dockerservicedown": 0})
-    quick = await ingest_event(db_pool, _occ(_subject(), 0, occurred_at=NOW), now=NOW)
-    out = await project(db_pool, quick.problem_id, now=NOW + timedelta(seconds=1))
-    assert out["created"] is True
-
-    await _settle(db_pool, {"dockerservicedown": "soon"})
-    bad = await ingest_event(db_pool, _occ(_subject(), 0, occurred_at=NOW), now=NOW)
-    assert (await project(db_pool, bad.problem_id, now=NOW))["settle_seconds"] == 300
 
 
 @pytest.mark.asyncio

@@ -23,15 +23,14 @@ async def get_brief(request: Request) -> dict[str, Any]:
         "SELECT count(*) FROM interactions WHERE status = 'pending'"
     )
     # Both numbers come from the problem hub, which is the thing that knows.
-    # This used to count `AlertInvestigationFlow` runs and call them alerts —
-    # but the hub starts a flow only for a NEW or returning problem, so an
-    # alert that deduped onto an open problem, or that a deploy window
-    # suppressed, started no flow and went uncounted. The tile read zero while
+    # This used to count investigation runs and call them alerts, but an
+    # alert that deduped onto an open problem started no run and went
+    # uncounted. The tile read zero while
     # a service was flapping.
     open_problems = (
         await pool.fetchval(
             "SELECT count(*) FROM problems WHERE closed_at IS NULL "
-            "AND status NOT IN ('resolved', 'suppressed') "
+            "AND status <> 'resolved' "
             "AND (muted_until IS NULL OR muted_until <= now())"
         )
         or 0

@@ -580,3 +580,61 @@ async def test_migration_054_strips_removed_tools_and_is_idempotent(db_pool):
     assert tools == ["search_knowledge", "capture_to_inbox"]
     assert row["agent_id"] == "sebas"
     assert row["config"]["max_coding"] == 0
+
+
+@pytest.mark.asyncio
+async def test_migration_056_clears_the_infra_lane_rows_and_is_idempotent(db_pool):
+    """056 deletes the infra lane's settings rows and seeded runbook, drops the
+    content routes and verb overrides that pointed at it, and strips the sweep's
+    alertmanager keys. Everything else in those rows stays."""
+    sql = (REPO_ROOT / "migrations" / "056_v1_removal_infra.sql").read_text()
+    await run_migrations(db_pool)
+    await load_seeds(db_pool, SEED_DIR)
+    keys = ["alert_remediation", "infra_alert_routing", "hub_settle_seconds", "infra_heartbeat_state"]
+    async with db_pool.acquire() as conn:
+        for key in keys:
+            await conn.execute(
+                "INSERT INTO settings (key, value) VALUES ($1, '{}'::jsonb) "
+                "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                key,
+            )
+        await conn.execute(
+            "INSERT INTO resources (kind, slug, title) "
+            "VALUES ('runbook', 'homelab-service-restart', 'restart') ON CONFLICT (slug) DO NOTHING"
+        )
+        await conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('content_routes', $1) "
+            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            [
+                {"key": "jira-app", "match": "prefix", "value": "APP-", "assignee": "@pandora"},
+                {"key": "bug", "match": "contains", "value": "[bug]", "assignee": "@raphael"},
+                {"key": "infra", "match": "contains", "value": "down", "gate": True},
+            ],
+        )
+        await conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('agent_task_verbs', $1) "
+            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            {"#alert": "infra", "#calendar": None, "#chat": "research"},
+        )
+        await conn.execute(
+            "UPDATE activities SET config = $1 WHERE slug = 'hub-sweep-5m'",
+            {"alertmanager_url": "http://am:9093", "alertmanager_min_uptime_seconds": 900,
+             "group_min_members": 4},
+        )
+        await conn.execute(sql)
+        await conn.execute(sql)  # a re-run is a no-op
+        left = await conn.fetch("SELECT key FROM settings WHERE key = ANY($1::text[])", keys)
+        runbook = await conn.fetchval(
+            "SELECT 1 FROM resources WHERE slug = 'homelab-service-restart'"
+        )
+        routes = await conn.fetchval("SELECT value FROM settings WHERE key = 'content_routes'")
+        verbs = await conn.fetchval("SELECT value FROM settings WHERE key = 'agent_task_verbs'")
+        sweep = await conn.fetchval("SELECT config FROM activities WHERE slug = 'hub-sweep-5m'")
+        await conn.execute("DELETE FROM settings WHERE key IN ('content_routes', 'agent_task_verbs')")
+        await conn.execute("UPDATE activities SET config = '{}'::jsonb WHERE slug = 'hub-sweep-5m'")
+    assert left == []
+    assert runbook is None
+    # A route with no assignee was the old `@pandora` default too.
+    assert [r["key"] for r in routes] == ["bug"]
+    assert verbs == {"#calendar": None, "#chat": "research"}
+    assert sweep == {"group_min_members": 4}

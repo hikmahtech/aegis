@@ -35,7 +35,7 @@ export default function AgentTaskVerbsPanel() {
       <p className="page-subtitle">
         What an agent does with a task assigned to it, by the task's source tag.{' '}
         <strong>ask</strong> hands it to the agent's own chat; <strong>research</strong> runs a
-        cited research pass; <strong>infra</strong>, <strong>email</strong> and{' '}
+        cited research pass; <strong>email</strong> and{' '}
         <strong>finance</strong> run those lanes. <strong>Left to you</strong> parks the task with
         a note. <code>{cfg?.untagged ?? 'untagged'}</code> is a hand-written task with no tag and
         no <code>@code</code>. Only the tags you change are stored.

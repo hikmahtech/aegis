@@ -24,7 +24,6 @@ labels:
     - name: "@sebas"
     - name: "@raphael"
     - name: "@maou"
-    - name: "@pandora"
   gtd_state:
     - name: "@next"
     - name: "@someday"
@@ -40,11 +39,7 @@ labels:
     - name: "@home"
     - name: "@office"
     - name: "@reading"
-  # Areas are now real Todoist projects (Work/Personal/Admin/...),
-  # not labels. Only @area/acme remains — the pandora investigation flow still
-  # tags Jira-linked tasks with it.
-  areas:
-    - name: "@area/acme"
+  # Areas are real Todoist projects (Work/Personal/Admin/...), not labels.
 
 # Pre-seeded Todoist filters (visible in the user's filter sidebar).
 # Queries use Todoist's filter syntax. Label refs in filter queries need
@@ -71,7 +66,5 @@ filters:
     query: "@@raphael"
   - name: "🤖 Maou"
     query: "@@maou"
-  - name: "🤖 Pandora"
-    query: "@@pandora"
   - name: "⏳ Waiting on me to chase"
     query: "@@waiting & today"

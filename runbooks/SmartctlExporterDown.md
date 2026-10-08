@@ -1,3 +1,0 @@
-# SmartctlExporterDown
-
-TODO: fill in

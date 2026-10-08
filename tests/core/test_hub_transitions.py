@@ -29,14 +29,13 @@ def _p(status: str, resolved_ago: timedelta | None = None) -> dict:
         (_p("open"), "occurrence", "attach", None),
         (_p("investigating"), "occurrence", "attach", None),
         (_p("waiting_human"), "occurrence", "attach", None),
-        (_p("fixing"), "occurrence", "attach", None),
         (_p("resolved", timedelta(hours=1)), "occurrence", "reopen", "open"),
         (_p("resolved", timedelta(hours=24)), "occurrence", "reopen", "open"),
         (_p("resolved", timedelta(hours=25)), "occurrence", "rollover", "open"),
         # resolved
         (None, "resolved", "ignore", None),
         (_p("open"), "resolved", "resolve", "resolved"),
-        (_p("fixing"), "resolved", "resolve", "resolved"),
+        (_p("waiting_human"), "resolved", "resolve", "resolved"),
         (_p("resolved", timedelta(hours=1)), "resolved", "note", None),
         (_p("closed"), "resolved", "note", None),
         # history kinds never create
@@ -50,28 +49,6 @@ def _p(status: str, resolved_ago: timedelta | None = None) -> dict:
 def test_decide(current, kind, action, status):
     d = decide(current, kind, now=NOW)
     assert (d.action, d.status) == (action, status)
-
-
-@pytest.mark.parametrize(
-    ("current", "suppressed", "action", "status"),
-    [
-        # inside a deploy/maintenance window
-        (None, True, "create", "suppressed"),
-        (_p("open"), True, "attach", None),
-        (_p("suppressed"), True, "attach", None),
-        (_p("resolved", timedelta(hours=1)), True, "reopen", "suppressed"),
-        (_p("resolved", timedelta(hours=48)), True, "rollover", "suppressed"),
-        # window over: a suppressed problem that recurs is real
-        (_p("suppressed"), False, "promote", "open"),
-    ],
-)
-def test_decide_with_suppression(current, suppressed, action, status):
-    d = decide(current, "occurrence", now=NOW, suppressed=suppressed)
-    assert (d.action, d.status) == (action, status)
-
-
-def test_resolved_on_a_suppressed_problem_resolves_it():
-    assert decide(_p("suppressed"), "resolved", now=NOW) == decide(_p("open"), "resolved", now=NOW)
 
 
 def test_reopen_window_is_a_parameter():
@@ -148,3 +125,11 @@ def test_a_source_outside_the_vocabulary_is_still_refused():
                 title="t",
             )
         )
+
+
+@pytest.mark.parametrize("source", ["alertmanager", "heartbeat", "drift", "investigation"])
+def test_the_infra_sources_left_the_vocabulary(source):
+    """The infra lane moved to the DevOps vertical (a2-devops); nothing in v1
+    produces these any more, so the hub refuses them like any unknown source."""
+    with pytest.raises(ValueError, match="unknown source"):
+        validate_event(_ev(source=source))

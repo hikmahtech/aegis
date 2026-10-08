@@ -1,3 +1,0 @@
-# SmartHighReallocatedSectors
-
-TODO: fill in

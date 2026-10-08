@@ -27,7 +27,7 @@ from aegis.connectors.todoist import TodoistConnector
 from aegis.errors import error_text
 from aegis.observability import log_audit
 from aegis.services import social_channels
-from aegis.services.hub_watch import mute_hint, reconcile_findings
+from aegis.services.hub_watch import reconcile_findings
 from aegis.services.settings_store import get_setting
 from temporalio import activity
 
@@ -1058,7 +1058,7 @@ class SocialActivities:
             findings=hub_findings,
         )
         fresh = outcome["fresh"]
-        result["deduped"] = outcome["attached"] + outcome["suppressed"]
+        result["deduped"] = outcome["attached"]
         result["muted"] = outcome["muted"]
 
         if fresh:
@@ -1068,8 +1068,7 @@ class SocialActivities:
                 + "\n\nCheck Postiz first: a stalled orchestrator shows 0 pollers on "
                 "`temporal task-queue describe --task-queue main`. "
                 "`docker service update --force postiz_postiz` revives it — reschedule "
-                "overdue posts BEFORE reviving or they all publish at once.\n"
-                + mute_hint([f["problem_id"] for f in fresh])
+                "overdue posts BEFORE reviving or they all publish at once."
             )
             await safe_send_message(
                 self.delivery,

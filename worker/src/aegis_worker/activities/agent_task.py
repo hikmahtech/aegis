@@ -11,13 +11,11 @@ from __future__ import annotations
 
 import asyncio
 import re
-import time
 from dataclasses import dataclass, field
 from typing import Any
 
-import httpx
 from aegis.errors import error_text, logged_failure
-from aegis.services import hub, work_sessions
+from aegis.services import work_sessions
 from aegis.services.agent_task_verbs import (
     DEFAULT_VERBS,
     UNTAGGED,
@@ -29,11 +27,11 @@ from aegis.services.project_repo_map import get_project_repo_map, lookup
 from aegis.services.settings_store import get_setting
 from temporalio import activity
 
-from aegis_worker.activities.alerts import infra_remediation_enabled
+from aegis_worker.activities.repo_resolve import resolve_repo_by_text
 
 # Assignee labels this flow will act on. @me is deliberately absent: a task the
 # user has claimed is theirs to handle.
-ADDRESSABLE_ASSIGNEES = ["@sebas", "@raphael", "@maou", "@pandora"]
+ADDRESSABLE_ASSIGNEES = ["@sebas", "@raphael", "@maou"]
 
 # Reaching either of these removes a task from the eligible pool. Without that,
 # the cooldown becomes an infinite slow loop over the same tasks.
@@ -63,9 +61,7 @@ _TURN_TOKEN_GRACE_SECONDS = 3600
 # its ONLY user-visible explanation, and a transient Todoist http_503 silently
 # lost both comments on this flow's first production tick (issue #159).
 # ponytail: 3 attempts / 2s; worst case 4s of sleep inside comment's 60s
-# TIMEOUT_STANDARD budget. `apply_restart_approval` calls comment() directly
-# inside InteractionFlow's hard 30s post_resolve deadline, so this must stay
-# small — see the budget note there before raising it.
+# TIMEOUT_STANDARD budget.
 _COMMENT_ATTEMPTS = 3
 _COMMENT_RETRY_SECONDS = 2
 
@@ -94,19 +90,6 @@ async def load_verbs(pool: Any) -> dict[str, str | None]:
     return merge_verbs(value)
 
 
-# Swarm service names as they appear in real prod alert titles, and in the
-# heartbeat's own (flows/infra_heartbeat.py). A task the hub projected never
-# needs these — its problem names the subject — but one that predates the hub
-# has only its title.
-_SERVICE_PATTERNS = (
-    re.compile(r"^PROLONGED:\s+(\S+)\s+(?:degraded|still\s+down)", re.I),
-    re.compile(r"^Service\s+(\S+)\s+has\s+fewer\s+tasks", re.I),
-    re.compile(r"^Service\s+(\S+)\s+down\b", re.I),
-    re.compile(r"^([A-Za-z][\w.-]*)\s+is\s+down\b", re.I),
-)
-_NODE_PATTERN = re.compile(r"^Swarm\s+node\s+(\S+)\s+down\b", re.I)
-
-
 def resolve_verb(task: dict, verbs: dict[str, str | None] | None = None) -> str:
     """Verb for a task: its source tag's, or `coding` for an untagged `@code` task.
 
@@ -124,27 +107,6 @@ def resolve_verb(task: dict, verbs: dict[str, str | None] | None = None) -> str:
     if source_tag not in table:
         return "unknown"
     return table[source_tag] or "none"
-
-
-def extract_service_name(title: str) -> str:
-    """Swarm service named by an alert title, or '' when none is."""
-    text = (title or "").strip()
-    for pattern in _SERVICE_PATTERNS:
-        match = pattern.match(text)
-        if match:
-            # Compose-style names (`redis_redis`) already come out of the
-            # PROLONGED/fewer-tasks patterns lowercase and underscore-joined —
-            # don't touch them. Only the free-text "X is down" pattern needs
-            # normalising, since that title can carry whatever casing a human
-            # or another system used.
-            return match.group(1).lower() if "_" not in match.group(1) else match.group(1)
-    return ""
-
-
-def extract_node_name(title: str) -> str:
-    """Swarm node named by the heartbeat's node-down title, or ''."""
-    match = _NODE_PATTERN.match((title or "").strip())
-    return match.group(1) if match else ""
 
 
 # #receipt task title shapes. LEGACY: the v1 subscription tracker's renewal
@@ -188,18 +150,14 @@ def extract_merchant(title: str) -> str:
 # changed without editing code (issue #345). Ships EMPTY: a deployment with no
 # mapping simply falls through to the resolver's later tiers.
 
-# Tier 2 (title/description match via AlertActivities.resolve_alert_resource)
-# auto-accepts only at or above this bar. resolve_alert_resource's OWN "llm"
-# vs "llm_unconfirmed" split sits at 0.5 — calibrated for the alert-investigation
-# flow, which re-scores the pick against the issue content at its own Gate-0
-# (score_resource_relevance) and further guards with an active-work check
-# before ever touching a repo. resolve_task_repo has neither of those extra
-# checks downstream — the flow proceeds straight to a real kimi run — so a
+# Tier 2 (title/description match via `repo_resolve.resolve_repo_by_text`)
+# auto-accepts only at or above this bar. The resolver's OWN "llm" vs
+# "llm_unconfirmed" split sits at 0.5. resolve_task_repo has no further check
+# downstream — the flow proceeds straight to a real kimi run — so a
 # bare 0.5 here would let a coin-flip LLM guess kick one off unsupervised,
 # which is the one thing this resolver must never do (issue #158). 0.8 still
 # passes genuinely confident picks (free-text token overlap is always 1.0;
-# a clear LLM match commonly scores >= 0.85 — see
-# tests/worker/test_alert_resource_resolution.py) while anything softer is
+# a clear LLM match commonly scores >= 0.85) while anything softer is
 # surfaced as `candidates` for the flow's tier 3 Gate-0 confirm card instead
 # of guessed.
 _TIER2_CONFIDENCE_THRESHOLD = 0.8
@@ -224,27 +182,17 @@ def match_repo_candidate(candidates: list[dict], comment: str) -> dict | None:
     return None
 
 
-# --- the `ask` verb and the infra verb's plan (#344) ------------------------
+# --- the `ask` verb (#344) --------------------------------------------------
 
-# How much of a thread, a description, a verdict or a runbook a message
-# quotes. Per field, so one pasted stack trace cannot crowd out the rest.
+# How much of a thread or a description a message quotes. Per field, so one pasted stack trace cannot crowd out the rest.
 _ASK_NOTE_LIMIT = 15
 _ASK_NOTE_CAP = 800
 _FIELD_CAP = 2000
-_QUOTE_CAP = 400
-_RUNBOOK_CAP = 1200
-_GROUP_MEMBER_CAP = 12
-# One GET, bounded well inside the plan activity's 60s start-to-close.
-_PROBE_TIMEOUT_S = 10.0
 
 
 def _cut(text: str, cap: int) -> str:
     value = (text or "").strip()
     return value if len(value) <= cap else value[:cap].rstrip() + " […]"
-
-
-def _at(value: Any) -> str:
-    return f"{value:%Y-%m-%d %H:%M} UTC" if hasattr(value, "strftime") else str(value or "")
 
 
 def _ask_message(task: dict) -> str:
@@ -277,119 +225,19 @@ def _ask_message(task: dict) -> str:
     )
 
 
-# A task with no problem on the hub has no timeline to read.
-_NO_FACTS: dict = {
-    "sources": frozenset(),
-    "alertname": "",
-    "url": "",
-    "description": "",
-    "verdict": None,
-}
-
-
-def _report(handler: str, kind: str, parts: list[str], reason: str) -> dict:
-    """A plan the flow posts as one comment before parking the task once."""
-    return {
-        "action": "report",
-        "handler": handler,
-        "kind": kind,
-        "comment": "\n\n".join(p for p in parts if p),
-        "reason": reason,
-    }
-
-
-def _verdict_line(problem: dict | None, facts: dict) -> str:
-    """The hub's latest investigation finding, quoted, or that there is none.
-
-    Read from the problem's timeline, never re-run: the investigation is the
-    hub's, started once when the problem appeared (`IngestResult.investigate`).
-    """
-    if problem is None:
-        return ""
-    row = facts.get("verdict")
-    if row is None:
-        return "No investigation has reported on it yet."
-    payload = row["payload"] if isinstance(row["payload"], dict) else {}
-    text = _cut(str(payload.get("text") or payload.get("status") or ""), _QUOTE_CAP)
-    resource = str(payload.get("resource") or "")
-    line = f"The investigation said ({_at(row['occurred_at'])}): {text}"
-    return line + (f" (looked at {resource})" if resource else "")
-
-
-def _timeline_line(problem: dict | None) -> str:
-    if problem is None:
-        return ""
-    status = str(problem.get("status") or "")
-    head = f"The hub has this problem as {status}. " if status in ("resolved", "closed") else ""
-    return (
-        f"{head}Full timeline: problem {problem['id']} on the admin Problems page, "
-        "or `task_context` from a session."
-    )
-
-
-def _alert_says(facts: dict) -> str:
-    description = str(facts.get("description") or "")
-    return f"The alert says: {_cut(description, _QUOTE_CAP)}" if description else ""
-
-
-# What a person does about a problem of one of AEGIS's own kinds. Generic
-# AEGIS vocabulary (the producers are AEGIS's flow-health, comms and social
-# watchdogs), not anything a deployment names.
-_TODO_BY_KIND = {
-    "flow": (
-        "What to do: open the flow's recent failed runs on the admin Workflows page "
-        "(a failing LLM purpose also shows on the Models page) and fix what they show. "
-        "The watchdog resolves this problem when the failures stop."
-    ),
-    "comms": (
-        "What to do: check that the comms service is running and that its chat tokens "
-        "are valid (admin Slack page). The watchdog resolves this problem when messages "
-        "arrive again."
-    ),
-    "post": (
-        "What to do: check the social scheduler's worker and its queue. The watchdog "
-        "resolves this problem when the posts publish."
-    ),
-}
-
-
-async def _probe(url: str) -> dict:
-    """One GET against `url`: its status and time, or why it did not answer."""
-    started = time.monotonic()
-    try:
-        async with httpx.AsyncClient(timeout=_PROBE_TIMEOUT_S, follow_redirects=True) as client:
-            response = await client.get(url)
-    except Exception as exc:  # noqa: BLE001 — a failed probe IS the finding
-        return {"ok": False, "status": 0, "ms": 0,
-                "error": error_text(exc)}
-    return {
-        "ok": response.status_code < 400,
-        "status": response.status_code,
-        "ms": int((time.monotonic() - started) * 1000),
-        "error": "",
-    }
-
-
 @dataclass
 class AgentTaskActivities:
     db_pool: Any = None
     todoist_connector: Any = None
     remote_script: Any = None
-    homelab_connector: Any = None
     gmail_accounts: list[str] = field(default_factory=list)
-    # InfraOpsActivities instance. A plain field, not a private seam, so tests
-    # pass a fake and production passes the real thing.
-    infra_ops: Any = None
     # GmailActivities instance (for triage_email's apply_label calls). A plain
-    # field like infra_ops above, late-wired in __main__.py after GmailActivities
-    # is constructed.
+    # field, late-wired in __main__.py after GmailActivities is constructed.
     gmail_activities: Any = None
-    # AlertActivities instance — resolve_task_repo's tier 2 reuses its
-    # resolve_alert_resource directly (same plain-field, direct-call pattern as
-    # gmail_activities.apply_label above), late-wired in __main__.py after
-    # AlertActivities is constructed. None ⇒ tier 2/3 are skipped and
-    # resolve_task_repo behaves exactly as tier-1-only (never guesses).
-    alert_act: Any = None
+    # resolve_task_repo's tier 2 (`repo_resolve.resolve_repo_by_text`) asks the
+    # model. None ⇒ tier 2 runs its deterministic match only.
+    llm_client: Any = None
+    model: str = ""
 
     @activity.defn
     async def find_actionable_tasks(
@@ -459,14 +307,12 @@ class AgentTaskActivities:
         by source: `alert-<fingerprint>`, `gmail-<message_id>`, which is why
         the mail lane can read a message id back out of it.
 
-        `subject` / `subject_kind` come from the problem behind the task, so
-        the infra verb resolves a service from `problems.subject` instead of
-        parsing it out of a title.
+        `subject` / `subject_kind` come from the problem behind the task.
 
         Every key here has a reader. The alert `fingerprint` this used to
         return was the pre-hub identity — nothing has looked one up since the
         problem hub replaced that lookup, and the problem id it also returned
-        was never read either: `subject` is what the verb actually needs.
+        was never read either.
 
         `verb` is the task's verb under the effective table (`load_verbs`): a
         settings row can change it, and the flow cannot read the database, so
@@ -494,7 +340,7 @@ class AgentTaskActivities:
         )
         empty["verb"] = verb
         # A task the problem hub projected knows its subject exactly
-        # (`problems.subject`), so the infra verb need not parse the title.
+        # (`problems.subject`).
         problem = await self.db_pool.fetchrow(
             "SELECT id::text AS id, subject, subject_kind FROM problems "
             "WHERE todoist_task_id = $1 "
@@ -674,109 +520,6 @@ class AgentTaskActivities:
         return {"ok": False, "error": last_error}
 
     @activity.defn
-    async def apply_restart_approval(
-        self, interaction_id: str, response: dict, metadata: dict
-    ) -> dict:
-        """InteractionFlow post_resolve hook for the restart card.
-
-        Approve: restart, re-check health, and complete the task only if the
-        service actually recovered — a restart that didn't fix it must stay
-        visible, so it parks instead.
-        """
-        choice = (response.get("value") or "").strip()
-        task_id = str(metadata.get("task_id") or "")
-        service = str(metadata.get("service") or "")
-        agent_id = str(metadata.get("agent_id") or "")
-        if not task_id or not service:
-            return {"applied": "none"}
-
-        if choice == "skip":
-            await self.comment(task_id, agent_id, f"Leaving `{service}` alone as you asked.")
-            await self.park_task(task_id, "restart declined")
-            return {"applied": "skipped"}
-
-        if choice != "approve":
-            activity.logger.info(
-                "agent_task_restart_no_action interaction_id=%s choice=%s",
-                interaction_id,
-                choice,
-            )
-            return {"applied": "none"}
-
-        # The homelab moved to DevOps (a2-devops) on 2026-10-08 and v1 no longer
-        # writes to the swarm (aegis#708): with `alert_remediation.enabled` off,
-        # an approval restarts nothing.
-        if not await infra_remediation_enabled(self.db_pool):
-            await self.comment(
-                task_id,
-                agent_id,
-                f"Not restarting `{service}`: restarts moved to DevOps (a2-devops) "
-                "and AEGIS v1 no longer writes to the swarm.",
-            )
-            await self.park_task(task_id, "remediation_disabled")
-            return {"applied": "remediation_disabled"}
-
-        # This activity has maximum_attempts=2 (flows/interaction.py's
-        # _BEST_EFFORT_RETRY) and `restart_service` is a real write —
-        # `docker service update --force` — so a retried attempt must NOT
-        # re-issue it: that would reschedule the tasks the first call just
-        # scheduled and actively delay the convergence we're polling for.
-        # Treat a second attempt as having already issued the restart.
-        if activity.in_activity() and activity.info().attempt > 1:
-            restart = {"ok": True, "detail": "restart already issued on a previous attempt"}
-        else:
-            restart = await self.infra_ops.restart_service(service)
-
-        if not restart.get("ok"):
-            # The restart call itself failed (no connector, connector
-            # exception, or `docker service update --force` exiting non-zero —
-            # covers a renamed/missing service, a read_only infra entry, or an
-            # unreachable daemon). Nothing was restarted, so say so — do NOT
-            # fall into the "still converging" message below, which would
-            # falsely claim a restart happened.
-            await self.comment(
-                task_id,
-                agent_id,
-                f"Tried to restart `{service}` but the restart itself failed "
-                f"({restart.get('detail', 'unknown error')}) — nothing was restarted.",
-            )
-            await self.park_task(task_id, "restart_service failed")
-            return {"applied": "approved"}
-
-        # `restart_service` runs `docker service update --force --detach`
-        # (connectors/homelab.py:175) and returns BEFORE the swarm converges, so
-        # a single immediate health check would essentially never see recovery.
-        # The sibling `remediate_infra_service` (alerts.py:1220-1252) polls 6x5s
-        # for exactly this reason — but this runs as InteractionFlow's
-        # post_resolve activity, which has a hard 30s timeout
-        # (flows/interaction.py:67) and only ONE retry-safe attempt (above), so
-        # budget the poll with real headroom inside it, not right up against it.
-        # ponytail: 3x3s=9s; if swarm convergence is routinely slower, move the
-        # verification out of the hook and let the next sweep tick observe it.
-        health = {"healthy": False, "detail": "not checked"}
-        for _ in range(3):
-            await asyncio.sleep(3)
-            health = await self.infra_ops.service_health(service)
-            if health.get("healthy"):
-                break
-
-        if health.get("healthy"):
-            await self.comment(
-                task_id, agent_id, f"Restarted `{service}` and it's healthy again — closing."
-            )
-            await self.complete_task(task_id)
-        else:
-            await self.comment(
-                task_id,
-                agent_id,
-                f"Restarted `{service}` but it hadn't come back healthy within 9s "
-                f"({health.get('detail', 'unknown')}) — it may still be converging; "
-                "leaving this open for you.",
-            )
-            await self.park_task(task_id, "restart did not restore health")
-        return {"applied": "approved"}
-
-    @activity.defn
     async def triage_email(self, task_id: str, title: str, gmail_message_id: str) -> dict:
         """Archive notification mail; leave anything needing a reply.
 
@@ -934,315 +677,24 @@ class AgentTaskActivities:
             "reason": "",
         }
 
-    # --- the infra verb's plan (#344) ------------------------------------------
+    # --- the retired infra verb ------------------------------------------------
 
     @activity.defn
     async def plan_infra_task(self, task_id: str, title: str) -> dict:
-        """What the infra verb can usefully do for this task.
-
-        Decided from the problem behind the task (`hub.find_problem_for_task`);
-        the title is read only when the hub has no problem for it. Before, the
-        verb understood swarm services and nothing else: a Dagster failure ran
-        `docker service ps dagster` and got a restart card for a service that
-        does not exist, and every other kind parked with an apology — 85 of 110
-        runs in the fortnight to 2026-09-11 did nothing.
-
-        Returns one of two plans:
-
-        * `{"action": "service", "service", "health"}` — a service the swarm
-          runs. `health` is `service_health`'s answer; the flow completes a
-          healthy one and cards a restart for an unhealthy one, as before.
-        * `{"action": "report", "handler", "kind", "comment", "reason"}` —
-          anything else. Every handler is read-only: it reads the hub, reads
-          the heartbeat's last sample, or probes a URL once, and says what a
-          person does next. The flow posts `comment` and parks with `reason`.
-
-        Money problems keep the answer they had: they are Maou's (#497).
-        """
-        problem = (
-            await hub.find_problem_for_task(self.db_pool, task_id)
-            if self.db_pool is not None and task_id
-            else None
-        )
-        if problem is None:
-            return await self._plan_from_title(title, None, _NO_FACTS) or self._plan_manual(
-                None, _NO_FACTS
-            )
-        facts = await self._problem_facts(problem["id"])
-        kind = str(problem.get("subject_kind") or "")
-        subject = str(problem.get("subject") or "")
-        if "money" in facts["sources"]:
-            return _report(
-                "money",
-                kind,
-                [
-                    f"This is a {kind} problem ({subject}); there is no service to check or "
-                    "restart, so I have no automatic action for it."
-                ],
-                f"no automatic action for a {kind} problem",
-            )
-        if subject == hub.GROUP_SUBJECT or problem.get("group_key"):
-            return await self._plan_group(problem, facts)
-        if kind == "node" and subject:
-            return await self._plan_node(problem, facts, subject)
-        if facts["url"]:
-            return await self._plan_endpoint(problem, facts, facts["url"])
-        if kind == "service" and subject:
-            return await self._plan_service(subject, problem, facts)
-        if kind in ("", hub.TASK_SUBJECT_KIND, "repo") or problem.get("class") == "manual":
-            # The subject is the task itself, or nothing: the title may still
-            # name a service or a node.
-            return await self._plan_from_title(title, problem, facts) or self._plan_manual(
-                problem, facts
-            )
-        return self._plan_kind(problem, facts)
-
-    async def _problem_facts(self, problem_id: str) -> dict:
-        """What the timeline says about a problem: who reported it, what the
-        latest alert carried, and the investigation's latest finding."""
-        sources = {
-            r["source"]
-            for r in await self.db_pool.fetch(
-                "SELECT DISTINCT source FROM problem_events "
-                "WHERE problem_id = $1::uuid AND kind = 'occurrence'",
-                problem_id,
-            )
-        }
-        payload = await self.db_pool.fetchval(
-            "SELECT payload FROM problem_events WHERE problem_id = $1::uuid "
-            "AND kind = 'occurrence' ORDER BY occurred_at DESC, id DESC LIMIT 1",
-            problem_id,
-        )
-        # The closing verdict wins over a later "investigation started" line:
-        # it is the finding a person acts on.
-        verdict = await self.db_pool.fetchrow(
-            "SELECT payload, occurred_at FROM problem_events WHERE problem_id = $1::uuid "
-            "AND kind = 'investigation' "
-            "ORDER BY (payload ? 'verdict') DESC, occurred_at DESC, id DESC LIMIT 1",
-            problem_id,
-        )
-        payload = payload if isinstance(payload, dict) else {}
-        labels = payload.get("labels") if isinstance(payload.get("labels"), dict) else {}
-        instance = str(labels.get("instance") or "")
+        """Stub for one release: the infra verb is gone (the lane moved to the
+        DevOps vertical, a2-devops). Only an `AgentTaskFlow` run recorded
+        before the change can schedule this (`PATCH_DROP_INFRA_VERB`); it gets a
+        plan that parks the task with a note. Remove it with that branch."""
         return {
-            "sources": sources,
-            "alertname": str(labels.get("alertname") or ""),
-            "url": instance if instance.startswith(("http://", "https://")) else "",
-            "description": str(payload.get("description") or ""),
-            "verdict": verdict,
+            "action": "report",
+            "handler": "retired",
+            "kind": "",
+            "comment": (
+                "AEGIS v1 no longer works infra tasks: the infra lane moved to the "
+                "DevOps vertical. Handle this one yourself and complete the task."
+            ),
+            "reason": "infra lane moved to DevOps",
         }
-
-    async def _plan_service(self, service: str, problem: dict | None, facts: dict) -> dict:
-        """A service the swarm runs goes to the flow's check; anything else is
-        reported. `restart_service` would refuse a name the swarm does not run
-        anyway, so the card it used to get could never have worked."""
-        if self.infra_ops is None:
-            health = {"found": False, "healthy": False, "detail": "no swarm connection wired"}
-        else:
-            health = await self.infra_ops.service_health(service)
-        if health.get("found"):
-            return {"action": "service", "service": service, "health": health,
-                    "handler": "service", "kind": "service"}
-        detail = str(health.get("detail") or "not found")
-        return _report(
-            "no_swarm_service",
-            str((problem or {}).get("subject_kind") or "service"),
-            [
-                f"I can't check `{service}` as a swarm service ({detail}), so there is "
-                "nothing here to restart and I have not offered a restart.",
-                _alert_says(facts),
-                _verdict_line(problem, facts),
-                "What to do: act on what the investigation found, in the system that "
-                "raised the alert, then complete this task.",
-                _timeline_line(problem),
-            ],
-            f"{service} is not a swarm service I can check ({detail[:80]})",
-        )
-
-    async def _plan_node(self, problem: dict | None, facts: dict, node: str) -> dict:
-        """The heartbeat's last sample of the node, from its own settings row.
-
-        Never a Docker or SSH command: a node that is down cannot answer
-        either, and the heartbeat already asks the swarm's managers every tick.
-        """
-        from aegis_worker.activities.homelab import HomelabActivities
-
-        row = (
-            await self.db_pool.fetchrow(
-                "SELECT value, updated_at FROM settings WHERE key = $1",
-                HomelabActivities._HEARTBEAT_STATE_KEY,
-            )
-            if self.db_pool is not None
-            else None
-        )
-        value = row["value"] if row is not None and isinstance(row["value"], dict) else {}
-        nodes = value.get("nodes") if isinstance(value.get("nodes"), dict) else {}
-        status = str(nodes.get(node) or "")
-        if row is None:
-            seen = f"The heartbeat has no sample yet, so I can't say whether `{node}` is up."
-        elif not status:
-            seen = f"The heartbeat's last sample ({_at(row['updated_at'])}) does not list `{node}`."
-        else:
-            seen = f"Node `{node}`: the heartbeat's last sample ({_at(row['updated_at'])}) has it {status}."
-        fails = int(value.get("fail_count") or 0)
-        if fails:
-            seen += (
-                f" The heartbeat has failed to reach the swarm {fails} time(s) in a row "
-                "since then, so that sample may be old."
-            )
-        if status == "Ready":
-            todo = (
-                "What to do: nothing, unless it drops again. The heartbeat resolves this "
-                "problem, and that closes this task."
-            )
-            reason = f"node {node} is Ready again"
-        else:
-            todo = (
-                "What to do: check the machine itself, power and network first, then "
-                "Docker once it answers. The heartbeat resolves this problem when it sees "
-                "the node Ready."
-            )
-            reason = f"node {node} is {status or 'not in the heartbeat'}; a person has to look at it"
-        return _report(
-            "node",
-            "node",
-            [
-                seen,
-                "I ran nothing against the node: a machine that is down cannot answer "
-                "Docker or SSH.",
-                _verdict_line(problem, facts),
-                todo,
-                await self._runbook(facts.get("alertname") or ""),
-                _timeline_line(problem),
-            ],
-            reason,
-        )
-
-    async def _plan_endpoint(self, problem: dict, facts: dict, url: str) -> dict:
-        """One GET against the URL the alert probes, and what that says."""
-        probe = await _probe(url)
-        if probe["ok"]:
-            seen = f"{url} answered {probe['status']} in {probe['ms']} ms just now."
-            todo = (
-                "What to do: nothing, unless it fails again. The alert resolves on its "
-                "own, and that closes this task."
-            )
-            reason = f"{url} answers again"
-        else:
-            seen = (
-                f"{url} answered {probe['status']} just now."
-                if probe["status"]
-                else f"{url} did not answer just now: {probe['error']}."
-            )
-            todo = (
-                "What to do: check the route to it (proxy, DNS, TLS certificate) and "
-                "the service behind it."
-            )
-            reason = f"{url} still fails ({probe['status'] or probe['error'][:60]})"
-        return _report(
-            "endpoint",
-            str(problem.get("subject_kind") or ""),
-            [seen, _verdict_line(problem, facts), todo, _timeline_line(problem)],
-            reason,
-        )
-
-    async def _plan_group(self, problem: dict, facts: dict) -> dict:
-        """One problem standing for many members: who they are, from the hub."""
-        rows = await self.db_pool.fetch(
-            "SELECT DISTINCT m FROM ("
-            "  SELECT jsonb_array_elements_text(payload->'members') AS m FROM problem_events"
-            "   WHERE problem_id = $1::uuid AND kind = 'state_change'"
-            "     AND payload->>'action' = 'grouped' AND jsonb_typeof(payload->'members') = 'array'"
-            "  UNION ALL"
-            "  SELECT payload->>'member_subject' FROM problem_events"
-            "   WHERE problem_id = $1::uuid AND kind = 'occurrence'"
-            ") s WHERE m IS NOT NULL AND m <> '' ORDER BY m",
-            problem["id"],
-        )
-        members = [r["m"] for r in rows]
-        kind = str(problem.get("subject_kind") or "")
-        listed = ", ".join(f"`{m}`" for m in members[:_GROUP_MEMBER_CAP])
-        if len(members) > _GROUP_MEMBER_CAP:
-            listed += f" and {len(members) - _GROUP_MEMBER_CAP} more"
-        times = int(problem.get("occurrences") or 0)
-        return _report(
-            "group",
-            kind,
-            [
-                f"This one problem stands for {len(members)} {kind or 'subject'}s with the "
-                f"same failure (`{problem.get('class')}`): {listed or 'none recorded'}. "
-                f"Seen {times} time(s) in all, last at {_at(problem.get('last_seen_at'))}.",
-                _verdict_line(problem, facts),
-                "What to do: one fix should clear all of them, so work it here. The "
-                "members' own tasks were closed into this one, and a new member joins it "
-                "instead of opening another.",
-                _timeline_line(problem),
-            ],
-            f"a group of {len(members)} {kind}s; the shared fix is a person's call",
-        )
-
-    def _plan_kind(self, problem: dict, facts: dict) -> dict:
-        """A kind of AEGIS's own (a flow, the comms probe, a post) or one this
-        lane has no check for: the finding and what a person does."""
-        kind = str(problem.get("subject_kind") or "")
-        subject = str(problem.get("subject") or "")
-        todo = _TODO_BY_KIND.get(kind) or (
-            "What to do: act on what the investigation found, then complete this task. "
-            f"This lane has no check of its own for a {kind or 'problem of this'} kind."
-        )
-        return _report(
-            kind or "other",
-            kind,
-            [
-                f"This is a {kind} problem (`{subject}`), not a swarm service, so there is "
-                "nothing here to check or restart.",
-                _alert_says(facts),
-                _verdict_line(problem, facts),
-                todo,
-                _timeline_line(problem),
-            ],
-            f"a {kind} problem; the fix is a person's",
-        )
-
-    async def _plan_from_title(self, title: str, problem: dict | None, facts: dict) -> dict | None:
-        """A service or node the title names, when the problem names none."""
-        service = extract_service_name(title)
-        if service:
-            return await self._plan_service(service, problem, facts)
-        node = extract_node_name(title)
-        if node:
-            return await self._plan_node(problem, facts, node)
-        return None
-
-    def _plan_manual(self, problem: dict | None, facts: dict) -> dict:
-        return _report(
-            "manual",
-            str((problem or {}).get("subject_kind") or ""),
-            [
-                "Nothing on this task names a service, node or URL I can check.",
-                _verdict_line(problem, facts),
-                "What to do: reply on this task with what you want done, or do it "
-                "yourself and complete the task.",
-                _timeline_line(problem),
-            ],
-            "nothing on the task names something to check",
-        )
-
-    async def _runbook(self, alertname: str) -> str:
-        """The runbook for this alert, cut short, when the deployment has one.
-
-        Read through AlertActivities, which owns where runbooks live (the
-        `runbooks` table first, then the files) and skips a stub.
-        Best-effort: a missing runbook is a shorter comment, not a failure.
-        """
-        if not alertname or self.alert_act is None:
-            return ""
-        try:
-            text = await self.alert_act._read_runbook(alertname)
-        except Exception as exc:  # noqa: BLE001
-            activity.logger.warning("agent_task_runbook_read_failed err=%s", error_text(exc))
-            return ""
-        return f"Runbook ({alertname}):\n{_cut(text, _RUNBOOK_CAP)}" if text else ""
 
     @activity.defn
     async def resolve_task_repo(self, task: dict) -> dict:
@@ -1251,16 +703,10 @@ class AgentTaskActivities:
         Tier 1: Todoist project name -> the `project_repo_map` setting — the strongest
         signal, since a project already mirrors a repo.
 
-        Tier 2 (only when tier 1 misses): reuse
-        AlertActivities.resolve_alert_resource's title/description-matching
-        tiers by synthesising an alert-shaped dict. `service` is deliberately
-        left blank — a Todoist task has no alertmanager service label, so the
-        (otherwise deterministic) sentry_project/service_match tiers correctly
-        sit out rather than false-matching on an empty string, and `fingerprint`
-        is a synthetic `task:<id>` that no knowledge-graph claim was ever
-        written against, so the KG tier misses by construction too. Both fall
-        through to the free-text/LLM tiers, which is the intent. A confident
-        pick (>= _TIER2_CONFIDENCE_THRESHOLD) resolves exactly like tier 1.
+        Tier 2 (only when tier 1 misses): `repo_resolve.resolve_repo_by_text`,
+        a deterministic token match on the title and description, then the
+        model. A confident pick (>= _TIER2_CONFIDENCE_THRESHOLD) resolves
+        exactly like tier 1.
 
         Tier 3: anything less confident is surfaced as `candidates` (never
         auto-applied) for the flow's Gate-0 confirm card — running a coding
@@ -1278,7 +724,7 @@ class AgentTaskActivities:
         if github_repo:
             # repo_path is the workspace-relative checkout path start_kimi_run needs.
             # The JSONB key is `path`, NOT `resource_path`. `resource_path` is only an
-            # application-level rename applied AFTER reading (alerts.py:521);
+            # application-level rename applied AFTER reading;
             # inventory.py:386-397 writes {"path", "github_repo", "origin_url"}.
             # Querying 'resource_path' always yields NULL, silently flattening a
             # nested checkout (stockopedia/bcp -> bcp) so start_kimi_run then hard-
@@ -1297,8 +743,6 @@ class AgentTaskActivities:
         if name:
             activity.logger.info("agent_task_repo_unmapped project=%s", name)
 
-        if self.alert_act is None:
-            return empty
         synthetic_alert = {
             "title": str(task.get("content") or ""),
             "description": str(task.get("description") or ""),
@@ -1306,7 +750,9 @@ class AgentTaskActivities:
             "service": "",
         }
         try:
-            resolved = await self.alert_act.resolve_alert_resource(synthetic_alert)
+            resolved = await resolve_repo_by_text(
+                self.db_pool, self.llm_client, self.model, synthetic_alert
+            )
         except Exception as exc:  # noqa: BLE001 — tier 2 is best-effort; never guess on error
             activity.logger.warning("agent_task_repo_tier2_failed err=%s", error_text(exc))
             return empty

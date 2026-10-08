@@ -1,3 +1,0 @@
-# LokiIngesterHighMemory
-
-TODO: fill in

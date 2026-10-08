@@ -1,3 +1,0 @@
-# MinIOHighDiskUsage
-
-TODO: fill in

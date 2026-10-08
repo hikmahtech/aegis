@@ -1,3 +1,0 @@
-# ClickHouseReplicasMaxAbsoluteDelay
-
-TODO: fill in

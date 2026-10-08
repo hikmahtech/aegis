@@ -8,8 +8,8 @@ had, so it is what this pins.
 from __future__ import annotations
 
 import pytest
-from aegis_worker.activities.alerts import _decode_metadata
 from aegis_worker.activities.channels import _decode_config
+from aegis_worker.activities.repo_resolve import _decode_metadata
 from aegis_worker.activities.review import _decode_counts
 from aegis_worker.shared.jsonb import decode_jsonb
 

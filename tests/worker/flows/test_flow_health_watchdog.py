@@ -62,7 +62,7 @@ def _make_dead_llm(rows, boom: bool = False):
 
 
 @activity.defn(name="report_flow_health")
-async def stub_report(findings: list[dict], agent_id: str = "pandoras-actor") -> dict:
+async def stub_report(findings: list[dict], agent_id: str = "sebas") -> dict:
     _report_calls.append((findings, agent_id))
     return {"alerted": len(findings), "deduped": 0, "muted": 0, "recovered": 0}
 
@@ -96,7 +96,7 @@ async def _run(
 @pytest.mark.asyncio
 async def test_every_detector_feeds_one_report():
     result = await _run(
-        FlowHealthConfig(), "fh-1", failing=[FAILING], stale=[STALE], dead_llm=[DEAD_LLM]
+        FlowHealthConfig(agent_id="sebas"), "fh-1", failing=[FAILING], stale=[STALE], dead_llm=[DEAD_LLM]
     )
     assert result["failing"] == 1
     assert result["stale"] == 1
@@ -115,7 +115,7 @@ async def test_every_detector_feeds_one_report():
         "zzwd-sched-a",
         "llm-purpose:zzwd-purpose-a",
     ]
-    assert agent_id == "pandoras-actor"
+    assert agent_id == "sebas"
     assert result["alerted"] == 3
 
 

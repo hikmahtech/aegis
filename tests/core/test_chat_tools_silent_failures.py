@@ -125,7 +125,7 @@ async def test_defer_task_surfaces_item_not_found(db_pool) -> None:
 
 
 @pytest.mark.asyncio
-async def test_handoff_task_surfaces_item_not_found(db_pool, infra_agent_active) -> None:
+async def test_handoff_task_surfaces_item_not_found(db_pool) -> None:
     async with db_pool.acquire() as conn:
         await conn.execute(
             "INSERT INTO todoist_projects (id, name, is_managed, raw) "
@@ -156,7 +156,7 @@ async def test_handoff_task_surfaces_item_not_found(db_pool, infra_agent_active)
     ):
         result = await _exec_handoff_task(
             db_pool,
-            {"task_id": "T_HO", "to_assignee": "@pandora"},
+            {"task_id": "T_HO", "to_assignee": "@maou"},
             ToolContext(agent_id="sebas"),
         )
 
@@ -317,7 +317,7 @@ async def test_mark_waiting_retryable_queues_outbox(db_pool) -> None:
 
 
 @pytest.mark.asyncio
-async def test_handoff_task_retryable_queues_outbox(db_pool, infra_agent_active) -> None:
+async def test_handoff_task_retryable_queues_outbox(db_pool) -> None:
     async with db_pool.acquire() as conn:
         await conn.execute(
             "INSERT INTO todoist_projects (id, name, is_managed, raw) "
@@ -348,7 +348,7 @@ async def test_handoff_task_retryable_queues_outbox(db_pool, infra_agent_active)
     ):
         result = await _exec_handoff_task(
             db_pool,
-            {"task_id": "T_HOR", "to_assignee": "@pandora"},
+            {"task_id": "T_HOR", "to_assignee": "@maou"},
             ToolContext(agent_id="sebas"),
         )
     after = await _outbox_count(db_pool)

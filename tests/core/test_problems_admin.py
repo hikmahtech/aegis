@@ -50,7 +50,7 @@ def _subject() -> str:
 
 def _occ(subject: str, n: int = 1, **kw) -> Event:
     return Event(
-        source="heartbeat",
+        source="flow_health",
         external_id=f"{subject}@{n}",
         kind="occurrence",
         title=f"Service {subject} down",
@@ -97,30 +97,30 @@ async def test_detail_carries_the_timeline_links_and_sessions(client, db_pool):
     r = await ingest_event(db_pool, _occ(s), now=NOW)
     await db_pool.execute(
         "INSERT INTO todoist_tasks (id, content, labels, is_completed, updated_at) "
-        "VALUES ($1, 'fix it', ARRAY['@pandora'], false, now()) ON CONFLICT (id) DO NOTHING",
+        "VALUES ($1, 'fix it', ARRAY['@sebas'], false, now()) ON CONFLICT (id) DO NOTHING",
         task,
     )
     await link_task(db_pool, r.problem_id, task)
-    await work_sessions.create_session(db_pool, task_id=task, agent_id="pandoras-actor")
+    await work_sessions.create_session(db_pool, task_id=task, agent_id="sebas")
 
     body = (await client.get(f"/api/admin/problems/{r.problem_id}")).json()
     assert body["problem"]["id"] == r.problem_id
     assert [e["kind"] for e in body["events"]].count("occurrence") == 1
     assert ("todoist_task", task) in [(x["link_kind"], x["ref"]) for x in body["links"]]
     assert [x["owner"] for x in body["sessions"]] == ["aegis"]
-    assert body["window"] is None
+    assert "window" not in body  # the deploy windows left with the infra lane
 
     missing = await client.get(f"/api/admin/problems/{uuid.uuid4()}")
     assert missing.status_code == 404
 
 
-async def test_mute_resolve_and_close_reuse_the_hub_transitions(client, db_pool):
+async def test_resolve_and_close_reuse_the_hub_transitions(client, db_pool):
     s = _subject()
     r = await ingest_event(db_pool, _occ(s), now=NOW)
 
+    # Mute left with the infra lane: the route is gone.
     muted = await client.post(f"/api/admin/problems/{r.problem_id}/mute", json={"hours": 3})
-    assert muted.status_code == 200 and muted.json()["muted_until"]
-    assert (await get_problem(db_pool, r.problem_id))["muted_until"] is not None
+    assert muted.status_code in (404, 405)
 
     resolved = await client.post(
         f"/api/admin/problems/{r.problem_id}/resolve", json={"reason": "fixed by hand"}
@@ -167,7 +167,7 @@ async def test_merge_moves_the_duplicate_and_reports_what_moved(client, db_pool)
 async def _task(pool, task_id: str) -> None:
     await pool.execute(
         "INSERT INTO todoist_tasks (id, content, labels, is_completed, updated_at) "
-        "VALUES ($1, 'fix it', ARRAY['@pandora'], false, now()) ON CONFLICT (id) DO NOTHING",
+        "VALUES ($1, 'fix it', ARRAY['@sebas'], false, now()) ON CONFLICT (id) DO NOTHING",
         task_id,
     )
 
@@ -209,24 +209,6 @@ async def test_merge_retires_the_duplicates_task_like_the_chat_tool(client, db_p
     assert r.json()["merged_task_retired"] is True
 
 
-async def test_service_state_round_trip(client, db_pool):
-    s = _subject()
-    put = await client.put(
-        "/api/admin/service-state",
-        json={"subject": s, "state": "maintenance", "minutes": 15, "note": "disk swap"},
-    )
-    assert put.status_code == 200 and put.json()["state"] == "maintenance"
-    windows = (await client.get("/api/admin/service-state")).json()["windows"]
-    assert [w for w in windows if w["subject"] == s][0]["note"] == "disk swap"
-
-    cleared = await client.put("/api/admin/service-state", json={"subject": s, "state": "ok"})
-    assert cleared.status_code == 200 and cleared.json()["cleared"] is True
-    assert [w for w in (await client.get("/api/admin/service-state")).json()["windows"] if w["subject"] == s] == []
-
-    bad = await client.put("/api/admin/service-state", json={"subject": s, "state": "bogus"})
-    assert bad.status_code == 400
-
-
 async def test_the_digest_route_is_the_briefing_query(client, db_pool):
     # A REAL timestamp, not the module's fixed `NOW`. The digest's window is
     # relative to the wall clock, so an event stamped `NOW + 1min`
@@ -266,73 +248,5 @@ async def test_resolving_a_closed_problem_is_a_404(client, db_pool):
     assert (
         await client.post(f"/api/admin/problems/{r.problem_id}/resolve", json={})
     ).status_code == 404
-    assert (
-        await client.post(f"/api/admin/problems/{r.problem_id}/mute", json={"hours": 1})
-    ).status_code == 404
 
 
-async def test_the_settle_windows_round_trip_through_the_admin_api(client, db_pool):
-    """#559: the hub's settle windows were DB-backed and reachable only by raw
-    SQL. An operator now edits them like every other config family.
-
-    Falsifiable: drop the PUT route and this 405s; drop the validation and the
-    bad value below saves a 200 that does nothing.
-    """
-    await db_pool.execute("DELETE FROM settings WHERE key = 'hub_settle_seconds'")
-    try:
-        before = await client.get("/api/admin/hub-settle-seconds")
-        assert before.status_code == 200
-        assert before.json()["overrides"] == {}
-        # The defaults come back too, so a blank field can be shown as what it
-        # means rather than as zero.
-        assert before.json()["defaults"]["nodedown"] == 300
-
-        saved = await client.put(
-            "/api/admin/hub-settle-seconds",
-            json={"overrides": {"Docker Service Down": 45, "*": 0}},
-        )
-        assert saved.status_code == 200
-        assert saved.json()["overrides"] == {"docker-service-down": 45, "*": 0}
-
-        # Strict on write: a typo is a 400, never a quiet no-op.
-        bad = await client.put(
-            "/api/admin/hub-settle-seconds", json={"overrides": {"nodedown": "soon"}}
-        )
-        assert bad.status_code == 400
-        assert "whole number" in bad.json()["detail"]
-        # ...and the rejected write changed nothing.
-        assert (await client.get("/api/admin/hub-settle-seconds")).json()["overrides"] == {
-            "docker-service-down": 45,
-            "*": 0,
-        }
-
-        cleared = await client.put("/api/admin/hub-settle-seconds", json={"overrides": {}})
-        assert cleared.json()["overrides"] == {}
-    finally:
-        await db_pool.execute("DELETE FROM settings WHERE key = 'hub_settle_seconds'")
-
-
-async def test_the_platform_hint_round_trips_through_the_admin_api(client, db_pool):
-    """The routing row has had an API since #503 and no UI at all, so the
-    `platform_hint` added in #505 was raw-SQL-only in practice. The UI now reads
-    and writes it through here."""
-    await db_pool.execute("DELETE FROM settings WHERE key = 'infra_alert_routing'")
-    try:
-        hint = "This cluster is k3s. Read it with `kubectl get pods -A`."
-        saved = await client.put(
-            "/api/admin/infra-alert-routing",
-            json={
-                "repo": "acme/infra",
-                "platform_hint": hint,
-                "extra_alertnames": ["ClickHouseDown"],
-            },
-        )
-        assert saved.status_code == 200
-        assert saved.json()["platform_hint"] == hint
-        assert "clickhousedown" in saved.json()["alertnames"]
-
-        read_back = await client.get("/api/admin/infra-alert-routing")
-        assert read_back.json()["platform_hint"] == hint
-        assert read_back.json()["repo"] == "acme/infra"
-    finally:
-        await db_pool.execute("DELETE FROM settings WHERE key = 'infra_alert_routing'")

@@ -382,7 +382,8 @@ async def life_webhook(
 async def ping() -> None:
     """The ingress canary's target: proof that a request reached core (#548).
 
-    The heartbeat GETs this from outside the cluster every couple of minutes, so
+    An outside canary GETs this every couple of minutes (the infra heartbeat
+    did, before it moved to the DevOps vertical), so
     a proxy that has stopped reaching core cannot drop every inbound webhook in
     silence (#492). It lives under `/api/webhooks/` deliberately — that prefix
     is the one an identity proxy is configured to let through, because real

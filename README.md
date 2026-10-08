@@ -9,7 +9,7 @@
 **Autonomous Executive Guild Intelligence System** — a flow-first, self-hosted
 personal AI orchestration platform. A small fleet
 of named agents run scheduled and event-driven workflows over your own data —
-GTD/tasks, money, knowledge, homelab alerts — and ask you for a decision only
+GTD/tasks, money, knowledge — and ask you for a decision only
 when they actually need one. Local-LLM-first: it runs against your own models
 through a LiteLLM proxy, and can reach for Claude or OpenAI when you want the
 extra horsepower.
@@ -30,12 +30,12 @@ before you trust *any* LLM workflow in production, run the free
 
 ## What it does
 
-- **Agents, not a chatbot.** Four personalities (an assistant, a researcher, a
-  money agent, an infra/ops agent) each own a slice of your life. Routing
+- **Agents, not a chatbot.** Three personalities (an assistant, a researcher, a
+  money agent) each own a slice of your life. Routing
   between them is data-driven (per-agent keywords/tools in the DB, not hardcoded).
 - **Flows do the work.** ~40 Temporal workflows on a schedule or trigger:
   triage email, mirror your task manager, sweep subscriptions, watch a Google
-  Drive folder, investigate alerts, build a daily brief — and a watchdog over
+  Drive folder, build a daily brief — and a watchdog over
   AEGIS's own flows, so a wedged schedule tells you instead of going quiet.
 - **Human-in-the-loop, budgeted.** When an agent needs a decision it sends a
   card to your chat channel; you Approve / Edit / Reject. A daily
@@ -54,8 +54,8 @@ before you trust *any* LLM workflow in production, run the free
   to its own stack, so a shared swarm stays legible).
 - **Agents that write code.** Register your repos and a coding host in the UI —
   SSH identity plus **Claude Code / Kimi** engines, named Claude accounts, and
-  per-GitHub-org routing. The ops agent SSHes in and runs the CLI on the right
-  repo, on the right account, to investigate alerts and propose fixes.
+  per-GitHub-org routing. An agent SSHes in and runs the CLI on the right
+  repo, on the right account, to work a coding task and open a draft PR.
 - **Market data without a vendor contract.** A provider-agnostic finance
   connector (keyless Yahoo / Stooq) backs the money agent's quotes, market
   overview, and finance news.
@@ -94,7 +94,7 @@ Backed by **Postgres 16 + pgvector** (migrations auto-apply on core startup),
 `fast` / `balanced` / `smart` model tiers to whatever models you point it at.
 
 Full design: [`docs/architecture/overview.md`](docs/architecture/overview.md).
-Operator's guide — what runs when, human-in-the-loop, the alert pipeline, and
+Operator's guide — what runs when, human-in-the-loop, the problem hub, and
 the failure modes worth recognising: [`docs/how-it-works.md`](docs/how-it-works.md).
 
 ## Quick start

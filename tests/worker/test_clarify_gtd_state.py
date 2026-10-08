@@ -6,9 +6,9 @@ state: invisible to "what's next", to "what am I blocked on", and to every revie
 filter. In production 83 tasks clarify had marked terminal were in exactly that
 limbo (excluding `trash`, which completes the item), and they were not spread
 evenly: `reference` (303/303) and `next_action` (122/123) always stamped a state,
-while `pandora_owned` (49/66), `mine` (17/17), `2_min` (9/9) and
-`pandora_investigation` (6/14) stamped only a *context* label (`@5min`), only a
-*person* label (`@me`), or nothing at all.
+while the infra agent's outcomes (49/66 and 6/14), `mine` (17/17) and `2_min`
+(9/9) stamped only a *context* label (`@5min`), only a *person* label (`@me`),
+or nothing at all.
 
 The tests here are deliberately of three kinds:
 
@@ -46,8 +46,8 @@ _CLARIFY_SRC = pathlib.Path(clarify_mod.__file__)
 
 @pytest_asyncio.fixture(autouse=True, loop_scope="function")
 async def _auto_content_route(seed_app_route):
-    """Route-driven outcomes (`route_apply`, `pandora_investigation`) need the
-    seeded APP- content route, same as the main clarify-activities module."""
+    """The route-driven outcome (`route_apply`) needs the seeded APP- content
+    route, same as the main clarify-activities module."""
     yield
 
 
@@ -220,7 +220,7 @@ def test_agent_handoff_outcomes_stay_eligible_for_the_executor() -> None:
     pick the task up."""
     from aegis_worker.activities.agent_task import EXCLUDED_LABELS
 
-    for classification in ("route_apply", "pandora_investigation", "pandora_owned", "hub_owned"):
+    for classification in ("route_apply", "hub_owned"):
         assert gtd_state_label(classification) not in EXCLUDED_LABELS
 
 
@@ -249,19 +249,11 @@ _CASES: dict[str, dict] = {
     "mine": {"task": {"id": "G_MINE", "labels": ["#email"]}},
     "route_apply": {
         "task": {"id": "G_ROUTE", "content": "APP-1: broken", "labels": []},
-        "decision": {"assignee": "@pandora", "contexts": ["@code"]},
+        "decision": {"assignee": "@raphael", "contexts": ["@code"]},
     },
-    "pandora_investigation": {
-        "task": {"id": "G_INV", "content": "APP-2: broken", "labels": []},
-        "decision": {"assignee": "@pandora", "contexts": ["@code"]},
-    },
-    "pandora_owned": {"task": {"id": "G_OWNED", "labels": ["@pandora"]}},
-    # The projector creates a hub task with `#alert` and the infra agent's
-    # label only (hub_project.project), so clarify owes it the state.
-    "hub_owned": {"task": {"id": "G_HUB", "labels": ["#alert", "@pandora"]}},
-    "pandora_followup": {
-        "task": {"id": "G_FOLLOW", "content": "APP-3: broken", "labels": ["@pandora"]},
-    },
+    # The projector creates a hub task with `#alert` and its owner's label
+    # only (hub_project.project), so clarify owes it the state.
+    "hub_owned": {"task": {"id": "G_HUB", "labels": ["#alert", "@sebas"]}},
     "someday": {"task": {"id": "G_SOMEDAY", "labels": ["#email"]}},
     "leave": {"task": {"id": "G_LEAVE", "labels": ["#email"]}},
     "reference": {"task": {"id": "G_REF", "labels": ["#research"]}},
@@ -341,25 +333,11 @@ async def test_route_apply_gets_next(db_pool, _inbox) -> None:
     acts, connector = _acts(db_pool)
     out = await acts.apply_outcome(
         {"id": "L_ROUTE", "content": "APP-9: thing", "labels": []},
-        _decision("route_apply", assignee="@pandora", contexts=["@code"]),
+        _decision("route_apply", assignee="@raphael", contexts=["@code"]),
     )
     assert out["applied"] is True
     labels = _labels_written(connector)
-    assert "@pandora" in labels
-    assert "@next" in labels
-
-
-@pytest.mark.asyncio
-async def test_pandora_investigation_gets_next(db_pool, _inbox) -> None:
-    acts, connector = _acts(db_pool)
-    out = await acts.apply_outcome(
-        {"id": "L_INV", "content": "APP-8: thing", "labels": []},
-        _decision("pandora_investigation", assignee="@pandora", contexts=["@code"]),
-    )
-    assert out["applied"] is True
-    assert out["interaction_spawned"] is True
-    labels = _labels_written(connector)
-    assert "@pandora" in labels
+    assert "@raphael" in labels
     assert "@next" in labels
 
 
@@ -393,21 +371,6 @@ async def test_trash_gets_no_state_label(db_pool, _inbox) -> None:
     written = _labels_written(connector)
     assert "#trash" in written  # labels WERE written — the emptiness below is real
     assert written & set(GTD_STATE_LABELS) == set()
-
-
-@pytest.mark.asyncio
-async def test_pandora_gate_still_writes_nothing(db_pool, _inbox) -> None:
-    """A card is pending — the resolution sets the state. Stamping one here
-    would pre-empt the user's answer."""
-    acts, connector = _acts(db_pool)
-    out = await acts.apply_outcome(
-        {"id": "L_GATE", "content": "APP-7: thing", "labels": [], "source_tag": None},
-        _decision("pandora_gate", assignee="@pandora"),
-    )
-    assert out["applied"] is False
-    assert out["interaction_spawned"] is True
-    assert out["commands_sent"] == 0
-    connector.commands.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -81,7 +81,7 @@ async def test_find_unclassified_includes_user_created_agent_addressed_task(
     db_pool, _inbox_seeded
 ) -> None:
     """User-created Todoist tasks (no source_tag, not APP-Jira) labelled
-    @sebas/@raphael/@maou/@pandora must be eligible for clarify so the
+    @sebas/@raphael/@maou must be eligible for clarify so the
     comment-channel agent-followup short-circuit can run.
 
     Regression: prod task `6ghxpGJ7q2j5P6mv` (labelled @raphael, user
@@ -234,9 +234,9 @@ async def test_find_unclassified_latest_user_note_skips_aegis_workflow_run_notes
     db_pool, _inbox_seeded
 ) -> None:
     """latest_user_note subquery must skip notes that contain the
-    `Workflow run:` footer (AEGIS-authored). Otherwise Pandora's own
-    progress comments are mistaken for user input and re-trigger
-    pandora_followup every clarify tick."""
+    `Workflow run:` footer (AEGIS-authored). Otherwise an agent's own
+    progress comments are mistaken for user input and re-trigger clarify
+    every tick."""
     earlier = dt.datetime(2026, 5, 19, 10, 0, 0, tzinfo=dt.UTC)
     aegis_posted = dt.datetime(2026, 5, 19, 11, 0, 0, tzinfo=dt.UTC)
     user_posted = dt.datetime(2026, 5, 19, 11, 30, 0, tzinfo=dt.UTC)
@@ -282,7 +282,7 @@ async def test_find_unclassified_skips_task_with_only_aegis_notes_after_watermar
     """Eligibility regression (2026-05-27 loop fix): a task whose only
     post-watermark notes are AEGIS-authored (Workflow run: footer, agent
     reply prefix, ClarifyFlow prefix) must NOT be surfaced. Pre-fix, any
-    note bumped last_note_at and re-eligibled the task — pandora's own
+    note bumped last_note_at and re-eligibled the task — an agent's own
     reply notes drove a 15-min self-trigger loop on 3 prod tasks.
     """
     earlier = dt.datetime(2026, 5, 19, 10, 0, 0, tzinfo=dt.UTC)
@@ -312,158 +312,6 @@ async def test_find_unclassified_skips_task_with_only_aegis_notes_after_watermar
     finally:
         async with db_pool.acquire() as conn:
             await conn.execute("DELETE FROM todoist_notes WHERE id = 'N_AEGIS_ONLY'")
-
-
-@pytest.mark.asyncio
-async def test_find_unclassified_pandora_cooldown_suppresses_within_30min(
-    db_pool, _inbox_seeded
-) -> None:
-    """Pandora cooldown (defence-in-depth): a @pandora APP- task that
-    had an AlertInvestigationFlow start within the last 30 min is NOT
-    re-surfaced, regardless of last_note_at vs last_clarified_at. This
-    blocks any runaway loop that bypasses the `Workflow run:` filter."""
-    task_id = "T_PANDORA_COOLDOWN"
-    earlier = dt.datetime(2026, 5, 22, 10, 0, 0, tzinfo=dt.UTC)
-    fresh_note = dt.datetime(2026, 5, 22, 10, 30, 0, tzinfo=dt.UTC)
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO todoist_tasks "
-            "(id, project_id, content, labels, is_completed, raw, "
-            " last_clarified_at, last_note_at) "
-            "VALUES ($1,'P_INBOX','APP-99999: cooldown probe',"
-            " ARRAY['@pandora','@area/acme'],false,'{}'::jsonb,$2,$3) "
-            "ON CONFLICT (id) DO UPDATE SET "
-            "  labels = EXCLUDED.labels, "
-            "  last_clarified_at = EXCLUDED.last_clarified_at, "
-            "  last_note_at = EXCLUDED.last_note_at",
-            task_id,
-            earlier,
-            fresh_note,
-        )
-        # Seed a workflow_runs row 10 min ago — well inside the cooldown.
-        await conn.execute(
-            """
-            INSERT INTO workflow_runs
-              (run_id, workflow_id, workflow_type, agent_id, status,
-               started_at, completed_at, duration_ms)
-            VALUES ($1, $2, 'AlertInvestigationFlow', 'pandoras-actor', 'completed',
-                    NOW() - INTERVAL '10 minutes', NOW() - INTERVAL '5 minutes', 300000)
-            ON CONFLICT (run_id) DO NOTHING
-            """,
-            f"run-{task_id}-recent",
-            f"pandora-jira-{task_id}-recent",
-        )
-    try:
-        acts = ClarifyActivities(
-            db_pool=db_pool, todoist_connector=AsyncMock(), llm_client=AsyncMock()
-        )
-        rows = await acts.find_unclassified_items(max_items=20)
-        ids = [r["id"] for r in rows]
-        assert task_id not in ids, f"Cooldown should have suppressed {task_id}, got {ids}"
-    finally:
-        async with db_pool.acquire() as conn:
-            await conn.execute(
-                "DELETE FROM workflow_runs WHERE run_id = $1",
-                f"run-{task_id}-recent",
-            )
-            await conn.execute("DELETE FROM todoist_tasks WHERE id = $1", task_id)
-
-
-@pytest.mark.asyncio
-async def test_find_unclassified_pandora_cooldown_lifts_after_30min(db_pool, _inbox_seeded) -> None:
-    """After 30 min since the last investigation, the cooldown lifts —
-    a @pandora APP- task with a fresh USER comment past last_clarified_at
-    surfaces normally. The user-note is required (2026-05-27 loop fix):
-    bare last_note_at advance from an agent reply does NOT surface."""
-    task_id = "T_PANDORA_COOLDOWN_LIFT"
-    earlier = dt.datetime(2026, 5, 22, 8, 0, 0, tzinfo=dt.UTC)
-    fresh_note = dt.datetime(2026, 5, 22, 9, 0, 0, tzinfo=dt.UTC)
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO todoist_tasks "
-            "(id, project_id, content, labels, is_completed, raw, "
-            " last_clarified_at, last_note_at) "
-            "VALUES ($1,'P_INBOX','APP-77777: cooldown lifted',"
-            " ARRAY['@pandora'],false,'{}'::jsonb,$2,$3) "
-            "ON CONFLICT (id) DO UPDATE SET "
-            "  labels = EXCLUDED.labels, "
-            "  last_clarified_at = EXCLUDED.last_clarified_at, "
-            "  last_note_at = EXCLUDED.last_note_at",
-            task_id,
-            earlier,
-            fresh_note,
-        )
-        # Workflow run completed 2 hours ago — well outside cooldown.
-        await conn.execute(
-            """
-            INSERT INTO workflow_runs
-              (run_id, workflow_id, workflow_type, agent_id, status,
-               started_at, completed_at, duration_ms)
-            VALUES ($1, $2, 'AlertInvestigationFlow', 'pandoras-actor', 'completed',
-                    NOW() - INTERVAL '2 hours', NOW() - INTERVAL '110 minutes', 600000)
-            ON CONFLICT (run_id) DO NOTHING
-            """,
-            f"run-{task_id}-old",
-            f"pandora-jira-{task_id}-old",
-        )
-        # A user-authored followup note past last_clarified_at — required
-        # for the eligibility filter post-2026-05-27 loop fix.
-        await conn.execute(
-            "INSERT INTO todoist_notes (id, item_id, content, posted_at) "
-            "VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
-            f"note-{task_id}-user",
-            task_id,
-            "any update?",
-            fresh_note,
-        )
-    try:
-        acts = ClarifyActivities(
-            db_pool=db_pool, todoist_connector=AsyncMock(), llm_client=AsyncMock()
-        )
-        rows = await acts.find_unclassified_items(max_items=20)
-        ids = [r["id"] for r in rows]
-        assert task_id in ids
-    finally:
-        async with db_pool.acquire() as conn:
-            await conn.execute(
-                "DELETE FROM workflow_runs WHERE run_id = $1",
-                f"run-{task_id}-old",
-            )
-            await conn.execute("DELETE FROM todoist_notes WHERE id = $1", f"note-{task_id}-user")
-            await conn.execute("DELETE FROM todoist_tasks WHERE id = $1", task_id)
-
-
-@pytest.mark.asyncio
-async def test_find_unclassified_pandora_cooldown_doesnt_block_first_investigation(
-    db_pool, _inbox_seeded
-) -> None:
-    """A brand-new @pandora APP- task (or any APP- task) with no prior
-    AlertInvestigationFlow row must NOT be blocked by the cooldown — the
-    first investigation needs to fire."""
-    task_id = "T_PANDORA_FIRST"
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "DELETE FROM workflow_runs WHERE workflow_id LIKE $1", f"pandora-jira-{task_id}-%"
-        )
-        await conn.execute(
-            "INSERT INTO todoist_tasks "
-            "(id, project_id, content, labels, is_completed, raw) "
-            "VALUES ($1,'P_INBOX','APP-66666: first-time investigation',"
-            " ARRAY[]::text[],false,'{}'::jsonb) "
-            "ON CONFLICT (id) DO UPDATE SET labels = EXCLUDED.labels, "
-            "  last_clarified_at = NULL, last_note_at = NULL",
-            task_id,
-        )
-    try:
-        acts = ClarifyActivities(
-            db_pool=db_pool, todoist_connector=AsyncMock(), llm_client=AsyncMock()
-        )
-        rows = await acts.find_unclassified_items(max_items=20)
-        ids = [r["id"] for r in rows]
-        assert task_id in ids
-    finally:
-        async with db_pool.acquire() as conn:
-            await conn.execute("DELETE FROM todoist_tasks WHERE id = $1", task_id)
 
 
 @pytest.mark.asyncio
@@ -1680,43 +1528,7 @@ async def test_apply_clarify_resolution_unknown_choice_no_apply(db_pool, _resolu
     connector.commands.assert_not_called()
 
 
-# --- Inbox gate: pandora_gate card + @me hands-off (2026-07) ---
-
-
-def _decision_gate() -> dict:
-    return {
-        "classification": "pandora_gate",
-        "confidence": 1.0,
-        "assignee": "@pandora",
-        "contexts": ["@deep", "@code"],
-        "reason": "APP-<n>: jira ticket — ask before investigating",
-        "llm_model": "rules",
-        "source_tag": None,
-    }
-
-
-@pytest.mark.asyncio
-async def test_apply_outcome_pandora_gate_spawns_card(db_pool) -> None:
-    """pandora_gate spawns a two-option choice card and sends NO Todoist
-    commands — nothing touches the ticket until the user picks."""
-    connector = AsyncMock()
-    acts = ClarifyActivities(db_pool=db_pool, todoist_connector=connector, llm_client=AsyncMock())
-    task = {
-        "id": "T_GATE",
-        "content": "APP-11175: Ownership importer not writing internal id",
-        "labels": [],
-        "source_tag": None,
-    }
-    out = await acts.apply_outcome(task, _decision_gate())
-    assert out["applied"] is False
-    assert out["interaction_spawned"] is True
-    payload = out["interaction_payload"]
-    assert payload["flavor"] == "pandora_gate"
-    # No spawn_kind → ClarifyFlow routes to InteractionFlow, not the alert flow.
-    assert "spawn_kind" not in payload
-    assert set(payload["options"]) == {"investigate", "mine"}
-    assert out["commands_sent"] == 0
-    connector.commands.assert_not_called()
+# --- @me hands-off (2026-07) ---
 
 
 @pytest.mark.asyncio
@@ -1742,99 +1554,6 @@ async def test_apply_outcome_mine_adds_me_label(db_pool) -> None:
     upd = next(c for c in sent if c["type"] == "item_update")
     assert "@me" in upd["args"]["labels"]
     assert not any(c["type"] == "item_complete" for c in sent)
-
-
-@pytest.mark.asyncio
-async def test_apply_clarify_resolution_pandora_gate_investigate(db_pool, _resolution_task) -> None:
-    """Gate 'investigate' stamps @pandora + @area/acme AND clears the watermark
-    so the next tick re-surfaces the task for the real AlertInvestigationFlow
-    spawn (child-workflow spawns must happen in the flow, not this activity)."""
-    connector = AsyncMock()
-    connector.commands = AsyncMock(
-        return_value={"ok": True, "data": {"sync_status": {}, "temp_id_mapping": {}}}
-    )
-    acts = ClarifyActivities(db_pool=db_pool, todoist_connector=connector, llm_client=AsyncMock())
-    # Pre-bump the watermark so a passing NULL assertion proves the clear ran.
-    # Give the task an APP-<n>: title so it matches the seeded content route —
-    # the route's area_label (@area/acme) is what gets stamped on investigate.
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE todoist_tasks SET content='APP-500: vendor issue', "
-            "last_clarified_at = now() WHERE id='T_RES'"
-        )
-    metadata = {
-        "source": "gtd_clarify",
-        "flavor": "pandora_gate",
-        "task_id": "T_RES",
-        "decision": _decision_gate(),
-        "pass_n": 1,
-    }
-    out = await acts.apply_clarify_resolution(
-        "88888888-8888-8888-8888-888888888888",
-        {"value": "investigate"},
-        metadata,
-    )
-    assert out["applied"] is True
-    assert out["choice"] == "investigate"
-    sent = connector.commands.await_args.args[0]
-    upd = next(c for c in sent if c["type"] == "item_update")
-    assert "@pandora" in upd["args"]["labels"]
-    assert "@area/acme" in upd["args"]["labels"]
-    async with db_pool.acquire() as conn:
-        wm = await conn.fetchval("SELECT last_clarified_at FROM todoist_tasks WHERE id='T_RES'")
-    assert wm is None
-
-
-@pytest.mark.asyncio
-async def test_apply_clarify_resolution_pandora_gate_mine(db_pool, _resolution_task) -> None:
-    """Gate 'I've got it' stamps @me (hands off); the watermark stays bumped so
-    the task is doubly excluded from clarify."""
-    connector = AsyncMock()
-    connector.commands = AsyncMock(
-        return_value={"ok": True, "data": {"sync_status": {}, "temp_id_mapping": {}}}
-    )
-    acts = ClarifyActivities(db_pool=db_pool, todoist_connector=connector, llm_client=AsyncMock())
-    metadata = {
-        "source": "gtd_clarify",
-        "flavor": "pandora_gate",
-        "task_id": "T_RES",
-        "decision": _decision_gate(),
-        "pass_n": 1,
-    }
-    out = await acts.apply_clarify_resolution(
-        "99999999-9999-9999-9999-999999999999",
-        {"value": "mine"},
-        metadata,
-    )
-    assert out["applied"] is True
-    assert out["choice"] == "mine"
-    sent = connector.commands.await_args.args[0]
-    upd = next(c for c in sent if c["type"] == "item_update")
-    assert "@me" in upd["args"]["labels"]
-    async with db_pool.acquire() as conn:
-        wm = await conn.fetchval("SELECT last_clarified_at FROM todoist_tasks WHERE id='T_RES'")
-    assert wm is not None
-
-
-@pytest.mark.asyncio
-async def test_apply_clarify_resolution_pandora_gate_unknown_choice(db_pool, _resolution_task) -> None:
-    connector = AsyncMock()
-    acts = ClarifyActivities(db_pool=db_pool, todoist_connector=connector, llm_client=AsyncMock())
-    metadata = {
-        "source": "gtd_clarify",
-        "flavor": "pandora_gate",
-        "task_id": "T_RES",
-        "decision": _decision_gate(),
-        "pass_n": 1,
-    }
-    out = await acts.apply_clarify_resolution(
-        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
-        {"value": "nonsense"},
-        metadata,
-    )
-    assert out["applied"] is False
-    assert "unknown_gate_choice" in out["reason"]
-    connector.commands.assert_not_called()
 
 
 @pytest_asyncio.fixture(loop_scope="function")
@@ -2216,62 +1935,11 @@ async def test_apply_clarify_resolution_low_conf_confirm_ingests_reference(
 
 
 @pytest.mark.asyncio
-async def test_classify_one_app_prefix_returns_pandora_gate(db_pool) -> None:
-    """A FRESH task (no @pandora) whose content starts with APP-<n>: skips the
-    LLM and routes to the pandora_gate choice card — NOT a silent
-    investigation. (inbox gate — user asks before an agent runs.)"""
-    acts = ClarifyActivities(db_pool=db_pool, todoist_connector=AsyncMock(), llm_client=AsyncMock())
-    task = {
-        "id": "T_APP",
-        "content": "APP-12345: Portfolio valuation incorrect for ZAR positions",
-        "labels": [],
-        "source_tag": "#manual",
-    }
-    decision = await acts.classify_one(task)
-    assert decision["classification"] == "pandora_gate"
-    assert decision["confidence"] == 1.0
-    assert decision["assignee"] == "@pandora"
-    assert decision["llm_model"] == "rules"
-
-
-@pytest.mark.asyncio
-async def test_classify_one_app_prefix_requires_colon(db_pool) -> None:
-    """Bare mentions of APP-1234 (no colon) fall through to the LLM."""
-    llm = AsyncMock()
-    llm.think = AsyncMock(
-        return_value={
-            "response": json.dumps(
-                {
-                    "classification": "reference",
-                    "confidence": 0.9,
-                    "assignee": "@me",
-                    "contexts": [],
-                    "reason": "test",
-                }
-            ),
-            "model": "qwen3:14b",
-            "prompt_tokens": 1,
-            "completion_tokens": 1,
-        }
-    )
-    acts = ClarifyActivities(db_pool=db_pool, todoist_connector=AsyncMock(), llm_client=llm)
-    task = {
-        "id": "T_NOPP",
-        "content": "APP-12345 was discussed yesterday",
-        "labels": [],
-        "source_tag": "#manual",
-    }
-    decision = await acts.classify_one(task)
-    # LLM-routed — not a pandora branch (neither gate nor investigation)
-    assert decision["classification"] not in {"pandora_investigation", "pandora_gate"}
-
-
-@pytest.mark.asyncio
 async def test_classify_one_gate_false_route_applies_labels_directly(db_pool) -> None:
-    """A content route with gate:false routes by content to `route_apply` — the
-    route's assignee + contexts (+ area_label) are applied directly, no choice
-    card and no agent run. Proves routing is config-driven, not hardcoded to
-    APP-/@pandora: here a `contains "[bug]"` route hands the task to @raphael."""
+    """A content route routes by content to `route_apply` — the route's
+    assignee + contexts (+ area_label) are applied directly, no choice card
+    and no agent run. Here a `contains "[bug]"` route hands the task to
+    @raphael. A route stored with the retired `gate: true` reads the same."""
     from aegis.services.content_routes import save_content_routes
     from aegis_worker.activities import clarify as _cl
 
@@ -2282,7 +1950,7 @@ async def test_classify_one_gate_false_route_applies_labels_directly(db_pool) ->
                 "key": "bug",
                 "match": "contains",
                 "value": "[bug]",
-                "gate": False,
+                "gate": True,
                 "assignee": "@raphael",
                 "contexts": ["@reading"],
                 "area_label": "@area/oss",
@@ -2310,247 +1978,6 @@ async def test_classify_one_gate_false_route_applies_labels_directly(db_pool) ->
     assert not any(c["type"] == "item_complete" for c in sent)
 
 
-@pytest.mark.asyncio
-async def test_classify_one_pandora_label_short_circuits(db_pool) -> None:
-    """Tasks already carrying @pandora bypass classification entirely."""
-    acts = ClarifyActivities(db_pool=db_pool, todoist_connector=AsyncMock(), llm_client=AsyncMock())
-    task = {
-        "id": "T_OWNED",
-        "content": "Anything at all",
-        "labels": ["#alert", "@pandora"],
-        "source_tag": "#alert",
-    }
-    decision = await acts.classify_one(task)
-    assert decision["classification"] == "pandora_owned"
-    assert decision["confidence"] == 1.0
-    assert decision["llm_model"] == "rules"
-
-
-@pytest.mark.asyncio
-async def test_classify_one_pandora_app_with_completed_investigation_stays_owned(
-    db_pool,
-) -> None:
-    """@pandora APP-<n>: task with a SUCCESSFUL prior investigation stays
-    pandora_owned (no retry — the run did its job)."""
-    task_id = "T_PANDORA_DONE"
-    async with db_pool.acquire() as conn:
-        # Seed a completed run for this task
-        await conn.execute(
-            """
-            INSERT INTO workflow_runs
-              (run_id, workflow_id, workflow_type, agent_id, status,
-               started_at, completed_at, duration_ms)
-            VALUES ($1, $2, 'AlertInvestigationFlow', 'pandoras-actor', 'completed',
-                    NOW() - INTERVAL '2 hours', NOW() - INTERVAL '1 hour', 3600000)
-            ON CONFLICT (run_id) DO NOTHING
-            """,
-            f"run-{task_id}",
-            f"pandora-jira-{task_id}-scheduled-x",
-        )
-    try:
-        acts = ClarifyActivities(
-            db_pool=db_pool, todoist_connector=AsyncMock(), llm_client=AsyncMock()
-        )
-        task = {
-            "id": task_id,
-            "content": "APP-12345: real ticket",
-            "labels": ["@pandora", "@area/acme"],
-            "source_tag": None,
-        }
-        decision = await acts.classify_one(task)
-        assert decision["classification"] == "pandora_owned"
-    finally:
-        async with db_pool.acquire() as conn:
-            await conn.execute("DELETE FROM workflow_runs WHERE run_id = $1", f"run-{task_id}")
-
-
-@pytest.mark.asyncio
-async def test_classify_one_pandora_app_without_investigation_retries(db_pool) -> None:
-    """@pandora APP-<n>: task with NO successful prior investigation
-    re-routes to pandora_investigation (retry — prior attempt crashed)."""
-    task_id = "T_PANDORA_RETRY"
-    # No prior run for this task — verify the helper sees none
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "DELETE FROM workflow_runs WHERE workflow_id LIKE $1",
-            f"pandora-jira-{task_id}-%",
-        )
-    acts = ClarifyActivities(db_pool=db_pool, todoist_connector=AsyncMock(), llm_client=AsyncMock())
-    task = {
-        "id": task_id,
-        "content": "APP-99999: never investigated",
-        "labels": ["@pandora"],
-        "source_tag": None,
-    }
-    decision = await acts.classify_one(task)
-    assert decision["classification"] == "pandora_investigation"
-    assert "retry" in decision["reason"].lower() or "no successful" in decision["reason"].lower()
-
-
-@pytest.mark.asyncio
-async def test_classify_one_pandora_app_with_only_failed_runs_still_retries(
-    db_pool,
-) -> None:
-    """A previously-FAILED AlertInvestigationFlow does NOT count as
-    completed — the retry branch still fires."""
-    task_id = "T_PANDORA_FAILED_ONLY"
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "DELETE FROM workflow_runs WHERE workflow_id LIKE $1",
-            f"pandora-jira-{task_id}-%",
-        )
-        await conn.execute(
-            """
-            INSERT INTO workflow_runs
-              (run_id, workflow_id, workflow_type, agent_id, status,
-               started_at, completed_at, duration_ms, error)
-            VALUES ($1, $2, 'AlertInvestigationFlow', 'pandoras-actor', 'failed',
-                    NOW() - INTERVAL '6 hours', NOW() - INTERVAL '5 hours',
-                    3600000, 'ActivityError: timed out')
-            ON CONFLICT (run_id) DO NOTHING
-            """,
-            f"run-{task_id}",
-            f"pandora-jira-{task_id}-scheduled-x",
-        )
-    try:
-        acts = ClarifyActivities(
-            db_pool=db_pool, todoist_connector=AsyncMock(), llm_client=AsyncMock()
-        )
-        task = {
-            "id": task_id,
-            "content": "APP-77777: failed earlier",
-            "labels": ["@pandora"],
-        }
-        decision = await acts.classify_one(task)
-        assert decision["classification"] == "pandora_investigation"
-    finally:
-        async with db_pool.acquire() as conn:
-            await conn.execute("DELETE FROM workflow_runs WHERE run_id = $1", f"run-{task_id}")
-
-
-@pytest.mark.asyncio
-async def test_apply_outcome_pandora_owned_applies_no_routing_changes(db_pool) -> None:
-    """pandora_owned makes no routing/assignee changes and logs as applied. Its
-    only write is the GTD state stamp (issue #139) — no note, no completion, no
-    label churn beyond the one state label."""
-    await _seed_managed_projects(db_pool)()
-    connector = AsyncMock()
-    connector.commands = AsyncMock(
-        return_value={"ok": True, "data": {"sync_status": {}, "temp_id_mapping": {}}}
-    )
-    acts = ClarifyActivities(db_pool=db_pool, todoist_connector=connector, llm_client=AsyncMock())
-    task = {"id": "T_OWNED", "labels": ["@pandora"]}
-    decision = {
-        "classification": "pandora_owned",
-        "confidence": 1.0,
-        "assignee": "@pandora",
-        "contexts": [],
-        "reason": "owned",
-        "llm_model": "rules",
-    }
-    out = await acts.apply_outcome(task, decision)
-    assert out["applied"] is True
-    assert out["commands_sent"] == 1
-    sent = connector.commands.await_args.args[0]
-    assert [c["type"] for c in sent] == ["item_update"]
-    assert set(sent[0]["args"]["labels"]) == {"@pandora", "@next"}
-
-
-@pytest.mark.asyncio
-async def test_apply_outcome_pandora_owned_stamps_next_label(db_pool) -> None:
-    """The single largest limbo bucket in production (49/66 all-time
-    pandora_owned tasks carried no GTD state). A task claimed by a prior
-    investigation is still open work → @next."""
-    await _seed_managed_projects(db_pool)()
-    connector = AsyncMock()
-    connector.commands = AsyncMock(
-        return_value={"ok": True, "data": {"sync_status": {}, "temp_id_mapping": {}}}
-    )
-    acts = ClarifyActivities(db_pool=db_pool, todoist_connector=connector, llm_client=AsyncMock())
-    task = {"id": "T_OWNED_STATE", "labels": ["@pandora", "@code"]}
-    decision = {
-        "classification": "pandora_owned",
-        "confidence": 1.0,
-        "assignee": "@pandora",
-        "contexts": [],
-        "reason": "owned",
-        "llm_model": "rules",
-    }
-    out = await acts.apply_outcome(task, decision)
-    assert out["applied"] is True
-    upd = next(c for c in connector.commands.await_args.args[0] if c["type"] == "item_update")
-    assert "@next" in upd["args"]["labels"]
-    # Pre-existing labels survive the stamp.
-    assert {"@pandora", "@code"} <= set(upd["args"]["labels"])
-
-
-@pytest.mark.asyncio
-async def test_apply_outcome_pandora_owned_stamp_is_idempotent(db_pool) -> None:
-    """pandora_owned is re-visited on every note; once the state label is on the
-    task the branch must go back to sending nothing (135 all-time visits)."""
-    await _seed_managed_projects(db_pool)()
-    connector = AsyncMock()
-    connector.commands = AsyncMock(
-        return_value={"ok": True, "data": {"sync_status": {}, "temp_id_mapping": {}}}
-    )
-    acts = ClarifyActivities(db_pool=db_pool, todoist_connector=connector, llm_client=AsyncMock())
-    task = {"id": "T_OWNED_IDEM", "labels": ["@pandora", "@next"]}
-    decision = {
-        "classification": "pandora_owned",
-        "confidence": 1.0,
-        "assignee": "@pandora",
-        "contexts": [],
-        "reason": "owned",
-        "llm_model": "rules",
-    }
-    out = await acts.apply_outcome(task, decision)
-    assert out["applied"] is True
-    assert out["commands_sent"] == 0
-    connector.commands.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_apply_outcome_pandora_investigation_labels_and_signal(db_pool) -> None:
-    """pandora_investigation stamps the area+pandora labels and returns a
-    spawn payload carrying the alert dict for AlertInvestigationFlow."""
-    await _seed_managed_projects(db_pool)()
-    connector = AsyncMock()
-    connector.commands = AsyncMock(
-        return_value={"ok": True, "data": {"sync_status": {}, "temp_id_mapping": {}}}
-    )
-    acts = ClarifyActivities(db_pool=db_pool, todoist_connector=connector, llm_client=AsyncMock())
-    task = {
-        "id": "T_APP",
-        "content": "APP-12345: Portfolio valuation incorrect for ZAR positions",
-        "description": "Spotted on 2026-05-20",
-        "labels": ["#manual"],
-    }
-    decision = {
-        "classification": "pandora_investigation",
-        "confidence": 1.0,
-        "assignee": "@pandora",
-        "contexts": ["@deep", "@code"],
-        "reason": "detected APP-<n>: jira-key prefix",
-        "llm_model": "rules",
-    }
-    out = await acts.apply_outcome(task, decision)
-    assert out["applied"] is True
-    assert out["interaction_spawned"] is True
-    payload = out["interaction_payload"]
-    assert payload["spawn_kind"] == "pandora_investigation"
-    alert = payload["alert"]
-    assert alert["todoist_task_id"] == "T_APP"
-    assert alert["resource_tag_filter"] == ["acme"]
-    assert alert["requires_approval"] is False
-    assert alert["source"] == "todoist-jira"
-    assert alert["fingerprint"] == "route-T_APP"
-    # item_update was sent with both labels
-    sent = connector.commands.await_args.args[0]
-    upd = next(c for c in sent if c["type"] == "item_update")
-    assert "@area/acme" in upd["args"]["labels"]
-    assert "@pandora" in upd["args"]["labels"]
-
-
 @pytest_asyncio.fixture(loop_scope="function")
 async def _inbox_with_app_jira(db_pool):
     """Seed an inbox task that mimics a Jira-synced APP- ticket: no source_tag."""
@@ -2573,7 +2000,7 @@ async def _inbox_with_app_jira(db_pool):
             "VALUES ('T_APP_JIRA','P_INBOX',"
             "'APP-9955: Spy: remove dead code and upgrade python',"
             # Fresh Jira sync carries no @me (labels come verbatim from
-            # Todoist); @me would trip the inbox-gate hands-off exclusion.
+            # Todoist); @me would trip the hands-off exclusion.
             "ARRAY['@area/acme'],NULL,false,'{}'::jsonb)"
         )
 
@@ -2583,7 +2010,7 @@ async def test_find_unclassified_includes_app_jira_without_source_tag(
     db_pool, _inbox_with_app_jira
 ) -> None:
     """APP-<n>: tasks synced from Jira have no source_tag but must still
-    enter clarify so the pandora_investigation branch can fire."""
+    enter clarify so their content route can apply its labels."""
     acts = ClarifyActivities(db_pool=db_pool, todoist_connector=AsyncMock(), llm_client=AsyncMock())
     rows = await acts.find_unclassified_items(max_items=10)
     found = [r for r in rows if r["id"] == "T_APP_JIRA"]
@@ -2630,10 +2057,10 @@ async def test_apply_outcome_per_command_rejected_returns_applied_false(db_pool)
         "labels": [],
     }
     decision = {
-        "classification": "pandora_investigation",
+        "classification": "route_apply",
         "confidence": 1.0,
-        "assignee": "@pandora",
-        "contexts": ["@deep", "@code"],
+        "assignee": "@raphael",
+        "contexts": ["@deep"],
         "reason": "x",
         "llm_model": "rules",
     }
@@ -2671,10 +2098,10 @@ async def test_apply_outcome_per_command_5xx_queues_outbox(db_pool) -> None:
     acts = ClarifyActivities(db_pool=db_pool, todoist_connector=connector, llm_client=AsyncMock())
     task = {"id": "T_503", "content": "APP-9002: x", "labels": []}
     decision = {
-        "classification": "pandora_investigation",
+        "classification": "route_apply",
         "confidence": 1.0,
-        "assignee": "@pandora",
-        "contexts": ["@deep", "@code"],
+        "assignee": "@raphael",
+        "contexts": ["@deep"],
         "reason": "x",
         "llm_model": "rules",
     }
@@ -2709,98 +2136,6 @@ async def test_log_classification_skips_watermark_when_bump_false(db_pool) -> No
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow("SELECT last_clarified_at FROM todoist_tasks WHERE id='T_WM'")
     assert row["last_clarified_at"] is None, "watermark must stay NULL when bump=False"
-
-
-@pytest.mark.asyncio
-async def test_classify_one_detects_pandora_followup_on_user_comment(db_pool) -> None:
-    """When an @pandora-labelled APP-* task has a fresh user comment,
-    classify_one routes to pandora_followup (not pandora_owned), which
-    triggers a fresh delta-investigation in apply_outcome."""
-    acts = ClarifyActivities(db_pool=db_pool, llm_client=AsyncMock())
-    task = {
-        "id": "T_FOLLOWUP",
-        "content": "APP-10741: > rule bug on screener",
-        "labels": ["@pandora", "@area/acme"],
-        "latest_user_note": "Reproduced on screener-p-server staging too",
-        "last_note_at": dt.datetime(2026, 5, 21, 10, 30, tzinfo=dt.UTC),
-    }
-    decision = await acts.classify_one(task)
-    assert decision["classification"] == "pandora_followup"
-    assert decision["confidence"] == 1.0
-
-
-@pytest.mark.asyncio
-async def test_classify_one_pandora_owned_when_no_user_comment(db_pool) -> None:
-    """No user comment + a SUCCESSFUL prior investigation → pandora_owned
-    (the historical short-circuit; the retry branch added 2026-05-21
-    only fires when no completed run exists for this task)."""
-    task_id = "T_OWNED2"
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO workflow_runs
-              (run_id, workflow_id, workflow_type, agent_id, status,
-               started_at, completed_at, duration_ms)
-            VALUES ($1, $2, 'AlertInvestigationFlow', 'pandoras-actor', 'completed',
-                    NOW() - INTERVAL '2 hours', NOW() - INTERVAL '1 hour', 3600000)
-            ON CONFLICT (run_id) DO NOTHING
-            """,
-            f"run-{task_id}",
-            f"pandora-jira-{task_id}-scheduled-x",
-        )
-    try:
-        acts = ClarifyActivities(db_pool=db_pool, llm_client=AsyncMock())
-        task = {
-            "id": task_id,
-            "content": "APP-10741: > rule bug on screener",
-            "labels": ["@pandora", "@area/acme"],
-            "latest_user_note": None,
-        }
-        decision = await acts.classify_one(task)
-        assert decision["classification"] == "pandora_owned"
-    finally:
-        async with db_pool.acquire() as conn:
-            await conn.execute("DELETE FROM workflow_runs WHERE run_id = $1", f"run-{task_id}")
-
-
-@pytest.mark.asyncio
-async def test_apply_outcome_pandora_followup_builds_followup_alert(db_pool) -> None:
-    """pandora_followup builds an alert dict with the user's comment
-    appended to the description and a unique per-comment fingerprint
-    (so each comment is its own occurrence when the flow ingests it)."""
-    await _seed_managed_projects(db_pool)()
-    connector = AsyncMock()
-    connector.commands = AsyncMock(
-        return_value={"ok": True, "data": {"sync_status": {}, "temp_id_mapping": {}}}
-    )
-    acts = ClarifyActivities(db_pool=db_pool, todoist_connector=connector, llm_client=AsyncMock())
-    task = {
-        "id": "T_FU",
-        "content": "APP-10741: > rule bug",
-        "description": "Original report",
-        "labels": ["@pandora", "@area/acme"],
-        "latest_user_note": "Also affects production — escalate",
-        "last_note_at": dt.datetime(2026, 5, 21, 11, 0, tzinfo=dt.UTC),
-    }
-    decision = {
-        "classification": "pandora_followup",
-        "confidence": 1.0,
-        "assignee": "@pandora",
-        "contexts": ["@deep", "@code"],
-        "reason": "x",
-        "llm_model": "rules",
-    }
-    out = await acts.apply_outcome(task, decision)
-    assert out["applied"] is True
-    assert out["interaction_spawned"] is True
-    alert = out["interaction_payload"]["alert"]
-    assert alert["todoist_task_id"] == "T_FU"
-    # Fingerprint includes a token derived from last_note_at (per-comment)
-    assert alert["fingerprint"].startswith("route-T_FU-followup-")
-    assert alert["fingerprint"] != "route-T_FU"
-    # User comment carried into description
-    assert "Also affects production" in alert["description"]
-    assert "User followup comment" in alert["description"]
 
 
 # --- references-as-knowledge: completion & demotion paths ---
@@ -3188,7 +2523,7 @@ async def test_fetch_recent_task_notes_excludes_clarify_and_workflow_notes(db_po
         await conn.execute("DELETE FROM todoist_tasks WHERE id = 'TASK_FN'")
         await conn.execute(
             "INSERT INTO todoist_tasks (id, project_id, content, labels, raw) "
-            "VALUES ('TASK_FN','PRJ_FN','t',ARRAY['@pandora'],'{}'::jsonb)"
+            "VALUES ('TASK_FN','PRJ_FN','t',ARRAY['@maou'],'{}'::jsonb)"
         )
         # 4 notes: user, clarify, agent reply, workflow-run
         await conn.execute(
@@ -3213,7 +2548,7 @@ async def test_fetch_recent_task_notes_excludes_clarify_and_workflow_notes(db_po
                 (
                     "N_FN_AGENT",
                     "TASK_FN",
-                    "[Agent reply @ 11:00 UTC agent=pandoras-actor]\nlooked at the code...",
+                    "[Agent reply @ 11:00 UTC agent=maou]\nlooked at the code...",
                     _dt.datetime(2026, 5, 27, 11, 0, tzinfo=_dt.UTC),
                 ),
                 (
@@ -3242,12 +2577,12 @@ def test_build_agent_synthetic_input_warns_against_echoing_markers() -> None:
     recent_notes = [
         {
             "posted_at": dt.datetime(2026, 5, 27, 13, 27, tzinfo=dt.UTC),
-            "content": "[Agent reply @ 13:27 UTC agent=pandoras-actor]\nI've kicked off the run.",
+            "content": "[Agent reply @ 13:27 UTC agent=maou]\nI've kicked off the run.",
         },
     ]
     out = acts._build_agent_synthetic_input(
         {"id": "T1", "content": "fix it", "description": "", "latest_user_note": "status?"},
-        "pandoras-actor",
+        "maou",
         recent_notes=recent_notes,
     )
     assert "do NOT reproduce or echo them" in out

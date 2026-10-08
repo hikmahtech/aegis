@@ -8,8 +8,10 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from aegis.services.hub import get_problem, mute_problem, set_service_state
-from aegis.services.hub_watch import mute_hint, reconcile_findings
+from aegis.services.hub import get_problem
+from aegis.services.hub_watch import reconcile_findings
+
+from tests.hub_helpers import mute_problem
 
 pytestmark = pytest.mark.asyncio
 
@@ -78,15 +80,15 @@ async def test_only_this_watchdogs_classes_are_resolved(db_pool):
     assert (await get_problem(db_pool, other_pid))["status"] == "open"
 
 
-async def test_muted_and_suppressed_findings_are_counted_not_fresh(db_pool):
-    s, t = _subject(), _subject()
+async def test_muted_findings_are_counted_not_fresh(db_pool):
+    s = _subject()
     first = await _rec(db_pool, [_f(s)])
     await mute_problem(db_pool, first["fresh"][0]["problem_id"], hours=24, by="test", now=NOW)
     await _rec(db_pool, [], now=NOW + timedelta(minutes=1))  # resolve while muted
-    await set_service_state(db_pool, t, "deploying", subject_kind="flow", minutes=30, set_by="t", now=NOW)
-    out = await _rec(db_pool, [_f(s), _f(t)], now=NOW + timedelta(minutes=2))
+    out = await _rec(db_pool, [_f(s)], now=NOW + timedelta(minutes=2))
     assert out["fresh"] == []
-    assert out["muted"] == 1 and out["suppressed"] == 1
+    assert out["muted"] == 1
+    assert "suppressed" not in out  # the windows left with the infra lane
 
 
 async def test_unusable_findings_are_skipped(db_pool):
@@ -125,11 +127,3 @@ async def test_projection_failure_does_not_break_the_reconcile(db_pool, monkeypa
     assert len(out["fresh"]) == 1
 
 
-def test_mute_hint_points_at_the_problems_page_and_names_the_problems():
-    """The page's Mute button goes through `hub.mute_problem`, which writes the
-    `mute` event. The raw UPDATE the card used to carry skipped it (#478)."""
-    assert mute_hint([]) == ""
-    hint = mute_hint(["a", "", "b"])
-    assert hint.startswith("Silence: admin Problems page")
-    assert "Mute 24h" in hint and "a, b" in hint
-    assert "UPDATE" not in hint

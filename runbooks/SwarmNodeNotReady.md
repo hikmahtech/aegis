@@ -1,3 +1,0 @@
-# SwarmNodeNotReady
-
-TODO: fill in

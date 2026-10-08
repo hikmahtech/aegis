@@ -174,7 +174,7 @@ async def absorb_strays(
         "  AND NOT EXISTS (SELECT 1 FROM problem_events e "
         "                  WHERE e.problem_id IN (p.id, g.id) AND e.source = ANY($5::text[])) "
         "GROUP BY 1, 2, 3, 4, 5 ORDER BY 1",
-        sorted(LIVE_STATUSES - {"suppressed"}),
+        sorted(LIVE_STATUSES),
         sorted(LIVE_STATUSES),
         TASK_SUBJECT_KIND,
         since,

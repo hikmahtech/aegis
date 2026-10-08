@@ -1,3 +1,0 @@
-# MySQLHighConnections
-
-TODO: fill in

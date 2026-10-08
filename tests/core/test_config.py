@@ -71,22 +71,6 @@ def test_env_prefix():
         del os.environ["AEGIS_API_KEY"]
 
 
-def test_homelab_settings_defaults(monkeypatch):
-    """Homelab settings load with defaults and comma-separated domain list."""
-    monkeypatch.setenv("AEGIS_DATABASE_URL", "postgresql://x")
-    monkeypatch.setenv("AEGIS_LITELLM_URL", "http://x")
-    monkeypatch.setenv("AEGIS_TEMPORAL_UI_URL", "http://x")
-    monkeypatch.setenv("AEGIS_ADMIN_USERNAME", "u")
-    monkeypatch.setenv("AEGIS_ADMIN_PASSWORD", "p")
-    monkeypatch.setenv("AEGIS_HOMELAB_PUBLIC_DOMAINS", "a.example.com,b.example.com")
-
-    s = Settings()
-    # homelab_enabled defaults to False — operators must opt in.
-    assert s.homelab_enabled is False
-    assert s.homelab_docker_context == ""
-    assert s.homelab_public_domains == ["a.example.com", "b.example.com"]
-
-
 def test_homelab_probe_fields_deleted():
     """The owner-specific monitoring probes (Dagster GraphQL, Traefik API,
     NFS backup audit + restore drill) were stripped for OSS — their config
@@ -99,6 +83,16 @@ def test_homelab_probe_fields_deleted():
         "homelab_restore_drill_host",
         "homelab_restore_drill_disk_min_gb",
         "homelab_drift_sustained_minutes",
+        # The infra lane, moved to the DevOps vertical (a2-devops).
+        "homelab_enabled",
+        "homelab_docker_context",
+        "homelab_public_domains",
+        "infra_cluster",
+        "infra_heartbeat_ping_url",
+        "runbooks_dir",
+        "vercel_token",
+        "vercel_team_id",
+        "alert_webhook_secret",
         "chat_auto_extract_enabled",
         "money_hygiene_haiku_batch",
         "money_hygiene_cancellation_threshold_multiplier",
@@ -127,9 +121,9 @@ def test_comma_separated_list_fields_parse_from_env(monkeypatch):
     """
     for k, v in _REQUIRED.items():
         monkeypatch.setenv(f"AEGIS_{k.upper()}", v)
-    monkeypatch.setenv("AEGIS_HOMELAB_PUBLIC_DOMAINS", "a.com,b.com, c.com")
+    monkeypatch.setenv("AEGIS_CORS_ALLOWED_ORIGINS", "https://a.com,https://b.com, https://c.com")
     s = Settings()
-    assert s.homelab_public_domains == ["a.com", "b.com", "c.com"]
+    assert s.cors_allowed_origins == ["https://a.com", "https://b.com", "https://c.com"]
 
 
 def test_settings_default_todoist_fields_empty(monkeypatch):

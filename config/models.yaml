@@ -36,7 +36,7 @@ routes:
     intent_route: classify                                  # which agent answers a chat message — a verdict, not a fast-tier reply
     money_event_extraction: extract
     memory_consolidation: extract
-    alert_resource_resolution: extract
+    alert_resource_resolution: extract                      # the coding lane's repo pick (repo_resolve.py)
     content_route_suggest: extract
     persona_draft: extract                                  # parses {soul, operating_notes, user_context}
     review_frame: extract                                   # parses {narrative, order}
@@ -45,11 +45,9 @@ routes:
     gmail_classification: classify
     clarify_classification: classify
     intel_score_significance: classify
-    alert_assessment: classify
     books_answer_account: classify
     daylog_narrative: write
     daylog_rollup: write
-    alert_investigation: write                              # prose verdict, keyword-scanned
     briefing_frame: write                                   # the morning narrative, no JSON
     knowledge_ask: write                                    # the Knowledge UI's RAG answer, read by a person
 

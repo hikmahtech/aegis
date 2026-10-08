@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import pytest_asyncio
 
-# The pre-2026-07 hardcoded Acme `^APP-\d+:` → @pandora investigation is now just
-# a content_routes row. The clarify-activities tests exercise that path, so seed
-# the equivalent route (regex mode keeps the required colon) before each such test
-# and reset the worker's 30s route cache so it re-reads. Gated to the
+# A content route the clarify-activities tests route `APP-<n>:` titles with
+# (regex mode keeps the required colon). Seeded before each such test, with the
+# worker's 30s route cache reset so it re-reads. Gated to the
 # `clarify_activities` modules only — resolved lazily via getfixturevalue so it
 # never couples the rest of the worker suite to Postgres.
 _APP_CONTENT_ROUTE = [
@@ -15,19 +14,16 @@ _APP_CONTENT_ROUTE = [
         "key": "jira-app",
         "match": "regex",
         "value": r"^APP-\d+:",
-        "gate": True,
-        "assignee": "@pandora",
+        "assignee": "@raphael",
         "contexts": ["@deep", "@code"],
         "area_label": "@area/acme",
-        "service": "acme",
-        "resource_tags": ["acme"],
     }
 ]
 
 
 @pytest_asyncio.fixture(loop_scope="function")
 async def seed_app_route(db_pool):
-    """Seed the Acme APP-<n>: content route + reset the worker's 30s route cache
+    """Seed the APP-<n>: content route + reset the worker's 30s route cache
     (and clear on teardown). Clarify-activities test modules opt in via a thin
     autouse wrapper, so no other worker test is coupled to this."""
     from aegis.services.content_routes import save_content_routes

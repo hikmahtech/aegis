@@ -172,8 +172,7 @@ class IntelligenceScanFlow:
         # LiteLLM proxy load (07:00-08:00 scan window); with 3 retries that's a
         # ~9-min hard workflow failure and no intel that run. Fail fast
         # (RETRY_ONCE) and degrade to "nothing worthy this run" instead of
-        # letting the ActivityError kill the scan — same pattern as
-        # alert_investigation's assess guard (PR #282).
+        # letting the ActivityError kill the scan (PR #282).
         topics_arg = [{"name": t} for t in topics]
         try:
             scored = await workflow.execute_activity(

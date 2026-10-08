@@ -1,3 +1,0 @@
-# GrafanaDown
-
-TODO: fill in

@@ -373,7 +373,7 @@ async def test_unserved_tools_cannot_be_invoked_even_though_they_are_granted(cli
     assert "result" not in body  # nothing ran
 
 
-async def test_the_unserved_set_is_exactly_these_nine(client):
+async def test_the_unserved_set_is_exactly_these(client):
     """A closed list, asserted by name: adding a run-spawning tool to an agent's
     `tool_set` without adding it here silently re-opens the recursion door, and
     the only way to notice is a test that pins the membership.
@@ -393,21 +393,14 @@ async def test_the_unserved_set_is_exactly_these_nine(client):
     to the user's records rather than to AEGIS. `ledger_query` is read-only and
     stays served.
 
-    `set_service_state` is a fifth: it opens a deploy/maintenance window that
-    stops the problem hub raising anything about a subject. A run that could
-    open one could silence the alert about itself, so it is operator-only.
-
-    `report_progress` and `merge_problems` are the sixth and seventh: an AEGIS
+    `report_progress` and `merge_problems` are the fifth and sixth: an AEGIS
     turn reports through its own activity, so a run holding `report_progress`
     could only mark its own task done; and a merge hides a problem, which is a
     person's call."""
     assert set(mcp_server_mod._UNSERVED_TOOLS) == {
         "dispatch_agent_run",
-        "aegis_self_diagnose",
-        "investigate_resource",
         "stop_agent_run",
         "comment_on_task",
-        "set_service_state",
         "report_progress",
         "merge_problems",
         "ledger_post",

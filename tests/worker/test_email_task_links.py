@@ -213,7 +213,7 @@ async def test_already_completed_task_is_not_touched_again(db_pool):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("agent_label", ["@sebas", "@raphael", "@maou", "@pandora"])
+@pytest.mark.parametrize("agent_label", ["@sebas", "@raphael", "@maou"])
 async def test_unblock_refuses_an_agent_parked_task(db_pool, agent_label):
     """`@waiting` on an agent task is PARK_LABEL, not "blocked on a human".
 
@@ -244,7 +244,7 @@ async def test_unblock_refuses_an_agent_parked_task(db_pool, agent_label):
 async def test_complete_still_works_on_an_agent_parked_task(db_pool):
     """The guard is scoped to `unblock`; closing a done ticket stays correct
     whether or not an agent was working it."""
-    await _seed(db_pool, "etl-6", "APP-1234: agent worked this", ["@waiting", "@pandora"])
+    await _seed(db_pool, "etl-6", "APP-1234: agent worked this", ["@waiting", "@maou"])
     connector = _RecordingConnector()
     acts = CaptureActivities(db_pool=db_pool, connector=connector)
     result = await ActivityEnvironment().run(

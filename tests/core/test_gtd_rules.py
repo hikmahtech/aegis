@@ -16,7 +16,7 @@ def test_merge_defaults():
 def test_merge_override_keeps_other_defaults():
     r = merge({"assignee": {"#email": "@maou"}, "skip_inbox": {"#chat": "reference"}})
     assert r["assignee"]["#email"] == "@maou"  # overridden
-    assert r["assignee"]["#alert"] == "@pandora"  # default kept
+    assert r["assignee"]["#alert"] == "@me"  # default kept
     assert r["skip_inbox"]["#chat"] == "reference"
     assert r["skip_inbox"]["#research"] == "reference"  # default kept
 
@@ -40,4 +40,4 @@ async def test_save_and_get_merges(clean_gtd):
     assert r["assignee"]["#email"] == "@raphael" and r["contexts"]["#chat"] == ["@5min"]
     r2 = await get_gtd_rules(clean_gtd)
     assert r2["assignee"]["#email"] == "@raphael"  # persisted
-    assert r2["assignee"]["#alert"] == "@pandora"  # default kept
+    assert r2["assignee"]["#alert"] == "@me"  # default kept

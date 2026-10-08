@@ -1,3 +1,0 @@
-# ClickHouseHighMemory
-
-TODO: fill in

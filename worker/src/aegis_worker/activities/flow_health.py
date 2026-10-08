@@ -66,7 +66,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import structlog
-from aegis.services.hub_watch import mute_hint, reconcile_findings
+from aegis.services.hub_watch import reconcile_findings
 from temporalio import activity
 
 from aegis_worker.activities.delivery import safe_send_message
@@ -555,7 +555,7 @@ class FlowHealthActivities:
             findings=hub_findings,
         )
         fresh = outcome["fresh"]
-        result["deduped"] = outcome["attached"] + outcome["suppressed"]
+        result["deduped"] = outcome["attached"]
         result["muted"] = outcome["muted"]
 
         if fresh:
@@ -574,7 +574,6 @@ class FlowHealthActivities:
                     "FROM llm_calls WHERE purpose = '<purpose>' "
                     "ORDER BY created_at DESC LIMIT 10;"
                 )
-            body += "\n" + mute_hint([f["problem_id"] for f in fresh])
             await safe_send_message(
                 self.delivery,
                 agent_id=agent_id,

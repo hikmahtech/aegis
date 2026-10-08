@@ -240,8 +240,6 @@ async def test_status_digest_route_shape(app, auth_headers, mock_db_pool):
             "llm_calls",
             "llm_tokens",
             "pending_interactions",
-            "infra_stuck",
-            "infra_confirmed",
         ):
             assert key in data
 

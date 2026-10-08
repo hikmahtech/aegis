@@ -29,10 +29,9 @@ async def _seeded(db_pool):
     return _keywords_of(agents), _generalists_of(agents)
 
 
-async def test_keyword_route_picks_domain_agent(db_pool, infra_agent_active):
+async def test_keyword_route_picks_domain_agent(db_pool):
     kmap, gens = await _seeded(db_pool)
     assert _keyword_route("what's my AWS bill this month", kmap, gens) == "maou"
-    assert _keyword_route("restart the docker swarm node", kmap, gens) == "pandoras-actor"
     assert _keyword_route("summarize what we know about X", kmap, gens) == "raphael"
     assert _keyword_route("add a task to my inbox for tomorrow", kmap, gens) == "sebas"
 

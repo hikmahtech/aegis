@@ -102,8 +102,6 @@ class Settings(BaseSettings):
     reload: bool = False
 
     # Connectors
-    vercel_token: str = ""
-    vercel_team_id: str = ""
     searxng_url: str = "http://localhost:8888"
     gmail_accounts: str = ""  # "name1:email1,name2:email2"
     gmail_credentials_file: str = "config/google_credentials.json"
@@ -149,7 +147,7 @@ class Settings(BaseSettings):
     # Browser-facing Postiz URL for admin-UI links — distinct from postiz_url,
     # which may be an internal-only address the browser can't reach.
     postiz_public_url: str = ""
-    # Kimi CLI — the remote coding-CLI used by alert_investigation for auto-fix proposals.
+    # Kimi CLI — the remote coding-CLI the coding lane runs on the coding host.
     kimi_cli_binary_path: str = "/usr/local/bin/kimi"
     # Claude CLI on remote_script_host — used instead of kimi for repos whose
     # GitHub org is listed in remote_script_claude_orgs.
@@ -158,21 +156,11 @@ class Settings(BaseSettings):
     # NON-org repo. The default ~/.claude login belongs to an org (acme);
     # the fallback runs under the personal account instead. Empty ⇒ default config.
     claude_personal_config_dir: str = ""
-    # AEGIS self-healing — workspace-relative path (under
-    # `remote_script_repo_base`) of AEGIS's own checkout. Pandora's
-    # `aegis_self_diagnose` tool runs kimi against this checkout to
-    # investigate / propose fixes to AEGIS itself. The checkout is part of
-    # the fixed workspace hierarchy maintained by WorkspaceRepoSyncFlow.
+    # Workspace-relative path (under `remote_script_repo_base`) of AEGIS's own
+    # checkout on the coding host. The coding lane seeds a claude run's
+    # skills from its `config/skills` (`RemoteScriptConnector._skills_source_dir`).
     aegis_self_repo_path: str = "aegis"
-    # Prometheus/Alertmanager `cluster` label value that marks an alert as an
-    # infra/swarm alert (routed straight to infra-gitops, skipping the LLM
-    # repo-match). Blank ⇒ the cluster-label fast path is off; alertname
-    # matching (the `infra_alert_routing` settings row) still classifies infra
-    # alerts. Set this to your own cluster label to also route by cluster.
-    # Editable from the admin Integrations page.
-    infra_cluster: str = ""
-    infra_heartbeat_ping_url: str = ""  # healthchecks.io dead-man URL ("" = off)
-    slack_owner_member_id: str = ""  # Slack member id for escalation @-mentions ("" = no mention)
+    slack_owner_member_id: str = ""  # the owner's Slack member id ("" = unset)
     # Curated self-signal ingest (comms reads these over /api/internal/slack-config).
     # Reaction names (no colons, comma-separated) that file YOUR OWN message as a
     # life_fact; and a channel id where every message you post is filed the same
@@ -200,8 +188,6 @@ class Settings(BaseSettings):
     # stray env can grant write access on its own. Turning this back off kills
     # writes fleet-wide on the next worker restart, no DB edit needed.
     memory_consolidation_apply_enabled: bool = False
-    # Per-alert runbook directory — baked into the worker image at /app/runbooks.
-    runbooks_dir: str = "/app/runbooks"
     # Swarm stack name AEGIS itself is deployed as. The System Monitoring page
     # filters `docker service ls` to this stack (com.docker.stack.namespace
     # label) so it shows AEGIS's own services, not every stack on the swarm.
@@ -247,11 +233,6 @@ class Settings(BaseSettings):
     # Kept as env vars (not settings table) per spec §15 resolution.
     # Optional read-only token for GitHub search (#677). Empty = unauthenticated.
     github_token: str = ""
-    # The problem hub's ingress (/api/hub/events, /api/hub/service-state) has no
-    # vendor HMAC to verify. Set this to require an X-Alert-Token (or Bearer)
-    # header matching it; empty = unauthenticated (legacy default — anyone who
-    # can reach the port can post hub events).
-    alert_webhook_secret: str = ""  # X-Alert-Token
     # /api/webhooks/life/{source} — signed push from phones/watches/home
     # automation. Empty = the endpoint rejects EVERYTHING (503). Never treat
     # an unset secret as "skip verification": this door writes into the
@@ -334,15 +315,6 @@ class Settings(BaseSettings):
     # v3 seed directory (YAML files for agents, channels, resources, activities)
     seed_dir: str = "./config/seed"
 
-    # Homelab Guardian (Docker Swarm drift + TLS cert radar). When enabled,
-    # the worker builds a HomelabConnector; an empty docker_context relies on
-    # the DOCKER_HOST env var inside the worker container.
-    homelab_enabled: bool = False
-    homelab_docker_context: str = ""
-    # NoDecode: skip pydantic-settings' JSON decoding so the raw env/dotenv
-    # string reaches _parse_homelab_domains, which splits it on commas.
-    homelab_public_domains: Annotated[list[str], NoDecode] = Field(default_factory=list)
-
     # Money Hygiene (Maou)
     money_hygiene_enabled: bool = False
     # The books cutover switch (#703); read per run from the DB by the worker. Declared so the
@@ -393,18 +365,6 @@ class Settings(BaseSettings):
                 "unless AEGIS_AUTH_DISABLED=true"
             )
         return self
-
-    @model_validator(mode="before")
-    @classmethod
-    def _parse_homelab_domains(cls, data: Any) -> Any:
-        """Parse comma-separated homelab_public_domains into list."""
-        if isinstance(data, dict) and "homelab_public_domains" in data:
-            domains = data["homelab_public_domains"]
-            if isinstance(domains, str):
-                data["homelab_public_domains"] = [
-                    s.strip() for s in domains.split(",") if s.strip()
-                ]
-        return data
 
     @model_validator(mode="before")
     @classmethod

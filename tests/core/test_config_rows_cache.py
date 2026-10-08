@@ -14,7 +14,7 @@ Falsifiable: assign `self._cached` on the `_UNREADABLE` branch of
 from __future__ import annotations
 
 import pytest
-from aegis.services import alert_remediation, email_rules
+from aegis.services import email_rules
 from aegis.services.config_rows import SettingsRow
 from aegis.services.settings_store import setting_exists
 
@@ -106,27 +106,14 @@ async def test_email_rules_keeps_its_overrides_after_a_blip(db_pool):
 
 
 async def test_stored_means_a_row_exists(db_pool):
-    """`alert_remediation.stored` is a fact about the row, not about its value.
-    A row holding the JSON scalar `null` reads back as None — the same as no
-    row — so `get_setting` alone cannot answer it."""
-    key = alert_remediation.SETTINGS_KEY
+    """`setting_exists` is a fact about the row, not about its value. A row
+    holding the JSON scalar `null` reads back as None — the same as no row —
+    so `get_setting` alone cannot answer it."""
+    key = "zz_test_stored_row"
     await db_pool.execute("DELETE FROM settings WHERE key = $1", key)
     try:
-        assert (await alert_remediation.get_alert_remediation(db_pool))["stored"] is False
-
+        assert await setting_exists(db_pool, key) is False
         await db_pool.execute("INSERT INTO settings (key, value) VALUES ($1, 'null'::jsonb)", key)
         assert await setting_exists(db_pool, key) is True
-        view = await alert_remediation.get_alert_remediation(db_pool)
-        assert view["stored"] is True
-        assert view["repeat_window_minutes"] == alert_remediation.DEFAULT_REPEAT_WINDOW_MINUTES
     finally:
         await db_pool.execute("DELETE FROM settings WHERE key = $1", key)
-        alert_remediation.ROW.clear_cache()
-
-
-async def test_alert_remediation_raises_on_a_failed_read():
-    """It used to read with a bare `fetchrow`, so a database outage was a 500.
-    Answering 200 with the defaults and `stored: false` would read as "nothing
-    is configured" — on the row that gates a forced restart."""
-    with pytest.raises(RuntimeError):
-        await alert_remediation.get_alert_remediation(_BrokenPool())

@@ -1,8 +1,8 @@
 """AEGIS's own operating surface as chat tools.
 
 Scheduled activities and their run history, manual workflow triggers, new
-schedules, the pending-interaction list, the status digest, and the two
-operator-configuration writers (triage settings, runbook knowledge). What they
+schedules, the pending-interaction list, the status digest, and the
+operator-configuration writer for triage settings. What they
 have in common is that the subject is AEGIS itself rather than the outside
 world.
 """
@@ -18,7 +18,6 @@ import structlog
 from pydantic import Field
 
 from aegis.agent_tags import GENERALIST_TAG
-from aegis.errors import error_text
 from aegis.observability import log_audit
 from aegis.services.agents import resolve_tag
 from aegis.services.settings_store import get_setting, put_setting
@@ -272,35 +271,3 @@ async def _exec_configure_triage(
 
     await put_setting(pool, db_key, new_val)
     return json.dumps({"ok": True, "setting": setting, "action": action, "current": new_val})
-
-
-@aegis_tool
-async def _exec_update_runbook(
-    pool: asyncpg.Pool, ctx: ToolContext, *, target: str, content: str
-) -> str:
-    """Update or add operational runbook knowledge for alert types or projects.
-
-    Args:
-        target: What to update, e.g. 'alert_type:ServiceDown', 'project:bcp'
-        content: The runbook content to add
-    """
-    if not ctx.knowledge_connector:
-        return json.dumps({"error": "Knowledge service not available"})
-
-    if not target or not content:
-        return json.dumps({"error": "Both target and content are required"})
-
-    # ponytail: runbook knowledge is stored as a searchable content chunk
-    # (no knowledge graph). gather_alert_knowledge finds it via chunk search.
-    try:
-        await ctx.knowledge_connector.ingest_content(
-            url=f"aegis://runbook/{target}",
-            title=f"Runbook: {target}",
-            source_type="runbook",
-            raw_text=content,
-            tags=["runbook", target],
-        )
-        return json.dumps({"ok": True, "target": target})
-    except Exception as exc:
-        logger.warning("update_runbook_failed", error=error_text(exc, 500))
-        return json.dumps({"ok": False, "error": error_text(exc, 500)})

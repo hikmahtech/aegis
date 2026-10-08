@@ -1,5 +1,6 @@
-"""HubSweepFlow: promote, read completed tasks back, project, then group —
-and only group on a yes."""
+"""HubSweepFlow: read completed tasks back, project, then group — and only
+group on a yes. The legacy (pre-`PATCH_DROP_INFRA_STEPS`) shape's replay is in
+`test_deprecated_patches.py`; its stubs live here."""
 
 from __future__ import annotations
 
@@ -125,8 +126,8 @@ async def _run(
     flow=HubSweepFlow,
     config: HubSweepConfig | None = None,
 ):
-    """Run one sweep; returns `(result, history)`. The two #629/#630 steps get
-    a quiet stub unless the test brings its own."""
+    """Run one sweep; returns `(result, history)`. The legacy #629/#630 steps
+    get a quiet stub unless the test brings its own."""
     given = {_name(a) for a in activities}
     activities = [
         *activities,
@@ -143,7 +144,7 @@ async def _run(
     ):
         handle = await env.client.start_workflow(
             flow.run,
-            config or HubSweepConfig(agent_id="pandoras-actor"),
+            config or HubSweepConfig(agent_id="sebas"),
             id=f"hub-{uuid.uuid4()}",
             task_queue=worker.task_queue,
         )
@@ -152,17 +153,13 @@ async def _run(
 
 
 @pytest.mark.asyncio
-async def test_sweep_promotes_then_projects_and_reports():
+async def test_sweep_reads_back_then_projects_and_reports():
     _calls.clear()
     _verify_args.clear()
     out, _ = await _run(
         [_promote, _reconcile, _verify, _project, _finder([]), _judge(True), _apply]
     )
     assert out == {
-        "promoted": 2,
-        # The stub finds nothing a producer would have investigated (#630).
-        "promoted_investigated": 0,
-        "cards_finished": 1,
         "task_completed": 1,
         "task_reopened": 1,
         "projected": 3,
@@ -171,32 +168,13 @@ async def test_sweep_promotes_then_projects_and_reports():
         "group_candidates": 0,
         "grouped": 0,
         "folded": 0,
-        # No alertmanager configured in this fixture, so the reconciliation
-        # step declines to act and says why (#551).
-        "alertmanager_resolved": 0,
-        "alertmanager_skipped": "",
-        # -1 says the step did not run, which is a different fact from "ran and
-        # found nothing" — the two used to be indistinguishable here.
-        "alertmanager_checked": -1,
     }
-    # Promotion first, so a just-promoted problem gets its task in the same
-    # tick; completed tasks next, so what they resolve or reopen is projected
-    # in the same tick too; grouping last, on problems
-    # that already have their tasks.
-    # The promoted problems are offered for investigation at once (#630), and
-    # retired cards are finished after every step that can resolve and before
-    # projection (#629).
-    assert _calls == [
-        "promote",
-        "promoted_investigations",
-        "reconcile",
-        "retire_cards",
-        "project",
-        "find",
-    ]
-    assert _retire_inputs[-1] == {}
-    # The fix verification is retired (the GitHub intake left v1): a new tick
-    # never schedules it. Only a replayed history does (test_deprecated_patches).
+    # Completed tasks first, so what they resolve or reopen is projected in the
+    # same tick; grouping last, on problems that already have their tasks. The
+    # infra steps (window promotion and its investigations, the alertmanager
+    # reconcile, card retirement) and the fix verification never run on a new
+    # tick; only a replayed history schedules them (test_deprecated_patches).
+    assert _calls == ["reconcile", "project", "find"]
     assert _verify_args == []
 
 
@@ -209,9 +187,7 @@ async def test_sweep_groups_a_cluster_the_judge_agrees_on():
     assert out["grouped"] == 1
     assert out["folded"] == 2
     assert out["group_candidates"] == 1
-    assert [c for c in _calls if c not in {"promoted_investigations", "retire_cards"}] == [
-        "promote", "reconcile", "project", "find", "judge", "apply"
-    ]
+    assert _calls == ["reconcile", "project", "find", "judge", "apply"]
 
 
 @pytest.mark.asyncio
@@ -245,11 +221,11 @@ async def test_the_sweep_resolves_a_problem_whose_task_a_person_completed(db_poo
     r = await ingest_event(
         db_pool,
         Event(
-            source="heartbeat",
+            source="flow_health",
             external_id=f"{subject}@1",
             kind="occurrence",
-            title=f"Service {subject} down",
-            klass="DockerServiceDown",
+            title=f"Flow {subject} failing",
+            klass="flow_failing",
             subject=subject,
             occurred_at=now,
         ),
@@ -258,7 +234,7 @@ async def test_the_sweep_resolves_a_problem_whose_task_a_person_completed(db_poo
     task = f"zzs-{uuid.uuid4().hex[:8]}"
     await db_pool.execute(
         "INSERT INTO todoist_tasks (id, content, labels, is_completed, updated_at) "
-        "VALUES ($1, 'down', ARRAY['#alert','@pandora'], true, now())",
+        "VALUES ($1, 'down', ARRAY['#alert','@sebas'], true, now())",
         task,
     )
     assert await link_task(db_pool, r.problem_id, task)
@@ -276,45 +252,6 @@ async def test_the_sweep_resolves_a_problem_whose_task_a_person_completed(db_poo
 async def _reconcile_am(url: str, min_uptime_seconds: int = 900) -> dict:
     _calls.append(f"reconcile_alertmanager:{url}:{min_uptime_seconds}")
     return {"checked": 4, "resolved": 2, "problems": ["p-1", "p-2"], "active_alerts": 7}
-
-
-@pytest.mark.asyncio
-async def test_the_sweep_reconciles_alertmanager_before_it_projects():
-    """A problem whose alert alertmanager forgot is resolved in the same tick it
-    is projected, so the resolve reaches the Todoist task now rather than in
-    five minutes (#551).
-
-    Falsifiable: drop the step and `reconcile_alertmanager` never appears; move
-    it after `project_pending` and the order assertion fails.
-    """
-    _calls.clear()
-    _verify_args.clear()
-    out, _ = await _run(
-        [_promote, _reconcile, _verify, _project, _reconcile_am, _finder([]), _judge(True), _apply],
-        config=HubSweepConfig(
-            agent_id="pandoras-actor",
-            alertmanager_url="http://alertmanager:9093",
-            alertmanager_min_uptime_seconds=1200,
-        ),
-    )
-
-    assert out["alertmanager_resolved"] == 2
-    assert "reconcile_alertmanager:http://alertmanager:9093:1200" in _calls
-    assert _calls.index("reconcile_alertmanager:http://alertmanager:9093:1200") < _calls.index(
-        "project"
-    )
-
-
-@pytest.mark.asyncio
-async def test_the_sweep_does_not_ask_an_alertmanager_it_has_no_address_for():
-    """Unset means off: a fork must not probe a guessed monitoring host."""
-    _calls.clear()
-    _verify_args.clear()
-    out, _ = await _run(
-        [_promote, _reconcile, _verify, _project, _reconcile_am, _finder([]), _judge(True), _apply]
-    )
-    assert out["alertmanager_resolved"] == 0
-    assert not [c for c in _calls if c.startswith("reconcile_alertmanager")]
 
 
 @activity.defn(name="promoted_investigations")
@@ -341,25 +278,3 @@ class _NoInvestigation:
     @workflow.run
     async def run(self, alert: dict) -> dict:
         return {"status": "stub"}
-
-
-@pytest.mark.asyncio
-async def test_a_promoted_problem_gets_the_investigation_its_window_held_back():
-    """#630: once an outage (or any window) ends, what is still broken gets a
-    card as well as a task. The sweep starts the investigation itself, as an
-    abandoned child named like every hub investigation."""
-    _calls.clear()
-    out, history = await _run(
-        [_promote, _one_promoted_investigation, _reconcile, _verify, _project, _finder([])],
-        workflows=(HubSweepFlow, _NoInvestigation),
-    )
-    assert out["promoted_investigated"] == 1
-    started = [
-        e.start_child_workflow_execution_initiated_event_attributes
-        for e in history.events
-        if e.HasField("start_child_workflow_execution_initiated_event_attributes")
-    ]
-    assert len(started) == 1
-    assert started[0].workflow_type.name == "AlertInvestigationFlow"
-    assert started[0].workflow_id.startswith("investigate-a-pr")
-    await Replayer(workflows=[HubSweepFlow]).replay_workflow(history)

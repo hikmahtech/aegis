@@ -1,3 +1,0 @@
-# MySQLInnoDBBufferPoolLow
-
-TODO: fill in

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest_asyncio
+from aegis_worker.activities import agent_task as agent_task_mod
 from aegis_worker.activities.agent_task import (
     _TIER2_CONFIDENCE_THRESHOLD,
     AgentTaskActivities,
@@ -59,7 +60,7 @@ async def test_unmapped_project_returns_no_repo_never_a_guess(db_pool, _seed):
     assert result["source"] == "none"
 
 
-async def test_missing_project_id_returns_no_repo(db_pool, _seed):
+async def test_missing_project_id_returns_no_repo(db_pool, _seed, monkeypatch):
     act = AgentTaskActivities(db_pool=db_pool)
     result = await act.resolve_task_repo({"id": "x", "content": "Fix", "project_id": None})
     assert result["github_repo"] == ""
@@ -68,12 +69,10 @@ async def test_missing_project_id_returns_no_repo(db_pool, _seed):
 # --- Issue #158: tier 2 (title/description match) and tier 3 (candidates for
 # the flow's Gate-0 confirm card) -----------------------------------------
 #
-# `alert_act` is a plain late-wired field (mirrors gmail_activities); a fake
-# with a controllable resolve_alert_resource stands in for the real
-# AlertActivities instance so these tests exercise resolve_task_repo's OWN
-# integration logic (synthetic-alert shape, threshold, candidate mapping),
-# not resolve_alert_resource's internals — those are already covered by
-# tests/worker/test_alert_resource_resolution.py.
+# Tier 2 is `repo_resolve.resolve_repo_by_text`. A fake with a controllable
+# answer stands in for it so these tests exercise resolve_task_repo's OWN
+# integration logic (synthetic-alert shape, threshold, candidate mapping), not
+# the resolver's internals (tests/worker/test_repo_resolve.py).
 
 
 class _FakeAlertAct:
@@ -91,12 +90,19 @@ class _RaisingAlertAct:
         raise RuntimeError("boom")
 
 
-async def test_tier2_confident_match_resolves_repo_and_synthesizes_alert_shape(db_pool):
+def _wired(db_pool, fake, monkeypatch) -> AgentTaskActivities:
+    async def _resolve(pool, llm, model, alert):
+        return await fake.resolve_alert_resource(alert)
+
+    monkeypatch.setattr(agent_task_mod, "resolve_repo_by_text", _resolve)
+    return AgentTaskActivities(db_pool=db_pool)
+
+
+async def test_tier2_confident_match_resolves_repo_and_synthesizes_alert_shape(db_pool, monkeypatch):
     """A confident tier-2 pick resolves the task exactly like tier 1, and the
-    synthetic alert passed to resolve_alert_resource has the shape the issue
+    synthetic alert passed to the resolver has the shape the issue
     specifies: title=content, description=description, fingerprint=task:<id>,
-    service='' (so the deterministic service/sentry_project tiers correctly
-    sit out inside resolve_alert_resource)."""
+    service=''."""
     fake = _FakeAlertAct(
         {
             "github_repo": "hikmahtech/em-credibility-monitor",
@@ -113,7 +119,7 @@ async def test_tier2_confident_match_resolves_repo_and_synthesizes_alert_shape(d
             ],
         }
     )
-    act = AgentTaskActivities(db_pool=db_pool, alert_act=fake)
+    act = _wired(db_pool, fake, monkeypatch)
     result = await act.resolve_task_repo(
         {
             "id": "t-tier2-1",
@@ -136,7 +142,7 @@ async def test_tier2_confident_match_resolves_repo_and_synthesizes_alert_shape(d
     ]
 
 
-async def test_tier2_low_confidence_surfaces_candidates_not_a_guess(db_pool):
+async def test_tier2_low_confidence_surfaces_candidates_not_a_guess(db_pool, monkeypatch):
     """Below the confidence bar: the repo stays unresolved (never guessed) but
     the resources are surfaced as `candidates` in the shape
     _build_repo_confirm_prompt expects, for the flow's tier-3 Gate-0 card."""
@@ -161,7 +167,7 @@ async def test_tier2_low_confidence_surfaces_candidates_not_a_guess(db_pool):
             ],
         }
     )
-    act = AgentTaskActivities(db_pool=db_pool, alert_act=fake)
+    act = _wired(db_pool, fake, monkeypatch)
     result = await act.resolve_task_repo(
         {"id": "t-tier2-2", "content": "something ambiguous", "project_id": None}
     )
@@ -183,7 +189,7 @@ async def test_tier2_low_confidence_surfaces_candidates_not_a_guess(db_pool):
     ]
 
 
-async def test_tier2_confidence_just_below_threshold_is_unconfirmed(db_pool):
+async def test_tier2_confidence_just_below_threshold_is_unconfirmed(db_pool, monkeypatch):
     fake = _FakeAlertAct(
         {
             "github_repo": "hikmahtech/aegis",
@@ -200,7 +206,7 @@ async def test_tier2_confidence_just_below_threshold_is_unconfirmed(db_pool):
             ],
         }
     )
-    act = AgentTaskActivities(db_pool=db_pool, alert_act=fake)
+    act = _wired(db_pool, fake, monkeypatch)
     result = await act.resolve_task_repo(
         {"id": "t-tier2-3", "content": "x", "project_id": None}
     )
@@ -208,7 +214,7 @@ async def test_tier2_confidence_just_below_threshold_is_unconfirmed(db_pool):
     assert len(result["candidates"]) == 1
 
 
-async def test_tier2_confidence_exactly_at_threshold_resolves(db_pool):
+async def test_tier2_confidence_exactly_at_threshold_resolves(db_pool, monkeypatch):
     fake = _FakeAlertAct(
         {
             "github_repo": "hikmahtech/aegis",
@@ -225,7 +231,7 @@ async def test_tier2_confidence_exactly_at_threshold_resolves(db_pool):
             ],
         }
     )
-    act = AgentTaskActivities(db_pool=db_pool, alert_act=fake)
+    act = _wired(db_pool, fake, monkeypatch)
     result = await act.resolve_task_repo(
         {"id": "t-tier2-4", "content": "x", "project_id": None}
     )
@@ -233,8 +239,8 @@ async def test_tier2_confidence_exactly_at_threshold_resolves(db_pool):
     assert result["source"] == "title_match"
 
 
-async def test_tier2_no_match_returns_empty_like_tier1_miss(db_pool):
-    """resolve_alert_resource's own null_result (no candidates at all) must
+async def test_tier2_no_match_returns_empty_like_tier1_miss(db_pool, monkeypatch):
+    """The resolver's own null result (no candidates at all) must
     still hard-park, exactly like an unmapped project with no title signal."""
     fake = _FakeAlertAct(
         {
@@ -247,7 +253,7 @@ async def test_tier2_no_match_returns_empty_like_tier1_miss(db_pool):
             "resources": [],
         }
     )
-    act = AgentTaskActivities(db_pool=db_pool, alert_act=fake)
+    act = _wired(db_pool, fake, monkeypatch)
     result = await act.resolve_task_repo(
         {"id": "t-tier2-5", "content": "nothing matches", "project_id": None}
     )
@@ -256,7 +262,7 @@ async def test_tier2_no_match_returns_empty_like_tier1_miss(db_pool):
     assert result["candidates"] == []
 
 
-async def test_tier2_skipped_without_alert_act_wired(db_pool):
+async def test_tier2_skipped_without_alert_act_wired(db_pool, monkeypatch):
     """alert_act=None (the dataclass default) — tier 2/3 are a no-op and
     resolve_task_repo behaves exactly as tier-1-only."""
     act = AgentTaskActivities(db_pool=db_pool)
@@ -268,8 +274,8 @@ async def test_tier2_skipped_without_alert_act_wired(db_pool):
     assert result["candidates"] == []
 
 
-async def test_tier2_exception_is_caught_and_never_guesses(db_pool):
-    act = AgentTaskActivities(db_pool=db_pool, alert_act=_RaisingAlertAct())
+async def test_tier2_exception_is_caught_and_never_guesses(db_pool, monkeypatch):
+    act = _wired(db_pool, _RaisingAlertAct(), monkeypatch)
     result = await act.resolve_task_repo(
         {"id": "t-tier2-7", "content": "x", "project_id": None}
     )
@@ -278,12 +284,12 @@ async def test_tier2_exception_is_caught_and_never_guesses(db_pool):
     assert result["candidates"] == []
 
 
-async def test_tier1_hit_skips_tier2_entirely(db_pool, _seed):
+async def test_tier1_hit_skips_tier2_entirely(db_pool, _seed, monkeypatch):
     """When the project map already resolves the repo, tier 2 is never
     consulted — the strongest signal wins without spending an LLM call."""
     fake = _FakeAlertAct({"github_repo": "should-not-be-used", "confidence": 1.0,
                           "source": "llm", "resources": []})
-    act = AgentTaskActivities(db_pool=db_pool, alert_act=fake)
+    act = _wired(db_pool, fake, monkeypatch)
     result = await act.resolve_task_repo(
         {"id": "t-tier1-skip", "content": "Fix the exporter", "project_id": "pr-bcp"}
     )

@@ -7,7 +7,7 @@ Detail lives in `docs/`, and the last section says which file to read and when.
 
 A self-hosted personal AI platform built around workflows. Named agents run scheduled and
 event-driven [Temporal](https://temporal.io) workflows over your own data (tasks, money,
-knowledge, homelab alerts). They ask you for a decision only when they need one. Models go
+knowledge). They ask you for a decision only when they need one. Models go
 through a LiteLLM proxy, local first.
 
 | Package | Path | Role |
@@ -83,8 +83,8 @@ The full stack is `docker compose up -d`. Add `--profile slack` for comms and
   Activities class, which needs its constructor call in `main()`. `check_registration()` refuses to
   start a half-wired worker.
 - Every flow config dataclass has `agent_id: str` as its first field.
-- Never branch on a literal agent id. Resolve by capability tag (`gtd`, `finance`, `research`,
-  `infra`) with `services/agents.py::resolve_tag` in core or `AgentRegistryActivities.resolve_agents`
+- Never branch on a literal agent id. Resolve by capability tag (`gtd`, `finance`, `research`)
+  with `services/agents.py::resolve_tag` in core or `AgentRegistryActivities.resolve_agents`
   in the worker. No holder means skip and warn, never crash.
 - New chat tool: a typed executor decorated with `@aegis_tool` under `services/tools/`. A new
   module needs its import added in `services/chat.py`. Regenerate
@@ -110,8 +110,10 @@ The full stack is `docker compose up -d`. Add `--profile slack` for comms and
   `set_personality`. Only the `user` kind may be written automatically.
 - The `life` schema is written only through its services. External readings go through
   `observations.record_external_observation`; a `None` return means "already ingested".
-- The problem hub owns alert identity. A new producer builds an `Event`, calls
-  `hub.ingest_event`, and adds its source to `SOURCES`. A Todoist task is a projection of a
+- The problem hub owns problem identity. A new producer builds an `Event`, calls
+  `hub.ingest_event`, and adds its source to `SOURCES`. The infra lane (alerts,
+  investigations, the swarm heartbeat, runbooks, deploy windows) moved to the
+  DevOps vertical (a2-devops) on 2026-10-08; do not add it back here. A Todoist task is a projection of a
   problem, never its identity.
 - The hledger journal is the money record; Postgres is only its index. Writes go through
   `services/books.py` and `services/ledger_write.py`. Keep `run_hledger`'s exact-match allowlist.
@@ -140,13 +142,14 @@ add a build or deploy job; a fork wires up its own. Fork-facing notes: `docs/pro
   models, clarify, email triage, settings rows and observability. Read it before changing any of them.
 - `docs/architecture/domain-rules.md`: GTD and Todoist, knowledge ranking, `life`, interactions,
   meeting notes.
-- `docs/architecture/problem-hub.md`: read before touching `hub*.py`, alert producers or outages.
+- `docs/architecture/problem-hub.md`: read before touching `hub*.py` or a hub producer.
 - `docs/architecture/money-and-trading-desk.md`: read before touching the books, bank parsers,
   money email or the trading desk.
 - `docs/architecture/research-lane.md`: read before touching research, feeds, Calibre, topics,
   areas, or the world, GitHub and tender watches.
 - `docs/architecture/vault.md`: read before touching `notes.py`, the journal or `vault_layout`.
-- `docs/infrastructure.md`: the infra registry, the coding host, and setup guides per lane.
+- `docs/infrastructure.md`: the infra registry, the coding host, and setup guides per lane
+  (the registry and coding lane stay until a later removal PR).
 - `docs/superpowers/specs/`: design specs.
 
 ## Issue tracking

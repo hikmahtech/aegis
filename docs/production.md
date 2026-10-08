@@ -175,26 +175,19 @@ one signal to grep for.
 token** — update it on the admin **Slack** page afterwards, or comms authenticates with
 a dead token.
 
-## Alert routing (inbound webhooks)
+## Inbound webhooks
 
-The Sentry, Jira, GitHub and Alertmanager/Grafana intakes left v1: alert
-intake moved to the v2 DevOps vertical, and Sentry, Jira and GitHub pull
-requests to the v2 Development vertical. `/api/webhooks/sentry`,
-`/api/webhooks/alert` and `/api/webhooks/github` no longer exist; a sender
-still pointed at them gets a 404. What v1 still takes in:
+v1 takes no alerts. The Alertmanager/Grafana intake, the swarm heartbeat and
+deploy windows moved to the v2 DevOps vertical (a2-devops); Sentry, Jira and
+GitHub pull requests moved to the v2 Development vertical. `/api/webhooks/alert`,
+`/api/webhooks/sentry`, `/api/webhooks/github`, `/api/hub/events` and
+`/api/hub/service-state` no longer exist; a sender still pointed at them gets a
+404. `AEGIS_ALERT_WEBHOOK_SECRET` is no longer read.
+
+What v1 still takes in:
 
 - `POST /api/webhooks/todoist` — Todoist sync events
-- `POST /api/hub/events` and `POST /api/hub/service-state` — hub events and
-  deploy windows, gated by `AEGIS_ALERT_WEBHOOK_SECRET`
-- **AEGIS heartbeat (2-min poll)** → `InfraHeartbeatFlow` → `AlertInvestigationFlow` on
-  node/service transitions (source `aegis-heartbeat`)
-
-All of them feed `AlertInvestigationFlow` / the flows described in
-[`architecture/overview.md`](architecture/overview.md). Per-alert runbooks come
-from the `runbooks` table first (admin **Runbooks** page), then the generic
-`runbooks/<AlertName>.md` baked into the worker image. Write runbooks about your
-own setup into the table; see
-[`infrastructure.md`](infrastructure.md#the-runbook-an-investigation-reads).
+- `POST /api/webhooks/life/{source}` — life-data pushes (below)
 
 ## Life-data push (`POST /api/webhooks/life/{source}`)
 
@@ -359,48 +352,6 @@ body data into a second store with its own retention and its own web UI.
 Retention: 365 days by `observed_at`, shared with the rest of
 `life.observations`. `CleanupFlow` prunes per table, so a shorter window for
 health alone is not expressible today.
-
-### Infra heartbeat & escalation
-
-`InfraHeartbeatFlow` (schedule `infra-heartbeat-2m`, gated by `homelab_enabled`) polls
-`docker node ls` + `docker service ls` every 2 min and records state transitions on the
-problem hub (`ingest_alert`): a node or service going down is an occurrence, one coming back
-is a `resolved` event on the same problem, and only a new or returning problem starts an
-investigation. (The `/api/webhooks/alert` handler that did the same for alertmanager
-payloads is gone: alert intake moved to the v2 DevOps vertical.) A service
-still stuck after `restuck_hours` is re-investigated on that same problem, once per
-`restuck_hours` (`stale_stuck_problems`).
-
-**Cross-source dedup invariant:** a heartbeat-detected outage and an alertmanager-pushed
-one collapse onto ONE problem when they produce the same correlation key,
-`{class}:{subject_kind}:{subject}` — for a down service, `dockerservicedown:service:<name>`.
-The class comes from the alert name and the subject from the service or node, both
-slugged, so what has to match across sources is the SERVICE NAME and the alert name, not
-the cluster. The old `infra-class:<cluster>:<alertname>` signature is gone with the rest of
-the pre-hub dedupe, and `infra_cluster` no longer affects whether two alerts merge.
-
-Two sources that name the same service differently will still make two problems. That is
-recoverable: fold one into the other with `merge_problems`, or the Merge button on the
-admin **Problems** page.
-
-Configure on the admin Integrations page (worker restart required):
-
-- **Heartbeat dead-man ping URL** — healthchecks.io check pinged on every successful tick.
-- **Slack member id for escalation mentions** — critical infra Gate-2 cards re-ping with
-  an @-mention every 3 min (max 10) until acked or self-resolved.
-
-**Known limitation:** a service held below desired replicas for ~9+ min by a slow deploy
-can trip a heartbeat `DockerServiceDown` and get force-restarted (transient deploys usually
-converge before the 2-tick debounce, so this is rare).
-
-Infra Gate-2 cards can carry a **Run fix** option (the investigation's `FIX_COMMANDS:`)
-and a **Run checks** option (read-only `CHECK_COMMANDS:`; code, not the model, decides
-which is which — see `docs/infrastructure.md`, #641); approval executes the commands on
-the coding host via SSH (refused if the infra row is `read_only`), posts outputs to the
-task, and re-verifies after a fix. Approving Run fix with a note runs the note's lines
-instead. To route hand-captured Todoist tasks ("noon is down") into the
-same pipeline, add a content route with `alert_overrides`, e.g.
-`{"source": "todoist-infra", "alertname": "NodeDown", "severity": "critical"}`.
 
 ## Debugging comms/Slack
 

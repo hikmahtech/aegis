@@ -10,43 +10,20 @@ Rule lookups (skip_inbox / default_assignee / default_contexts) live in
 the `_RuleSet` Python class below, keyed on source_tag (where a task came
 from). A second, complementary axis routes by task CONTENT: `content_routes`
 (aegis.services.content_routes) is an admin-configured, ordered list of
-regex/prefix/contains rules — the old hardcoded Acme `^APP-\\d+:` → @pandora
-investigation is now just one such row. First match wins; ships empty.
+regex/prefix/contains rules. First match wins; ships empty.
 
 Content-route classifications:
 
-- `pandora_gate` — a *fresh* task matching a `gate: true` content route (no
-  @pandora yet). Doesn't auto-fire: classify_one returns `pandora_gate` →
-  apply_outcome spawns a two-option choice card ("🔍 investigate" / "🙋 I've
-  got it"). apply_clarify_resolution then either stamps the route's assignee
-  (@pandora) + clears the watermark — so the next tick's retry branch fires
-  the real AlertInvestigationFlow, scoped by the route's service/resource_tags
-  — or stamps @me.
+- `route_apply` — a task matching a content route: apply the route's assignee
+  + contexts (+ area_label) directly, no card, no agent run.
 
-- `pandora_investigation` — a @pandora task matching a content route with no
-  completed investigation (the retry surface, or the gate's approved path).
-  apply_outcome stamps the route's assignee + area_label and returns a spawn
-  flag; ClarifyFlow fires AlertInvestigationFlow with the existing task_id.
-
-- `route_apply` — a task matching a `gate: false` content route: apply the
-  route's assignee + contexts (+ area_label) directly, no card, no agent run.
-
-- `pandora_owned` — task already carries the @pandora label (claimed by a
-  prior AlertInvestigationFlow run). apply_outcome applies no routing changes —
-  only the GTD state stamp below; log_classification still bumps
-  last_clarified_at so the task drops out of find_unclassified_items.
-
-- `hub_owned` — a task the problem hub owns (#472) whose title matches a
-  route. The hub projects its `#alert` tasks into the Inbox, and a route like
-  `infra-incident` matches their titles; investigating one again started a
-  second investigation and a second problem for an incident the hub was
-  already handling. The hub decides whether a problem is investigated, so
-  this outcome starts nothing and only stamps the GTD state. A user's comment
-  on such a task is still `pandora_followup`, investigated on the task's own
-  problem. A `#money` task is `hub_owned` whatever its title: Maou raised it for
+- `hub_owned` — a task the problem hub owns (#472): its `#alert` tasks, or a
+  task some problem holds. The hub projects these into the Inbox and decides
+  what happens to them, so this outcome starts nothing and only stamps the GTD
+  state. A `#money` task is `hub_owned` whatever its title: Maou raised it for
   the user to act on, and the classifier must never trash it.
 
-Any task carrying @me — set on a gate card or by hand — is skipped by
+Any task carrying @me — set by hand — is skipped by
 find_unclassified_items entirely: the user's "hands off, I'm on it" signal.
 
 GTD state contract (issue #139): GTD state lives entirely in labels, so a task
@@ -140,7 +117,7 @@ async def get_gtd_ruleset(pool) -> _RuleSet:
 
 
 # 30s-cached content routes (regex/prefix/contains on task title → assignee /
-# labels / gate). Ships empty; each deployment configures its own from the admin
+# labels). Ships empty; each deployment configures its own from the admin
 # UI. Empty list without a pool or on read failure — routing must never break
 # classification.
 _routes_cache: dict = {"routes": None, "ts": 0.0}
@@ -163,12 +140,7 @@ async def get_content_routes(pool) -> list[dict]:
 # Per-agent addressable labels. classify_one's per-agent short-circuit
 # (added 2026-05-26) routes user comments on @<agent>-labelled tasks to
 # the matching personality. Iteration order is documented + deterministic:
-# @sebas wins co-occurrence with @raphael or @maou. @pandora-bearing
-# tasks bypass this block — the Jira route stays sacred (Branch 2 at
-# the `if "@pandora" in existing_labels` block owns all @pandora
-# routing, including the non-APP `pandora_chat_followup` branch added
-# 2026-05-27 so user comments on manual @pandora-labelled tasks reach
-# pandoras-actor instead of dead-ending in pandora_owned).
+# @sebas wins co-occurrence with @raphael or @maou.
 #
 # The addressable list + assignee vocabulary + context-hook gating are all
 # DERIVED from the active agents (issue #36): mention_aliases give the labels,
@@ -221,23 +193,12 @@ async def get_agent_registry(pool) -> dict[str, dict]:
 def _addressable_agents(reg: dict[str, dict]) -> list[tuple[str, str]]:
     """(@label, "<id>_followup") pairs from the registry. Ordered gtd-owner
     first, then by id, so the GTD owner wins co-occurrence (preserves the old
-    '@sebas wins' guarantee). @pandora-labelled tasks bypass this list upstream,
-    so including the infra agent here is inert."""
+    '@sebas wins' guarantee)."""
     out: list[tuple[str, str]] = []
     for aid in sorted(reg, key=lambda a: (0 if "gtd" in reg[a]["caps"] else 1, a)):
         for label in reg[aid]["aliases"]:
             out.append((label, f"{aid}_followup"))
     return out
-
-
-def _label_owner(reg: dict[str, dict], label: str) -> str | None:
-    """The agent (first by id) whose aliases include `label`, e.g. "@pandora"."""
-    return next((aid for aid in sorted(reg) if label in reg[aid]["aliases"]), None)
-
-
-def _cap_holder(reg: dict[str, dict], cap: str) -> str | None:
-    """The agent (first by id) holding behavior tag `cap`."""
-    return next((aid for aid in sorted(reg) if cap in reg[aid]["caps"]), None)
 
 
 def _assignee_labels(reg: dict[str, dict]) -> list[str]:
@@ -288,24 +249,17 @@ _GTD_STATE_FOR: dict[str, str | None] = {
     # force_apply path used to stamp only "@5min", which is a CONTEXT (where the
     # work happens), never a state — 9/9 all-time 2_min tasks ended in limbo.
     "2_min": _LABEL_NEXT,
-    # The human claimed the task ("I've got it" on the gate card, or @me by
-    # hand). It is theirs to do now, so it belongs in their next-actions view —
+    # The human claimed the task (@me by hand). It is theirs to do now, so it belongs in their next-actions view —
     # @me is a person label, not a state. 17/17 all-time `mine` tasks in limbo.
     "mine": _LABEL_NEXT,
     # Handed to an AEGIS agent. Actionable, and must NOT carry a park label or
     # the agent-task sweep will never pick the task up.
     "route_apply": _LABEL_NEXT,
-    "pandora_investigation": _LABEL_NEXT,
-    # Claimed by a prior investigation and still open — the single largest limbo
-    # bucket in production (49/66 all-time).
-    "pandora_owned": _LABEL_NEXT,
-    # The hub's own task (#472): an open problem assigned to the infra agent.
-    # The projector creates it with `#alert` and the agent label only, so this
-    # is the one write clarify owes it. Skipped when the task already has a
-    # state — an investigation that parked it on a card left it `@waiting`,
-    # and a `#money` task is created with `@next`.
+    # The hub's own task (#472): the projector creates it with `#alert` and the
+    # owner's label only, so this is the one write clarify owes it. Skipped
+    # when the task already has a state — a `#money` task is created with
+    # `@next`.
     "hub_owned": _LABEL_NEXT,
-    "pandora_followup": _LABEL_NEXT,
     # -- deliberately parked --------------------------------------------------
     "someday": _LABEL_SOMEDAY,
     # The human was already shown a card and chose "Leave for later". That is a
@@ -321,9 +275,6 @@ _GTD_STATE_FOR: dict[str, str | None] = {
     # item_complete fires: the row leaves every view, so a state label on it is
     # noise that would pollute "what's next" with completed junk.
     "trash": None,
-    # A choice card is pending. apply_clarify_resolution re-enters apply_outcome
-    # with the user's real classification, and THAT sets the state.
-    "pandora_gate": None,
     # Not a classification at all — classify_one's bail-out (kill switch off, no
     # LLM client). It always carries confidence 0.0, so apply_outcome routes it
     # to the low-conf card before any label branch runs; the resolution decides.
@@ -362,7 +313,7 @@ def _apply_gtd_state(commands: list[dict], item_id: str, labels: list[str], stat
     """Union ``state`` into the batch's item_update labels, in place.
 
     Branches build at most one item_update; when a branch sends none (e.g.
-    pandora_followup) a label-only update is appended so the state still lands.
+    hub_owned) a label-only update is appended so the state still lands.
     """
     from aegis.connectors.todoist import TodoistConnector
 
@@ -527,13 +478,10 @@ class ClarifyActivities:
                         -- user note" lookup. Two patterns:
                         --   * ClarifyFlow tags its own comments with
                         --     `[ClarifyFlow @ `.
-                        --   * Every AlertInvestigationFlow comment carries
-                        --     `Workflow run: ` as a footer marker (start,
-                        --     verdict, PR-opened, fix-discarded, etc.).
-                        -- Without the second filter, Pandora's own progress
-                        -- comments re-trigger pandora_followup every tick
-                        -- (caught 2026-05-21 — 5 tasks looped at 12:00
-                        -- because 11:45 spawn-comments bumped last_note_at).
+                        --   * Every workflow comment carries `Workflow run: `
+                        --     as a footer marker (the hub projector, the
+                        --     agent-task lane). Without that filter an agent's
+                        --     own progress comment re-triggers clarify.
                         SELECT content FROM todoist_notes
                         WHERE item_id = t.id
                           AND content NOT LIKE $3
@@ -552,9 +500,8 @@ class ClarifyActivities:
                       -- last_note_at — otherwise AgentChatReplyFlow's own
                       -- reply (success OR error) re-eligibles the task and
                       -- the next clarify tick spawns ANOTHER reply, in a
-                      -- 15-min loop. Caught in prod with 3 @pandora tasks
-                      -- 2026-05-27 — pandora burned ~9 redundant
-                      -- claude-sonnet runs / hour each. Mirror the same
+                      -- 15-min loop (caught in prod 2026-05-27: ~9 redundant
+                      -- model runs an hour per task). Mirror the same
                       -- AEGIS-author exclusion the latest_user_note
                       -- subquery already uses.
                       OR (
@@ -564,38 +511,6 @@ class ClarifyActivities:
                             AND content NOT LIKE $4
                             AND content NOT LIKE '%Workflow run:%'
                       ) > t.last_clarified_at
-                      -- Pandora retry surface (2026-05-21): @pandora APP-<n>:
-                      -- tasks whose prior AlertInvestigationFlow never
-                      -- completed get re-surfaced so classify_one's
-                      -- retry branch can fire. Throttled to 1h between
-                      -- attempts via last_clarified_at so a chronically-
-                      -- failing investigation doesn't loop every tick.
-                      OR (
-                          '@pandora' = ANY(t.labels)
-                          AND t.content ~ ANY($6)
-                          AND COALESCE(t.last_clarified_at, 'epoch'::timestamptz)
-                              < NOW() - INTERVAL '1 hour'
-                          AND NOT EXISTS (
-                              SELECT 1 FROM workflow_runs wr
-                              WHERE wr.workflow_type = 'AlertInvestigationFlow'
-                                AND wr.status = 'completed'
-                                AND wr.workflow_id LIKE '%' || t.id || '%'
-                          )
-                          -- Not a task the problem hub owns (#472). Its
-                          -- investigations are named for the problem, never
-                          -- the task, so the check above never saw one and
-                          -- re-admitted every open hub task each hour — and
-                          -- classify_one would only answer `hub_owned`. Same
-                          -- test as `_hub_owns`: the tag, or a problem.
-                          AND t.source_tag IS DISTINCT FROM $7
-                          AND NOT EXISTS (
-                              SELECT 1 FROM problems p WHERE p.todoist_task_id = t.id
-                          )
-                          AND NOT EXISTS (
-                              SELECT 1 FROM problem_links pl
-                              WHERE pl.link_kind = 'todoist_task' AND pl.ref = t.id
-                          )
-                      )
                   )
                   AND (
                       t.source_tag IS NOT NULL
@@ -605,30 +520,7 @@ class ClarifyActivities:
                       -- eligible too, otherwise the @sebas/@raphael/@maou
                       -- followup short-circuit in classify_one never runs
                       -- on them and the user's comment is silently dropped.
-                      -- @pandora is already covered by APP- but listed for
-                      -- symmetry — and to support manual @pandora-labelled
-                      -- tasks (rare but possible).
-                      OR t.labels && ARRAY['@sebas','@raphael','@maou','@pandora']
-                  )
-                  -- Pandora cooldown (2026-05-22): independent of the
-                  -- content-based bump filters in todoist.py +
-                  -- latest_user_note subquery above, force a 30-min gap
-                  -- between investigation spawns per @pandora APP- task.
-                  -- Defence-in-depth: if any AEGIS comment shape ever
-                  -- bypasses the `Workflow run:` filter and bumps
-                  -- last_note_at, this still blocks the runaway. Counts
-                  -- any AlertInvestigationFlow row (running OR completed)
-                  -- so a still-in-flight investigation doesn't get a
-                  -- concurrent sibling.
-                  AND NOT (
-                      '@pandora' = ANY(t.labels)
-                      AND t.content ~ ANY($6)
-                      AND EXISTS (
-                          SELECT 1 FROM workflow_runs wr
-                          WHERE wr.workflow_type = 'AlertInvestigationFlow'
-                            AND wr.workflow_id LIKE '%' || t.id || '%'
-                            AND wr.started_at > NOW() - INTERVAL '30 minutes'
-                      )
+                      OR t.labels && ARRAY['@sebas','@raphael','@maou']
                   )
                   -- Chat-reply error cooldown (2026-06-04): when the most
                   -- recent agent reply on a comment-channel task ERRORED, the
@@ -661,20 +553,17 @@ class ClarifyActivities:
                   AND NOT EXISTS (
                       SELECT 1 FROM work_sessions ts WHERE ts.task_id = t.id AND ts.owner = 'aegis'
                   )
-                  -- Hands-off signal (inbox gate): a task the user has claimed
+                  -- Hands-off signal: a task the user has claimed
                   -- with @me — and hasn't addressed to an agent — is theirs to
                   -- handle. Clarify ignores it entirely so aegis won't
-                  -- auto-classify or auto-investigate. This is the escape
-                  -- hatch: label a task @me in Todoist (or click "I've got it"
-                  -- on the gate card) and it drops out here. Agent-addressed
-                  -- tasks (@sebas/@raphael/@maou/@pandora) still pass so the
+                  -- auto-classify it. This is the escape hatch: label a task
+                  -- @me in Todoist and it drops out here. Agent-addressed
+                  -- tasks (@sebas/@raphael/@maou) still pass so the
                   -- comment-channel reply path keeps firing even if @me
-                  -- co-occurs. @me is never auto-applied by Jira sync (labels
-                  -- come verbatim from Todoist), so fresh APP-<n>: tickets have
-                  -- none and still reach the gate.
+                  -- co-occurs.
                   AND NOT (
                       '@me' = ANY(t.labels)
-                      AND NOT (t.labels && ARRAY['@sebas','@raphael','@maou','@pandora'])
+                      AND NOT (t.labels && ARRAY['@sebas','@raphael','@maou'])
                   )
                 ORDER BY t.last_note_at DESC NULLS LAST, t.updated_at
                 LIMIT $2
@@ -685,7 +574,6 @@ class ClarifyActivities:
                 AGENT_REPLY_SQL_LIKE,
                 AGENT_REPLY_ERROR_SQL_LIKE,
                 patterns,
-                HUB_SOURCE_TAG,
             )
         return [dict(r) for r in rows]
 
@@ -696,11 +584,10 @@ class ClarifyActivities:
         The tag is the cheap signal and also the only one for a task created
         through the outbox, which is linked by its temp id until the projector
         swaps in the real one. The problem covers a task the hub adopted — a
-        hand-captured task whose first investigation gave it a problem.
+        hand-captured task a problem holds.
 
         A lookup error is raised, not guessed: the flow skips the task without
-        moving its watermark and retries it next tick, where guessing "owned"
-        would lose its gate card for good and guessing "not owned" is the bug.
+        moving its watermark and retries it next tick.
         """
         if (task.get("source_tag") or "") == HUB_SOURCE_TAG:
             return True
@@ -720,47 +607,6 @@ class ClarifyActivities:
             "reason": reason,
             "llm_model": "rules",
         }
-
-    async def _live_problem_id(self, task_id: str) -> str | None:
-        """The id of the problem a task belongs to, when that problem is not
-        closed. A closed problem is history, so the caller starts fresh — the
-        rule `hub_project.ensure_problem_for_task` keeps."""
-        if self.db_pool is None or not task_id:
-            return None
-        problem = await hub.find_problem_for_task(self.db_pool, task_id)
-        if problem is None or problem["closed_at"] is not None:
-            return None
-        return problem["id"]
-
-    async def _has_completed_pandora_investigation(self, task_id: str) -> bool:
-        """Return True iff at least one AlertInvestigationFlow run for
-        this Todoist task id has completed cleanly.
-
-        Used by classify_one to break the pandora_owned dead-end when a
-        prior investigation crashed (e.g. assess_investigation LLM timeout).
-        Returns True (conservative — no retry) on any DB error so we never
-        spin a tight loop when the DB itself is the cause.
-        """
-        if self.db_pool is None or not task_id:
-            return True
-        try:
-            async with self.db_pool.acquire() as conn:
-                row = await conn.fetchrow(
-                    """
-                    SELECT 1
-                    FROM workflow_runs
-                    WHERE workflow_type = 'AlertInvestigationFlow'
-                      AND status = 'completed'
-                      AND workflow_id LIKE $1
-                    LIMIT 1
-                    """,
-                    # Match both the legacy `pandora-jira-<id>-…` and the new
-                    # `investigation-<id>-…` workflow-id schemes by task id.
-                    f"%{task_id}%",
-                )
-            return row is not None
-        except Exception:
-            return True
 
     async def _settings_bool(self, key: str, default: bool) -> bool:
         if self.db_pool is None:
@@ -818,7 +664,7 @@ class ClarifyActivities:
             "account digests — are NOT actions: classify them as trash (or "
             "reference if worth keeping), never 2_min.\n"
             "confidence ∈ [0.0, 1.0]\n"
-            f"assignee ∈ {{{', '.join(assignees or ['@me', '@sebas', '@raphael', '@maou', '@pandora'])}}}\n"
+            f"assignee ∈ {{{', '.join(assignees or ['@me', '@sebas', '@raphael', '@maou'])}}}\n"
             "contexts ⊆ {@5min, @deep, @email, @phone, @code, @errand, "
             "@home, @office, @reading, @waiting, @reference}"
         )
@@ -876,36 +722,17 @@ class ClarifyActivities:
         reg = await get_agent_registry(self.db_pool)
         routes = await get_content_routes(self.db_pool)
 
-        # Pandora ownership short-circuit. AlertInvestigationFlow may
-        # create inbox tasks with @pandora pre-applied; clarify must not
-        # re-classify them. log_classification still fires so
-        # last_clarified_at gets bumped and the task exits the
-        # find_unclassified_items watermark.
-        #
-        # Followup branch (2026-05-21): if the user posted a comment AFTER
-        # the @pandora label landed (latest_user_note is set, which means
-        # find_unclassified_items saw a user-authored note newer than
-        # last_clarified_at — post-2026-05-27 the eligibility filter
-        # ignores agent replies, so this signal is genuinely a user
-        # follow-up), the user is adding context — fire a fresh
-        # investigation that includes the comment instead of silently
-        # dropping the signal. Watermark-poisoning is prevented in
-        # apply_outcome by gating the spawn on a new fingerprint per
-        # comment.
         existing_labels = list(task.get("labels") or [])
         content_for_branch = task.get("content") or ""
 
         # Per-agent comment-channel short-circuit (2026-05-26).
         # Fires only when:
         #   - a fresh user comment is present (latest_user_note non-empty),
-        #   - @pandora is NOT in labels (pandora keeps priority for its
-        #     content-route workflow + own pipeline),
         #   - content does NOT match a content route (content routing wins).
         # The classification result spawns AgentChatReplyFlow downstream.
         latest_note_for_branch = (task.get("latest_user_note") or "").strip()
         if (
             latest_note_for_branch
-            and "@pandora" not in existing_labels
             and match_route(content_for_branch, routes) is None
         ):
             for label, branch in _addressable_agents(reg):
@@ -919,81 +746,14 @@ class ClarifyActivities:
                         "llm_model": "rules",
                     }
 
-        if "@pandora" in existing_labels:
-            latest_note = (task.get("latest_user_note") or "").strip()
-            content = task.get("content") or ""
-            if latest_note and match_route(content, routes) is not None:
-                return {
-                    "classification": "pandora_followup",
-                    "confidence": 1.0,
-                    "assignee": "@pandora",
-                    "contexts": ["@deep", "@code"],
-                    "reason": "user comment on @pandora content-route task",
-                    "llm_model": "rules",
-                }
-            # Retry branch (2026-05-21): a content-route task labelled @pandora
-            # with NO successful AlertInvestigationFlow completion in its
-            # history means a prior investigation crashed (most commonly
-            # qwen3:14b LLM timeouts during assess_investigation). Without
-            # this branch the task stays pandora_owned forever — the watermark
-            # bumps on the no-op, find_unclassified_items skips it, and only
-            # a user comment can trigger a fresh run. Re-route to
-            # pandora_investigation so the spawn fires again. The flow keeps no
-            # dedupe of its own any more (the problem hub decides what is
-            # investigated), so nothing blocks re-running a failed one.
-            if match_route(content, routes) is not None:
-                # Unless the hub owns the task (#472). Its own `#alert` tasks
-                # carry @pandora and match routes like `infra-incident`, and no
-                # investigation id names the task, so this branch called every
-                # one a crashed investigation and started a second one — with
-                # no problem id, so it ingested a fresh event and minted a
-                # second problem for the same incident. Whether a problem is
-                # investigated is the hub's call, made when the event came in.
-                if await self._hub_owns(task):
-                    return self._hub_owned(
-                        "the problem hub owns this task and decides its investigation"
-                    )
-                investigated = await self._has_completed_pandora_investigation(task["id"])
-                if not investigated:
-                    return {
-                        "classification": "pandora_investigation",
-                        "confidence": 1.0,
-                        "assignee": "@pandora",
-                        "contexts": ["@deep", "@code"],
-                        "reason": "@pandora content-route task with no successful prior investigation — retrying",
-                        "llm_model": "rules",
-                    }
-            # Comment-channel branch (2026-05-27): a manual @pandora-labelled
-            # inbox task (no APP-<n>: prefix) with a fresh user comment.
-            # Before this branch the task fell through to pandora_owned and
-            # the comment was silently dropped — find_unclassified_items
-            # admitted the task (PR #262 added @pandora to the labels
-            # filter) but no spawn fired. Route to AgentChatReplyFlow via
-            # the shared `agent_chat_reply` spawn so pandoras-actor handles
-            # the reply with its own tool set.
-            if latest_note:
-                return {
-                    "classification": "pandora_chat_followup",
-                    "confidence": 1.0,
-                    "assignee": "@pandora",
-                    "contexts": ["@deep"],
-                    "reason": "user comment on @pandora non-APP task",
-                    "llm_model": "rules",
-                }
-            return {
-                "classification": "pandora_owned",
-                "confidence": 1.0,
-                "assignee": "@pandora",
-                "contexts": [],
-                "reason": "task already labelled @pandora",
-                "llm_model": "rules",
-            }
-
+        # The hub's own `#alert` task (#472): the problem hub decides what
+        # happens to it, so the classifier must never trash or refile it. A
+        # comment on it has already gone to its owner's agent, above.
+        if (source_tag or "") == HUB_SOURCE_TAG:
+            return self._hub_owned("the problem hub owns this task")
         # A money problem's task (`#money @maou @next`) reaches the Inbox only
-        # when `books_todoist_projects` names no `personal` project. With no
-        # `@pandora` it skips the ownership check above, and the one below runs
-        # only for a title a gated route matches, so it fell through to the
-        # classifier. A `trash` verdict completes the task, and the hub reads a
+        # when `books_todoist_projects` names no `personal` project, and would
+        # otherwise fall through to the classifier. A `trash` verdict completes the task, and the hub reads a
         # completion back as the user acknowledging the finding. Maou raised it
         # and the user acts on it, so nothing below may touch it. A comment on
         # it has already gone to Maou, above.
@@ -1017,36 +777,14 @@ class ClarifyActivities:
         ):
             return self._hub_owned("a research task the problem hub raised for the research agent")
 
-        # Content-route branch. First encounter (no @pandora label yet — that
-        # case returned in the @pandora block above). A `gate: true` route
-        # DOESN'T auto-fire an investigation: ask first via a choice card
-        # (pandora_gate). Picking "investigate" applies the route's assignee,
-        # which re-enters the @pandora retry branch above on the next tick and
-        # fires the real AlertInvestigationFlow; "I've got it" applies @me and
-        # clarify leaves the task alone. A `gate: false` route just applies the
-        # route's assignee + contexts directly (route_apply) — plain label
-        # routing, no card, no agent run. (inbox gate — replaces the old
-        # hardcoded Acme APP-<n>: auto-dispatch.)
+        # Content-route branch: apply the route's assignee + contexts
+        # directly — plain label routing, no card, no agent run. A task the
+        # hub adopted (a problem holds it) is the hub's, not the route's (#472).
         content = task.get("content") or ""
         matched = match_route(content, routes)
         if matched is not None:
-            if matched.get("gate", True):
-                # A hub task without @pandora (a fork whose infra agent has
-                # another alias, or a label removed by hand) would get a card
-                # asking whether to investigate an incident the hub is already
-                # investigating — and "yes" leads to the branch above (#472).
-                if await self._hub_owns(task):
-                    return self._hub_owned(
-                        "the problem hub owns this task; no card for its investigation"
-                    )
-                return {
-                    "classification": "pandora_gate",
-                    "confidence": 1.0,
-                    "assignee": matched.get("assignee") or "@pandora",
-                    "contexts": list(matched.get("contexts") or ["@deep", "@code"]),
-                    "reason": f"content route {matched.get('key')!r} — ask before investigating",
-                    "llm_model": "rules",
-                }
+            if await self._hub_owns(task):
+                return self._hub_owned("the problem hub owns this task")
             return {
                 "classification": "route_apply",
                 "confidence": 1.0,
@@ -1188,58 +926,6 @@ class ClarifyActivities:
             "decision": decision,
             "pass_n": pass_n,
         }
-
-    @staticmethod
-    def _pandora_alert_payload(
-        content: str,
-        description: str,
-        fingerprint: str,
-        item_id: str,
-        *,
-        service: str | None = None,
-        resource_tags: list[str] | None = None,
-        alert_overrides: dict | None = None,
-        problem_id: str | None = None,
-    ) -> dict:
-        """Build the AlertInvestigationFlow spawn payload for a content-route
-        investigation. Shared by the pandora_investigation and pandora_followup
-        branches — they differ only in `description`/`fingerprint`; `service`
-        and `resource_tags` come from the matched content route (both optional —
-        omit to let the investigation repo-match unscoped). `problem_id` names
-        the problem the task already belongs to, so the flow records on it
-        instead of ingesting a new event.
-
-        `source` stays "todoist-jira": AlertInvestigationFlow treats that value
-        as a scoping-only contract (investigate + comment, never an autonomous
-        PR) — the right default for a gated inbox work ticket. A route's
-        `alert_overrides` (source/alertname/severity) can replace these
-        defaults — e.g. to route a hand-captured "noon is down" task through
-        the deterministic homelab-gitops infra pipeline instead.
-        """
-        labels: dict = {"alertname": content[:100]}
-        alert: dict = {
-            "title": content[:200],
-            "description": description[:2000],
-            "source": "todoist-jira",
-            "severity": "normal",
-            "fingerprint": fingerprint,
-            "labels": labels,
-            "requires_approval": False,
-            "todoist_task_id": item_id,
-        }
-        if service:
-            alert["service"] = service
-            labels["service"] = service
-        if resource_tags:
-            alert["resource_tag_filter"] = list(resource_tags)
-        for k, v in (alert_overrides or {}).items():
-            if k == "alertname":
-                labels["alertname"] = v
-            elif k in ("source", "severity"):
-                alert[k] = v
-        if problem_id:
-            alert["problem_id"] = problem_id
-        return {"spawn_kind": "pandora_investigation", "alert": alert}
 
     def _build_agent_synthetic_input(
         self, task: dict, agent_id: str, recent_notes: list[dict] | None = None
@@ -1423,32 +1109,6 @@ class ClarifyActivities:
             "pass_n": pass_n,
         }
 
-    def _build_gate_interaction_payload(self, task: dict, decision: dict, pass_n: int) -> dict:
-        """Choice card shown before any agent runs on an Inbox work ticket
-        (APP-<n>: Jira). Two options — hand it to Pandora, or claim it
-        yourself. Ignoring the card (24h timeout → archive) leaves the task
-        untouched in Inbox. No spawn_kind, so ClarifyFlow routes this through
-        InteractionFlow (not AlertInvestigationFlow). (inbox gate)
-        """
-        title = (task.get("content") or "").strip()[:120]
-        # Name the investigating agent from the matched route's assignee
-        # (@pandora → "Pandora"), so the card isn't hardcoded to one deployment.
-        handle = (decision.get("assignee") or "@pandora").lstrip("@")
-        who = (handle[:1].upper() + handle[1:]) if handle else "the agent"
-        return {
-            "flavor": "pandora_gate",
-            "prompt": (
-                f"🎫 New ticket in Inbox:\n{title}\n\n"
-                f"Want {who} to investigate, or are you on it?"
-            ),
-            "options": {
-                "investigate": f"🔍 {who}, investigate",
-                "mine": "🙋 I've got it",
-            },
-            "decision": decision,
-            "pass_n": pass_n,
-        }
-
     async def _stamp_gtd_state(
         self, item_id: str, existing_labels: list[str], classification: str
     ) -> int:
@@ -1547,36 +1207,17 @@ class ClarifyActivities:
         # Active-agent registry (aliases + behavior tags) for the per-agent
         # follow-up branch below — derived, not hardcoded (issue #36).
         reg = await get_agent_registry(self.db_pool)
-        followup_classifications = {f"{aid}_followup" for aid in reg} | {"pandora_chat_followup"}
-        # Content route matched by this task's title — drives the label set +
-        # investigation scoping for the route classifications below. None when
-        # no route matches (e.g. the pandora_investigation retry raced a config
-        # edit); the branches fall back to sane defaults.
+        followup_classifications = {f"{aid}_followup" for aid in reg}
+        # Content route matched by this task's title — drives the label set for
+        # route_apply below. None when no route matches (a config edit raced
+        # the classification); the branch falls back to sane defaults.
         matched_route = match_route(
             task.get("content") or "", await get_content_routes(self.db_pool)
         )
 
-        # Pandora-owned task — the classification itself has no side effects;
-        # classify_one already identified this case and log_classification
-        # bumps last_clarified_at so the watermark advances. The one write it
-        # DOES owe is the GTD state (issue #139): a task claimed by a prior
-        # investigation is still open work, and this branch left 49 of 66
-        # all-time pandora_owned tasks with no state at all. Idempotent — once
-        # stamped, existing_labels carries it and the next visit sends nothing.
-        if classification == "pandora_owned":
-            sent = await self._stamp_gtd_state(item_id, existing_labels, classification)
-            return {
-                "applied": True,
-                "interaction_spawned": False,
-                "interaction_payload": None,
-                "commands_sent": sent,
-                "outbox_queued": 0,
-            }
-
-        # The hub's task (#472): start nothing, owe only the GTD state. Unlike
-        # pandora_owned, a state the task already carries is kept — a hub task
-        # an investigation parked on a decision card is @waiting, and @next on
-        # top of it would give it two states. `applied` either way, so the flow
+        # The hub's task (#472): start nothing, owe only the GTD state. A state
+        # the task already carries is kept — @next on top of a `@waiting` task
+        # would give it two states. `applied` either way, so the flow
         # moves the watermark and the task leaves the queue.
         if classification == "hub_owned":
             sent = 0
@@ -1604,53 +1245,9 @@ class ClarifyActivities:
                 }
             )
 
-        elif classification == "pandora_gate":
-            # Ask-before-acting gate for Inbox work tickets (inbox gate).
-            # Apply NO labels/commands — just spawn the choice card. The flow
-            # bumps the watermark (an interaction spawned) so we don't re-card
-            # every tick; apply_clarify_resolution applies the chosen decision.
-            # No spawn_kind → ClarifyFlow routes this to InteractionFlow.
-            return {
-                "applied": False,
-                "interaction_spawned": True,
-                "interaction_payload": self._build_gate_interaction_payload(
-                    task, decision, pass_n
-                ),
-                "commands_sent": 0,
-                "outbox_queued": 0,
-            }
-
-        elif classification == "pandora_investigation":
-            # Content-route investigation. Stamp @pandora ownership (the label
-            # the investigation machinery — pandora_owned short-circuit, retry,
-            # cooldown SQL — keys on) plus the route's assignee + optional
-            # area_label, and signal the caller to spawn AlertInvestigationFlow
-            # as an abandoned child, scoped by the route's service/resource_tags.
-            route = matched_route or {}
-            label_set = {*existing_labels, "@pandora", route.get("assignee") or "@pandora", *contexts}
-            area = route.get("area_label")
-            if area:
-                label_set.add(area)
-            commands.append(
-                TodoistConnector.build_item_update_command(item_id, labels=list(label_set))
-            )
-            content = task.get("content") or ""
-            description = task.get("description") or ""
-            fingerprint = f"route-{item_id}"
-            interaction_payload = self._pandora_alert_payload(
-                content,
-                description,
-                fingerprint,
-                item_id,
-                service=route.get("service"),
-                resource_tags=route.get("resource_tags"),
-                alert_overrides=route.get("alert_overrides"),
-            )
-            interaction_spawned = True
-
         elif classification == "route_apply":
-            # Content route with gate:false — apply the route's assignee +
-            # contexts (+ optional area_label) directly. No card, no agent run.
+            # Content route — apply the route's assignee + contexts (+ optional
+            # area_label) directly. No card, no agent run.
             route = matched_route or {}
             label_set = {*existing_labels, assignee, *contexts}
             area = route.get("area_label")
@@ -1660,70 +1257,13 @@ class ClarifyActivities:
                 TodoistConnector.build_item_update_command(item_id, labels=list(label_set))
             )
 
-        elif classification == "pandora_followup":
-            # User commented on an existing @pandora task — fire a fresh
-            # investigation that includes the user's comment as context.
-            # No label changes (the task already has @pandora). Use a
-            # fingerprint keyed on last_note_at so each comment is its own
-            # occurrence when the flow has to ingest it (a task with no live
-            # problem). The latest_user_note is appended to the alert
-            # description so kimi sees the additional context.
-            content = task.get("content") or ""
-            description = task.get("description") or ""
-            latest_note = (task.get("latest_user_note") or "").strip()
-            last_note_at = task.get("last_note_at")
-            # Stable per-comment fingerprint: use an ISO timestamp slice if
-            # available, else hash of the note text.
-            note_token = ""
-            if last_note_at:
-                note_token = str(last_note_at)[:19].replace(":", "").replace(" ", "T")
-            elif latest_note:
-                note_token = str(abs(hash(latest_note)))[:12]
-            fingerprint = f"route-{item_id}-followup-{note_token}"
-            followup_desc = (
-                f"{description[:1500]}\n\n--- User followup comment ---\n{latest_note[:1500]}"
-            )
-            _route = matched_route or {}
-            interaction_payload = self._pandora_alert_payload(
-                content,
-                followup_desc,
-                fingerprint,
-                item_id,
-                service=_route.get("service"),
-                resource_tags=_route.get("resource_tags"),
-                alert_overrides=_route.get("alert_overrides"),
-                # The comment is about the problem this task already belongs
-                # to (#472). Named, the investigation's step 0 skips ingest;
-                # unnamed, it ingested a fresh event, minted a second problem
-                # and linked this task to both.
-                problem_id=await self._live_problem_id(item_id),
-            )
-            interaction_spawned = True
-            # No commands to send — labels already include @pandora. We
-            # explicitly synthesize an empty success below so apply_outcome
-            # returns applied=True and the ClarifyFlow spawn gate passes.
-
         elif classification in followup_classifications:
-            # Per-agent comment-channel branch (2026-05-26; pandora added
-            # 2026-05-27). Builds the synthetic chat turn for
-            # AgentChatReplyFlow and returns a spawn payload. No Todoist
-            # commands are sent here — the spawned workflow does all
-            # writes (chat + Todoist comment).
-            #
-            # "<id>_followup" names its agent. pandora_chat_followup names a
-            # label, not an id: the agent is whoever lists @pandora in its
-            # mention_aliases, else the `infra` holder — never an example id
-            # (#579). With neither, nobody can reply, so the task stays
-            # unclarified and is looked at again once one is configured.
-            if classification == "pandora_chat_followup":
-                target_agent = _label_owner(reg, "@pandora") or _cap_holder(reg, "infra")
-                if not target_agent:
-                    activity.logger.warning(
-                        "clarify_pandora_followup_no_agent task=%s", item_id
-                    )
-                    return {"applied": False, "commands_sent": 0, "outbox_queued": 0}
-            else:
-                target_agent = classification.replace("_followup", "")
+            # Per-agent comment-channel branch (2026-05-26). Builds the
+            # synthetic chat turn for AgentChatReplyFlow and returns a spawn
+            # payload. No Todoist commands are sent here — the spawned workflow
+            # does all writes (chat + Todoist comment). "<id>_followup" names
+            # its agent.
+            target_agent = classification.replace("_followup", "")
             # Fetch the recent comment thread so the agent sees its own
             # prior replies (and other agents' replies) and doesn't
             # repeat itself. Best-effort: empty list on DB failure.
@@ -1734,7 +1274,7 @@ class ClarifyActivities:
             # Per-agent pre-fetch hooks, gated on the target's behavior tag
             # (issue #36) rather than its id: a `research` agent gets the
             # knowledge context, a `finance` agent gets the transaction
-            # context. gtd/infra agents have no hook — their context IS the
+            # context. A gtd agent has no hook — their context IS the
             # task and their tool sets fetch what they need.
             target_caps = reg.get(target_agent, {}).get("caps", set())
             if "research" in target_caps:
@@ -1820,9 +1360,8 @@ class ClarifyActivities:
                 )
 
         elif classification == "mine":
-            # Hands-off resolution: user claimed the task with @me (via the
-            # gate card's "I've got it", or manually). find_unclassified_items
-            # excludes @me tasks, so stamping the label is terminal. (inbox gate)
+            # Hands-off resolution: the user claimed the task with @me.
+            # find_unclassified_items excludes @me tasks, so stamping the label is terminal.
             mine_labels = list({*existing_labels, "@me"})
             commands.append(
                 TodoistConnector.build_item_update_command(item_id, labels=mine_labels)
@@ -2042,26 +1581,6 @@ class ClarifyActivities:
             else:
                 return {"applied": False, "reason": f"unknown_low_conf_choice:{choice}"}
 
-        elif flavor == "pandora_gate":
-            # Inbox work-ticket gate resolution (inbox gate).
-            if choice == "investigate":
-                # Approve investigation. Route through pandora_investigation so
-                # apply_outcome stamps @pandora + the route's assignee/area; its
-                # spawn payload is ignored here (activities can't start
-                # workflows). We clear the watermark AFTER logging (below) so the
-                # next ClarifyFlow tick re-surfaces the task, hits the @pandora
-                # retry branch, and fires AlertInvestigationFlow from the flow.
-                # ponytail: ~15-min latency to investigation start — fine for
-                # async triage; upgrade path is a Temporal client on this
-                # activity if instant start is ever needed.
-                _route = match_route(task_content, await get_content_routes(self.db_pool)) or {}
-                resolved_decision["classification"] = "pandora_investigation"
-                resolved_decision["assignee"] = _route.get("assignee") or "@pandora"
-                resolved_decision["contexts"] = list(_route.get("contexts") or ["@deep", "@code"])
-            elif choice == "mine":
-                resolved_decision["classification"] = "mine"
-            else:
-                return {"applied": False, "reason": f"unknown_gate_choice:{choice}"}
         else:
             return {"applied": False, "reason": f"unknown_flavor:{flavor}"}
 
@@ -2084,11 +1603,6 @@ class ClarifyActivities:
             pass_n=pass_n,
             user_hint=f"chat:{choice}",
         )
-        # Gate "investigate" needs the task to re-enter find_unclassified_items
-        # so the @pandora retry branch fires AlertInvestigationFlow from the
-        # flow. log_classification just bumped the watermark — undo it. (inbox gate)
-        if flavor == "pandora_gate" and choice == "investigate":
-            await self.clear_clarify_watermark(task_id)
         # references-as-knowledge: if the resolution lands on 'reference'
         # and Todoist accepted the labels, inline-ingest + dispatch the
         # verdict (no Temporal scheduling — we're inside an activity).

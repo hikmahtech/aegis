@@ -4,7 +4,7 @@ editable from the admin UI (was hardcoded in worker clarify.py::_RuleSet).
 Lives in core (a worker dependency) so both the worker's classifier and the core
 admin route share the defaults + merge. Stored in the settings table under
 ``gtd_rules`` as ``{assignee, contexts, skip_inbox}``; the worker resolves it
-DB-first (merged over these defaults). The @sebas/@raphael/@maou/@pandora
+DB-first (merged over these defaults). The @sebas/@raphael/@maou
 *addressable* routing stays hardcoded in clarify.py — it's behavioural, not data.
 """
 
@@ -19,7 +19,7 @@ SOURCE_TAGS = ["#email", "#alert", "#receipt", "#research", "#calendar", "#manua
 
 DEFAULT_ASSIGNEE: dict[str, str] = {
     "#email": "@sebas",
-    "#alert": "@pandora",
+    "#alert": "@me",
     "#receipt": "@maou",
     "#research": "@raphael",
     "#calendar": "@sebas",
@@ -28,7 +28,7 @@ DEFAULT_ASSIGNEE: dict[str, str] = {
 }
 DEFAULT_CONTEXTS: dict[str, list[str]] = {
     "#email": ["@email", "@5min"],
-    "#alert": ["@code", "@deep"],
+    "#alert": ["@deep"],
     "#receipt": ["@deep"],
     "#research": ["@reading"],
     "#calendar": ["@deep"],

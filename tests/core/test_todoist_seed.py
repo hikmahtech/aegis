@@ -16,18 +16,16 @@ def _load_seed() -> dict:
 
 def test_todoist_seed_area_labels_are_now_projects():
     """After the GTD restructure, life-areas/work-streams are real Todoist
-    projects, not labels — so only @area/acme remains as a label (the pandora
-    investigation flow still tags Jira-linked tasks with it)."""
+    projects, not labels. The last one, @area/acme, went with the infra lane's
+    investigation flow; the retired @pandora assignee went with it."""
     data = _load_seed()
     all_label_names = {
         entry["name"]
         for group in data["labels"].values()
         for entry in group
     }
-    assert "@area/acme" in all_label_names
-    # The rest became projects and must no longer be seeded as labels.
-    retired = {"@area/business", "@area/aegis", "@area/finance", "@area/family", "@area/admin"}
-    assert not (retired & all_label_names), f"area labels that should be projects now: {retired & all_label_names}"
+    assert not {n for n in all_label_names if n.startswith("@area/")}
+    assert "@pandora" not in all_label_names
 
 
 def test_todoist_seed_preserves_existing_context_labels():

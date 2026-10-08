@@ -1,3 +1,0 @@
-# MinIODiskOffline
-
-TODO: fill in

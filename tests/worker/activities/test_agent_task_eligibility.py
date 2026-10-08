@@ -16,15 +16,15 @@ async def _seed(db_pool):
         INSERT INTO todoist_tasks
             (id, content, labels, source_tag, assignee_label, is_completed, updated_at)
         VALUES
-          ('tt-1','alert oldest',   ARRAY['@pandora'],           '#alert',  '@pandora', false, now() - interval '9 days'),
+          ('tt-1','alert oldest',   ARRAY['@maou'],           '#alert',  '@maou', false, now() - interval '9 days'),
           ('tt-2','email mid',      ARRAY['@sebas'],             '#email',  '@sebas',   false, now() - interval '8 days'),
           ('tt-3','receipt newer',  ARRAY['@maou'],              '#receipt','@maou',    false, now() - interval '7 days'),
-          ('tt-4','someday',        ARRAY['@pandora','@someday'],'#alert',  '@pandora', false, now() - interval '10 days'),
-          ('tt-5','waiting',        ARRAY['@pandora','@waiting'],'#alert',  '@pandora', false, now() - interval '10 days'),
-          ('tt-6','done',           ARRAY['@pandora'],           '#alert',  '@pandora', true,  now() - interval '10 days'),
+          ('tt-4','someday',        ARRAY['@maou','@someday'],'#alert',  '@maou', false, now() - interval '10 days'),
+          ('tt-5','waiting',        ARRAY['@maou','@waiting'],'#alert',  '@maou', false, now() - interval '10 days'),
+          ('tt-6','done',           ARRAY['@maou'],           '#alert',  '@maou', true,  now() - interval '10 days'),
           ('tt-7','no assignee',    ARRAY['@next'],              '#alert',  NULL,       false, now() - interval '10 days'),
-          ('tt-8','user code task', ARRAY['@pandora','@code'],   NULL,      '@pandora', false, now() - interval '6 days'),
-          ('tt-9','dateless alert', ARRAY['@pandora'],           '#alert',  '@pandora', false, now() - interval '5 days')
+          ('tt-8','user code task', ARRAY['@maou','@code'],   NULL,      '@maou', false, now() - interval '6 days'),
+          ('tt-9','dateless alert', ARRAY['@maou'],           '#alert',  '@maou', false, now() - interval '5 days')
         """
     )
     yield
@@ -102,7 +102,7 @@ async def test_at_most_one_coding_task_per_batch(db_pool, _seed):
     await db_pool.execute(
         """
         INSERT INTO todoist_tasks (id, content, labels, source_tag, assignee_label, is_completed, updated_at)
-        VALUES ('tt-10','code b', ARRAY['@pandora','@code'], NULL, '@pandora', false, now() - interval '11 days')
+        VALUES ('tt-10','code b', ARRAY['@maou','@code'], NULL, '@maou', false, now() - interval '11 days')
         """
     )
     try:
@@ -128,7 +128,7 @@ async def test_coding_backlog_does_not_underfill_batch(db_pool, _seed):
         """
         INSERT INTO todoist_tasks
             (id, content, labels, source_tag, assignee_label, is_completed, updated_at)
-        VALUES ($1, $2, ARRAY['@pandora','@code'], NULL, '@pandora', false, now() - make_interval(days => $3))
+        VALUES ($1, $2, ARRAY['@maou','@code'], NULL, '@maou', false, now() - make_interval(days => $3))
         """,
         [(cid, f"coding backlog {n}", 20 + n) for n, cid in enumerate(coding_ids, start=1)],
     )
@@ -150,7 +150,7 @@ async def test_a_task_with_a_session_row_leaves_the_pool(db_pool, _seed):
     """
     await db_pool.execute(
         "INSERT INTO work_sessions (task_id, agent_id, session_id) "
-        "VALUES ('tt-8', 'pandoras-actor', gen_random_uuid())"
+        "VALUES ('tt-8', 'maou', gen_random_uuid())"
     )
     try:
         act = AgentTaskActivities(db_pool=db_pool)

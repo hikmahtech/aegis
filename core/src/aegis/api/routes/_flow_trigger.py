@@ -1,9 +1,8 @@
 """Shared helpers for the manual flow-trigger admin routes.
 
-The ``/api/admin/money`` and ``/api/admin/homelab`` routers each expose a
-``POST /{flow}/run`` endpoint that maps a short flow slug to a Temporal
-workflow class name and starts it. The mapping table differs per router but
-the dispatch body (unknown-flow 400, manual workflow id, task queue) and the
+The ``/api/admin/money`` router exposes a ``POST /{flow}/run`` endpoint that
+maps a short flow slug to a Temporal workflow class name and starts it. The
+dispatch body (unknown-flow 400, manual workflow id, task queue) and the
 "no temporal client → 503" guard are identical.
 
 Workflow class names are passed as strings so Core never imports

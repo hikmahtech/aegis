@@ -41,7 +41,7 @@ def test_compile_unknown_mode_raises():
 def test_match_route_first_wins():
     routes = validate_routes(
         [
-            {"key": "app", "match": "prefix", "value": "APP-", "assignee": "@pandora"},
+            {"key": "app", "match": "prefix", "value": "APP-", "assignee": "@maou"},
             {"key": "bug", "match": "regex", "value": r"^\w+-\d+", "assignee": "@raphael"},
         ]
     )
@@ -53,8 +53,14 @@ def test_match_route_first_wins():
 
 def test_validate_defaults_and_rejections():
     r = validate_routes([{"key": "k", "match": "prefix", "value": "X-"}])[0]
-    assert r["assignee"] == "@pandora" and r["gate"] is True and r["contexts"] == []
-    assert r["area_label"] is None and r["service"] is None and r["resource_tags"] == []
+    assert r["assignee"] == "@me" and r["contexts"] == [] and r["area_label"] is None
+    # The investigation-only fields left with the infra lane (a2-devops); a
+    # stored route that still carries them reads as a plain route.
+    legacy = validate_routes(
+        [{"key": "k", "match": "prefix", "value": "X-", "gate": True, "service": "acme",
+          "resource_tags": ["acme"], "alert_overrides": {"exec": "rm"}}]
+    )[0]
+    assert set(legacy) == {"key", "match", "value", "assignee", "contexts", "area_label"}
 
     with pytest.raises(ValueError):  # bad match mode
         validate_routes([{"key": "k", "match": "nope", "value": "x"}])
@@ -100,16 +106,13 @@ async def test_save_and_get_roundtrip(clean_routes):
                 "key": "jira-app",
                 "match": "prefix",
                 "value": "APP-",
-                "assignee": "@pandora",
+                "assignee": "@maou",
                 "contexts": ["@code", "@deep"],
                 "area_label": "@area/acme",
-                "gate": True,
-                "service": "acme",
-                "resource_tags": ["acme"],
             }
         ],
     )
-    assert saved[0]["service"] == "acme"
+    assert saved[0]["area_label"] == "@area/acme"
     got = await get_content_routes(clean_routes)
     assert got == saved
     assert match_route("APP-999: x", got)["key"] == "jira-app"
@@ -120,27 +123,3 @@ async def test_save_rejects_bad_regex(clean_routes):
         await save_content_routes(clean_routes, [{"key": "k", "match": "regex", "value": "["}])
 
 
-def test_alert_overrides_validated_and_normalized():
-    routes = validate_routes(
-        [
-            {
-                "key": "infra",
-                "match": "contains",
-                "value": "down",
-                "alert_overrides": {"source": "todoist-infra", "alertname": "NodeDown"},
-            }
-        ]
-    )
-    assert routes[0]["alert_overrides"] == {"source": "todoist-infra", "alertname": "NodeDown"}
-
-
-def test_alert_overrides_rejects_unknown_keys():
-    with pytest.raises(ValueError):
-        validate_routes(
-            [{"key": "x", "match": "contains", "value": "y", "alert_overrides": {"exec": "rm"}}]
-        )
-
-
-def test_alert_overrides_absent_stays_none():
-    routes = validate_routes([{"key": "x", "match": "contains", "value": "y"}])
-    assert routes[0]["alert_overrides"] is None

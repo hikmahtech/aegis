@@ -1,11 +1,10 @@
 """Admin reads and mutations over the problem hub (`services/hub.py`).
 
 The Problems page is the operator's view of what AEGIS currently thinks is
-wrong: one row per problem, its timeline, the sessions on it and the deploy or
-maintenance windows in force.
+wrong: one row per problem, its timeline and the sessions on it.
 
 Two rules hold this module together. Every mutation calls the SAME function the
-chat tool and the worker call — closing, muting and merging live in `hub.py`,
+chat tool and the worker call — resolving, closing and merging live in `hub.py`,
 so the page can never drift into a second implementation of a transition. And
 Todoist is written only through the projector (`hub_project`): the sweep
 re-derives a live problem's task within five minutes of any change made here.
@@ -19,24 +18,20 @@ from typing import Any
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from aegis.api.auth import verify_auth
 from aegis.api.deps import get_pool, get_settings
-from aegis.api.settings_routes import settings_row_routes
 from aegis.config import Settings
 from aegis.errors import error_text
 from aegis.observability import log_audit
-from aegis.services import alert_remediation, hub_project, hub_settle, infra_alert_routing
+from aegis.services import hub_project
 from aegis.services.hub import (
     close_problem,
     digest,
     list_problems,
-    list_service_states,
     merge_problems,
-    mute_problem,
     problem_detail,
-    set_service_state,
     set_status,
 )
 
@@ -58,24 +53,12 @@ async def _audit(request: Request, action: str, target_id: str, details: dict) -
     )
 
 
-class MuteBody(BaseModel):
-    hours: float = Field(default=24.0, gt=0, le=24 * 30)
-
-
 class MergeBody(BaseModel):
     merge_id: str
 
 
 class CloseBody(BaseModel):
     reason: str = "closed from the admin panel"
-
-
-class ServiceStateBody(BaseModel):
-    subject: str
-    state: str
-    subject_kind: str = "service"
-    minutes: int | None = 30
-    note: str = ""
 
 
 @router.get("/problems")
@@ -110,23 +93,11 @@ async def get_digest(request: Request, hours: float = 24.0) -> dict[str, Any]:
 
 @router.get("/problems/{problem_id}")
 async def get_problem_detail(request: Request, problem_id: str, events: int = 50) -> dict[str, Any]:
-    """One problem with its timeline, links, sessions and active window."""
+    """One problem with its timeline, links and sessions."""
     detail = await problem_detail(get_pool(request), problem_id, events=events)
     if detail is None:
         raise HTTPException(status_code=404, detail="problem_not_found")
     return detail
-
-
-@router.post("/problems/{problem_id}/mute")
-async def post_mute(request: Request, problem_id: str, body: MuteBody) -> dict[str, Any]:
-    """Silence a problem for `hours`. Occurrences are still recorded and still
-    counted — muting stops the projection and the investigation, not the
-    record."""
-    until = await mute_problem(get_pool(request), problem_id, hours=body.hours, by="admin")
-    if until is None:
-        raise HTTPException(status_code=404, detail="problem_not_found_or_closed")
-    await _audit(request, "problem_muted", problem_id, {"hours": body.hours})
-    return {"problem_id": problem_id, "muted_until": until}
 
 
 @router.post("/problems/{problem_id}/resolve")
@@ -182,83 +153,3 @@ async def post_merge(
     result = {**result, "merged_task_retired": retired}
     await _audit(request, "problems_merged", problem_id, result)
     return result
-
-
-@router.get("/service-state")
-async def get_service_state(request: Request) -> dict[str, Any]:
-    """Every deploy / maintenance / degraded window in force."""
-    return {"windows": await list_service_states(get_pool(request))}
-
-
-@router.put("/service-state")
-async def put_service_state(request: Request, body: ServiceStateBody) -> dict[str, Any]:
-    """Open or clear a window. `state: "ok"` clears it."""
-    try:
-        row = await set_service_state(
-            get_pool(request),
-            body.subject,
-            body.state,
-            subject_kind=body.subject_kind,
-            minutes=body.minutes if body.state != "ok" else None,
-            set_by="admin",
-            note=body.note,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    await _audit(request, "service_state_set", f"{row['subject_kind']}:{row['subject']}", row)
-    return row
-
-
-settings_row_routes(
-    router,
-    "/infra-alert-routing",
-    get=lambda pool: infra_alert_routing.get_infra_alert_routing(pool, cached=False),
-    save=infra_alert_routing.save_infra_alert_routing,
-    view=lambda _pool, routing: {
-        "default_alertnames": sorted(infra_alert_routing.DEFAULT_INFRA_ALERTNAMES),
-        **routing,
-    },
-    doc=(
-        "Which alertnames are infra — the built-in list plus yours — and which repo "
-        "investigates them (`services/infra_alert_routing.py`). 400 on a bad value."
-    ),
-)
-
-settings_row_routes(
-    router,
-    "/hub-settle-seconds",
-    get=hub_settle.get_settle_seconds,
-    save=hub_settle.save_settle_seconds,
-    body=lambda body: body.get("overrides", body),
-    audit=lambda request, out: _audit(
-        request, "hub_settle_seconds_saved", "", {"overrides": out["overrides"]}
-    ),
-    doc=(
-        "How long each class of problem must persist before it earns a task, and before an "
-        "investigation spends effort on it (`services/hub_settle.py`). The GET returns your "
-        "overrides and the code defaults underneath them, so a blank field can be shown as "
-        "what it actually means rather than as zero. `{}` removes every override and returns "
-        "the class to its code default; the key `*` sets a window for every class at once — "
-        "and note it also shortens the matching verification delay, because both read one "
-        "number. 400 on a bad value rather than a quiet no-op."
-    ),
-)
-
-settings_row_routes(
-    router,
-    "/alert-remediation",
-    get=alert_remediation.get_alert_remediation,
-    save=alert_remediation.save_alert_remediation,
-    audit=lambda request, out: _audit(
-        request,
-        "alert_remediation_saved",
-        "",
-        {"repeat_window_minutes": out["repeat_window_minutes"]},
-    ),
-    doc=(
-        "The automatic restart's repeat window (`services/alert_remediation.py`, #501): the "
-        "effective minutes, the default under them and the cap. 400 on anything but a whole "
-        "number of minutes in range — this row gates `docker service update --force`, so a "
-        "typo must not save. `0` restarts every time."
-    ),
-)

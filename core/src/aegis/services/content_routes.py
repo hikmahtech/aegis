@@ -1,22 +1,20 @@
 """Content routing — regex/prefix/contains rules that route Inbox tasks by their
-CONTENT (title) to an assignee + labels, optionally behind an ask-before-acting
-choice card.
+CONTENT (title) to an assignee + labels.
 
 Complements ``gtd_rules`` (which routes by ``source_tag`` — where a task came
 from); this routes by what the task's title looks like. Stored in the settings
 table under ``content_routes`` as an ordered list; first match wins. Ships
-EMPTY — each deployment adds its own routes from the admin UI. The old hardcoded
-Acme ``^APP-\\d+:`` → @pandora investigation is now just one such row, e.g.::
+EMPTY — each deployment adds its own routes from the admin UI, e.g.::
 
-    {"key": "jira-app", "match": "prefix", "value": "APP-", "gate": true,
-     "assignee": "@pandora", "contexts": ["@code", "@deep"],
-     "area_label": "@area/acme", "service": "acme", "resource_tags": ["acme"]}
+    {"key": "tickets", "match": "prefix", "value": "TICKET-",
+     "assignee": "@me", "contexts": ["@deep"], "area_label": "@area/work"}
 
-A route with ``gate: true`` shows the choice card ("investigate / I've got it")
-before anything happens; the investigate path spawns AlertInvestigationFlow
-scoped by ``service``/``resource_tags``. A route with ``gate: false`` just
-applies ``assignee`` + ``contexts`` (+ ``area_label``) directly — plain
-label routing, no agent run.
+A matching task gets ``assignee`` + ``contexts`` (+ ``area_label``) applied
+directly: plain label routing, no card, no agent run. A blank assignee is
+``@me``. The ask-first ``gate`` and the investigation scoping fields
+(``service``, ``resource_tags``, ``alert_overrides``) left with the infra lane
+for the DevOps vertical (a2-devops); a stored route that still carries them
+reads as a plain route.
 """
 
 from __future__ import annotations
@@ -83,26 +81,14 @@ def validate_routes(routes: Any) -> list[dict]:
             raise ValueError(f"route {key!r}: value required")
         if not _valid_pattern(compile_pattern(match, value)):
             raise ValueError(f"route {key!r}: value is not a valid regex")
-        overrides_raw = r.get("alert_overrides") or {}
-        if not isinstance(overrides_raw, dict):
-            raise ValueError(f"route {key!r}: alert_overrides must be an object")
-        _allowed_overrides = {"source", "alertname", "severity"}
-        bad = set(overrides_raw) - _allowed_overrides
-        if bad:
-            raise ValueError(f"route {key!r}: unknown alert_overrides keys: {sorted(bad)}")
-        overrides = {k: str(v) for k, v in overrides_raw.items() if str(v).strip()}
         out.append(
             {
                 "key": key,
                 "match": match,
                 "value": value,
-                "assignee": str(r.get("assignee") or "@pandora"),
+                "assignee": str(r.get("assignee") or "@me"),
                 "contexts": [str(c) for c in (r.get("contexts") or [])],
                 "area_label": str(r["area_label"]) if r.get("area_label") else None,
-                "gate": bool(r.get("gate", True)),
-                "service": str(r["service"]) if r.get("service") else None,
-                "resource_tags": [str(t) for t in (r.get("resource_tags") or [])],
-                "alert_overrides": overrides or None,
             }
         )
     return out

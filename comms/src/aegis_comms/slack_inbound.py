@@ -10,7 +10,7 @@ Routing:
   (a) explicit `@<agent>` mention anywhere → async (AgentChatReplyFlow),
       mention stripped before the LLM sees it;
   (b) the bot itself @app_mention'd → async to the channel's agent;
-  (c) the channel maps to pandora → async (kimi tools run minutes);
+  (c) the channel maps to an async agent → async (its tools run minutes);
   (d) otherwise → sync `/api/chat` with the channel's agent; an unbound
       channel asks core's front door (POST /api/chat/route) who it is for.
 
@@ -1000,7 +1000,7 @@ class SlackInbound:
 
         * **The message is acknowledged at once**, with a :eyes: reaction on
           it (`ts`). Only async agents used to say anything before the answer
-          ("Routing to @pandora…"), so a sync agent's 13-second tool loop read
+          ("Routing to @<agent>…"), so a sync agent's 13-second tool loop read
           as no reply at all. The async text is kept only for when the
           reaction cannot be added (no `reactions:write` scope yet): an async
           answer can be minutes away, and silence for that long is worse.
@@ -1056,8 +1056,8 @@ class SlackInbound:
             )
             if triggered is not None:
                 if not acked:
-                    # No reaction to say it arrived, and pandora's kimi tools
-                    # can legitimately run minutes: say it in words.
+                    # No reaction to say it arrived, and an async agent's
+                    # tools can legitimately run minutes: say it in words.
                     await self._reply(
                         agent_id, channel_id, f"🤖 Routing to @{agent_id}…", reply_thread
                     )
@@ -1361,10 +1361,6 @@ class SlackInbound:
         pending = digest.get("pending_interactions") or 0
         if pending:
             lines.append(f"*Pending on you:* {pending} interaction(s)")
-
-        stuck = digest.get("infra_stuck") or []
-        if stuck:
-            lines.append(f"*Infra stuck:* {', '.join(stuck[:8])}")
 
         total_runs = sum(r.get("count", 0) for r in digest.get("runs_by_type_status") or [])
         lines.append(
