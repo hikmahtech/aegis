@@ -6,20 +6,9 @@ dataclass. Guards against drift between seed rows and the mapper table.
 
 from __future__ import annotations
 
-from aegis_worker.flows.cert_radar import CertRadarConfig, CertRadarFlow
 from aegis_worker.flows.daily_briefing import DailyBriefingConfig, DailyBriefingFlow
 from aegis_worker.flows.hub_sweep import HubSweepConfig, HubSweepFlow
-from aegis_worker.flows.infra_heartbeat import InfraHeartbeatConfig, InfraHeartbeatFlow
-from aegis_worker.flows.money_brief import MoneyBriefConfig, MoneyBriefFlow
-from aegis_worker.flows.month_close import MonthCloseConfig, MonthCloseFlow
-from aegis_worker.flows.receipt_ingest import (
-    DEFAULT_SENDER_FILTER,
-    ReceiptIngestFlow,
-    ReceiptIngestInput,
-)
-from aegis_worker.flows.service_drift import ServiceDriftConfig, ServiceDriftFlow
 from aegis_worker.flows.trading_desk import TradingDeskConfig, TradingDeskFlow
-from aegis_worker.flows.workspace_repo_sync import WorkspaceRepoSyncFlow, WorkspaceRepoSyncInput
 from aegis_worker.schedule_sync import _ACTIVITY_TYPE_MAP
 
 
@@ -32,60 +21,6 @@ def _act(slug: str, workflow_type: str, config: dict) -> dict:
         "config": config,
         "_settings": {"aegis_ui_url": ""},
     }
-
-
-def test_money_brief_flow_mapper_resolves():
-    mapper = _ACTIVITY_TYPE_MAP["MoneyBriefFlow"]
-    workflow_cls, cfg = mapper(
-        _act("money-brief-weekly", "MoneyBriefFlow", {"days": 14, "silent": True})
-    )
-    assert workflow_cls is MoneyBriefFlow
-    assert isinstance(cfg, MoneyBriefConfig)
-    assert cfg.agent_id == "maou"
-    assert cfg.days == 14
-    assert cfg.silent is True
-
-
-def test_money_brief_flow_mapper_defaults_to_a_week_and_speaks():
-    """A brief nobody is sent is a brief nobody reads: `silent` defaults off."""
-    mapper = _ACTIVITY_TYPE_MAP["MoneyBriefFlow"]
-    _, cfg = mapper(_act("money-brief-weekly", "MoneyBriefFlow", {}))
-    assert cfg.days == 7
-    assert cfg.silent is False
-
-
-def test_month_close_flow_mapper_resolves():
-    mapper = _ACTIVITY_TYPE_MAP["MonthCloseFlow"]
-    workflow_cls, cfg = mapper(_act("money-close-monthly", "MonthCloseFlow", {"silent": True}))
-    assert workflow_cls is MonthCloseFlow
-    assert isinstance(cfg, MonthCloseConfig)
-    assert cfg.agent_id == "maou"
-    assert cfg.silent is True
-
-
-def test_month_close_flow_mapper_defaults():
-    mapper = _ACTIVITY_TYPE_MAP["MonthCloseFlow"]
-    _, cfg = mapper(_act("money-close-monthly", "MonthCloseFlow", {}))
-    assert cfg.silent is False
-
-
-def test_service_drift_flow_mapper_resolves():
-    mapper = _ACTIVITY_TYPE_MAP["ServiceDriftFlow"]
-    workflow_cls, cfg = mapper(_act("service-drift-4h", "ServiceDriftFlow", {}))
-    assert workflow_cls is ServiceDriftFlow
-    assert isinstance(cfg, ServiceDriftConfig)
-    assert cfg.silent is False
-
-
-def test_cert_radar_flow_mapper_resolves():
-    domains = ["example.com", "aegis-api.example.com"]
-    mapper = _ACTIVITY_TYPE_MAP["CertRadarFlow"]
-    workflow_cls, cfg = mapper(
-        _act("cert-radar-daily", "CertRadarFlow", {"domains": domains})
-    )
-    assert workflow_cls is CertRadarFlow
-    assert isinstance(cfg, CertRadarConfig)
-    assert cfg.domains == domains
 
 
 def test_daily_briefing_flow_mapper_resolves() -> None:
@@ -128,115 +63,12 @@ def test_delivery_watchdog_mapper_threads_comms_url():
     assert cfg.comms_url == "http://aegis_comms:8081"
 
 
-def test_workspace_repo_sync_flow_mapper_resolves():
-    mapper = _ACTIVITY_TYPE_MAP["WorkspaceRepoSyncFlow"]
-    workflow_cls, cfg = mapper(
-        _act(
-            "workspace-repo-sync-daily",
-            "WorkspaceRepoSyncFlow",
-            {"min_repos": 8},
-        )
-    )
-    assert workflow_cls is WorkspaceRepoSyncFlow
-    assert isinstance(cfg, WorkspaceRepoSyncInput)
-    assert cfg.min_repos == 8
-
-
-def test_workspace_repo_sync_flow_mapper_defaults():
-    mapper = _ACTIVITY_TYPE_MAP["WorkspaceRepoSyncFlow"]
-    _, cfg = mapper(_act("ws-sync", "WorkspaceRepoSyncFlow", {}))
-    assert cfg.min_repos == 5
-
-
-def test_receipt_ingest_mapper_takes_an_explicit_sender_filter():
-    """A backfill narrows the scan by overriding the sender filter and window."""
-    mapper = _ACTIVITY_TYPE_MAP["ReceiptIngestFlow"]
-    workflow_cls, cfg = mapper(
-        _act(
-            "receipt-ingest-weekly",
-            "ReceiptIngestFlow",
-            {
-                "sender_filter": "(from:x@y.z)",
-                "query_window": "after:2026/06/30",
-                "sweep_limit": 200,
-            },
-        )
-    )
-    assert workflow_cls is ReceiptIngestFlow
-    assert isinstance(cfg, ReceiptIngestInput)
-    assert cfg.sender_filter == "(from:x@y.z)"
-    assert cfg.query == "(from:x@y.z) after:2026/06/30"
-    assert cfg.sweep_limit == 200
-
-
-def test_receipt_ingest_mapper_falls_back_on_an_empty_sender_filter():
-    """A blank `sender_filter` must NOT mean "no filter" — that query matches
-    the whole mailbox, and every message in it would be fanned out to
-    MoneyProcessFlow and its LLM call. Same for a blank window."""
-    mapper = _ACTIVITY_TYPE_MAP["ReceiptIngestFlow"]
-    _, cfg = mapper(
-        _act(
-            "receipt-ingest-weekly",
-            "ReceiptIngestFlow",
-            {"sender_filter": "", "query_window": ""},
-        )
-    )
-    assert cfg.sender_filter == DEFAULT_SENDER_FILTER
-    assert cfg.query_window == "newer_than:14d"
-    assert cfg.query == f"{DEFAULT_SENDER_FILTER} newer_than:14d"
-
-
-def test_receipt_ingest_mapper_defaults():
-    mapper = _ACTIVITY_TYPE_MAP["ReceiptIngestFlow"]
-    _, cfg = mapper(_act("receipt-ingest-weekly", "ReceiptIngestFlow", {}))
-    assert cfg.sender_filter == DEFAULT_SENDER_FILTER
-    assert cfg.query_window == "newer_than:14d"
-    assert cfg.sweep_limit == 20
-
-
 def test_trading_desk_flow_mapper_resolves():
     mapper = _ACTIVITY_TYPE_MAP["TradingDeskFlow"]
     workflow_cls, cfg = mapper(_act("trading-desk-daily", "TradingDeskFlow", {"mode": "paper"}))
     assert workflow_cls is TradingDeskFlow
     assert isinstance(cfg, TradingDeskConfig)
     assert cfg.agent_id == "maou"
-
-
-def test_infra_heartbeat_mapper_reads_the_canary_config():
-    """The canary is off until the row names a URL, so the row→config wiring is
-    the whole feature. Nothing pinned it: a typo in the key (`ingress-url`)
-    would have shipped green and the canary would simply never have run — the
-    passes-forever pattern this repo keeps getting caught by (#492).
-
-    Falsifiable: rename any of the three keys in the builder and this fails.
-    """
-    mapper = _ACTIVITY_TYPE_MAP["InfraHeartbeatFlow"]
-    workflow_cls, cfg = mapper(
-        _act(
-            "infra-heartbeat-2m",
-            "InfraHeartbeatFlow",
-            {
-                "ingress_url": "  https://aegis.example.com/api/webhooks/github  ",
-                "ingress_fail_threshold": 3,
-                "ingress_expect_status": 405,
-            },
-        )
-    )
-    assert workflow_cls is InfraHeartbeatFlow
-    assert isinstance(cfg, InfraHeartbeatConfig)
-    assert cfg.ingress_url == "https://aegis.example.com/api/webhooks/github"
-    assert cfg.ingress_fail_threshold == 3
-    assert cfg.ingress_expect_status == 405
-
-
-def test_infra_heartbeat_mapper_ships_the_canary_off():
-    """A fork cannot be given the operator's hostname, so an empty row means no
-    probe at all — not a probe of something guessed."""
-    mapper = _ACTIVITY_TYPE_MAP["InfraHeartbeatFlow"]
-    _, cfg = mapper(_act("infra-heartbeat-2m", "InfraHeartbeatFlow", {}))
-    assert cfg.ingress_url == ""
-    assert cfg.ingress_fail_threshold == 2
-    assert cfg.ingress_expect_status == 0
 
 
 def test_hub_sweep_mapper_reads_the_grouping_thresholds():
@@ -310,3 +142,14 @@ def test_hub_sweep_mapper_leaves_the_service_defaults_alone():
     )
     assert floored.group_window_hours == 0.0
     assert floored.group_min_members == 0
+
+
+def test_the_retired_lanes_have_no_mapper():
+    """v1 removal prep (054): their activities rows are gone, so they have no
+    schedule config; the flows stay registered for runs in flight."""
+    for flow in (
+        "MoneyBriefFlow", "MonthCloseFlow", "ReceiptIngestFlow", "StatementReconcileFlow",
+        "ServiceDriftFlow", "CertRadarFlow", "InfraHeartbeatFlow",
+        "SentryPollFlow", "JiraSyncFlow", "WorkspaceRepoSyncFlow",
+    ):
+        assert flow not in _ACTIVITY_TYPE_MAP, flow

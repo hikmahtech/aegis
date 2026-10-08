@@ -1,6 +1,9 @@
-"""Issue #36 — GmailIngestFlow's financial fan-out is addressed to whichever
-agent holds the `finance` tag (resolved once per run), not the literal "maou".
-When no agent holds `finance`, the MoneyProcessFlow fan-out is skipped.
+"""GmailIngestFlow's financial fan-out.
+
+Issue #36 addressed it to whichever agent holds the `finance` tag. Since the v1
+removal prep the fan-out is a no-op for every run that carries the
+`money-fanout-flag` patch marker: the books left v1. The flag read stays in that
+branch so a run in flight at the deploy still replays.
 """
 
 from __future__ import annotations
@@ -33,11 +36,13 @@ class _FakeMoneyProcessFlow:
 # Activities run OUTSIDE the workflow sandbox, so unlike the child-workflow
 # fake above, an activity stub can record what the flow actually passed it.
 _TRIAGE_ARGS: list[list] = []
+_FLAG_READS: list[bool] = []
 
 
 def _stubs(resolve_map, fanout=True):
     @activity.defn(name="money_fanout_enabled")
     async def money_fanout_enabled():
+        _FLAG_READS.append(fanout)
         return fanout
 
     @activity.defn(name="list_active_channels")
@@ -104,6 +109,7 @@ async def _run(resolve_map, agent_id, fanout=True):
     """Run the flow over one financial email; return the fan-out child's
     received agent_id, or None if no MoneyProcessFlow child was spawned."""
     _TRIAGE_ARGS.clear()
+    _FLAG_READS.clear()
     async with await WorkflowEnvironment.start_time_skipping() as env:
         client: Client = env.client
         async with Worker(
@@ -129,10 +135,13 @@ async def _run(resolve_map, agent_id, fanout=True):
 
 
 @pytest.mark.asyncio
-async def test_financial_fanout_uses_resolved_finance_agent():
-    """A renamed finance agent (not 'maou') receives the MoneyProcessFlow spawn."""
-    spawned_agent = await _run({"finance": "money-agent"}, agent_id="sebas")
-    assert spawned_agent == "money-agent"
+async def test_the_money_fanout_is_a_no_op():
+    """v1 removal prep: with a finance agent and the switch on, money mail is
+    still not handed to MoneyProcessFlow. The switch is still read, so the
+    command sequence of a run in flight at the deploy is unchanged."""
+    spawned_agent = await _run({"finance": "money-agent"}, agent_id="sebas", fanout=True)
+    assert spawned_agent is None
+    assert _FLAG_READS == [True]
 
 
 @pytest.mark.asyncio

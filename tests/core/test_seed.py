@@ -10,10 +10,12 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import yaml
 from aegis.db import run_migrations
 from aegis.seed import _load_agents, load_seeds
 
-SEED_DIR = Path(__file__).parent.parent.parent / "config" / "seed"
+REPO_ROOT = Path(__file__).parent.parent.parent
+SEED_DIR = REPO_ROOT / "config" / "seed"
 
 
 @pytest.mark.asyncio
@@ -103,19 +105,19 @@ async def test_load_seeds_preserves_sync_managed_resource_kinds(db_pool):
 _PHASE3_ACTIVITY_SLUGS = [
     "gmail-ingest-hourly",
     "calendar-ingest-daily",
-    "receipt-ingest-weekly",
     "raindrop-ingest-2h",
     "rss-ingest-hourly",
     "intel-scan-hn",
     "intel-scan-news",
     "intel-scan-finance",
-    "sentry-poll-30m",
 ]
 
 
 @pytest.mark.asyncio
 async def test_phase3_activities_loaded(db_pool):
-    """9 Phase 3 activity rows are upserted with correct workflow_type and agent_id."""
+    """The 7 Phase 3 activity rows still seeded are upserted with correct
+    workflow_type and agent_id (receipt-ingest-weekly and sentry-poll-30m left
+    in the v1 removal prep)."""
     await run_migrations(db_pool)
     await load_seeds(db_pool, SEED_DIR)
 
@@ -126,7 +128,7 @@ async def test_phase3_activities_loaded(db_pool):
             f"WHERE slug IN ({slugs_sql}) ORDER BY slug"
         )
 
-    assert len(rows) == 9, f"Expected 9 activity rows, got {len(rows)}"
+    assert len(rows) == 7, f"Expected 7 activity rows, got {len(rows)}"
     slugs_found = {r["slug"] for r in rows}
     assert "gmail-ingest-hourly" in slugs_found
     assert "intel-scan-hn" in slugs_found
@@ -137,9 +139,7 @@ async def test_phase3_activities_loaded(db_pool):
 
     by_slug = {r["slug"]: r for r in rows}
     assert by_slug["gmail-ingest-hourly"]["agent_id"] == "sebas"
-    assert by_slug["receipt-ingest-weekly"]["agent_id"] == "maou"
     assert by_slug["raindrop-ingest-2h"]["agent_id"] == "raphael"
-    assert by_slug["sentry-poll-30m"]["agent_id"] == "pandoras-actor"
 
 
 @pytest.mark.asyncio
@@ -492,3 +492,91 @@ def test_the_journal_rows_belong_to_the_gtd_holder():
     ):
         assert by_slug[slug]["agent_id"] in holds["gtd"], slug
     assert by_slug["notes-sync-hourly"]["agent_id"] in holds["research"]
+
+
+# --- v1 removal prep (migration 054) ----------------------------------------
+
+_REMOVED_SLUGS = {
+    "infra-heartbeat-2m", "service-drift-4h", "cert-radar-daily",
+    "profile-reflection-weekly-pandoras-actor", "memory-reflection-nightly-pandoras-actor",
+    "sentry-poll-30m", "jira-sync-30m", "workspace-repo-sync-daily",
+    "money-statements-reconcile", "receipt-ingest-weekly", "money-brief-weekly",
+    "money-close-monthly",
+}
+_REASSIGNED_SLUGS = {
+    "hub-sweep-5m", "llm-spend-guard-15min", "flow-health-watchdog-30m",
+    "delivery-watchdog-hourly", "cleanup-daily", "agent-task-15min",
+}
+
+
+def _seed_rows(name: str, key: str) -> list[dict]:
+    return yaml.safe_load((SEED_DIR / name).read_text())[key]
+
+
+def test_the_seed_no_longer_carries_the_removed_schedules():
+    slugs = {r["slug"] for r in _seed_rows("activities.yaml", "activities")}
+    assert not (slugs & _REMOVED_SLUGS)
+    assert all(
+        r["agent_id"] != "pandoras-actor" for r in _seed_rows("activities.yaml", "activities")
+    )
+
+
+def test_the_shared_schedules_belong_to_sebas_and_no_coding_runs():
+    rows = {r["slug"]: r for r in _seed_rows("activities.yaml", "activities")}
+    for slug in _REASSIGNED_SLUGS:
+        assert rows[slug]["agent_id"] == "sebas", slug
+    assert rows["agent-task-15min"]["config"]["max_coding"] == 0
+
+
+def test_the_infra_agent_ships_inactive():
+    """`seed.py` writes `active` on every boot, so the YAML must agree with 054."""
+    agents = {a["id"]: a for a in _seed_rows("agents.yaml", "agents")}
+    assert agents["pandoras-actor"]["active"] is False
+
+
+@pytest.mark.asyncio
+async def test_migration_054_leaves_the_db_as_the_seed_says(db_pool):
+    await run_migrations(db_pool)
+    await load_seeds(db_pool, SEED_DIR)
+    async with db_pool.acquire() as conn:
+        gone = await conn.fetch(
+            "SELECT slug FROM activities WHERE slug = ANY($1::text[])", list(_REMOVED_SLUGS)
+        )
+        owners = await conn.fetch(
+            "SELECT slug, agent_id FROM activities WHERE slug = ANY($1::text[])",
+            list(_REASSIGNED_SLUGS),
+        )
+        active = await conn.fetchval("SELECT active FROM agents WHERE id = 'pandoras-actor'")
+    assert gone == []
+    assert {r["slug"]: r["agent_id"] for r in owners} == dict.fromkeys(_REASSIGNED_SLUGS, "sebas")
+    assert active is False
+
+
+@pytest.mark.asyncio
+async def test_migration_054_strips_removed_tools_and_is_idempotent(db_pool):
+    """Run the 054 SQL over a DB tool_set that still lists removed tools."""
+    sql = (REPO_ROOT / "migrations" / "054_v1_removal_prep.sql").read_text()
+    await run_migrations(db_pool)
+    await load_seeds(db_pool, SEED_DIR)
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO agents (id, name, role, system_prompt_path, metadata) "
+            "VALUES ('zz-054', 'zz', 'test', 'personalities/zz', $1) "
+            "ON CONFLICT (id) DO UPDATE SET metadata = EXCLUDED.metadata",
+            {"tool_set": ["search_knowledge", "dispatch_agent_run", "ledger_query",
+                          "capture_to_inbox", "list_nodes", "task_context"]},
+        )
+        await conn.execute(
+            "UPDATE activities SET agent_id = 'pandoras-actor', config = '{}'::jsonb "
+            "WHERE slug = 'agent-task-15min'"
+        )
+        await conn.execute(sql)
+        await conn.execute(sql)  # a re-run is a no-op
+        tools = await conn.fetchval("SELECT metadata->'tool_set' FROM agents WHERE id = 'zz-054'")
+        await conn.execute("DELETE FROM agents WHERE id = 'zz-054'")
+        row = await conn.fetchrow(
+            "SELECT agent_id, config FROM activities WHERE slug = 'agent-task-15min'"
+        )
+    assert tools == ["search_knowledge", "capture_to_inbox"]
+    assert row["agent_id"] == "sebas"
+    assert row["config"]["max_coding"] == 0

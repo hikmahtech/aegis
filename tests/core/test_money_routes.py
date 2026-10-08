@@ -555,7 +555,10 @@ def test_money_flow_names_dispatch_seeded_workflow_types():
     }
 
     assert set(money_routes._FLOW_NAMES) == {"money_brief", "month_close", "receipt_scan"}
-    assert set(money_routes._FLOW_NAMES.values()) <= seeded
+    # The money schedules were deleted by the v1 removal prep (migration 054);
+    # the flows stay registered (money_hygiene_enabled) until the books leave.
+    unscheduled_by_054 = {"MoneyBriefFlow", "MonthCloseFlow", "ReceiptIngestFlow"}
+    assert set(money_routes._FLOW_NAMES.values()) <= seeded | unscheduled_by_054
     assert money_routes._FLOW_NAMES["money_brief"] == "MoneyBriefFlow"
     assert money_routes._FLOW_NAMES["month_close"] == "MonthCloseFlow"
 

@@ -14,7 +14,9 @@ import aegis_worker.__main__ as worker_main
 from aegis_worker.registry import expected_activity_names, workflows_for
 
 # Prod settings: both feature flags on.
-_PROD = SimpleNamespace(homelab_enabled=True, money_hygiene_enabled=True)
+_PROD = SimpleNamespace(
+    homelab_enabled=True, money_hygiene_enabled=True, trading_desk_enabled=True
+)
 
 
 def test_agent_chat_reply_flow_registered():

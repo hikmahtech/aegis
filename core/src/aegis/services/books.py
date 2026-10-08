@@ -9,12 +9,8 @@ This module is shared by core (tools) and worker (flows). Amounts are
 from __future__ import annotations
 
 import asyncio
-import base64
 import csv
-import fcntl
-import os
 import re
-import shutil
 import subprocess
 from collections.abc import Callable, Collection
 from dataclasses import dataclass
@@ -26,10 +22,27 @@ import structlog
 import yaml
 
 from aegis.api.models.money import MoneyEvent
+from aegis.services import git_checkout
 from aegis.services.books_chart import Chart as BooksChart
+from aegis.services.git_checkout import (  # noqa: F401 — re-exports
+    CLONE_TIMEOUT_S,
+    parse_csv_set,
+    parse_kv,
+    write_deploy_key,
+)
 from aegis.services.money_format import fmt_money  # noqa: F401 — re-export (spec §5.1)
 
 logger = structlog.get_logger()
+
+# The git layer moved to `git_checkout` so the vault outlives the books lane.
+# These names stay here: the books code and its tests use them.
+BooksError = git_checkout.CheckoutError
+BooksDisabled = git_checkout.CheckoutDisabled
+_LOCK_NAME = git_checkout.LOCK_NAME
+_FileLock = git_checkout.FileLock
+_git_paths = git_checkout.git_paths
+_revert_sync = git_checkout.revert_sync
+_spawn = git_checkout.spawn
 
 _SYMBOL = {"INR": "₹", "USD": "$", "GBP": "£", "EUR": "€"}
 _CENT = Decimal("0.01")
@@ -183,14 +196,6 @@ def canonical_instrument(
 
 # ----------------------------------------------------------------- errors/config
 
-class BooksError(Exception):
-    """A books operation failed; the working copy is left clean."""
-
-
-class BooksDisabled(BooksError):  # noqa: N818 — a state, not an error suffix (spec §5)
-    """No `books_repo_url` and no checkout: the books are not configured."""
-
-
 class BooksCheckError(BooksError):
     """`hledger check --strict` rejected a write; it was reverted."""
 
@@ -223,50 +228,6 @@ def install_deploy_key(settings) -> Path | None:
     `<gmail_token_dir>/books_deploy_key` with mode 0600. Never logs the value."""
     path = Path(getattr(settings, "gmail_token_dir", "config/")) / "books_deploy_key"
     return write_deploy_key(getattr(settings, "books_deploy_key", ""), path, "books_deploy_key")
-
-
-def write_deploy_key(raw: str, path: Path, label: str) -> Path | None:
-    """Write one deploy key (PEM, or base64 of PEM) to `path` with mode 0600.
-
-    Shared by the books key and the vault key (`notes.install_deploy_key`,
-    #514), so both land on disk the same way. Never logs the value."""
-    raw = (raw or "").strip()
-    if not raw:
-        return None
-    if "\n" not in raw:
-        try:
-            raw = base64.b64decode(raw, validate=True).decode("utf-8").strip()
-        except Exception as exc:  # noqa: BLE001
-            raise BooksError(f"{label} is neither PEM text nor base64 PEM") from exc
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # O_CREAT's mode applies only when the file is NEW, so this closes the window
-    # where a fresh key file exists world-readable; the chmod then covers the
-    # case where the path already existed with looser permissions.
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as fh:
-        fh.write(raw + "\n")
-    path.chmod(0o600)
-    return path
-
-
-def parse_csv_set(raw: str) -> frozenset[str]:
-    """`" a, b ,,c"` → `{"a", "b", "c"}`. Blank/None ⇒ empty."""
-    return frozenset(s.strip() for s in (raw or "").split(",") if s.strip())
-
-
-def parse_kv(raw: str) -> dict[str, str]:
-    """`"personal=6h2f, acme = 6h2g"` → `{"personal": "6h2f", "acme": "6h2g"}`.
-
-    Lenient by design: a malformed pair is dropped, never raised — these are
-    admin-typed strings and a typo must not take a boot path down.
-    """
-    out: dict[str, str] = {}
-    for part in (raw or "").split(","):
-        if "=" in part:
-            k, v = part.split("=", 1)
-            if k.strip() and v.strip():
-                out[k.strip()] = v.strip()
-    return out
 
 
 # ----------------------------------------------------------------- block grammar
@@ -811,37 +772,8 @@ _GIT_IDENTITY = {
     "GIT_COMMITTER_NAME": "Maou",
     "GIT_COMMITTER_EMAIL": "maou@aegis.local",
 }
-_LOCK_NAME = ".aegis.lock"
-# How long a clone may take. Every activity that can trigger the first write
-# must allow MORE than this, or it times out mid-clone and burns every retry
-# attempt on the same clone (`_POST_TIMEOUT` in the money flows).
-CLONE_TIMEOUT_S = 180
-
-
 def _env(cfg: BooksConfig) -> dict[str, str]:
-    env = {**os.environ, **_GIT_IDENTITY}
-    if cfg.deploy_key:
-        env["GIT_SSH_COMMAND"] = (
-            f"ssh -i {cfg.deploy_key} -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes"
-        )
-    return env
-
-
-def _spawn(
-    cmd: list[str], *, cwd: str, timeout: int, env: dict[str, str] | None = None
-) -> subprocess.CompletedProcess:
-    """`subprocess.run`, with the two non-`BooksError` escapes closed: a missing
-    binary or working copy (`OSError`) and a hung pull/push (`TimeoutExpired`).
-    Callers see one exception type, so a degraded host never escapes as a bare
-    `FileNotFoundError` through an async activity."""
-    try:
-        return subprocess.run(
-            cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise BooksError(f"{cmd[0]} timed out after {timeout}s") from exc
-    except OSError as exc:
-        raise BooksError(f"{cmd[0]} could not run: {exc}") from exc
+    return {**git_checkout.ssh_env(cfg), **_GIT_IDENTITY}
 
 
 def _run(
@@ -858,33 +790,9 @@ def _has_remote(cfg: BooksConfig) -> bool:
 
 
 def ensure_checkout_sync(cfg: BooksConfig) -> None:
-    """Clone if the working copy is missing. Raises BooksDisabled with no
-    repo url and no checkout.
-
-    Called with the flock HELD (see `_write_sync`), so core and worker cannot
-    both clone on the first-ever write. That is also why the clone stages in a
-    sibling directory: the lock lives INSIDE `cfg.path` (the spec gitignores it
-    there), and a clone refuses a destination that is not empty — measured,
-    exit 128, "already exists and is not an empty directory". Nothing is moved
-    into place until the clone has succeeded.
-    """
-    if (cfg.path / ".git").exists():
-        return
-    if not cfg.repo_url:
-        raise BooksDisabled("books_repo_url is not configured and no checkout exists")
-    cfg.path.mkdir(parents=True, exist_ok=True)
-    staging = cfg.path.parent / f".{cfg.path.name}.cloning"
-    shutil.rmtree(staging, ignore_errors=True)
-    proc = _spawn(
-        ["git", "clone", "-q", cfg.repo_url, str(staging)],
-        cwd=str(cfg.path.parent), timeout=CLONE_TIMEOUT_S, env=_env(cfg),
-    )
-    if proc.returncode != 0:
-        shutil.rmtree(staging, ignore_errors=True)
-        raise BooksError(f"git clone failed: {proc.stderr.strip()[:500]}")
-    for item in staging.iterdir():
-        item.rename(cfg.path / item.name)
-    staging.rmdir()
+    """Clone if the working copy is missing (`git_checkout.ensure_checkout_sync`).
+    Raises BooksDisabled with no repo url and no checkout."""
+    git_checkout.ensure_checkout_sync(cfg, what="books_repo_url")
 
 
 def _pull_sync(cfg: BooksConfig) -> None:
@@ -898,48 +806,6 @@ def _check_sync(cfg: BooksConfig) -> None:
     )
     if proc.returncode != 0:
         raise BooksCheckError(proc.stderr.strip()[:1000] or proc.stdout.strip()[:1000])
-
-
-def _git_paths(cfg: BooksConfig, paths: list[str], *, on_disk_only: bool = False) -> list[str]:
-    """The pathspec git can actually act on.
-
-    The lock file is dropped by NAME rather than with a `:!` exclusion pathspec:
-    combining an exclusion with a positive pathspec makes `git add` stage
-    nothing at all for a new file, silently and with exit 0 (measured on git
-    2.x), which is how a written report would never reach a commit. And a
-    pathspec matching neither the working tree nor the index makes `git add`
-    and `git commit` fail outright, so those are dropped too — a journal file
-    the write never had to create cannot have changed.
-    """
-    wanted = [p for p in paths if p != _LOCK_NAME]
-    if not wanted or on_disk_only:
-        return wanted
-    listed = _run(["git", "ls-files", "-z", "--", *wanted], cfg, check=False).stdout
-    tracked = set(listed.split("\0"))
-    return [p for p in wanted if (cfg.path / p).exists() or p in tracked]
-
-
-def _revert_sync(cfg: BooksConfig, paths: list[str]) -> None:
-    """Undo ONLY the paths this write touched. A repo-wide revert would destroy
-    a human's unrelated uncommitted edits — including the hand edit that made
-    the write fail in the first place."""
-    targets = _git_paths(cfg, paths, on_disk_only=True)
-    if not targets:
-        return
-    # Unstage first. A write can fail AFTER `git add` (the commit itself), and
-    # `git checkout — <path>` restores from the INDEX, so a staged bad version
-    # would be "restored" straight back into the working copy. Reset also makes
-    # a newly-added file untracked again, so the `clean` below can remove it.
-    _run(["git", "reset", "-q", "HEAD", "--", *targets], cfg, check=False)
-    # One checkout per path: git aborts the WHOLE command when any pathspec
-    # names an untracked file, reverting nothing, so a new year's journal in
-    # the list would silently protect every other path from being restored.
-    for rel in targets:
-        _run(["git", "checkout", "-q", "--", rel], cfg, check=False)
-    # The lock file is outside `targets`, so `clean` cannot delete it out from
-    # under a holder — which would hand the next writer a different inode and
-    # therefore no mutual exclusion at all.
-    _run(["git", "clean", "-qfd", "--", *targets], cfg, check=False)
 
 
 def _commit_push_sync(cfg: BooksConfig, summary: str, paths: list[str]) -> bool:
@@ -970,25 +836,6 @@ def unpushed_commits_sync(cfg: BooksConfig) -> int:
 
 
 _ASYNC_LOCK = asyncio.Lock()
-
-
-class _FileLock:
-    """flock on <books>/.aegis.lock — core and worker share the directory."""
-
-    def __init__(self, cfg: BooksConfig) -> None:
-        self._path = cfg.path / _LOCK_NAME
-
-    def __enter__(self):
-        # The directory may not exist yet: the clone happens INSIDE this lock,
-        # so the lock file has to be creatable before there is a checkout.
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._fd = open(self._path, "w")  # noqa: SIM115 — held for the with-block
-        fcntl.flock(self._fd, fcntl.LOCK_EX)
-        return self
-
-    def __exit__(self, *exc):
-        fcntl.flock(self._fd, fcntl.LOCK_UN)
-        self._fd.close()
 
 
 def _write_sync(

@@ -12,7 +12,8 @@ import os
 import structlog
 from aegis.errors import error_text
 from aegis.services.agents import resolve_tag
-from aegis.services.books import config_from_settings, parse_csv_set, parse_kv
+from aegis.services.books import config_from_settings
+from aegis.services.git_checkout import parse_csv_set, parse_kv
 from aegis.services.user_agent import bot_user_agent
 from temporalio.client import Client
 from temporalio.contrib.opentelemetry import TracingInterceptor
@@ -68,6 +69,7 @@ from aegis_worker.activities.statements import StatementActivities
 from aegis_worker.activities.tender_watch import TenderWatchActivities
 from aegis_worker.activities.todoist import TodoistActivities
 from aegis_worker.activities.trading_desk import TradingDeskActivities
+from aegis_worker.activities.watchdog import WatchdogActivities
 from aegis_worker.activities.wearable import WearableActivities
 from aegis_worker.activities.world_watch import WorldWatchActivities
 from aegis_worker.bootstrap import bootstrap
@@ -279,6 +281,11 @@ async def main():
     agent_registry_act = AgentRegistryActivities(db_pool=deps.pool)
     llm_governor_act = LLMGovernorActivities(db_pool=deps.pool)
 
+    # The delivery watchdog's activities. Always built: the watchdog checks
+    # AEGIS's own card delivery and comms inbound, not the homelab. Its cards
+    # speak as the generalist (`gtd` holder).
+    watchdog_act = WatchdogActivities(db_pool=deps.pool, delivery=delivery_act, agent_id=gtd_agent)
+
     homelab_act = None
     if settings.homelab_enabled:
         homelab_act = HomelabActivities(
@@ -319,9 +326,9 @@ async def main():
             or "arshad-hikmah",
         )
 
-    # Maou's paper trading desk rides the money flag, like the rest of the lane.
+    # Maou's paper trading desk has its own flag: it stays when the books leave v1.
     desk_act = None
-    if settings.money_hygiene_enabled:
+    if settings.trading_desk_enabled:
         desk_act = TradingDeskActivities(
             db_pool=deps.pool, settings=settings, finance=connectors.get("finance")
         )
@@ -704,6 +711,7 @@ async def main():
         infra_ops_act,
         expiring_items_act,
         flow_health_act,
+        watchdog_act,
         # None when their feature flag is off — collect_activities skips those.
         homelab_act,
         money_act,

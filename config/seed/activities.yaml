@@ -79,67 +79,6 @@ activities:
     config: {}
     active: true
 
-  # Maou — weekly receipt safety-net. Per-message money hygiene is owned by
-  # GmailIngestFlow's tag-based fan-out (financial/payments → MoneyProcessFlow).
-  # This run only catches anything the hourly triage missed, then sweeps every
-  # receipt_email row still below parsed.version 2 back through the same path.
-  # The sender filter defaults to the bank + vendor senders in the flow;
-  # override with `sender_filter`. `query_window` and `sweep_limit` are the
-  # knobs for a backfill.
-  - slug: receipt-ingest-weekly
-    workflow_type: ReceiptIngestFlow
-    agent_id: maou
-    schedule_cron: "0 5 * * 0"
-    config:
-      query_window: "newer_than:14d"
-    active: true
-
-  # The weekly money brief, read off the books (spec §7.2). Sunday 03:00 UTC
-  # (08:30 at UTC+5:30), an hour ahead of receipt-ingest-weekly so the brief covers the
-  # week the safety-net scan has already drained into the journal.
-  - slug: money-brief-weekly
-    workflow_type: MoneyBriefFlow
-    agent_id: maou
-    schedule_cron: "0 3 * * 0"
-    config:
-      days: 7
-    active: true
-
-  # The previous calendar month's close (spec §7.3). 1st of the month, 04:00
-  # UTC (09:30 at UTC+5:30). `build_month_close` picks the month, so the cron only
-  # decides when — a manual run closes the same month on any day.
-  - slug: money-close-monthly
-    workflow_type: MonthCloseFlow
-    agent_id: maou
-    schedule_cron: "0 4 1 * *"
-    config: {}
-    active: true
-
-  # The statement lane (spec §14 step 7). Daily at 05:30 UTC (11:00 at UTC+5:30) —
-  # statements arrive monthly, but intake is idempotent on `row_id`, so a daily
-  # tick costs a Drive listing and finds a statement the day it lands rather
-  # than up to a month later.
-  #
-  # `post: false` and `active: false` are BOTH deliberate. The flow writes to
-  # `hikmahtech/books`, and neither a fresh fork nor this deployment should
-  # start posting on a schedule until an operator has read what a dry run would
-  # write. Turn `active` on to see the findings and the digest; turn `post` on
-  # after that.
-  #
-  # `silent` withholds the digest, not the findings — those always reach the
-  # hub. It defaults off because the digest is now produced once a month
-  # (#464), which is the cadence a report on how the lane is doing deserves;
-  # daily is what made it unreadable.
-  - slug: money-statements-reconcile
-    workflow_type: StatementReconcileFlow
-    agent_id: maou
-    schedule_cron: "30 5 * * *"
-    config:
-      post: false
-      since: "2026-07-01"
-      silent: false
-    active: false
-
   # Raphael's world watch (#676): what changed in the countries and central
   # banks you watch, from a Quantamentry API, filed under one tracked topic so
   # the morning brief's area digest (#674) judges it with everything else.
@@ -412,13 +351,6 @@ activities:
     config: {lookback_days: 7, max_per_day: 1}
     active: true
 
-  - slug: profile-reflection-weekly-pandoras-actor
-    workflow_type: ProfileReflectionFlow
-    agent_id: pandoras-actor
-    schedule_cron: "31 2 * * 6"
-    config: {lookback_days: 7, max_per_day: 1}
-    active: true
-
   # Raphael — knowledge ingestion (raindrop + rss + intel scans)
   - slug: raindrop-ingest-2h
     workflow_type: RaindropIngestFlow
@@ -591,13 +523,6 @@ activities:
     config: {keep: 50, consolidate: true, dry_run: true, max_ops_pct: 0.25, min_age_hours: 24, retire_grace_days: 0}
     active: true
 
-  - slug: memory-reflection-nightly-pandoras-actor
-    workflow_type: MemoryReflectionFlow
-    agent_id: pandoras-actor
-    schedule_cron: "29 3 * * *"
-    config: {keep: 50, consolidate: true, dry_run: true, max_ops_pct: 0.25, min_age_hours: 24, retire_grace_days: 0}
-    active: true
-
   # significance_threshold: the LLM scorer rates 1–5; only items >= this ingest.
   # Was 5 (top-tier-only, since the 2026-05-19 over-volume). Lowered to 4 on
   # 2026-06-18 alongside the gemma4:e2b scorer swap (PR #320) — gemma4 scores a
@@ -651,94 +576,15 @@ activities:
       query_template: "{topic} site:ft.com OR site:reuters.com OR site:bloomberg.com"
     active: true
 
-  # Sebas — close Todoist tasks whose Jira issue already has a resolution.
-  # Ships ACTIVE but INERT: blank jira_base_url/jira_email/jira_api_token means
-  # the flow reports `not_configured` and makes no request (same pattern as the
-  # LLM spend guard below). Set the three on the admin Integrations page, then
-  # restart the worker — connector config applies at BOOT.
-  # This is NOT redundant with email_task_links: Jira sends no notification for
-  # a transition you make yourself, so mail can only close tickets somebody
-  # else resolved. Set dry_run: true for one run to see what it would close.
-  - slug: jira-sync-30m
-    workflow_type: JiraSyncFlow
-    agent_id: sebas
-    schedule_cron: "*/30 * * * *"
-    config:
-      max_tasks: 100
-      dry_run: false
-    active: true
-
-  # Pandora — Sentry poll safety-net (webhook is the fast path)
-  - slug: sentry-poll-30m
-    workflow_type: SentryPollFlow
-    agent_id: pandoras-actor
-    schedule_cron: "*/30 * * * *"
-    config:
-      mode: poll
-    active: true
-
-  # Pandora — LLM spend guard. Ships ACTIVE but INERT: the rolling-24h token
+  # LLM spend guard. Ships ACTIVE but INERT: the rolling-24h token
   # budget lives in settings.llm_governor.daily_token_budget, which defaults
   # to 0 = disabled, so this is a no-op until a budget is set on the admin
   # Settings page (same ship-active-but-inert pattern as the social kill
   # switch). Over budget ⇒ flips settings.llm_kill_switch + system event.
   - slug: llm-spend-guard-15min
     workflow_type: LLMSpendGuardFlow
-    agent_id: pandoras-actor
+    agent_id: sebas
     schedule_cron: "*/15 * * * *"
-    config: {}
-    active: true
-
-  # Pandora — proactive homelab monitoring (drift, certs)
-  # Secondary AEGIS-side drift check (alertmanager DockerServiceDown/NodeDown
-  # is the primary, fast path). Slowed hourly → 4h: it has found zero drift in
-  # practice and the real alerting covers the urgent cases.
-  - slug: service-drift-4h
-    workflow_type: ServiceDriftFlow
-    agent_id: pandoras-actor
-    schedule_cron: "0 */4 * * *"
-    config: {}
-    active: true
-
-  # Pandora — 2-min swarm liveness heartbeat (spec 2026-07-24). Primary fast
-  # internal detector for node-down and post-reboot stuck services; emits only
-  # on state transitions so steady state costs nothing. Complements (does not
-  # replace) alertmanager push — a power flap that silences alertmanager is
-  # exactly what this catches.
-  #
-  # `ingress_url` (#492) is the canary on the way IN: AEGIS's own public or LAN
-  # URL, which the worker GETs every tick so a proxy that has stopped reaching
-  # core cannot drop every inbound webhook in silence. Any answer under 500
-  # from that same host passes, so point it at something an identity proxy will
-  # not challenge. `/api/webhooks/ping` answers 204, which no proxy invents
-  # on its own, so it is the target to pin; a plain webhook path answers 404 to
-  # a bare GET (the admin SPA's catch-all claims it), which a proxy that lost
-  # its route also answers, so it asserts less.
-  # Empty, the default, disables it: AEGIS cannot guess your hostname.
-  # `ingress_fail_threshold` (2) is how many consecutive failures raise the
-  # alert — one dropped request is what a rolling update of core looks like,
-  # and this alert escalates. `ingress_expect_status` (0 = anything under 500)
-  # pins the status only core would give, so a proxy serving its own 404 for a
-  # route it has lost is a fault rather than a pass.
-  - slug: infra-heartbeat-2m
-    workflow_type: InfraHeartbeatFlow
-    agent_id: pandoras-actor
-    schedule_cron: "*/2 * * * *"
-    # config.quiet_nodes: [node, ...] — nodes expected to leave/rejoin the
-    # swarm (dual-boot boxes etc.); their transitions send a plain FYI ping
-    # instead of spawning an investigation. Edit the DB activities row —
-    # schedule_sync propagates within ~5 min, no redeploy.
-    # config.restuck_hours: hours a service must sit confirmed-stuck before it
-    # is re-investigated as ServiceDownProlonged, and the minimum gap between
-    # two such re-investigations of the same service (default 24; 0 disables).
-    # config.outage_min_nodes: how many nodes not ready at once make a cluster
-    # outage (#630). One `outage` problem is raised and the hub holds back the
-    # other infra problems until it ends (default 2; quiet_nodes do not count;
-    # 0 disables).
-    # config.outage_recent_hours: only a node that went not ready within this
-    # many hours counts toward outage_min_nodes (#633), so a node that has been
-    # off for days does not turn the next failure into an outage (default 6;
-    # 0 counts every node however long it has been down).
     config: {}
     active: true
 
@@ -747,7 +593,7 @@ activities:
   # a genuinely stuck card is an acceptable trade for 4× fewer runs.
   - slug: delivery-watchdog-hourly
     workflow_type: DeliveryWatchdogFlow
-    agent_id: pandoras-actor
+    agent_id: sebas
     schedule_cron: "0 * * * *"
     config: {}
     active: true
@@ -777,11 +623,11 @@ activities:
   # class; either at 0 keeps the defaults.
   - slug: hub-sweep-5m
     workflow_type: HubSweepFlow
-    agent_id: pandoras-actor
+    agent_id: sebas
     schedule_cron: "3-58/5 * * * *"
     config: {}
 
-  # Pandora — watchdog over AEGIS's own scheduled flows (#226): N consecutive
+  # Watchdog over AEGIS's own scheduled flows (#226): N consecutive
   # failures of one workflow_type, plus schedules that have stopped succeeding
   # within a multiple of their own cadence. Each fault is one problem on the
   # hub (`hub_watch.reconcile_findings`), so a flow wedged all day produces
@@ -794,7 +640,7 @@ activities:
   # unrestricted, so no daily slot is contended either.
   - slug: flow-health-watchdog-30m
     workflow_type: FlowHealthWatchdogFlow
-    agent_id: pandoras-actor
+    agent_id: sebas
     schedule_cron: "7,37 * * * *"
     # Knobs (all DB-editable on /admin/flows, propagate in <=5 min without a
     # redeploy): consecutive_failures, lookback_hours, stale_multiplier,
@@ -813,20 +659,6 @@ activities:
     # read: a leftover `llm_lookback_hours: 24` in a DB config row now does
     # nothing, where before it made the detector unable to fire at all.
     config: {}
-    active: true
-
-  - slug: cert-radar-daily
-    workflow_type: CertRadarFlow
-    agent_id: pandoras-actor
-    schedule_cron: "0 7 * * *"
-    config:
-      domains:
-        - hikmahtech.in
-        - aegis-api.hikmahtech.in
-        - litellm.hikmahtech.in
-        - grafana.hikmahtech.in
-        - knowledge.hikmahtech.in
-        - temporal.hikmahtech.in
     active: true
 
   # Sebas — life-document expiry radar (C6): passports, visas, licences,
@@ -854,31 +686,16 @@ activities:
       max_cards: 5
     active: true
 
-  # Pandora — nightly retention prune for unbounded ops tables.
+  # Nightly retention prune for unbounded ops tables.
   # Defaults from worker/src/aegis_worker/flows/cleanup.py::_DEFAULT_RETENTIONS.
   # Override per-table via config.retentions if needed. The other windows, in
   # days, 0 = off: dispatch_days (30), interaction_orphan_days (7),
   # task_session_days (7), problem_close_days (7; fractions allowed).
   - slug: cleanup-daily
     workflow_type: CleanupFlow
-    agent_id: pandoras-actor
+    agent_id: sebas
     schedule_cron: "0 4 * * *"
     config: {}
-    active: true
-
-  # Resource-inventory sync — keep `resources` mirroring the canonical
-  # workspace hierarchy (the workspace host's ~/Workspace) so alert
-  # investigation has the right candidate set. Daily at 05:00 UTC.
-  # WorkspaceRepoSyncFlow also mirrors missing checkouts onto the base host
-  # (node-a) at the same relative paths, and flags tracked GitHub repos
-  # whose AEGIS webhook is missing (detection only, result_summary.
-  # missing_webhooks).
-  - slug: workspace-repo-sync-daily
-    workflow_type: WorkspaceRepoSyncFlow
-    agent_id: pandoras-actor
-    schedule_cron: "0 5 * * *"
-    config:
-      min_repos: 5
     active: true
 
   # Executes AEGIS's own agent-assigned tasks. 3 per tick with a 6h per-task
@@ -886,7 +703,9 @@ activities:
   # stampeding on the first run.
   - slug: agent-task-15min
     workflow_type: AgentTaskSweepFlow
-    agent_id: pandoras-actor
+    agent_id: sebas
     schedule_cron: "*/15 * * * *"
     active: true
-    config: {}
+    # max_coding: 0 — no coding runs from v1; the development lane moved out.
+    config:
+      max_coding: 0

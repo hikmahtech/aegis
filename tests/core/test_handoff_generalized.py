@@ -16,7 +16,7 @@ async def test_assignee_labels_fallback_without_pool():
 
 
 @pytest.mark.asyncio
-async def test_assignee_labels_from_db_include_seed_aliases(db_pool):
+async def test_assignee_labels_from_db_include_seed_aliases(db_pool, infra_agent_active):
     labels = await _assignee_labels(db_pool)
     assert "@me" in labels
     # Seed aliases: sebas/raphael/maou default to their id, pandora is explicit.

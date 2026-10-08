@@ -28,12 +28,12 @@ import re
 from datetime import datetime
 from typing import Any
 
-from aegis.services import books, notes
+from aegis.services import git_checkout, notes
 from aegis.services.vault_layout import DEFAULT_LAYOUT, Layout
 
 # The writer's worst case: clone (first write only) + two attempts of pull,
 # commit and push. The activity's budget, not a chat tool's.
-NOTES_WRITE_TIMEOUT_S = books.CLONE_TIMEOUT_S + 2 * (120 + 60 + 120)
+NOTES_WRITE_TIMEOUT_S = git_checkout.CLONE_TIMEOUT_S + 2 * (120 + 60 + 120)
 
 NOTE_TEXT_MAX = 20_000
 HEADING_MAX = 120

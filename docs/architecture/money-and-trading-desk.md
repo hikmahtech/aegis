@@ -8,10 +8,11 @@ Maou's ledger (hledger journal, Postgres index, chat tools, chart of accounts) a
 
 ## Handing the books to another service
 
-`money_fanout_enabled` (Integrations → Features, on unless set to false) controls whether email
-triage hands money mail to `MoneyProcessFlow`. It is read on every triage run. Turning it off,
-together with deactivating the money schedules (`receipt-ingest-weekly`, `money-brief-weekly`,
-`money-close-monthly`, `money-statements-reconcile`), stops this deployment writing the journal
-while the trading desk and everything else keep running. Do not use `money_hygiene_enabled` or
-remove the `finance` tag for this: both also stop the trading desk and other lanes.
+**The money lane is leaving v1** (removal prep, migration 054). Email triage no longer hands money
+mail to `MoneyProcessFlow`: the `money-fanout-flag` branch of `GmailIngestFlow` is a no-op, and
+`money_fanout_enabled` is still read only so runs in flight replay. The money schedules
+(`receipt-ingest-weekly`, `money-brief-weekly`, `money-close-monthly`,
+`money-statements-reconcile`) are deleted. The trading desk stays, under its own flag
+`trading_desk_enabled` (on by default), so `money_hygiene_enabled` no longer gates it. Its routes
+live in `routes/desk.py` with the same `/api/admin/money/desk*` paths.
 

@@ -16,7 +16,7 @@ from aegis.services.chat import (
 )
 
 
-async def test_intent_prompt_lists_seeded_agents_generalist_last(db_pool):
+async def test_intent_prompt_lists_seeded_agents_generalist_last(db_pool, infra_agent_active):
     """The seeded agents' own descriptions, specific agents first and the `gtd`
     holder last — the order the old hardcoded precedence list gave."""
     agents = await _routing_agents(db_pool)

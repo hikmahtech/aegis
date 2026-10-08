@@ -5,7 +5,7 @@ from __future__ import annotations
 import datetime as dt
 
 import pytest
-from aegis_worker.activities.homelab import HomelabActivities
+from aegis_worker.activities.watchdog import WatchdogActivities
 from temporalio import activity, workflow
 from temporalio.testing import ActivityEnvironment, WorkflowEnvironment
 from temporalio.worker import Worker
@@ -257,7 +257,7 @@ async def test_find_undelivered_interactions_query(db_pool):
             old,
         )
     try:
-        act = HomelabActivities(db_pool=db_pool, homelab=None, delivery=None)
+        act = WatchdogActivities(db_pool=db_pool, delivery=None)
         env = ActivityEnvironment()
         rows = await env.run(act.find_undelivered_interactions, 120, 24)
         ids = {r["id"] for r in rows}
@@ -278,3 +278,50 @@ async def test_find_undelivered_interactions_query(db_pool):
                 "00000000-0000-0000-0000-0000000000a4",
                 "00000000-0000-0000-0000-0000000000a5",
             )
+
+
+# ----- the activities' home (v1 removal prep) -------------------------------
+
+
+def test_the_watchdog_activities_keep_their_temporal_names():
+    """They moved off HomelabActivities; a run in flight calls them by name."""
+    from aegis_worker.registry import activity_methods
+
+    names = set(activity_methods(WatchdogActivities).values())
+    assert names == {
+        "find_undelivered_interactions",
+        "notify_undelivered_interactions",
+        "check_comms_inbound_health",
+    }
+
+
+def test_the_watchdog_activities_are_not_homelab_gated():
+    from aegis_worker.registry import ACTIVITY_CLASS_FLAGS, expected_activity_names
+
+    assert "WatchdogActivities" not in ACTIVITY_CLASS_FLAGS
+
+    class _Off:
+        homelab_enabled = False
+
+    names = expected_activity_names(_Off())
+    assert {"find_undelivered_interactions", "check_comms_inbound_health"} <= names
+
+
+@pytest.mark.asyncio
+async def test_the_undelivered_card_speaks_as_the_configured_agent():
+    sent: list[dict] = []
+
+    class _Delivery:
+        channel = "slack"
+        db_pool = None
+
+        async def send_message(self, **kw):
+            sent.append(kw)
+            return {"ok": True}
+
+    act = WatchdogActivities(db_pool=None, delivery=_Delivery(), agent_id="sebas")
+    await ActivityEnvironment().run(
+        act.notify_undelivered_interactions, [{"id": "1", "origin": "clarify"}]
+    )
+    assert sent and sent[0].get("agent_id") == "sebas"
+    assert "1 undelivered" in sent[0].get("message", "")

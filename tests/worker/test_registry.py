@@ -41,9 +41,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SEED_DIR = REPO_ROOT / "config" / "seed"
 
 
-def _flags(homelab: bool = True, money: bool = True) -> SimpleNamespace:
-    """Prod's settings: both feature flags on."""
-    return SimpleNamespace(homelab_enabled=homelab, money_hygiene_enabled=money)
+def _flags(homelab: bool = True, money: bool = True, desk: bool = True) -> SimpleNamespace:
+    """Prod's settings: every feature flag on."""
+    return SimpleNamespace(
+        homelab_enabled=homelab, money_hygiene_enabled=money, trading_desk_enabled=desk
+    )
 
 
 def _activities_for(settings) -> list:
@@ -216,13 +218,46 @@ def test_books_write_flow_is_gated_on_money_hygiene():
     assert "BooksWriteFlow" not in {c.__name__ for c in workflows_for(_flags(money=False))}
 
 
+def test_delivery_watchdog_registers_with_homelab_off():
+    """v1 removal prep: the delivery watchdog watches AEGIS's own comms, so it
+    and its activities are served whatever homelab_enabled says."""
+    off = _flags(homelab=False, money=False, desk=False)
+    assert "DeliveryWatchdogFlow" in {c.__name__ for c in workflows_for(off)}
+    assert {
+        "find_undelivered_interactions",
+        "notify_undelivered_interactions",
+        "check_comms_inbound_health",
+    } <= expected_activity_names(off)
+    assert "DeliveryWatchdogFlow" not in feature_flagged_types().get("homelab_enabled", set())
+    check_registration(off, workflows_for(off), _activities_for(off), SEED_DIR)
+
+
+def test_trading_desk_registers_with_money_off_and_the_desk_on():
+    """v1 removal prep: the desk has its own flag, so it outlives the money lane."""
+    desk_only = _flags(homelab=False, money=False, desk=True)
+    assert "TradingDeskFlow" in {c.__name__ for c in workflows_for(desk_only)}
+    assert "desk_tick" in expected_activity_names(desk_only)
+    assert "TradingDeskFlow" in feature_flagged_types()["trading_desk_enabled"]
+    check_registration(desk_only, workflows_for(desk_only), _activities_for(desk_only), SEED_DIR)
+
+    no_desk = _flags(homelab=True, money=True, desk=False)
+    assert "TradingDeskFlow" not in {c.__name__ for c in workflows_for(no_desk)}
+    assert "desk_tick" not in expected_activity_names(no_desk)
+
+
+def test_trading_desk_flag_is_a_settings_field_on_by_default():
+    from aegis.config import Settings
+
+    assert Settings.model_fields["trading_desk_enabled"].default is True
+
+
 # --------------------------------------------------------------------------
 # the real registration passes — and the counts have not moved
 # --------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
-    ("homelab", "money", "flows", "activities"),
+    ("homelab", "money", "desk", "flows", "activities"),
     [
         # prod: `worker_starting activities=171 flows=35`, +1 flow and +2
         # activities from B7's WearableIngestFlow / WearableActivities, then
@@ -468,13 +503,20 @@ def test_books_write_flow_is_gated_on_money_hygiene():
         # Then +1 flow and +1 activity from the tender watch (#673):
         # TenderWatchFlow and `tender_watch_tick` on TenderWatchActivities.
         # Unflagged, so all three rows move.
-        (True, True, 56, 267),
-        (False, False, 45, 231),
-        (True, False, 49, 249),
+        # Then the v1 removal prep: DeliveryWatchdogFlow leaves the homelab
+        # flag, and its three activities move from HomelabActivities to the
+        # unflagged WatchdogActivities (+1 flow, +3 activities with homelab
+        # off). TradingDeskFlow and TradingDeskActivities.desk_tick move from
+        # the money flag to trading_desk_enabled, on in every row here (+1
+        # flow, +1 activity with money off). The fourth row is all three off.
+        (True, True, True, 56, 267),
+        (False, False, True, 47, 235),
+        (True, False, True, 50, 250),
+        (False, False, False, 46, 234),
     ],
 )
-def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):
-    settings = _flags(homelab, money)
+def test_real_registration_passes_the_boot_check(homelab, money, desk, flows, activities):
+    settings = _flags(homelab, money, desk)
     wfs = workflows_for(settings)
     acts = _activities_for(settings)
     assert (len(wfs), len(acts)) == (flows, activities)

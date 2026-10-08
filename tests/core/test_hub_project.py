@@ -193,7 +193,9 @@ async def test_first_projection_creates_the_task_with_block_and_label(db_pool, i
     assert len(adds) == 1
     args = adds[0]["args"]
     assert args["content"] == f"Service {s} down"
-    assert args["labels"] == ["#alert", "@pandora"]
+    # A heartbeat problem keeps the infra owner, whose agent is retired since
+    # migration 054: no assignee label, never a crash.
+    assert args["labels"] == ["#alert"]
     assert "Heartbeat saw" in args["description"] and "<!-- aegis:problem" in args["description"]
     p = await get_problem(db_pool, r.problem_id)
     assert p["todoist_task_id"] == out["task_id"]
@@ -207,6 +209,36 @@ async def test_first_projection_creates_the_task_with_block_and_label(db_pool, i
     again = await project(db_pool, r.problem_id, now=NOW)
     assert again == {"problem_id": r.problem_id, "task_id": out["task_id"], "created": False, "comments": 0}
     assert _cmds(todoist, "note_add") == []
+
+
+async def test_a_source_with_no_owner_falls_to_the_generalist(db_pool, inbox, todoist):
+    """v1 removal prep: a source missing from `_OWNER_BY_SOURCE` (the delivery
+    watchdog here) belongs to the generalist, the `gtd` holder, not the infra
+    agent, so its task keeps an assignee once Pandora is gone.
+
+    Falsifiable: put the infra owner back as the fallback and the label is gone.
+    """
+    from aegis.agent_tags import GENERALIST_TAG
+    from aegis.services import hub_project
+
+    assert hub_project._DEFAULT_OWNER.agent_tag == GENERALIST_TAG
+    assert "delivery" not in hub_project._OWNER_BY_SOURCE
+    assert hub_project._OWNER_BY_SOURCE["heartbeat"] is hub_project._INFRA_OWNER
+
+    ev = Event(
+        source="delivery",
+        external_id=f"delivery:undelivered_cards:{uuid.uuid4().hex[:8]}",
+        kind="occurrence",
+        title="2 undelivered interaction card(s)",
+        klass="undelivered_cards",
+        subject="interactions",
+        subject_kind="comms",
+        occurred_at=NOW,
+    )
+    r = await ingest_event(db_pool, ev, now=NOW)
+    out = await project(db_pool, r.problem_id, now=NOW)
+    assert out["created"] is True
+    assert _cmds(todoist, "item_add")[0]["args"]["labels"] == ["#alert", "@sebas"]
 
 
 _BOOKS_PROJECTS = "integration:books_todoist_projects"
@@ -247,7 +279,7 @@ async def test_a_money_problem_is_maous_task_in_the_personal_books_project(
     """All 13 money problems in prod (2026-09-11) were projected as
     `#alert @pandora` in the Inbox, and the agent sweep then ran Pandora's
     infra verb on them. A problem first raised by the money lane belongs to
-    the finance agent; every other source keeps the infra agent and the Inbox.
+    the finance agent; an infra source keeps the infra owner and the Inbox.
 
     Falsifiable: route every problem to the infra owner and the money task is
     `#alert @pandora` in the Inbox again.
@@ -273,7 +305,8 @@ async def test_a_money_problem_is_maous_task_in_the_personal_books_project(
     alert = await ingest_event(db_pool, _occ(s, 1), now=NOW)
     await project(db_pool, alert.problem_id, now=NOW)
     alert_args = _cmds(todoist, "item_add")[1]["args"]
-    assert alert_args["labels"] == ["#alert", "@pandora"]
+    # The infra owner, retired since migration 054, so no assignee label.
+    assert alert_args["labels"] == ["#alert"]
     assert alert_args["project_id"] == "P_INBOX"
 
 

@@ -85,7 +85,9 @@ async def test_apply_outcome_agent_followup_returns_spawn_payload(
 
 
 @pytest.mark.asyncio
-async def test_apply_outcome_pandora_chat_followup_returns_spawn_payload(db_pool):
+async def test_apply_outcome_pandora_chat_followup_returns_spawn_payload(
+    db_pool, infra_agent_active
+):
     """pandora_chat_followup routes through the shared agent_chat_reply
     spawn but maps to the personality id `pandoras-actor` (not `pandora`,
     which is just a label prefix). The label on the task stays @pandora
@@ -122,7 +124,9 @@ async def test_apply_outcome_pandora_chat_followup_returns_spawn_payload(db_pool
 
 
 @pytest.mark.asyncio
-async def test_apply_outcome_threads_recent_comments_into_synthetic_input(db_pool):
+async def test_apply_outcome_threads_recent_comments_into_synthetic_input(
+    db_pool, infra_agent_active
+):
     """Pin (2026-05-27): synthetic_input must include the recent comment
     thread on the Todoist task — both user notes AND prior agent
     replies — so the spawned chat reply can see what it already said

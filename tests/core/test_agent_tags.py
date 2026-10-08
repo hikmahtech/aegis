@@ -165,14 +165,13 @@ def test_shipped_seeds_carry_behavior_tags():
         assert by_id[agent_id]["metadata"]["intent_description"]
 
 
-def test_only_the_infra_agent_is_seeded_set_service_state():
+def test_no_agent_is_seeded_set_service_state():
     """`set_service_state` can open a window on `*`, which silences every
-    alert. It belongs to the infra agent alone — and the seed yaml, not
-    `AGENT_TOOL_SETS`, is what a fresh install's `tool_set` comes from, so a
-    grant that lives only in the Python dict is a grant nobody gets (#477)."""
+    alert. It was the infra agent's alone (#477); since the v1 removal prep
+    (migration 054) the infra lane is DevOps' and nobody in v1 holds it."""
     seeds = yaml.safe_load((SEED_DIR / "agents.yaml").read_text())["agents"]
     holders = {a["id"] for a in seeds if "set_service_state" in (a.get("metadata") or {}).get("tool_set", [])}
-    assert holders == {"pandoras-actor"}
+    assert holders == set()
 
 
 # --- routes ---------------------------------------------------------------

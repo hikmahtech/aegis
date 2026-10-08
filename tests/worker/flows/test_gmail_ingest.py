@@ -679,12 +679,13 @@ async def stub_store_money_result(
 
 
 @pytest.mark.asyncio
-async def test_financial_tags_trigger_money_process_fanout():
-    """Receipt with financial+payments tags → MoneyProcessFlow child started.
+async def test_financial_tags_no_longer_trigger_the_money_fanout():
+    """v1 removal prep: a receipt with financial+payments tags no longer starts
+    MoneyProcessFlow. The books left v1; the `money-fanout-flag` branch is a
+    no-op for every run that records the marker.
 
-    The parent GmailIngestFlow's completion does not wait on the child
-    (ParentClosePolicy.ABANDON), but with start_time_skipping we can still
-    observe that the child's first activity (store_receipt_email) fired.
+    The child would be ABANDONed, so the test waits a moment for one before
+    asserting none ran.
     """
     import asyncio
 
@@ -732,22 +733,16 @@ async def test_financial_tags_trigger_money_process_fanout():
         )
 
         # Parent returns immediately (ABANDON); give the child a moment to run.
-        for _ in range(100):
+        for _ in range(20):
             await asyncio.sleep(0.05)
             if _calls.get("money_stamped"):
                 break
 
     assert result["processed"] == 1
     assert result["by_category"].get("important_read") == 1
-    # Child fan-out fired end-to-end
-    assert _calls.get("money_store") == [("msg-receipt-1", "sebas")]
-    assert _calls.get("money_body") == [("sebas", "msg-receipt-1")]
-    assert _calls.get("money_store_body") == [
-        ("uid-msg-receipt-1", "Receipt from Stripe $9.99 Paid")
-    ]
-    assert _calls.get("money_parse") == ["uid-msg-receipt-1"]
-    assert _calls.get("money_post") == [("uid-msg-receipt-1", "sebas", "transaction")]
-    assert _calls.get("money_stamped") == [("uid-msg-receipt-1", "personal/2026.journal")]
+    # No child: nothing of the money lane ran.
+    for key in ("money_store", "money_body", "money_parse", "money_post", "money_stamped"):
+        assert _calls.get(key) is None, key
 
 
 @pytest.mark.asyncio

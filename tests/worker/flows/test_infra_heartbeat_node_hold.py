@@ -150,16 +150,6 @@ async def test_a_node_back_up_leaves_the_map():
     assert hb._calls["written"][-1]["not_ready_since"] == {}
 
 
-def test_outage_recent_hours_is_read_from_activities_config():
-    from aegis_worker.registry import FLOWS
-
-    spec = next(s for s in FLOWS if s.flow is InfraHeartbeatFlow)
-    row = {"agent_id": "pandoras-actor", "_settings": {}}
-    assert spec.schedule_config({**row, "config": {}}).outage_recent_hours == 6
-    assert spec.schedule_config({**row, "config": {"outage_recent_hours": 24}}).outage_recent_hours == 24
-    assert spec.schedule_config({**row, "config": {"outage_recent_hours": ""}}).outage_recent_hours == 6
-
-
 # --- a tick in flight across the deploy ----------------------------------------
 
 
