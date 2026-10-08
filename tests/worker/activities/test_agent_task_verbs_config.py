@@ -34,7 +34,7 @@ async def test_a_table_saved_on_the_admin_page_reroutes_the_lane(clean):
     verbs = await load_verbs(pool)
     assert resolve_verb({"source_tag": "#calendar"}, verbs) == "none"
     assert resolve_verb({"source_tag": "#chat"}, verbs) == "research"
-    assert resolve_verb({"source_tag": "#alert"}, verbs) == "infra"  # untouched default
+    assert resolve_verb({"source_tag": "#alert"}, verbs) == "none"  # untouched default (decided: the user's)
 
     await core_verbs.save_agent_task_verbs(pool, {})
     assert await load_verbs(pool) == core_verbs.DEFAULT_VERBS

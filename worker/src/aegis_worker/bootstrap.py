@@ -229,7 +229,6 @@ async def bootstrap(settings: Settings | None = None) -> WorkerDeps:
             claude_binary=getattr(settings, "claude_cli_binary_path", ""),
             kimi_binary=getattr(settings, "kimi_cli_binary_path", ""),
             self_repo_path=getattr(settings, "aegis_self_repo_path", ""),
-            runbooks_dir=getattr(settings, "runbooks_dir", ""),
             # The worker owns AgentRunFlow, so this is the connector that
             # actually mounts AEGIS's tools into a run — core's copy matters
             # only for the chat-tool lane.
@@ -288,18 +287,6 @@ async def bootstrap(settings: Settings | None = None) -> WorkerDeps:
         else {},
         timeout=60.0,
     )
-
-    # Homelab Guardian connector (Docker Swarm drift + TLS cert radar).
-    # An empty docker_context relies on the DOCKER_HOST env var (preferred
-    # inside the worker container where no local contexts exist).
-    if getattr(settings, "homelab_enabled", False):
-
-        def _homelab() -> Any:
-            from aegis.connectors.homelab import HomelabConnector
-
-            return HomelabConnector(docker_context=settings.homelab_docker_context)
-
-        _register_connector(connectors, connector_errors, "homelab", _homelab)
 
     if connector_errors:
         logger.error(

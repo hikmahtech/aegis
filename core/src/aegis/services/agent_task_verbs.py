@@ -23,8 +23,7 @@ chat path — ``AgentChatReplyFlow``, the executor clarify already uses when you
 comment on an agent's task. A ``#chat``, ``#research``, ``#calendar`` or
 ``#manual`` task given to an agent is a request to that agent; before #344 all
 four resolved to no verb, got "No executor for this task type" and parked with
-nothing done (prod: an outage question given to the infra agent, an article
-given to the research agent).
+nothing done.
 
 ``research`` (#509) runs ``ResearchFlow`` on a ``#research`` task — knowledge
 store, web and papers, a cited answer — and posts the answer on the task.
@@ -48,7 +47,10 @@ SETTINGS_KEY = "agent_task_verbs"
 UNTAGGED = "untagged"  # the key for a task with no source tag
 
 DEFAULT_VERBS: dict[str, str | None] = {
-    "#alert": "infra",
+    # A problem hub task. The infra verb that worked these left with the infra
+    # lane (DevOps vertical, a2-devops); the hub's remaining producers are
+    # AEGIS's own watchdogs, whose tasks are the user's to act on.
+    "#alert": None,
     "#receipt": "finance",
     "#email": "email",
     "#chat": "ask",
@@ -67,7 +69,7 @@ DEFAULT_VERBS: dict[str, str | None] = {
 }
 # The verbs a tag may be routed to. `coding` is not one: it is chosen by the
 # `@code` label on an untagged task, never by a tag.
-VERBS = frozenset({"infra", "email", "finance", "ask", "research"})
+VERBS = frozenset({"email", "finance", "ask", "research"})
 
 # A source tag is `#` and a word (the shape every capture writes), or the
 # `untagged` key.

@@ -9,7 +9,6 @@ import asyncpg  # noqa: F401  (type hint)
 import pytest
 from aegis.services import chat
 from aegis.services.chat import (
-    AGENT_TOOL_SETS,
     CHAT_TOOLS,
     TOOL_EXECUTORS,
     ToolContext,
@@ -463,26 +462,6 @@ async def test_exec_run_infra_script_rejects_bad_context_and_name():
         None, {"context": "swarm", "script_name": "../etc/passwd"}, ctx
     )
     assert "error" in json.loads(result)
-
-
-def test_pandoras_actor_has_all_infra_tools():
-    # Full infra surface across Swarm (swarm homelab) and k8s/ArgoCD (acme).
-    expected_infra_tools = {
-        "list_nodes",
-        "list_services",
-        "inspect_service",
-        "get_service_logs",
-        "restart_service",
-        "list_pods",
-        "list_deployments",
-        "get_pod_logs",
-        "list_argocd_apps",
-        "sync_argocd_app",
-        "run_infra_script",
-    }
-    pa_tools = AGENT_TOOL_SETS["pandoras-actor"]
-    missing = expected_infra_tools - pa_tools
-    assert not missing, f"Missing tools for pandoras-actor: {missing}"
 
 
 def test_all_infra_tools_registered_in_executors():

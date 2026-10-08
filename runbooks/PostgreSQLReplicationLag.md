@@ -1,3 +1,0 @@
-# PostgreSQLReplicationLag
-
-TODO: fill in

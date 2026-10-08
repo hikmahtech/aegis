@@ -31,12 +31,12 @@ AUTH = ("admin", "admin")
 AGENT = "zztest-behavior"
 SEED_AGENTS = Path(__file__).resolve().parents[2] / "config" / "seed" / "agents.yaml"
 
-# What comms' old id-keyed table gave the four example agents.
+# What comms' old id-keyed table gave the example agents (the retired infra
+# agent's row stays, inactive and bare).
 _ICONS_BEFORE_556 = {
     "sebas": ":bust_in_silhouette:",
     "raphael": ":books:",
     "maou": ":moneybag:",
-    "pandoras-actor": ":robot_face:",
 }
 
 

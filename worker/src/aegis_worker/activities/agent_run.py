@@ -8,14 +8,10 @@ What is dropped is the Todoist coupling: the task lane's own launch activity
 (``AgentTaskActivities.launch_task_turn``) takes a task session and resumes it,
 so it cannot carry a free-form ask the way this one does.
 
-Completion is detected by PROCESS EXIT, not by the ``STATUS:`` footer that
-``alerts._kimi_output_complete`` looks for. That regex accepts a closed
-vocabulary of alert-RCA and Jira-scoping verbs (``investigated``,
-``scoped``, …) which a general-purpose run has no reason to emit, so keying
-on it would make every run wait out its full timeout. ``kimi_run_alive``
-(``fuser`` on the output file, fail-OPEN on a flaky probe) is the same
-liveness signal ``AlertActivities`` already uses to fail an early-death run
-fast, and for a general run it is the whole completion signal.
+Completion is detected by PROCESS EXIT, not by a ``STATUS:`` footer: a
+general-purpose run has no reason to emit one, so keying on it would make
+every run wait out its full timeout. ``kimi_run_alive`` (``fuser`` on the
+output file, fail-OPEN on a flaky probe) is the whole completion signal.
 """
 
 from __future__ import annotations
@@ -198,8 +194,8 @@ class AgentRunActivities:
         the caller can retry it freely — unlike `launch_agent_run`.
 
         `probe_alive=False` skips the liveness probe, which the flow passes on
-        its first poll: same launch grace period `AlertActivities` gives its
-        own loop, so SSH/checkout latency can never read as a dead run.
+        its first poll, a launch grace period so SSH/checkout latency can
+        never read as a dead run.
 
         Returns status `running` | `finished` | `failed`. Process exit with no
         recoverable transcript is `failed` (early death — e.g. a bad CLI flag);
@@ -212,7 +208,7 @@ class AgentRunActivities:
         to the transcript tail, so both are returned rather than one choice
         being made here.
         """
-        from aegis_worker.activities.alerts import (
+        from aegis_worker.activities.coding_output import (
             _INVESTIGATION_OUTPUT_CAP,
             _extract_kimi_transcript,
         )

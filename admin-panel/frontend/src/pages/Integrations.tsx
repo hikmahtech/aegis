@@ -64,7 +64,7 @@ export default function Integrations() {
       <p className="page-subtitle">
         Connector tokens + webhook secrets + feature toggles, stored in the DB (secrets encrypted; your env vars are the fallback).
         Token changes apply on the next worker restart; webhook secrets go live on save. The <strong>Features</strong> section
-        turns whole subsystems on/off — each note lists the extra config it needs; homelab/money features need a worker restart to take effect.
+        turns whole subsystems on/off — each note lists the extra config it needs; money features need a worker restart to take effect.
       </p>
       <ErrorBanner error={error} onDismiss={() => setError(null)} />
 

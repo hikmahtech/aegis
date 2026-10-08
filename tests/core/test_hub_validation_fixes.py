@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 import pytest
 from aegis.services import hub_project
@@ -20,7 +20,6 @@ from aegis.services.hub import (
     get_problem,
     ingest_event,
     list_events,
-    set_service_state,
     set_status,
 )
 
@@ -35,7 +34,7 @@ def _subject() -> str:
 
 def _occ(subject: str, n: int = 1, **kw) -> Event:
     return Event(
-        source="heartbeat",
+        source="flow_health",
         external_id=f"{subject}@{n}",
         kind="occurrence",
         title=f"Service {subject} down",
@@ -106,21 +105,17 @@ async def test_a_status_move_off_resolved_clears_it_and_reopens_the_task(db_pool
     """A move off `resolved` left a stale `resolved_at` behind: `close_resolved`
     then never retired the problem, and the projector left its task completed
     while the problem was live, so the next occurrence attached to a closed
-    task in silence.
-
-    Since #484 only a caller that is NOT an investigation can make this move;
-    an investigation's late verdict leaves the problem resolved instead
-    (`test_hub_problem_state.py`)."""
+    task in silence."""
     r = await ingest_event(db_pool, _occ(_subject()), now=NOW)
     await set_status(db_pool, r.problem_id, "resolved", reason="recovered", now=NOW)
     assert (await get_problem(db_pool, r.problem_id))["resolved_at"] is not None
 
     assert await set_status(
-        db_pool, r.problem_id, "fixing", reason="not really", source="admin", now=NOW
+        db_pool, r.problem_id, "investigating", reason="not really", source="admin", now=NOW
     )
 
     p = await get_problem(db_pool, r.problem_id)
-    assert p["status"] == "fixing"
+    assert p["status"] == "investigating"
     assert p["resolved_at"] is None, "a live problem is not a resolved one"
     latest = [e for e in await list_events(db_pool, r.problem_id) if e["kind"] == "state_change"][0]
     assert latest["payload"]["action"] == "reopen", "the projector uncompletes on this"
@@ -182,33 +177,3 @@ async def test_the_same_event_delivered_twice_at_once_counts_once(db_pool):
 # --- 7a. one subject kind, at ingest and at promotion -------------------------
 
 
-async def test_a_subject_less_event_is_not_promoted_out_of_a_live_window(db_pool):
-    """The suppression lookup asked about kind `service` while the row was
-    stored with kind `""`, so a wildcard window suppressed the occurrence and
-    the next sweep promoted it back while the window was still in force."""
-    from aegis.services.hub import promote_expired_suppressions
-
-    await set_service_state(
-        db_pool, "*", "maintenance", subject_kind="*", minutes=60, set_by="test", now=NOW
-    )
-    try:
-        r = await ingest_event(
-            db_pool,
-            Event(
-                source="manual",
-                external_id=f"nosubject-{uuid.uuid4().hex[:8]}",
-                kind="occurrence",
-                title="ValueError in a service nobody named",
-                klass="ValueError",
-                occurred_at=NOW,
-            ),
-            now=NOW,
-        )
-        assert r.suppressed is True
-        assert (await get_problem(db_pool, r.problem_id))["status"] == "suppressed"
-
-        promoted = await promote_expired_suppressions(db_pool, now=NOW + timedelta(minutes=1))
-        assert r.problem_id not in promoted, "the window is still in force"
-        assert (await get_problem(db_pool, r.problem_id))["status"] == "suppressed"
-    finally:
-        await set_service_state(db_pool, "*", "ok", subject_kind="*", set_by="test", now=NOW)

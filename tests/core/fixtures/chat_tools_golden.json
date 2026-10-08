@@ -93,8 +93,8 @@
         "properties": {
           "active_only": {
             "type": "boolean",
-            "default": true,
-            "description": "Only show active activities"
+            "description": "Only show active activities",
+            "default": true
           },
           "limit": {
             "type": "integer",
@@ -793,30 +793,6 @@
   {
     "type": "function",
     "function": {
-      "name": "update_runbook",
-      "description": "Update or add operational runbook knowledge for alert types or projects.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "target": {
-            "type": "string",
-            "description": "What to update, e.g. 'alert_type:ServiceDown', 'project:bcp'"
-          },
-          "content": {
-            "type": "string",
-            "description": "The runbook content to add"
-          }
-        },
-        "required": [
-          "target",
-          "content"
-        ]
-      }
-    }
-  },
-  {
-    "type": "function",
-    "function": {
       "name": "list_nodes",
       "description": "List infrastructure cluster nodes and their status (up/down/drain). Use for checking Docker Swarm node health.",
       "parameters": {
@@ -902,8 +878,8 @@
           },
           "tail": {
             "type": "integer",
-            "default": 50,
-            "description": "Number of log lines (1-500)"
+            "description": "Number of log lines (1-500)",
+            "default": 50
           }
         },
         "required": [
@@ -1008,8 +984,8 @@
           },
           "tail": {
             "type": "integer",
-            "default": 50,
-            "description": "Number of log lines (1-500)"
+            "description": "Number of log lines (1-500)",
+            "default": 50
           },
           "container": {
             "type": "string",
@@ -1165,48 +1141,8 @@
   {
     "type": "function",
     "function": {
-      "name": "set_service_state",
-      "description": "Declare a swarm service or node deploying, in maintenance, degraded, or ok again. While a subject is deploying or in maintenance the problem hub records what it sees there but raises nothing; `ok` ends the window early.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "subject": {
-            "type": "string",
-            "description": "the swarm service (`stack_service`) or node name, or `*` for everything."
-          },
-          "state": {
-            "type": "string",
-            "enum": [
-              "deploying",
-              "maintenance",
-              "degraded",
-              "ok"
-            ],
-            "description": "deploying | maintenance | degraded | ok."
-          },
-          "minutes": {
-            "type": "integer",
-            "description": "how long the window lasts; ignored for ok.",
-            "default": 30
-          },
-          "note": {
-            "type": "string",
-            "description": "why \u2014 shown on every problem the window suppresses.",
-            "default": ""
-          }
-        },
-        "required": [
-          "subject",
-          "state"
-        ]
-      }
-    }
-  },
-  {
-    "type": "function",
-    "function": {
       "name": "task_context",
-      "description": "What to read first when picking up a task: the problem behind it, its recent events, every session on it (AEGIS's and yours) with their summaries, its links and any deploy window, plus the command that takes AEGIS's session over. Give the Todoist task id or the problem id.",
+      "description": "What to read first when picking up a task: the problem behind it, its recent events, every session on it (AEGIS's and yours) with their summaries and its links, plus the command that takes AEGIS's session over. Give the Todoist task id or the problem id.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -1305,34 +1241,6 @@
   {
     "type": "function",
     "function": {
-      "name": "aegis_self_diagnose",
-      "description": "Investigate / fix AEGIS itself by driving the kimi CLI over SSH on node-a against the AEGIS source checkout. The kimi run has full Shell / Read / Glob / WriteFile permissions. Use this when the user asks about AEGIS's own behavior, bugs, or improvements. For code FIXES, kimi MUST create a branch (`aegis-fix/<slug>`), commit, push, and open a PR via `gh pr create` \u2014 never direct-commit to main. The tool waits up to 8 minutes for kimi's STATUS footer; if the run exceeds that, the partial output is returned with a `still_running` flag so the user can ask for a follow-up.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "issue": {
-            "type": "string",
-            "description": "What kimi should investigate or fix. Be concrete: file paths, error messages, observed behavior, what 'good' looks like."
-          },
-          "mode": {
-            "type": "string",
-            "enum": [
-              "investigate",
-              "fix"
-            ],
-            "description": "`investigate` = read-only RCA + propose fix in chat. `fix` = also commit + push + open PR. Both modes give kimi the full toolset; the prompt enforces the convention."
-          }
-        },
-        "required": [
-          "issue",
-          "mode"
-        ]
-      }
-    }
-  },
-  {
-    "type": "function",
-    "function": {
       "name": "list_interactions",
       "description": "List pending human-in-the-loop interactions (approvals, choices, inputs) for an agent. Use this when the user asks about pending decisions, approvals awaiting their response, or what needs their attention.",
       "parameters": {
@@ -1397,7 +1305,7 @@
     "type": "function",
     "function": {
       "name": "list_next_actions",
-      "description": "Read open (incomplete), actionable tasks from the Todoist projection. Excludes @reference/@someday/@to-read, and excludes @waiting for @me. When assignee is an agent label (e.g. @pandora), @waiting tasks ARE included and marked [parked] \u2014 for an agent @waiting means 'a run finished a pass', not 'blocked', so this is that agent's own working queue. Optional filters: assignee label, context label, due window.",
+      "description": "Read open (incomplete), actionable tasks from the Todoist projection. Excludes @reference/@someday/@to-read, and excludes @waiting for @me. When assignee is an agent label (e.g. @maou), @waiting tasks ARE included and marked [parked] \u2014 for an agent @waiting means 'a run finished a pass', not 'blocked', so this is that agent's own working queue. Optional filters: assignee label, context label, due window.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -1542,7 +1450,7 @@
     "type": "function",
     "function": {
       "name": "handoff_task",
-      "description": "Reassign a task to a different personality assignee, given as an @label (e.g. @me, @raphael, @pandora). Valid labels are the active agents' mention aliases plus @me; an invalid one is rejected with the list of valid labels.",
+      "description": "Reassign a task to a different personality assignee, given as an @label (e.g. @me, @raphael, @maou). Valid labels are the active agents' mention aliases plus @me; an invalid one is rejected with the list of valid labels.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -1756,6 +1664,24 @@
   {
     "type": "function",
     "function": {
+      "name": "desk_status",
+      "description": "Read the paper trading desk you run: what it holds now, what the book is worth, cash, gain against the starting capital, orders waiting to fill, the latest plan and what it held back, this month's score against the benchmark, and any open problems. Read-only; the desk trades on its own schedule and this cannot place, change or cancel an order. Use it whenever the user asks about holdings, positions, trades, the portfolio or how the desk is doing \u2014 the ledger does not hold these.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "history_days": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 30,
+            "description": "Also return the last N decision dates (1-30) with the orders written on each. Omit or 0 for the current state only."
+          }
+        }
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "last_contact_with_person",
       "description": "Look up someone in the people registry: when you were last in contact, how you know them, their key dates and any notes. Matches their name or any alias (nickname, maiden name, email).",
       "parameters": {
@@ -1792,129 +1718,6 @@
         },
         "required": [
           "metric"
-        ]
-      }
-    }
-  },
-  {
-    "type": "function",
-    "function": {
-      "name": "vercel_get_project",
-      "description": "Look up a Vercel project's metadata: framework, production domain, linked GitHub repo, etc. Use this when you need basic context about a project before investigating deployments.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "project": {
-            "type": "string",
-            "description": "Vercel project name (e.g. 'example-site') or resources slug (e.g. 'vercel-example-site')."
-          }
-        },
-        "required": [
-          "project"
-        ]
-      }
-    }
-  },
-  {
-    "type": "function",
-    "function": {
-      "name": "vercel_list_deployments",
-      "description": "List recent Vercel deployments for a project, with optional time-window and state filters. Use `state='ERROR'` to find failed deploys, `since_hours=24` to scope to the last day.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "project": {
-            "type": "string",
-            "description": "Vercel project name or 'vercel-<name>' slug."
-          },
-          "limit": {
-            "type": "integer",
-            "description": "Max deployments returned (1-100). Default 10.",
-            "default": 10
-          },
-          "since_hours": {
-            "type": "integer",
-            "description": "Only return deployments created within the last N hours. Omit for no time filter."
-          },
-          "state": {
-            "type": "string",
-            "description": "Filter by readyState: READY|ERROR|BUILDING|CANCELED|INITIALIZING|QUEUED. Case-insensitive. Omit for any state."
-          }
-        },
-        "required": [
-          "project"
-        ]
-      }
-    }
-  },
-  {
-    "type": "function",
-    "function": {
-      "name": "vercel_get_deployment",
-      "description": "Fetch a single Vercel deployment by id (dpl_*). Surfaces errorCode/errorMessage/errorStep if the deploy ERROR'd, plus the git commit ref/sha/message that triggered it.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "deployment_id": {
-            "type": "string",
-            "description": "Vercel deployment uid (starts with 'dpl_')."
-          }
-        },
-        "required": [
-          "deployment_id"
-        ]
-      }
-    }
-  },
-  {
-    "type": "function",
-    "function": {
-      "name": "vercel_get_build_logs",
-      "description": "Fetch build event log for a Vercel deployment (newest first). Set errors_only=true to filter to stderr lines \u2014 useful for isolating the failure in a deploy that ERROR'd.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "deployment_id": {
-            "type": "string",
-            "description": "Vercel deployment uid (starts with 'dpl_')."
-          },
-          "limit": {
-            "type": "integer",
-            "description": "Max events (1-1000). Default 100.",
-            "default": 100
-          },
-          "errors_only": {
-            "type": "boolean",
-            "description": "If true, only return stderr-typed events.",
-            "default": false
-          }
-        },
-        "required": [
-          "deployment_id"
-        ]
-      }
-    }
-  },
-  {
-    "type": "function",
-    "function": {
-      "name": "investigate_resource",
-      "description": "Kick off a full code investigation (kimi over SSH) of a registered repository this task concerns. Use when the task or the user's comment clearly pertains to a specific repo in the resource list. Runs asynchronously: the findings and a fix-approval (Gate-2) card are posted back to THIS Todoist task in a few minutes. Only works when replying on a Todoist task (not a DM).",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "repo": {
-            "type": "string",
-            "description": "The resource/repo the task is about, e.g. 'bcp'."
-          },
-          "focus": {
-            "type": "string",
-            "description": "One line: what to investigate, derived from the task title and the user's comment."
-          }
-        },
-        "required": [
-          "repo",
-          "focus"
         ]
       }
     }
@@ -2088,24 +1891,6 @@
       "parameters": {
         "type": "object",
         "properties": {}
-      }
-    }
-  },
-  {
-    "type": "function",
-    "function": {
-      "name": "desk_status",
-      "description": "Read the paper trading desk you run: what it holds now, what the book is worth, cash, gain against the starting capital, orders waiting to fill, the latest plan and what it held back, this month's score against the benchmark, and any open problems. Read-only; the desk trades on its own schedule and this cannot place, change or cancel an order. Use it whenever the user asks about holdings, positions, trades, the portfolio or how the desk is doing \u2014 the ledger does not hold these.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "history_days": {
-            "type": "integer",
-            "minimum": 0,
-            "maximum": 30,
-            "description": "Also return the last N decision dates (1-30) with the orders written on each. Omit or 0 for the current state only."
-          }
-        }
       }
     }
   }

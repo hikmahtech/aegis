@@ -43,7 +43,6 @@ export const NAV: NavSection[] = [
       { path: '/admin/research', label: 'Research', icon: 'knowledge' },
       { path: '/slack', label: 'Slack', icon: 'slack' },
       { path: '/resources', label: 'Resources', icon: 'resources' },
-      { path: '/runbooks', label: 'Runbooks', icon: 'alert' },
     ],
   },
   {

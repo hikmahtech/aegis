@@ -26,11 +26,9 @@ from unittest.mock import AsyncMock, MagicMock
 from aegis.services import chat
 from aegis.services.chat import TOOL_EXECUTORS, ToolContext, _execute_tool
 from aegis.services.tools import infra as tools_infra
-from aegis.services.tools import vercel as tools_vercel
 
 # Every chat tool as of the services/tools split. Sorted.
 EXPECTED_TOOL_NAMES = [
-    "aegis_self_diagnose",
     "ask_knowledge",
     "capture_to_inbox",
     "cloud_identity",
@@ -50,7 +48,6 @@ EXPECTED_TOOL_NAMES = [
     "github_issues",
     "handoff_task",
     "inspect_service",
-    "investigate_resource",
     "last_contact_with_person",
     "ledger_add_rule",
     "ledger_post",
@@ -91,7 +88,6 @@ EXPECTED_TOOL_NAMES = [
     "restart_service",
     "run_infra_script",
     "search_knowledge",
-    "set_service_state",
     "social_timeline",
     "stop_agent_run",
     "subscribe_feed",
@@ -102,11 +98,6 @@ EXPECTED_TOOL_NAMES = [
     "trigger_workflow",
     "unsubscribe_feed",
     "untrack_topic",
-    "update_runbook",
-    "vercel_get_build_logs",
-    "vercel_get_deployment",
-    "vercel_get_project",
-    "vercel_list_deployments",
     "web_search",
     "whats_next",
     "youtube_transcript",
@@ -131,10 +122,6 @@ EXPECTED_EXECUTOR_IDENTITY = {
     "restart_service": "_exec_restart_service",
     "run_infra_script": "_exec_run_infra_script",
     "sync_argocd_app": "_exec_sync_argocd_app",
-    "vercel_get_build_logs": "_exec_vercel_get_build_logs",
-    "vercel_get_deployment": "_exec_vercel_get_deployment",
-    "vercel_get_project": "_exec_vercel_get_project",
-    "vercel_list_deployments": "_exec_vercel_list_deployments",
 }
 
 
@@ -161,9 +148,7 @@ def test_moved_executor_identities_are_unchanged():
 def test_moved_executors_live_in_their_domain_modules():
     """The split actually happened, and chat.py re-exports the SAME objects."""
     assert TOOL_EXECUTORS["run_infra_script"] is tools_infra._exec_run_infra_script
-    assert TOOL_EXECUTORS["vercel_get_project"] is tools_vercel._exec_vercel_get_project
     assert chat._exec_run_infra_script is tools_infra._exec_run_infra_script
-    assert chat._normalize_vercel_project is tools_vercel._normalize_vercel_project
 
 
 def test_infra_k8s_context_set_is_shared_not_copied():
@@ -192,16 +177,3 @@ async def test_moved_infra_executor_reachable_through_real_dispatch():
     script, script_args = connector.run_script.call_args[0][:2]
     assert script == "infra/infra_list_nodes"
     assert script_args == ["swarm"]
-
-
-async def test_moved_vercel_executor_reachable_through_real_dispatch():
-    """Same, for the other extracted domain."""
-    connector = MagicMock()
-    connector.get_project = AsyncMock(return_value={"name": "example-site"})
-    ctx = ToolContext(vercel_connector=connector)
-
-    raw = await _execute_tool(None, "vercel_get_project", {"project": "vercel-example-site"}, ctx)
-
-    assert json.loads(raw) == {"name": "example-site"}
-    # the `vercel-` slug prefix is stripped by the moved helper
-    connector.get_project.assert_awaited_once_with("example-site")

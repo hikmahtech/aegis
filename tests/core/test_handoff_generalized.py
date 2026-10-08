@@ -16,12 +16,14 @@ async def test_assignee_labels_fallback_without_pool():
 
 
 @pytest.mark.asyncio
-async def test_assignee_labels_from_db_include_seed_aliases(db_pool, infra_agent_active):
+async def test_assignee_labels_from_db_include_seed_aliases(db_pool):
     labels = await _assignee_labels(db_pool)
     assert "@me" in labels
-    # Seed aliases: sebas/raphael/maou default to their id, pandora is explicit.
-    for lab in ("@sebas", "@raphael", "@maou", "@pandora"):
+    # Seed aliases: sebas/raphael/maou default to their id. The retired infra
+    # agent is inactive, so its alias is not offered.
+    for lab in ("@sebas", "@raphael", "@maou"):
         assert lab in labels
+    assert "@pandora" not in labels
 
 
 @pytest.mark.asyncio

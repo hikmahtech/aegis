@@ -49,11 +49,9 @@ from aegis_worker.flows.agent_task import (
     AgentTaskSweepConfig,
     AgentTaskSweepFlow,
 )
-from aegis_worker.flows.alert_investigation import AlertInvestigationFlow
 from aegis_worker.flows.books_write import BooksWriteFlow
 from aegis_worker.flows.calendar_ingest import CalendarIngestFlow, CalendarIngestInput
 from aegis_worker.flows.calibre_sync import CalibreSyncConfig, CalibreSyncFlow
-from aegis_worker.flows.cert_radar import CertRadarFlow
 from aegis_worker.flows.clarify import ClarifyConfig, ClarifyFlow
 from aegis_worker.flows.cleanup import CleanupConfig, CleanupFlow
 from aegis_worker.flows.curiosity import CuriosityCardFlow, CuriosityConfig
@@ -66,7 +64,6 @@ from aegis_worker.flows.flow_health import FlowHealthConfig, FlowHealthWatchdogF
 from aegis_worker.flows.github_rising import GithubRisingConfig, GithubRisingFlow
 from aegis_worker.flows.gmail_ingest import GmailIngestFlow, GmailIngestInput
 from aegis_worker.flows.hub_sweep import HubSweepConfig, HubSweepFlow
-from aegis_worker.flows.infra_heartbeat import InfraHeartbeatFlow
 from aegis_worker.flows.intelligence_scan import IntelligenceScanFlow, IntelligenceScanInput
 from aegis_worker.flows.interaction import InteractionFlow
 from aegis_worker.flows.journal_prompt import JournalPromptConfig, JournalPromptFlow
@@ -94,7 +91,6 @@ from aegis_worker.flows.review import (
     WeeklyReviewFlow,
 )
 from aegis_worker.flows.rss_ingest import RssIngestFlow, RssIngestInput
-from aegis_worker.flows.service_drift import ServiceDriftFlow
 from aegis_worker.flows.social_metrics import SocialMetricsConfig, SocialMetricsFlow
 from aegis_worker.flows.social_publish import SocialPublishConfig, SocialPublishFlow
 from aegis_worker.flows.statement_reconcile import (
@@ -215,7 +211,6 @@ FLOWS: tuple[FlowSpec, ...] = (
         ),
     ),
     FlowSpec(AgentTaskFlow),
-    FlowSpec(AlertInvestigationFlow),
     # Event-driven: started by the three ledger write tools with a workflow id
     # derived from the write's own content (issue #388). No schedule config and
     # no activities.yaml row — nothing but a chat tool ever starts it. Gated on
@@ -434,7 +429,7 @@ FLOWS: tuple[FlowSpec, ...] = (
             agent_id=act["agent_id"],
         ),
     ),
-    # Unscheduled since the v1 removal prep (see the homelab_enabled block below).
+    # Unscheduled since the v1 removal prep (see the money block below).
     FlowSpec(WorkspaceRepoSyncFlow),
     FlowSpec(
         SocialPublishFlow,
@@ -514,11 +509,7 @@ FLOWS: tuple[FlowSpec, ...] = (
             max_cards=_int(act["config"], "max_cards", 5),
         ),
     ),
-    # Watchdog over AEGIS's own scheduled flows (#226). Deliberately NOT behind
-    # homelab_enabled: it watches workflow_runs, which every install has, and
-    # the silent-failure gap it closes is not homelab-specific.
-    # The problem hub's housekeeping tick. Not behind homelab_enabled: the hub
-    # ingests from every producer, not only the swarm ones.
+    # The problem hub's housekeeping tick.
     FlowSpec(
         HubSweepFlow,
         lambda act: HubSweepConfig(
@@ -534,15 +525,9 @@ FLOWS: tuple[FlowSpec, ...] = (
                 0.0,
                 _float(act["config"], "group_window_hours", HubSweepConfig.group_window_hours),
             ),
-            # Empty disables the alertmanager reconciliation entirely (#551).
-            alertmanager_url=str(act["config"].get("alertmanager_url") or "").strip(),
-            alertmanager_min_uptime_seconds=_int(
-                act["config"],
-                "alertmanager_min_uptime_seconds",
-                HubSweepConfig.alertmanager_min_uptime_seconds,
-            ),
         ),
     ),
+    # Watchdog over AEGIS's own scheduled flows (#226).
     FlowSpec(
         FlowHealthWatchdogFlow,
         lambda act: FlowHealthConfig(
@@ -558,8 +543,8 @@ FLOWS: tuple[FlowSpec, ...] = (
             silent=bool((act["config"] or {}).get("silent", False)),
         ),
     ),
-    # Watches AEGIS's own card delivery and comms inbound channel. Not behind
-    # homelab_enabled: every install has interactions and a comms service, and
+    # Watches AEGIS's own card delivery and comms inbound channel. Not
+    # feature-flagged: every install has interactions and a comms service, and
     # its activities live on WatchdogActivities, which is always built.
     FlowSpec(
         DeliveryWatchdogFlow,
@@ -570,14 +555,10 @@ FLOWS: tuple[FlowSpec, ...] = (
             comms_url=act["_settings"].get("comms_url", ""),
         ),
     ),
-    # --- homelab_enabled ---------------------------------------------------
-    # These and the money flows below are unscheduled since the v1 removal prep:
+    # The money flows below are unscheduled since the v1 removal prep:
     # migration 054 deletes their activities rows (so does the workspace repo
-    # sync above). Still registered so a run in flight can finish
-    # and a manual start still works, until the removal PRs delete them.
-    FlowSpec(ServiceDriftFlow, feature_flag="homelab_enabled"),
-    FlowSpec(CertRadarFlow, feature_flag="homelab_enabled"),
-    FlowSpec(InfraHeartbeatFlow, feature_flag="homelab_enabled"),
+    # sync above). Still registered so a run in flight can finish and a manual
+    # start still works, until the removal PRs delete them.
     # --- money_hygiene_enabled ---------------------------------------------
     FlowSpec(ReceiptIngestFlow, feature_flag="money_hygiene_enabled"),
     FlowSpec(MoneyProcessFlow, feature_flag="money_hygiene_enabled"),
@@ -628,7 +609,6 @@ FLOWS: tuple[FlowSpec, ...] = (
 # Activity classes whose *instance* main() only builds behind a feature flag.
 # Everything else in aegis_worker.activities is unconditionally served.
 ACTIVITY_CLASS_FLAGS: dict[str, str] = {
-    "HomelabActivities": "homelab_enabled",
     "MoneyActivities": "money_hygiene_enabled",
     # Same flag as the rest of the money lane: the statement activities write
     # to the same books through the same flock, and a money-off install must

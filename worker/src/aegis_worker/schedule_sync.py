@@ -91,10 +91,8 @@ async def sync_schedules(
 
     Returns the number of schedules registered.
 
-    When settings is provided, type-specific defaults are injected into the
-    activity config — e.g. cert_radar domains fall back to
-    settings.homelab_public_domains so a freshly-seeded activity row with
-    an empty config still probes the right domains.
+    When settings is provided, selected fields reach the config mappers as
+    `act["_settings"]`.
     """
     import dataclasses
     import hashlib
@@ -151,16 +149,6 @@ async def sync_schedules(
             except (json.JSONDecodeError, TypeError):
                 config = {}
         act["config"] = config or {}
-
-        # Settings-backed defaults for homelab flows
-        if (
-            settings is not None
-            and act_type == "CertRadarFlow"
-            and not act["config"].get("domains")
-        ):
-            fallback = getattr(settings, "homelab_public_domains", None) or []
-            if fallback:
-                act["config"]["domains"] = list(fallback)
 
         # Expose selected settings fields to mappers (Gmail/Receipt reauth link,
         # comms service URL). Mappers read via act["_settings"].get(...).

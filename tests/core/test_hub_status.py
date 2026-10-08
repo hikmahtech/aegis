@@ -1,6 +1,7 @@
-"""PR 3b hub additions: the investigate decision, status transitions, mutes,
-the verification delay by class, stale-problem lookup, and the source
-normalisation `event_from_alert` applies to the synthetic-alert producers."""
+"""PR 3b hub additions that stay: the fresh-problem decision, status
+transitions, mutes set before the infra lane left, and task linking. The
+verification delay, stale-problem lookup, investigation claims and the alert
+source normalisation left with the infra lane (DevOps vertical, a2-devops)."""
 
 from __future__ import annotations
 
@@ -12,16 +13,14 @@ from aegis.services import hub_project
 from aegis.services.hub import (
     Event,
     IngestResult,
-    event_from_alert,
     get_problem,
     ingest_event,
     list_events,
-    mute_problem,
     set_status,
     slug,
-    stale_open_problems,
-    verify_seconds,
 )
+
+from tests.hub_helpers import mute_problem
 
 NOW = datetime(2026, 9, 7, 12, 0, tzinfo=UTC)
 
@@ -32,7 +31,7 @@ def _subject() -> str:
 
 def _occ(subject: str, n: int = 1, **kw) -> Event:
     return Event(
-        source="heartbeat",
+        source="flow_health",
         external_id=f"{subject}@{n}",
         kind="occurrence",
         title=f"Service {subject} down",
@@ -46,54 +45,28 @@ def _occ(subject: str, n: int = 1, **kw) -> Event:
 
 
 @pytest.mark.parametrize(
-    ("action", "suppressed", "muted", "expected"),
+    ("action", "muted", "expected"),
     [
-        ("created", False, False, True),
-        ("reopened", False, False, True),
-        ("rolled_over", False, False, True),
-        ("promoted", False, False, True),
-        ("attached", False, False, False),
-        ("duplicate", False, False, False),
-        ("resolved", False, False, False),
-        ("noted", False, False, False),
-        ("ignored", False, False, False),
-        ("created", True, False, False),
-        ("created", False, True, False),
+        ("created", False, True),
+        ("reopened", False, True),
+        ("rolled_over", False, True),
+        ("attached", False, False),
+        ("duplicate", False, False),
+        ("resolved", False, False),
+        ("noted", False, False),
+        ("ignored", False, False),
+        ("created", True, False),
     ],
 )
-def test_investigate_decision(action, suppressed, muted, expected):
-    r = IngestResult("p", action, "k", occurrences=1, muted=muted, suppressed=suppressed)
+def test_investigate_decision(action, muted, expected):
+    r = IngestResult("p", action, "k", occurrences=1, muted=muted)
     assert r.investigate is expected
     assert r.to_dict()["investigate"] is expected
-
-
-@pytest.mark.parametrize(
-    ("klass", "seconds"),
-    [
-        ("NodeDown", 300),
-        ("DockerServiceDown", 300),
-        ("ServiceDownProlonged", 0),
-        ("HeartbeatCollectFailed", 0),
-        ("DiskAlmostFull", 0),
-        ("HostOutOfMemory", 0),
-        ("OOMKilled", 0),
-        ("HighCPU", 180),
-        ("", 180),
-    ],
-)
-def test_verify_seconds_by_class(klass, seconds):
-    assert verify_seconds(klass) == seconds
 
 
 def test_slug_is_the_hub_normalisation():
     assert slug("Monitoring CAdvisor") == "monitoring-cadvisor"
     assert slug("aegis_core") == "aegis_core"
-
-
-def test_synthetic_alert_sources_map_onto_the_vocabulary():
-    for src, expect in (("todoist-jira", "chat"), ("todoist-chat", "chat"), ("todoist-infra", "chat"), ("bogus", "manual"), ("grafana", "manual"), ("alertmanager", "alertmanager")):
-        e = event_from_alert({"source": src, "title": "t", "fingerprint": "f", "labels": {"alertname": "X"}}, occurred_at=NOW)
-        assert e.source == expect, src
 
 
 # --- set_status ---------------------------------------------------------------
@@ -124,8 +97,10 @@ async def test_set_status_rejects_closed_and_bad_values(db_pool):
     with pytest.raises(ValueError):
         await set_status(db_pool, r.problem_id, "exploded", reason="x")
     await db_pool.execute("UPDATE problems SET closed_at = $2 WHERE id = $1::uuid", r.problem_id, NOW)
-    assert await set_status(db_pool, r.problem_id, "fixing", reason="x", now=NOW) is False
-    assert await set_status(db_pool, str(uuid.uuid4()), "fixing", reason="x", now=NOW) is False
+    assert await set_status(db_pool, r.problem_id, "investigating", reason="x", now=NOW) is False
+    assert await set_status(db_pool, str(uuid.uuid4()), "investigating", reason="x", now=NOW) is False
+    with pytest.raises(ValueError):  # `fixing` left with the investigations
+        await set_status(db_pool, r.problem_id, "fixing", reason="x")
 
 
 # --- mute ---------------------------------------------------------------------
@@ -148,26 +123,6 @@ async def test_mute_silences_projection_and_investigation_but_counts(db_pool):
 # --- stale problems -----------------------------------------------------------
 
 
-async def test_stale_open_problems_needs_age_and_no_recent_investigation(db_pool):
-    old, fresh, investigated = _subject(), _subject(), _subject()
-    t0 = NOW - timedelta(hours=30)
-    r_old = await ingest_event(db_pool, _occ(old, occurred_at=t0), now=t0)
-    await ingest_event(db_pool, _occ(fresh, occurred_at=NOW - timedelta(hours=2)), now=NOW - timedelta(hours=2))
-    r_inv = await ingest_event(db_pool, _occ(investigated, occurred_at=t0), now=t0)
-    await ingest_event(
-        db_pool,
-        Event(source="investigation", external_id=f"inv-{investigated}", kind="investigation", title="looked", problem_id=r_inv.problem_id, occurred_at=NOW - timedelta(hours=1)),
-        now=NOW - timedelta(hours=1),
-    )
-    rows = await stale_open_problems(db_pool, [old, fresh, investigated, "unknown"], hours=24, now=NOW)
-    assert [r["id"] for r in rows] == [r_old.problem_id]
-    assert rows[0]["subject"] == old and rows[0]["hours"] == 30.0
-    assert await stale_open_problems(db_pool, [], hours=24, now=NOW) == []
-    # a suppressed problem is never re-investigated; a resolved one neither
-    await set_status(db_pool, r_old.problem_id, "resolved", reason="x", now=NOW)
-    assert await stale_open_problems(db_pool, [old], hours=24, now=NOW) == []
-
-
 # --- link_task ------------------------------------------------------------------
 
 
@@ -183,32 +138,3 @@ async def test_link_task_adopts_an_existing_task_once(db_pool):
     assert await hub_project.link_task(db_pool, str(uuid.uuid4()), "T") is False
 
 
-async def test_claim_investigation_has_one_winner(db_pool):
-    """#639: two runs claiming the same problem at once. The claim is a
-    compare-and-swap, so exactly one wins and the other sees it as holder."""
-    import asyncio
-
-    from aegis.services.hub import claim_investigation
-
-    res = await ingest_event(db_pool, _occ(_subject()), now=NOW)
-
-    async def live(_holder: str) -> bool:
-        return True
-
-    a, b = await asyncio.gather(
-        claim_investigation(db_pool, res.problem_id, "run-a", is_running=live),
-        claim_investigation(db_pool, res.problem_id, "run-b", is_running=live),
-    )
-    assert sorted([a["claimed"], b["claimed"]]) == [False, True]
-    winner = "run-a" if a["claimed"] else "run-b"
-    assert a["holder"] == b["holder"] == winner
-
-
-async def test_claim_investigation_on_a_missing_problem_is_claimed(db_pool):
-    from aegis.services.hub import claim_investigation
-
-    async def never(_holder: str) -> bool:
-        raise AssertionError("no holder to ask about")
-
-    out = await claim_investigation(db_pool, str(uuid.uuid4()), "run-a", is_running=never)
-    assert out == {"claimed": True, "holder": "run-a"}

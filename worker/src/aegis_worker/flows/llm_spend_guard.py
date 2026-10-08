@@ -32,7 +32,7 @@ with workflow.unsafe.imports_passed_through():
 class LLMSpendGuardConfig:
     # agent_id first — WorkflowRunRecorderInterceptor reads it to populate
     # workflow_runs.agent_id (repo convention: every flow config starts here).
-    agent_id: str = "pandoras-actor"
+    agent_id: str = ""
 
 
 @workflow.defn

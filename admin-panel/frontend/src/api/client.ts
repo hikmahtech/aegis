@@ -119,7 +119,7 @@ export const api = {
       method: 'PUT', body: JSON.stringify(kinds),
     }),
 
-  // Resources (v3 — connectors, runbooks, repositories, etc.)
+  // Resources (v3 — connectors, repositories, etc.)
   listResources: (kind?: string) =>
     apiFetch<any[]>(`/api/admin/resources${kind ? `?kind=${kind}` : ''}`),
   createResource: (data: any) =>
@@ -128,19 +128,6 @@ export const api = {
     apiFetch<any>(`/api/admin/resources/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   deleteResource: (id: string) =>
     apiFetch<any>(`/api/admin/resources/${id}`, { method: 'DELETE' }),
-
-  // Per-alert runbooks (the `runbooks` table). The worker reads these before
-  // the built-in runbooks/<AlertName>.md files. `name` is an alert name in any
-  // spelling, so it is always URL-encoded ("Dagster Pipeline Failure").
-  listRunbooks: () => apiFetch<any[]>('/api/admin/runbooks'),
-  getRunbook: (name: string) =>
-    apiFetch<any>(`/api/admin/runbooks/${encodeURIComponent(name)}`),
-  putRunbook: (name: string, body: string) =>
-    apiFetch<any>(`/api/admin/runbooks/${encodeURIComponent(name)}`, {
-      method: 'PUT', body: JSON.stringify({ body }),
-    }),
-  deleteRunbook: (name: string) =>
-    apiFetch<void>(`/api/admin/runbooks/${encodeURIComponent(name)}`, { method: 'DELETE' }),
 
   // People registry (life.people — name, aliases, relationship, key dates)
   listPeople: (q?: string) =>
@@ -172,11 +159,6 @@ export const api = {
   getProblem: (id: string) => apiFetch<any>(`/api/admin/problems/${id}`),
   problemDigest: (hours = 24) =>
     apiFetch<any>(`/api/admin/problems/digest?hours=${hours}`),
-  muteProblem: (id: string, hours: number) =>
-    apiFetch<any>(`/api/admin/problems/${id}/mute`, {
-      method: 'POST',
-      body: JSON.stringify({ hours }),
-    }),
   resolveProblem: (id: string, reason: string) =>
     apiFetch<any>(`/api/admin/problems/${id}/resolve`, {
       method: 'POST',
@@ -188,61 +170,6 @@ export const api = {
     apiFetch<any>(`/api/admin/problems/${keepId}/merge`, {
       method: 'POST',
       body: JSON.stringify({ merge_id: mergeId }),
-    }),
-  listServiceState: () => apiFetch<{ windows: any[] }>('/api/admin/service-state'),
-  setServiceState: (body: {
-    subject: string;
-    state: string;
-    subject_kind?: string;
-    minutes?: number;
-    note?: string;
-  }) => apiFetch<any>('/api/admin/service-state', { method: 'PUT', body: JSON.stringify(body) }),
-
-  // The hub's own configuration. Both rows were DB-backed but reachable only by
-  // raw SQL, which is not "configurable" in a system meant to be forked (PR #559).
-  getHubSettleSeconds: () =>
-    apiFetch<{
-      overrides: Record<string, number>;
-      defaults: Record<string, number>;
-      default_seconds: number;
-      max_seconds: number;
-      wildcard: string;
-    }>('/api/admin/hub-settle-seconds'),
-  saveHubSettleSeconds: (overrides: Record<string, number>) =>
-    apiFetch<any>('/api/admin/hub-settle-seconds', {
-      method: 'PUT',
-      body: JSON.stringify({ overrides }),
-    }),
-  getInfraAlertRouting: () =>
-    apiFetch<{
-      alertnames: string[];
-      default_alertnames: string[];
-      extra_alertnames: string[];
-      repo: string;
-      platform_hint: string;
-    }>('/api/admin/infra-alert-routing'),
-  saveInfraAlertRouting: (body: {
-    extra_alertnames: string[];
-    repo: string;
-    platform_hint: string;
-  }) =>
-    apiFetch<any>('/api/admin/infra-alert-routing', {
-      method: 'PUT',
-      body: JSON.stringify(body),
-    }),
-  // The automatic restart's repeat window (`alert_remediation`, #501/#558).
-  getAlertRemediation: () =>
-    apiFetch<{
-      repeat_window_minutes: number;
-      defaults: { repeat_window_minutes: number };
-      max_minutes: number;
-      stored: boolean;
-    }>('/api/admin/alert-remediation'),
-  // `null` for a blank field: the server refuses it rather than reading 0.
-  saveAlertRemediation: (repeat_window_minutes: number | null) =>
-    apiFetch<any>('/api/admin/alert-remediation', {
-      method: 'PUT',
-      body: JSON.stringify({ repeat_window_minutes }),
     }),
 
   // Expiry radar registry (life.expiring_items — passports, policies, warranties)

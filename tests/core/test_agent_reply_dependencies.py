@@ -6,7 +6,7 @@ they did not: `settings` and four connectors were silently dropped, so those
 surfaces built a half-populated ToolContext. Nothing raised — the tools just
 degraded, differently from the admin UI, which is the hardest kind of bug to
 notice. `aegis_self_diagnose` returned "settings not threaded into ToolContext"
-and the knowledge / money / search / vercel tools ran connector-less.
+and the knowledge / money / search tools ran connector-less.
 
 The signature test is the point: it fails when a NEW dependency is added to
 `send_message` and not forwarded, which is exactly how this happened.
@@ -53,7 +53,6 @@ async def test_agent_reply_forwards_every_dependency():
         "finance_connector": object(),
         "search_connector": object(),
         "remote_script_connector": object(),
-        "vercel_connector": object(),
     }
     fake = AsyncMock(
         return_value={"response": "ok", "model": "m", "tool_calls": [], "error": None}

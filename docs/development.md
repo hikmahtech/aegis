@@ -172,7 +172,7 @@ deployment — tick it in the Behavior tab once.
 **Adding a new agent:** create it (Agents page or `POST /api/agents`), write its
 persona, then check the capability tag(s) that describe its role and pick its tool
 set on the Behavior tab. No code changes — every tag-driven feature (GTD reviews,
-briefings, money processing, alerts, Slack @-addressing, chat routing) follows the
+briefings, money processing, Slack @-addressing, chat routing) follows the
 tags automatically.
 
 ### Ingestion channels
@@ -225,10 +225,9 @@ Three things bound what a mounted client can do:
   MCP surface can never be wider than that agent's chat surface. An agent id
   with no row is a 404. Point a harness at a *narrow* agent.
 - **`_UNSERVED_TOOLS` is always removed** from the served list, even when the
-  agent holds those tools. `dispatch_agent_run`,
-  `aegis_self_diagnose` and `investigate_resource` each **start another CLI
+  agent holds those tools. `dispatch_agent_run` **starts another CLI
   run** — which mounts this same endpoint with the same tool set, so serving
-  them is unbounded recursion with no depth counter anywhere in the loop (the
+  it is unbounded recursion with no depth counter anywhere in the loop (the
   only brake is the coding host's tmux window cap, past which launches fall
   through to detached `nohup` and stop being bounded at all). The exclusion is
   applied where the served set is *derived*, so an excluded tool is neither
@@ -487,10 +486,9 @@ Three invariants worth knowing before you touch `flows/agent_run.py`:
   for the same reason, except a launch that TIMED OUT, which may already have
   forked the agent.
 
-Completion is detected by **process exit**, not by the `STATUS:` footer
-`alerts._kimi_output_complete` looks for: that regex accepts a closed
-vocabulary of alert-RCA / Jira-scoping verbs a general run has no reason to
-emit.
+Completion is detected by **process exit**, not by a `STATUS:` footer: the
+old alert investigation's footer regex accepted a closed vocabulary of
+alert-RCA verbs a general run has no reason to emit.
 
 ### What a run gets in its workspace
 
@@ -684,7 +682,7 @@ with this exact command in it.
 only. On a running deployment, add it on the admin **Behavior** tab or:
 
 ```bash
-curl -X PATCH "$AEGIS_URL/api/agents/pandoras-actor" \
+curl -X PATCH "$AEGIS_URL/api/agents/sebas" \
   -H 'content-type: application/json' \
   -d '{"metadata": {"tool_set": [<existing tools...>, "dispatch_agent_run"]}}'
 ```

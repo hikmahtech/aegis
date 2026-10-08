@@ -3,8 +3,8 @@
 Every executor here is built on the same script-host + infra-registry helper
 base (`_INFRA_SPECS` / `_run_infra_script` / `_validate_infra_name` /
 `_registry_k8s_id`), and that shared base is what draws the module boundary.
-Pandora's other two tools — `aegis_self_diagnose` and `investigate_resource` —
-use none of it and live in `tools/agents.py`.
+The infra lane itself moved to the DevOps vertical (a2-devops); this module
+stays until the coding lane leaves (PR 4 of the v1 removal).
 """
 
 from __future__ import annotations

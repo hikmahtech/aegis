@@ -59,7 +59,7 @@ async def _task(db_pool):
         "INSERT INTO todoist_tasks (id, content, description, labels, source_tag, "
         "assignee_label, is_completed, updated_at) "
         "VALUES ($1, 'Fix the retry policy', 'It retries forever.', "
-        "ARRAY['@pandora','@code'], NULL, '@pandora', false, now())",
+        "ARRAY['@maou','@code'], NULL, '@maou', false, now())",
         _TASK,
     )
     yield
@@ -233,8 +233,8 @@ async def test_load_task_returns_the_task_and_its_recent_notes(db_pool, _task):
     assert task["id"] == _TASK
     assert task["content"] == "Fix the retry policy"
     assert task["description"] == "It retries forever."
-    assert task["labels"] == ["@pandora", "@code"]
-    assert task["assignee_label"] == "@pandora"
+    assert task["labels"] == ["@maou", "@code"]
+    assert task["assignee_label"] == "@maou"
     assert [n["content"] for n in task["notes"]] == [f"note {n}" for n in range(2, 32)]
     # An activity result crosses Temporal's payload boundary — timestamps go as
     # ISO strings, never as datetimes.
@@ -254,11 +254,11 @@ async def test_load_task_without_a_pool_is_empty():
 
 
 async def test_find_task_turns_due_surfaces_an_unanswered_user_comment(db_pool, _task):
-    await svc.create_session(db_pool, task_id=_TASK, agent_id="pandoras-actor")
+    await svc.create_session(db_pool, task_id=_TASK, agent_id="maou")
     await _note(db_pool, "use the other repo")
     due = await AgentTaskActivities(db_pool=db_pool).find_task_turns_due(10)
     assert [(d["task_id"], d["agent_id"], d["comment"]) for d in due] == [
-        (_TASK, "pandoras-actor", "use the other repo")
+        (_TASK, "maou", "use the other repo")
     ]
 
 
@@ -268,7 +268,7 @@ async def test_find_task_turns_due_without_a_pool_is_empty():
 
 async def test_record_task_turn_counts_only_launched_turns(db_pool, _task):
     """Every verdict moves the watermark; only a launched turn is a turn."""
-    await svc.create_session(db_pool, task_id=_TASK, agent_id="pandoras-actor")
+    await svc.create_session(db_pool, task_id=_TASK, agent_id="maou")
     act = AgentTaskActivities(db_pool=db_pool)
 
     assert (await act.record_task_turn(_TASK, False))["recorded"] is True
@@ -302,7 +302,7 @@ async def test_set_task_slack_ref_remembers_the_thread_root(db_pool, _task):
     under `slack_ref->>'ts'` and inbound routing matches on it, so a
     double-encoded value would silently open a fresh thread on every turn and
     lose the reply route with it."""
-    await svc.create_session(db_pool, task_id=_TASK, agent_id="pandoras-actor")
+    await svc.create_session(db_pool, task_id=_TASK, agent_id="maou")
     act = AgentTaskActivities(db_pool=db_pool)
 
     assert await act.set_task_slack_ref(_TASK, {"channel": "C1", "ts": "1.1"}) == {"stored": True}
@@ -312,7 +312,7 @@ async def test_set_task_slack_ref_remembers_the_thread_root(db_pool, _task):
 async def test_set_task_slack_ref_refuses_an_empty_ref(db_pool, _task):
     """An empty ref would overwrite a real root with one that matches no
     thread — worse than never storing one."""
-    await svc.create_session(db_pool, task_id=_TASK, agent_id="pandoras-actor")
+    await svc.create_session(db_pool, task_id=_TASK, agent_id="maou")
     act = AgentTaskActivities(db_pool=db_pool)
     await act.set_task_slack_ref(_TASK, {"channel": "C1", "ts": "1.1"})
 
@@ -330,7 +330,7 @@ async def test_set_task_slack_ref_without_a_pool_stores_nothing():
 
 
 async def _ready_row(db_pool) -> None:
-    await svc.create_session(db_pool, task_id=_TASK, agent_id="pandoras-actor")
+    await svc.create_session(db_pool, task_id=_TASK, agent_id="maou")
     await svc.set_repo(
         db_pool,
         _TASK,
@@ -356,7 +356,7 @@ async def test_ready_row_skips_the_resolver_but_still_verifies_its_worktree(db_p
     calls: list = []
     act.resolve_task_repo = _resolver(_RESOLVED, calls)
 
-    out = await act.ensure_task_session(_TASK, "pandoras-actor", {"id": _TASK}, "")
+    out = await act.ensure_task_session(_TASK, "maou", {"id": _TASK}, "")
 
     assert out["status"] == "ready"
     assert out["session"]["repo"] == "hikmah/aegis"
@@ -376,7 +376,7 @@ async def test_a_ready_row_whose_worktree_cannot_be_rebuilt_is_unresolved(db_poo
     act = AgentTaskActivities(db_pool=db_pool, remote_script=conn)
     act.resolve_task_repo = _resolver(_RESOLVED, [])
 
-    out = await act.ensure_task_session(_TASK, "pandoras-actor", {"id": _TASK}, "")
+    out = await act.ensure_task_session(_TASK, "maou", {"id": _TASK}, "")
 
     assert out["status"] == "unresolved"
     assert "checkout missing" in out["error"]
@@ -387,7 +387,7 @@ async def test_a_resolved_repo_needs_no_comment(db_pool, _task):
     act = AgentTaskActivities(db_pool=db_pool, remote_script=conn)
     act.resolve_task_repo = _resolver(_RESOLVED, [])
 
-    out = await act.ensure_task_session(_TASK, "pandoras-actor", {"id": _TASK}, "")
+    out = await act.ensure_task_session(_TASK, "maou", {"id": _TASK}, "")
 
     assert out["status"] == "ready"
     assert out["candidates"] == []
@@ -410,7 +410,7 @@ async def test_candidates_without_a_matching_comment_park_the_row_empty(db_pool,
     act = AgentTaskActivities(db_pool=db_pool, remote_script=conn)
     act.resolve_task_repo = _resolver(_UNRESOLVED, [])
 
-    out = await act.ensure_task_session(_TASK, "pandoras-actor", {"id": _TASK}, "which one?")
+    out = await act.ensure_task_session(_TASK, "maou", {"id": _TASK}, "which one?")
 
     assert out["status"] == "candidates"
     assert [c["github_repo"] for c in out["candidates"]] == ["hikmahtech/aegis", "acme/bcp"]
@@ -427,7 +427,7 @@ async def test_a_comment_naming_a_candidate_resolves_it(db_pool, _task):
     act = AgentTaskActivities(db_pool=db_pool, remote_script=conn)
     act.resolve_task_repo = _resolver(_UNRESOLVED, [])
 
-    out = await act.ensure_task_session(_TASK, "pandoras-actor", {"id": _TASK}, " HikmahTech/Aegis ")
+    out = await act.ensure_task_session(_TASK, "maou", {"id": _TASK}, " HikmahTech/Aegis ")
 
     assert out["status"] == "ready"
     assert out["session"]["repo"] == "hikmah/aegis"
@@ -444,7 +444,7 @@ async def test_a_candidate_can_be_named_by_title_or_path(db_pool, _task):
     act = AgentTaskActivities(db_pool=db_pool, remote_script=conn)
     act.resolve_task_repo = _resolver(_UNRESOLVED, [])
 
-    out = await act.ensure_task_session(_TASK, "pandoras-actor", {"id": _TASK}, "bcp")
+    out = await act.ensure_task_session(_TASK, "maou", {"id": _TASK}, "bcp")
 
     assert out["status"] == "ready"
     assert out["session"]["repo"] == "acme/bcp"
@@ -459,7 +459,7 @@ async def test_a_failed_worktree_leaves_the_row_unresolved(db_pool, _task):
     act = AgentTaskActivities(db_pool=db_pool, remote_script=conn)
     act.resolve_task_repo = _resolver(_RESOLVED, [])
 
-    out = await act.ensure_task_session(_TASK, "pandoras-actor", {"id": _TASK}, "")
+    out = await act.ensure_task_session(_TASK, "maou", {"id": _TASK}, "")
 
     assert out["status"] == "unresolved"
     assert "checkout missing" in out["error"]
@@ -470,7 +470,7 @@ async def test_a_failed_worktree_leaves_the_row_unresolved(db_pool, _task):
 async def test_ensure_without_a_connector_is_unresolved(db_pool, _task):
     act = AgentTaskActivities(db_pool=db_pool, remote_script=None)
     act.resolve_task_repo = _resolver(_RESOLVED, [])
-    out = await act.ensure_task_session(_TASK, "pandoras-actor", {"id": _TASK}, "")
+    out = await act.ensure_task_session(_TASK, "maou", {"id": _TASK}, "")
     assert out["status"] == "unresolved"
     assert out["error"]
 
@@ -486,7 +486,7 @@ def _collision_act(db_pool, conn):
 
 
 async def _own_session_row(db_pool, *, output_file: str = "", host: str = "meem") -> None:
-    await svc.create_session(db_pool, task_id=_TASK, agent_id="pandoras-actor")
+    await svc.create_session(db_pool, task_id=_TASK, agent_id="maou")
     if output_file:
         await svc.set_last_run(db_pool, _TASK, output_file=output_file, host=host)
 
@@ -693,7 +693,7 @@ _HUMAN = {
 
 _SESSION = {
     "task_id": _TASK,
-    "agent_id": "pandoras-actor",
+    "agent_id": "sebas",
     "session_id": _SESSION_ID,
     "repo": "hikmah/aegis",
     "github_repo": "hikmahtech/aegis",
@@ -709,13 +709,13 @@ async def test_launch_pins_the_turn_to_the_tasks_session_and_worktree():
     provision (and later remove) a throwaway worktree instead."""
     conn = _Connector()
     act = AgentTaskActivities(remote_script=conn)
-    out = await act.launch_task_turn(_SESSION, "investigate", "pandoras-actor", False, "task 1", 60)
+    out = await act.launch_task_turn(_SESSION, "investigate", "sebas", False, "task 1", 60)
 
     call = conn.launches[0]
     assert call["repo"] == "hikmah/aegis"
     assert call["github_repo"] == "hikmahtech/aegis"
     assert call["engine_override"] == "claude"
-    assert call["agent_id"] == "pandoras-actor"
+    assert call["agent_id"] == "sebas"
     assert call["session_id"] == _SESSION_ID
     assert call["resume"] is False
     assert call["name"] == "task 1"
@@ -740,10 +740,10 @@ async def test_a_running_launch_records_where_the_turn_writes(db_pool, _task):
 
     Falsifiable: drop the `set_last_run` call and both columns stay empty.
     """
-    await svc.create_session(db_pool, task_id=_TASK, agent_id="pandoras-actor")
+    await svc.create_session(db_pool, task_id=_TASK, agent_id="maou")
     conn = _Connector()
     act = AgentTaskActivities(db_pool=db_pool, remote_script=conn)
-    out = await act.launch_task_turn(_SESSION, "investigate", "pandoras-actor", False, "t", 60)
+    out = await act.launch_task_turn(_SESSION, "investigate", "sebas", False, "t", 60)
 
     assert out["status"] == "running"
     row = await svc.get_session(db_pool, _TASK)
@@ -755,13 +755,13 @@ async def test_a_running_launch_records_the_account_it_resolved(db_pool, _task):
     """The row remembers the CLAUDE_CONFIG_DIR label the connector picked, so
     the next turn's `--resume` runs under the same profile. An empty label
     (the host's default login) keeps whatever the row had."""
-    await svc.create_session(db_pool, task_id=_TASK, agent_id="pandoras-actor")
+    await svc.create_session(db_pool, task_id=_TASK, agent_id="maou")
     await svc.set_repo(
         db_pool, _TASK, repo="hikmah/aegis", github_repo="hikmahtech/aegis",
         worktree_path=_WT, branch=_BRANCH, host="meem",
     )
     act = AgentTaskActivities(db_pool=db_pool, remote_script=_Connector())
-    await act.launch_task_turn(_SESSION, "investigate", "pandoras-actor", False, "t", 60)
+    await act.launch_task_turn(_SESSION, "investigate", "sebas", False, "t", 60)
     row = await svc.get_session(db_pool, _TASK)
     assert row["account"] == "work" and row["engine"] == "claude"
     assert row["status"] == "active"
@@ -770,7 +770,7 @@ async def test_a_running_launch_records_the_account_it_resolved(db_pool, _task):
 async def test_a_later_turn_resumes_under_the_recorded_account():
     conn = _Connector()
     await AgentTaskActivities(remote_script=conn).launch_task_turn(
-        dict(_SESSION, turns=1, account="personal"), "go", "pandoras-actor", True, "t", 30
+        dict(_SESSION, turns=1, account="personal"), "go", "sebas", True, "t", 30
     )
     assert conn.launches[0]["claude_account"] == "personal"
     assert conn.launches[0]["resume"] is True
@@ -779,9 +779,9 @@ async def test_a_later_turn_resumes_under_the_recorded_account():
 async def test_a_failed_launch_records_no_run(db_pool, _task):
     """Nothing is writing, so nothing may claim to be: a stale output file left
     behind by a failed launch would read as a live orphan on the next turn."""
-    await svc.create_session(db_pool, task_id=_TASK, agent_id="pandoras-actor")
+    await svc.create_session(db_pool, task_id=_TASK, agent_id="maou")
     act = AgentTaskActivities(db_pool=db_pool, remote_script=_Connector(launch="failed"))
-    await act.launch_task_turn(_SESSION, "p", "pandoras-actor", False, "n", 60)
+    await act.launch_task_turn(_SESSION, "p", "sebas", False, "n", 60)
 
     row = await svc.get_session(db_pool, _TASK)
     assert row["last_output_file"] == "" and row["last_host"] == ""
@@ -790,7 +790,7 @@ async def test_a_failed_launch_records_no_run(db_pool, _task):
 async def test_a_later_turn_resumes_the_same_session():
     conn = _Connector()
     await AgentTaskActivities(remote_script=conn).launch_task_turn(
-        _SESSION, "and now implement", "pandoras-actor", True, "task 1", 30
+        _SESSION, "and now implement", "sebas", True, "task 1", 30
     )
     call = conn.launches[0]
     assert call["resume"] is True
@@ -801,7 +801,7 @@ async def test_a_later_turn_resumes_the_same_session():
 async def test_a_failed_launch_reports_the_error():
     conn = _Connector(launch="failed")
     out = await AgentTaskActivities(remote_script=conn).launch_task_turn(
-        _SESSION, "p", "pandoras-actor", False, "n", 60
+        _SESSION, "p", "sebas", False, "n", 60
     )
     assert out["status"] == "failed"
     assert "no such checkout" in out["error"]
@@ -809,7 +809,7 @@ async def test_a_failed_launch_reports_the_error():
 
 async def test_launch_without_a_connector_fails():
     out = await AgentTaskActivities(remote_script=None).launch_task_turn(
-        _SESSION, "p", "pandoras-actor", False, "n", 60
+        _SESSION, "p", "sebas", False, "n", 60
     )
     assert out["status"] == "failed"
     assert out["error"]
@@ -881,7 +881,7 @@ async def test_clarify_hands_a_session_task_over_and_stops_looking_at_it(db_pool
 
     assert _TASK in [r["id"] for r in await acts.find_unclassified_items(max_items=50)]
 
-    await svc.create_session(db_pool, task_id=_TASK, agent_id="pandoras-actor")
+    await svc.create_session(db_pool, task_id=_TASK, agent_id="maou")
 
     assert _TASK not in [r["id"] for r in await acts.find_unclassified_items(max_items=50)]
 

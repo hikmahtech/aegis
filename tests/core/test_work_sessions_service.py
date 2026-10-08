@@ -219,7 +219,7 @@ async def test_create_session_inherits_the_tasks_problem(db_pool, _clean):
 
     r = await ingest_event(
         db_pool,
-        Event(source="heartbeat", external_id=f"ws-{uuid.uuid4().hex[:8]}", kind="occurrence",
+        Event(source="flow_health", external_id=f"ws-{uuid.uuid4().hex[:8]}", kind="occurrence",
               title="down", klass="DockerServiceDown", subject=f"svc_{uuid.uuid4().hex[:6]}"),
     )
     await link_task(db_pool, r.problem_id, _TASK)

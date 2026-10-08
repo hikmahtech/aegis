@@ -37,7 +37,7 @@ class ConfigKey:
 
 
 # The user-facing integration config. Infra/bootstrap fields (db/temporal/admin/
-# paths/homelab/remote-script) are deliberately NOT here — they're env-only.
+# paths/remote-script) are deliberately NOT here — they're env-only.
 CONFIG_REGISTRY: list[ConfigKey] = [
     ConfigKey(
         "github_token", "Read-only API token (optional)", "GitHub", True,
@@ -58,8 +58,6 @@ CONFIG_REGISTRY: list[ConfigKey] = [
     ConfigKey("postiz_url", "Base URL", "Postiz", False),
     ConfigKey("postiz_api_key", "API key", "Postiz", True),
     ConfigKey("postiz_public_url", "Web UI URL (browser-facing)", "Postiz", False),
-    ConfigKey("vercel_token", "API token", "Vercel", True),
-    ConfigKey("vercel_team_id", "Team id", "Vercel", False),
     ConfigKey("elevenlabs_api_key", "API key", "Voice (ElevenLabs)", True),
     ConfigKey(
         "elevenlabs_stt_model", "Speech-to-text model", "Voice (ElevenLabs)", False,
@@ -115,23 +113,11 @@ CONFIG_REGISTRY: list[ConfigKey] = [
     ConfigKey("finance_indices", "Overview indices (comma-sep symbols)", "Finance", False),
     ConfigKey("aegis_stack_name", "Swarm stack name (blank = show all services)", "System Monitoring", False),
     ConfigKey(
-        "infra_cluster", "Infra cluster label (Prometheus `cluster` label)",
-        "System Monitoring", False,
-        help="Alerts whose cluster label equals this value route straight to infra-gitops, "
-        "skipping the LLM repo-match. Blank = alertname matching only. "
-        "Worker restart required; a set env var can only be overridden, not blanked, from here.",
-    ),
-    ConfigKey(
-        "infra_heartbeat_ping_url", "Heartbeat dead-man ping URL (healthchecks.io)",
-        "System Monitoring", True,
-        help="GET on every successful 2-min heartbeat tick; configure the check to alert "
-        "when pings stop. Blank = disabled. Worker restart required.",
-    ),
-    ConfigKey(
-        "slack_owner_member_id", "Slack member id for escalation mentions",
-        "System Monitoring", False,
-        help="Used to @-mention you on unacked critical infra cards (e.g. U0123456789). "
-        "Blank = escalate without mention. Worker restart required.",
+        "slack_owner_member_id", "Your Slack member id",
+        "Slack self-capture", False,
+        help="Your own Slack member id (e.g. U0123456789). The self-capture settings "
+        "below act only on messages from this id. Blank = self-capture is off. "
+        "Comms restart required.",
     ),
     ConfigKey(
         "slack_saveit_emoji", "Save-it reaction names (comma-sep, no colons)",
@@ -156,12 +142,6 @@ CONFIG_REGISTRY: list[ConfigKey] = [
     ),
     # Feature flags — enable/disable whole subsystems. Off by default unless noted.
     # `help` names the extra config a feature needs to actually work.
-    ConfigKey(
-        "homelab_enabled", "Homelab Guardian (swarm drift + cert radar)", "Features", False,
-        boolean=True,
-        help="Needs an infra registry entry for your Docker Swarm (Infra page) and, for cert-radar, "
-        "public domains (Sentry/Finance-style config or homelab_public_domains). Restart the worker after enabling.",
-    ),
     ConfigKey(
         "money_hygiene_enabled", "Money Hygiene (Maou: receipts, subscriptions)", "Features", False,
         boolean=True,

@@ -1,3 +1,0 @@
-# ClickHouseFailedQueries
-
-TODO: fill in

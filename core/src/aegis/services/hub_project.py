@@ -14,7 +14,7 @@ completion turns out to be the hub's own close from before a return, undoes
 What a projection does, in order:
 
 1. **Ensures the task** once the problem is worth a human's attention: any
-   projected status (§4) short of `resolved`, not suppressed, not muted. A
+   projected status (§4) short of `resolved`, not muted. A
    problem that is already over when it is first projected gets no task.
    Created through the same idempotent capture the chat tools use, with
    `external_id = problem-<id>`, so a retried projection finds its own task.
@@ -61,11 +61,9 @@ from aegis.services.hub import (
     QUESTION_CLASS,
     TASK_SUBJECT_KIND,
     TOPIC_CLASS,
-    _active_suppression,
     _aware,
     get_problem,
     set_status,
-    verify_seconds_for,
 )
 from aegis.services.settings_store import get_setting
 from aegis.services.todoist_config import resolve_todoist_api_key
@@ -80,24 +78,8 @@ SOURCE_TAG = "#alert"
 # too: such a task is the user's to act on, never the classifier's.
 MONEY_SOURCE_TAG = "#money"
 COLLAPSE_WINDOW = timedelta(minutes=30)
-# Statuses that earn a task. `suppressed` and `closed` never do.
-PROJECTED_STATUSES = frozenset(
-    {"open", "investigating", "waiting_human", "fixing", "resolved"}
-)
-# The two producers OUTSIDE AEGIS that send their own resolution: a monitoring
-# stack and the swarm heartbeat both re-check on a scale of seconds, so what
-# they raise may turn out to have been a blip, and only these wait out a settle
-# window before earning a task (#537).
-#
-# Every other source projects on sight, including the watchdogs that also
-# resolve their own findings (`flow_health`, `delivery`, `social`, `drift`,
-# `expiry`, `llm_governor`). They were in this set at first, which was a
-# mistake of kind rather than of degree: those sweeps run every 30 minutes or
-# hourly, so a three-minute window cannot observe a blip they would clear — it
-# can only delay the task. And they have already decided the thing is worth
-# reporting before the hub hears about it at all. The money, research and manual
-# sources are judgements that no amount of waiting makes truer.
-_SELF_CLEARING_SOURCES = frozenset({"alertmanager", "heartbeat"})
+# Statuses that earn a task. `closed` never does.
+PROJECTED_STATUSES = frozenset({"open", "investigating", "waiting_human", "resolved"})
 _BLOCK_RE = re.compile(r"<!-- aegis:problem [^>]*-->.*?<!-- /aegis:problem -->", re.S)
 _HISTORY_KINDS = frozenset({"investigation", "plan", "session_note"})
 # A plan of one step is a sentence, not a plan; more than this and the
@@ -140,19 +122,12 @@ class _Owner:
     books_entity: str = ""
 
 
-_INFRA_OWNER = _Owner(SOURCE_TAG, "infra")
 # The owner of a problem whose source has no entry in `_OWNER_BY_SOURCE`: the
-# generalist, who owns anything no other agent claims. It used to be the infra
-# owner; the infra agent is being retired from v1, and a task whose owner has no
-# holder gets no assignee label.
+# generalist, who owns anything no other agent claims. A task whose owner has
+# no holder gets no assignee label.
 _DEFAULT_OWNER = _Owner(SOURCE_TAG, GENERALIST_TAG)
-# The sources that raise infra or development problems keep the infra owner
-# until the lanes behind them are removed.
-_INFRA_SOURCES = ("alertmanager", "heartbeat", "drift", "investigation")
-# Problems another agent owns, by the source of their first occurrence. All 13
-# money problems in prod (2026-09-11) were projected as `#alert @pandora` in the
-# Inbox, and the agent sweep then ran Pandora's infra verb on them and parked
-# them. Money problems are Maou's: Maou raises them and the user acts.
+# Problems another agent owns, by the source of their first occurrence. Money
+# problems are Maou's: Maou raises them and the user acts.
 #
 # * `#money` comes first because the Todoist mirror takes the first `#` label
 #   as the task's source tag (`activities/todoist.py::_pick_source_tag`).
@@ -182,7 +157,6 @@ _OWNER_BY_SOURCE = {
     "money": _Owner(MONEY_SOURCE_TAG, "finance", ("@next",), "personal"),
     "research": _Owner(RESEARCH_SOURCE_TAG, "research", ("@next",)),
     "feeds": _Owner(FEEDS_SOURCE_TAG, "research", ("@next",)),
-    **dict.fromkeys(_INFRA_SOURCES, _INFRA_OWNER),
 }
 
 
@@ -195,7 +169,6 @@ def _ts(value: Any) -> str:
 def render_block(
     problem: dict[str, Any],
     *,
-    window: dict[str, Any] | None = None,
     links: list[dict[str, Any]] | None = None,
     sessions: list[dict[str, Any]] | None = None,
     steps: str = "",
@@ -216,9 +189,6 @@ def render_block(
             f"Group: every {problem['class']} on a {problem['subject_kind'] or 'subject'} · "
             "new ones join this problem"
         )
-    if window:
-        until = f"until {_ts(window['until_at'])}" if window.get("until_at") else "until cleared"
-        lines.append(f"Window: {window['state']} {until} (set by {window['set_by']})")
     refs = [
         f"{link['link_kind']}:{link['ref']}"
         for link in (links or [])
@@ -420,7 +390,7 @@ def merge_block(description: str | None, block: str) -> str:
     return (base.rstrip() + "\n\n" + block) if base.strip() else block
 
 
-async def _assignee_label(pool: asyncpg.Pool, tag: str = "infra") -> str:
+async def _assignee_label(pool: asyncpg.Pool, tag: str = GENERALIST_TAG) -> str:
     """The label that assigns the task to the agent holding ``tag`` — its first
     mention alias — or "" when no active agent holds it (logged: the task is
     then created with no assignee, and its GTD state label alone). Never
@@ -440,8 +410,7 @@ async def _assignee_label(pool: asyncpg.Pool, tag: str = "infra") -> str:
 
 async def _first_source(pool: asyncpg.Pool, problem_id: str) -> str:
     """The producer that raised the problem: the source of its FIRST
-    occurrence. Who owns the task and whether it may be a blip both follow
-    from it."""
+    occurrence. Who owns the task follows from it."""
     return str(
         await pool.fetchval(
             "SELECT source FROM problem_events "
@@ -751,9 +720,8 @@ async def project(
         return {"problem_id": problem_id, "skipped": "below_attention"}
 
     if not task_id and p["status"] == "resolved":
-        # It came and went before it earned a task: seen only inside a deploy
-        # window, or its inline projection failed and it recovered before the
-        # sweep. A task born closed tells nobody anything, so the events are
+        # It came and went before it earned a task: its inline projection
+        # failed and it recovered before the sweep. A task born closed tells nobody anything, so the events are
         # marked seen and nothing is created. Creating one moved the
         # watermark past the resolve, and that task never closed (#473). A
         # later occurrence reopens the problem, and THAT projects a task.
@@ -761,55 +729,6 @@ async def project(
         await _save_meta(pool, problem_id, meta)
         return {"problem_id": problem_id, "skipped": "resolved_without_task"}
 
-    if not task_id and p["status"] == "open":
-        # A blip earns no chore (#537). A quarter of every task the hub made in
-        # its first month was for a problem that was already over — a service
-        # that crash-looped for five minutes and came back on its own —
-        # created, clarified and auto-completed without a human ever acting on
-        # it. So a signal that can clear itself waits out its class's
-        # verification window before it is believed. This is the spec's §6
-        # threshold, unbuilt until now, measured in seconds rather than
-        # occurrences because a five-minute blip can occur five times.
-        #
-        # Nothing here has to come back for it: `list_projection_candidates`
-        # selects every open untasked problem outright, whatever its watermark,
-        # and the sweep runs every five minutes — so the task is late, never
-        # missing. One that resolves inside its window leaves through the
-        # branch above and never earns a task at all.
-        #
-        # Returning early writes no metadata at all, which is the point: the
-        # watermark still sits where the last projection left it, so the
-        # occurrence comments this problem has not been told about yet are
-        # still owed when a task finally exists.
-        #
-        # A recurrence is deliberately NOT held back. `reopen` leaves
-        # `first_seen_at` alone, so a problem that blipped, resolved untasked,
-        # and came back is already past its window and projects at once — the
-        # second episode is the evidence the first one lacked.
-        #
-        # That holds within `REOPEN_WINDOW` (24h), which is the whole of what it
-        # claims: a return after that is a `rollover`, a fresh problem with a
-        # fresh `first_seen_at`, so it waits out the window like any first
-        # sighting. "A return within a day of the resolve is a pattern" is the
-        # rule. Measuring age from the CURRENT episode instead would make a
-        # service that flaps every three minutes invisible forever.
-        #
-        # The investigation is untouched — Pandora diagnoses and posts its
-        # Slack card immediately. Only the human's chore waits.
-        settle = 0
-        if await _first_source(pool, problem_id) in _SELF_CLEARING_SOURCES:
-            settle = await verify_seconds_for(pool, str(p["class"]))
-        age = (now - _aware(p["first_seen_at"], now)).total_seconds()
-        if settle and age < settle:
-            return {
-                "problem_id": problem_id,
-                "skipped": "settling",
-                "settle_seconds": settle,
-                "age_seconds": int(age),
-            }
-
-    async with pool.acquire() as conn:
-        window = await _active_suppression(conn, p["subject"], p["subject_kind"], now)
     links = [
         dict(r)
         for r in await pool.fetch(
@@ -820,7 +739,6 @@ async def project(
     sessions = await work_sessions.list_for_task(pool, task_id) if task_id else []
     block = render_block(
         p,
-        window=dict(window) if window else None,
         links=links,
         sessions=sessions,
         steps=await _step_progress(pool, problem_id),
@@ -996,8 +914,7 @@ async def project(
     if progress and f"Steps: {progress}" not in block:
         block = render_block(
             p,
-            window=dict(window) if window else None,
-            links=links,
+                links=links,
             sessions=sessions,
             steps=progress,
         )

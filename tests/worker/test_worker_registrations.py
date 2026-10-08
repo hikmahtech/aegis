@@ -15,7 +15,7 @@ from aegis_worker.registry import expected_activity_names, workflows_for
 
 # Prod settings: both feature flags on.
 _PROD = SimpleNamespace(
-    homelab_enabled=True, money_hygiene_enabled=True, trading_desk_enabled=True
+    money_hygiene_enabled=True, trading_desk_enabled=True
 )
 
 
@@ -181,10 +181,10 @@ def test_agent_task_registrations_reach_the_worker():
     `check_registration()` refusing to boot on any disagreement (proved in
     tests/worker/test_registry.py).
 
-    What remains worth pinning here: these twenty names — the seventeen
-    agent_task registrations plus the three infra_ops ones added alongside the
-    infra verb, the restart-approval hook, the email verb and the finance verb —
-    are the activity names the worker serves. A rename or a dropped
+    What remains worth pinning here: these names — the agent_task
+    registrations for the email and finance verbs, the coding lane and the
+    `plan_infra_task` stub kept one release for replays — are the activity
+    names the worker serves. A rename or a dropped
     @activity.defn still breaks the flows that call them by name.
 
     The one-shot coding verb (`run_task_investigation` / `collect_coding_run` /
@@ -202,7 +202,6 @@ def test_agent_task_registrations_reach_the_worker():
         "park_task",
         "complete_task",
         "comment",
-        "apply_restart_approval",
         "triage_email",
         "merchant_history",
         "apply_finance_decision",
@@ -218,8 +217,5 @@ def test_agent_task_registrations_reach_the_worker():
         "record_plan",
         "prepare_agent_ask",
         "plan_infra_task",
-        "service_health",
-        "service_logs",
-        "restart_service",
     ):
         assert expected in served, f"{expected} is not an activity the worker serves"

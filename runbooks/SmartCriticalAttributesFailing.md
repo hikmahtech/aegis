@@ -1,3 +1,0 @@
-# SmartCriticalAttributesFailing
-
-TODO: fill in

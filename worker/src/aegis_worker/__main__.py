@@ -22,8 +22,6 @@ from temporalio.worker import Worker
 from aegis_worker.activities.agent_registry import AgentRegistryActivities
 from aegis_worker.activities.agent_run import AgentRunActivities
 from aegis_worker.activities.agent_task import AgentTaskActivities
-from aegis_worker.activities.alert_governance import AlertGovernanceActivities
-from aegis_worker.activities.alerts import AlertActivities
 from aegis_worker.activities.briefing import BriefingActivities
 from aegis_worker.activities.calendar import CalendarActivities
 from aegis_worker.activities.calibre import CalibreActivities
@@ -42,9 +40,7 @@ from aegis_worker.activities.expiring_items import ExpiringItemsActivities
 from aegis_worker.activities.flow_health import FlowHealthActivities
 from aegis_worker.activities.github_signals import GitHubSignalsActivities
 from aegis_worker.activities.gmail import GmailActivities
-from aegis_worker.activities.homelab import HomelabActivities
 from aegis_worker.activities.hub import HubActivities
-from aegis_worker.activities.infra_ops import InfraOpsActivities
 from aegis_worker.activities.intel_scan import IntelScanActivities
 from aegis_worker.activities.intelligence import IntelligenceActivities
 from aegis_worker.activities.interactions import InteractionActivities
@@ -164,16 +160,15 @@ async def main():
     research_agent = await resolve_tag(deps.pool, "research") or ""
     if not research_agent:
         logger.warning("research_agent_unresolved", tag="research")
-    # The same for the GTD, infra and finance owners (#579): the agent each
+    # The same for the GTD and finance owners (#579): the agent each
     # activity class below stamps on its llm_calls rows and speaks as — never
     # a dataclass default naming an example agent. "" when nobody holds the
     # tag: the rows record no agent and a message goes to comms' default.
     # Resolved at boot like the research lane, so a changed tag applies on the
     # next worker restart.
     gtd_agent = await resolve_tag(deps.pool, "gtd") or ""
-    infra_agent = await resolve_tag(deps.pool, "infra") or ""
     finance_agent = await resolve_tag(deps.pool, "finance") or ""
-    for tag, holder in (("gtd", gtd_agent), ("infra", infra_agent), ("finance", finance_agent)):
+    for tag, holder in (("gtd", gtd_agent), ("finance", finance_agent)):
         if not holder:
             logger.warning("agent_tag_unresolved_at_boot", tag=tag)
     # The one User-Agent AEGIS's fetches send, naming this deployment's
@@ -189,26 +184,6 @@ async def main():
         model=model_balanced,
         # Signals a retired decision card's waiting flow so its run ends (#629).
         temporal_client=client,
-    )
-    alert_governance_act = AlertGovernanceActivities(
-        db_pool=deps.pool,
-        remote_script=connectors.get("remote_script"),
-    )
-
-    alert_act = AlertActivities(
-        db_pool=deps.pool,
-        llm_client=deps.llm,
-        knowledge_connector=connectors.get("knowledge"),
-        remote_script=connectors.get("remote_script"),
-        model_balanced=model_balanced,
-        kimi_binary=getattr(settings, "kimi_cli_binary_path", "") or "",
-        claude_personal_config_dir=getattr(settings, "claude_personal_config_dir", "") or "",
-        runbooks_dir=getattr(settings, "runbooks_dir", "/app/runbooks") or "",
-        homelab_connector=connectors.get("homelab"),
-        temporal_ui_url=getattr(settings, "temporal_ui_url", "") or "",
-        temporal_namespace=temporal_namespace,
-        infra_cluster=getattr(settings, "infra_cluster", "") or "",
-        slack_owner_member_id=getattr(settings, "slack_owner_member_id", "") or "",
     )
     briefing_act = BriefingActivities(
         db_pool=deps.pool,
@@ -283,17 +258,6 @@ async def main():
     # AEGIS's own card delivery and comms inbound, not the homelab. Its cards
     # speak as the generalist (`gtd` holder).
     watchdog_act = WatchdogActivities(db_pool=deps.pool, delivery=delivery_act, agent_id=gtd_agent)
-
-    homelab_act = None
-    if settings.homelab_enabled:
-        homelab_act = HomelabActivities(
-            db_pool=deps.pool,
-            homelab=connectors.get("homelab"),
-            delivery=delivery_act,
-            heartbeat_ping_url=getattr(settings, "infra_heartbeat_ping_url", "") or "",
-            infra_cluster=getattr(settings, "infra_cluster", "") or "",
-            agent_id=infra_agent,
-        )
 
     money_act = None
     if settings.money_hygiene_enabled:
@@ -566,19 +530,12 @@ async def main():
         db_pool=deps.pool,
         todoist_connector=todoist_connector,
         remote_script=connectors.get("remote_script"),
-        homelab_connector=connectors.get("homelab"),
+        # resolve_task_repo's tier 2 asks the balanced tier to pick a repo.
+        llm_client=deps.llm,
+        model=model_balanced,
     )
-    infra_ops_act = InfraOpsActivities(homelab_connector=connectors.get("homelab"))
     expiring_items_act = ExpiringItemsActivities(db_pool=deps.pool)
     flow_health_act = FlowHealthActivities(db_pool=deps.pool, delivery=delivery_act)
-    # apply_restart_approval runs as an AgentTask activity but needs the infra
-    # ops. Mirrors the existing `alert_act.todoist_connector = todoist_connector`
-    # late-wiring below.
-    agent_task_act.infra_ops = infra_ops_act
-    # resolve_task_repo's tier 2 reuses alert_act.resolve_alert_resource
-    # directly (same direct-call pattern as gmail_activities.apply_label
-    # below). alert_act is constructed above, well before agent_task_act.
-    agent_task_act.alert_act = alert_act
     # triage_email needs GmailActivities.apply_label plus the set of accounts
     # to probe. Active email channels are the Gmail accounts to probe. Read
     # them from the channels table (kind='email', active) — config->>'label'
@@ -592,10 +549,6 @@ async def main():
             "WHERE kind = 'email' AND active AND config->>'label' IS NOT NULL"
         )
     ]
-    # AlertInvestigationFlow posts start- and final-comments on the Todoist
-    # track-task via alert_act.post_task_note. The dataclass declared
-    # todoist_connector=None upstream; wire the live connector now.
-    alert_act.todoist_connector = todoist_connector
     clarify_act = ClarifyActivities(
         db_pool=deps.pool,
         todoist_connector=todoist_connector,
@@ -621,8 +574,8 @@ async def main():
         client=CoreClient(
             base_url=getattr(settings, "core_api_url", "http://localhost:8080"),
             api_key=getattr(settings, "api_key", ""),
-            # ChatActivities.synthesize_reply covers smart-tier agents
-            # (pandoras-actor on claude-sonnet) with heavy tool calls —
+            # ChatActivities.synthesize_reply covers smart-tier agents with
+            # heavy tool calls —
             # remote_script kimi SSH, deep KS search — that legitimately
             # take 3-6 min wall time. Aligns below the activity-level
             # TIMEOUT_CHAT_REPLY (600s) with headroom; the chat-reply
@@ -639,8 +592,6 @@ async def main():
     activities = collect_activities(
         hub_act,
         agent_registry_act,
-        alert_governance_act,
-        alert_act,
         briefing_act,
         delivery_act,
         content_act,
@@ -681,12 +632,10 @@ async def main():
         inventory_act,
         agent_run_act,
         agent_task_act,
-        infra_ops_act,
         expiring_items_act,
         flow_health_act,
         watchdog_act,
         # None when their feature flag is off — collect_activities skips those.
-        homelab_act,
         money_act,
     )
 
@@ -727,15 +676,8 @@ async def main():
     # TracingInterceptor propagates OTel context across workflow/activity
     # boundaries so a Comms → Core → Worker waterfall stays connected.
     #
-    # max_concurrent_activities=10: backstop against infra-alert storms.
-    # alertmanager mints a fresh fingerprint per (alertname, instance), so a
-    # single outage (N nodes/services down) can dispatch N concurrent
-    # AlertInvestigationFlows all hammering the LiteLLM proxy simultaneously
-    # (whose backends may be the same infra that's down). Capping at 10
-    # queues bursts rather than letting them saturate the proxy. The problem
-    # hub's correlation key is the primary storm-collapse fix — a storm of one
-    # outage is one problem and one investigation — and this cap is the safety
-    # net for a burst of genuinely different problems.
+    # max_concurrent_activities=10: a backstop so a burst of model-bound
+    # activities queues rather than saturating the LiteLLM proxy.
     worker = Worker(
         client,
         task_queue=TASK_QUEUE,

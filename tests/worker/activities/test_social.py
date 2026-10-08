@@ -12,7 +12,6 @@ import respx
 from aegis.config import Settings
 from aegis.connectors.social import SocialConnector
 from aegis.crypto import decrypt_secret, encrypt_secret
-from aegis.services.hub import mute_problem
 from aegis_worker.activities.social import (
     CLOSE_ACTION,
     SocialActivities,
@@ -33,6 +32,17 @@ _TEST_REQUIRED_SETTINGS: dict = {
     "api_key": "k",
     "n8n_webhook_secret": "test-secret",
 }
+
+
+async def mute_problem(pool, problem_id: str, *, hours: float, by: str) -> None:
+    """A mute set before the infra lane left (its endpoint went with it):
+    `muted_until` is still honoured on ingest until it runs out."""
+    await pool.execute(
+        "UPDATE problems SET muted_until = now() + make_interval(hours => $2) "
+        "WHERE id = $1::uuid",
+        problem_id,
+        int(hours),
+    )
 
 _SETTINGS_KEYS = [
     "social_publishing_enabled",
@@ -2030,7 +2040,7 @@ async def test_stuck_alert_fires_once_not_on_every_sweep(stuck_env):
         )
         == 1
     )
-    assert "Silence: admin Problems page" in delivery.sent[0]
+    assert "Silence:" not in delivery.sent[0]  # the mute endpoint left with the infra lane
 
 
 async def test_stuck_alert_card_names_the_post_and_its_state(stuck_env):

@@ -615,27 +615,3 @@ def _isolate_model_tiers():
     yield
     _tier_mod._TIERS.clear()
     _tier_mod._TIERS.update(saved)
-
-
-@pytest_asyncio.fixture(loop_scope="function")
-async def infra_agent_active(db_pool):
-    """The infra agent, active for one test. Migration 054 retired it, but the
-    infra lane's code stays until the removal PRs delete it, and its tests
-    still pin how that code routes to the `infra` holder."""
-    def _drop_cache() -> None:
-        # The worker's clarify caches the active agents for 30s; an earlier
-        # test may have filled it while the agent was inactive. Core tests run
-        # without the worker package.
-        try:
-            from aegis_worker.activities import clarify
-        except ImportError:
-            return
-        clarify._agent_reg_cache.update(reg=None, ts=0.0)
-
-    await db_pool.execute("UPDATE agents SET active = true WHERE id = 'pandoras-actor'")
-    _drop_cache()
-    try:
-        yield
-    finally:
-        await db_pool.execute("UPDATE agents SET active = false WHERE id = 'pandoras-actor'")
-        _drop_cache()

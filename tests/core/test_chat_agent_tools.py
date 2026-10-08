@@ -9,9 +9,10 @@ from aegis.services.chat import (
 
 
 def test_seed_agents_have_tool_sets_defined():
-    """The 4 seed agents ship with tool sets — but the dict is NOT locked to
+    """The 3 seed agents ship with tool sets — but the dict is NOT locked to
     only them (a DB-created agent supplies its own via metadata.tool_set)."""
-    assert {"sebas", "raphael", "pandoras-actor", "maou"} <= set(AGENT_TOOL_SETS.keys())
+    assert {"sebas", "raphael", "maou"} <= set(AGENT_TOOL_SETS.keys())
+    assert "pandoras-actor" not in AGENT_TOOL_SETS
 
 
 def test_agent_tool_sets_are_subsets_of_executors():
@@ -32,27 +33,6 @@ def test_raphael_has_research_tools():
     tools = AGENT_TOOL_SETS["raphael"]
     assert "research_topic" in tools
     assert "search_knowledge" in tools
-
-
-def test_pandoras_actor_has_infra_tools():
-    tools = AGENT_TOOL_SETS["pandoras-actor"]
-    assert "trigger_workflow" in tools
-    assert "run_infra_script" in tools
-    # Swarm (swarm homelab):
-    assert "list_nodes" in tools
-    assert "list_services" in tools
-    assert "inspect_service" in tools
-    assert "get_service_logs" in tools
-    assert "restart_service" in tools
-    # k8s + ArgoCD (acme):
-    assert "list_pods" in tools
-    assert "list_deployments" in tools
-    assert "get_pod_logs" in tools
-    assert "list_argocd_apps" in tools
-    assert "sync_argocd_app" in tools
-    # Out-of-domain tools must NOT be in pandora's set:
-    assert "get_quote" not in tools
-    assert "research_topic" not in tools
 
 
 def test_maou_has_finance_tools():
@@ -114,15 +94,6 @@ def test_tool_count_reduction():
     total = len(TOOL_EXECUTORS)
     for agent_id, tools in AGENT_TOOL_SETS.items():
         assert len(tools) < total, f"{agent_id} sees all {total} tools"
-
-
-def test_pandora_has_vercel_tools():
-    """Pandora is the only agent with the 4 vercel_* tools (read-only)."""
-    pandora = AGENT_TOOL_SETS["pandoras-actor"]
-    assert "vercel_get_project" in pandora
-    assert "vercel_list_deployments" in pandora
-    assert "vercel_get_deployment" in pandora
-    assert "vercel_get_build_logs" in pandora
 
 
 def test_other_agents_do_not_have_vercel_tools():

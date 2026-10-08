@@ -85,7 +85,7 @@ UNBLOCK_ADD = "@next"
 #: purpose: this is a SAFETY guard, and it must still hold when the DB is
 #: unreachable or an agent row has been renamed. A stale extra entry here costs
 #: a skipped unblock; a missing one costs re-queued agent work.
-UNBLOCK_SKIP_LABELS = ("@sebas", "@raphael", "@maou", "@pandora")
+UNBLOCK_SKIP_LABELS = ("@sebas", "@raphael", "@maou")
 
 
 def blocks_unblock(labels: list[str] | None) -> str | None:

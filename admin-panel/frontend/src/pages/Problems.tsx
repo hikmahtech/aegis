@@ -1,9 +1,7 @@
 import { useEffect, useState } from 'react';
 import { api } from '../api/client';
-import RestartWindowPanel from '../components/RestartWindowPanel';
 
-// What the problem hub currently thinks is wrong, and the deploy or
-// maintenance windows that are keeping it quiet.
+// What the problem hub currently thinks is wrong.
 //
 // Every mutation here calls the same hub function the chat tools and the
 // worker call (`/api/admin/problems/{id}/...`), so the page cannot drift into
@@ -12,7 +10,7 @@ import RestartWindowPanel from '../components/RestartWindowPanel';
 // this page changes.
 
 const STATUSES = [
-  'open', 'investigating', 'waiting_human', 'fixing', 'suppressed', 'resolved',
+  'open', 'investigating', 'waiting_human', 'resolved',
 ];
 
 const SEVERITY_ORDER: Record<string, number> = {
@@ -44,11 +42,9 @@ const eventLabel = (e: any): string => {
 // written by `hub_project._note_projection`). One task per problem is the rule;
 // this is what stands in for it until the task exists.
 const NO_TASK_REASON: Record<string, string> = {
-  settling: 'settling — waits out its class\'s verification window before it earns a task',
   task_pending_outbox: 'task queued in the Todoist outbox',
   resolved_without_task: 'resolved before it earned a task',
   below_attention: 'below the topic\'s attention threshold',
-  muted: 'muted — nothing projected until the mute lapses',
   no_task: 'capture failed — the sweep retries',
 };
 
@@ -67,10 +63,7 @@ function TaskState({ p }: { p: any }) {
   const key = id ? 'task_pending_outbox' : proj.skipped;
   if (!key) return <span title="The five-minute sweep has not judged this one yet.">no task yet</span>;
   const why = NO_TASK_REASON[key] || `no task (${key})`;
-  const detail = key === 'settling' && proj.settle_seconds
-    ? ` (${Math.round(proj.settle_seconds / 60)} min, ${Math.round((proj.age_seconds || 0) / 60)} in)`
-    : '';
-  return <span title={proj.at ? `since ${ts(proj.at)}` : undefined}>{why}{detail}</span>;
+  return <span title={proj.at ? `since ${ts(proj.at)}` : undefined}>{why}</span>;
 }
 
 const eventText = (e: any): string => {
@@ -82,181 +75,8 @@ const eventText = (e: any): string => {
   return String(p.text || p.summary || p.reason || p.title || '').slice(0, 400);
 };
 
-// The hub's own configuration, which used to be reachable only by raw SQL.
-//
-// Both of these are setup-specific by nature — how long YOUR services take to
-// prove themselves, what YOUR cluster is and which repo holds its config — so
-// they belong in the database rather than in code, and a database row nobody
-// can edit without psql is only half the job (PR #559).
-function HubConfig({ onError }: { onError: (msg: string) => void }) {
-  const [settle, setSettle] = useState<any>(null);
-  const [rows, setRows] = useState<Array<[string, string]>>([]);
-  const [routing, setRouting] = useState<any>(null);
-  const [repo, setRepo] = useState('');
-  const [hint, setHint] = useState('');
-  const [extra, setExtra] = useState('');
-  const [saved, setSaved] = useState('');
-  const [open, setOpen] = useState(false);
-
-  const load = async () => {
-    try {
-      const s = await api.getHubSettleSeconds();
-      setSettle(s);
-      setRows(Object.entries(s.overrides ?? {}).map(([k, v]) => [k, String(v)]));
-      const r = await api.getInfraAlertRouting();
-      setRouting(r);
-      setRepo(r.repo ?? '');
-      setHint(r.platform_hint ?? '');
-      setExtra((r.extra_alertnames ?? []).join('\n'));
-    } catch (e) {
-      onError((e as Error).message);
-    }
-  };
-
-  useEffect(() => {
-    if (open && settle === null) void load();
-  }, [open]);
-
-  const saveSettle = async () => {
-    const overrides: Record<string, number> = {};
-    for (const [k, v] of rows) {
-      if (!k.trim()) continue;
-      overrides[k.trim()] = Number(v);
-    }
-    try {
-      const out = await api.saveHubSettleSeconds(overrides);
-      setSettle(out);
-      setRows(Object.entries(out.overrides ?? {}).map(([k, v]) => [k, String(v)]));
-      setSaved('Settle windows saved. The worker picks them up on its next read.');
-    } catch (e) {
-      onError((e as Error).message);
-    }
-  };
-
-  const saveRouting = async () => {
-    try {
-      const out = await api.saveInfraAlertRouting({
-        repo: repo.trim(),
-        platform_hint: hint.trim(),
-        extra_alertnames: extra.split('\n').map(s => s.trim()).filter(Boolean),
-      });
-      setRouting(out);
-      setSaved('Alert routing saved. The worker re-reads it within 30 seconds.');
-    } catch (e) {
-      onError((e as Error).message);
-    }
-  };
-
-  return (
-    <div className="card" style={{ marginBottom: '1rem' }}>
-      <div className="section-header-row">
-        <h3 style={{ marginBottom: 0 }}>Hub configuration</h3>
-        <button type="button" className="btn" style={{ fontSize: 11 }} onClick={() => setOpen(!open)}>
-          {open ? 'Hide' : 'Show'}
-        </button>
-      </div>
-
-      {!open && (
-        <span className="meta">
-          Settle windows, the infra repo, and what to tell an investigation about this cluster.
-        </span>
-      )}
-
-      {open && settle && (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-          {saved && <div className="meta">{saved}</div>}
-
-          <div>
-            <h4 style={{ marginBottom: 4 }}>Settle windows</h4>
-            <p className="meta" style={{ marginTop: 0 }}>
-              How long a problem of this class must keep failing before it earns a Todoist task —
-              and, deliberately, how long an investigation waits before spending effort on it. One
-              number, two jobs: shortening a class does both. Default{' '}
-              <code>{settle.default_seconds}s</code>; a class not listed here uses its built-in
-              value ({Object.entries(settle.defaults ?? {}).map(([k, v]) => `${k} ${v}s`).join(', ')}).
-              Use <code>{settle.wildcard}</code> for every class at once. Max{' '}
-              <code>{settle.max_seconds}s</code> — longer than that is a mute, not a window.
-            </p>
-            {rows.map(([k, v], i) => (
-              <div key={i} style={{ display: 'flex', gap: 6, marginBottom: 4 }}>
-                <input
-                  value={k}
-                  placeholder="problem class (e.g. dockerservicedown)"
-                  style={{ flex: 2 }}
-                  onChange={e => setRows(rows.map((r, j) => (j === i ? [e.target.value, r[1]] : r)))}
-                />
-                <input
-                  type="number"
-                  value={v}
-                  min={0}
-                  max={settle.max_seconds}
-                  style={{ width: 110 }}
-                  onChange={e => setRows(rows.map((r, j) => (j === i ? [r[0], e.target.value] : r)))}
-                />
-                <button
-                  type="button"
-                  className="btn"
-                  style={{ fontSize: 11 }}
-                  onClick={() => setRows(rows.filter((_, j) => j !== i))}
-                >
-                  Remove
-                </button>
-              </div>
-            ))}
-            <div style={{ display: 'flex', gap: 6, marginTop: 4 }}>
-              <button type="button" className="btn" style={{ fontSize: 11 }}
-                onClick={() => setRows([...rows, ['', '0']])}>
-                Add class
-              </button>
-              <button type="button" className="btn btn-primary" style={{ fontSize: 11 }}
-                onClick={saveSettle}>
-                Save settle windows
-              </button>
-            </div>
-          </div>
-
-          <RestartWindowPanel />
-
-          <div>
-            <h4 style={{ marginBottom: 4 }}>Infra alerts</h4>
-            <p className="meta" style={{ marginTop: 0 }}>
-              Which alerts have no application code behind them, and where their config lives.
-            </p>
-            <label style={{ display: 'block', marginBottom: 6 }}>
-              <span className="meta">Infra repo (owner/name)</span>
-              <input value={repo} placeholder="acme/infra-gitops" style={{ width: '100%' }}
-                onChange={e => setRepo(e.target.value)} />
-            </label>
-            <label style={{ display: 'block', marginBottom: 6 }}>
-              <span className="meta">
-                About this cluster — put in front of every infra investigation. AEGIS names no
-                orchestrator of its own, so say what yours is and how to read it.
-              </span>
-              <textarea value={hint} rows={3} style={{ width: '100%' }}
-                placeholder="This cluster is Docker Swarm. Read it with `docker --context swarm node ls`…"
-                onChange={e => setHint(e.target.value)} />
-            </label>
-            <label style={{ display: 'block', marginBottom: 6 }}>
-              <span className="meta">
-                Extra infra alertnames, one per line — added to the {routing?.default_alertnames?.length ?? 0} built in
-              </span>
-              <textarea value={extra} rows={3} style={{ width: '100%', fontFamily: 'monospace', fontSize: 12 }}
-                onChange={e => setExtra(e.target.value)} />
-            </label>
-            <button type="button" className="btn btn-primary" style={{ fontSize: 11 }}
-              onClick={saveRouting}>
-              Save alert routing
-            </button>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
 export default function Problems() {
   const [problems, setProblems] = useState<any[]>([]);
-  const [windows, setWindows] = useState<any[]>([]);
   const [counts, setCounts] = useState<any>(null);
   const [loading, setLoading] = useState(true);
   const [status, setStatus] = useState('');
@@ -266,18 +86,15 @@ export default function Problems() {
   const [busy, setBusy] = useState('');
   const [error, setError] = useState('');
   const [mergeInto, setMergeInto] = useState('');
-  const [windowForm, setWindowForm] = useState({ subject: '', state: 'maintenance', minutes: 30, note: '' });
 
   const load = () => {
     setLoading(true);
     Promise.all([
       api.listProblems({ status: status || undefined, includeClosed }),
-      api.listServiceState(),
       api.problemDigest(24),
     ])
-      .then(([p, w, d]) => {
+      .then(([p, d]) => {
         setProblems(p.problems || []);
-        setWindows(w.windows || []);
         setCounts(d.counts || null);
       })
       .catch(err => setError(err.message || 'Could not load problems'))
@@ -331,95 +148,6 @@ export default function Problems() {
 
       {error && <div className="form-error">{error}</div>}
 
-      <HubConfig onError={msg => setError(msg)} />
-
-      {/* Deploy and maintenance windows. While one is in force the hub records
-          what it sees for that subject and raises nothing. */}
-      <div className="card" style={{ marginBottom: '1rem' }}>
-        <div className="section-header-row">
-          <h3 style={{ marginBottom: 0 }}>Service state</h3>
-          <span className="meta">
-            {windows.length ? `${windows.length} window${windows.length === 1 ? '' : 's'} in force` : 'nothing suppressed'}
-          </span>
-        </div>
-        <div>
-          {windows.map(w => (
-            <div
-              key={`${w.subject_kind}:${w.subject}`}
-              style={{ display: 'flex', gap: 12, alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}
-            >
-              <div>
-                <code>{w.subject}</code> <span className="badge badge-type">{w.state}</span>{' '}
-                <span className="meta">
-                  {w.until_at ? `until ${ts(w.until_at)}` : 'until cleared'} · set by {w.set_by}
-                  {w.note ? ` · ${w.note}` : ''}
-                </span>
-              </div>
-              <button
-                className="btn btn-sm"
-                disabled={busy !== ''}
-                onClick={() => act(() => api.setServiceState({ subject: w.subject, subject_kind: w.subject_kind, state: 'ok' }), 'clear')}
-              >
-                Clear
-              </button>
-            </div>
-          ))}
-          <div className="form-row" style={{ marginTop: windows.length ? '0.75rem' : 0 }}>
-            <div className="form-group" style={{ flex: 2 }}>
-              <label>Subject</label>
-              <input
-                className="mono"
-                value={windowForm.subject}
-                onChange={e => setWindowForm({ ...windowForm, subject: e.target.value })}
-                placeholder="swarm service or node, or * for everything"
-              />
-            </div>
-            <div className="form-group">
-              <label>State</label>
-              <select value={windowForm.state} onChange={e => setWindowForm({ ...windowForm, state: e.target.value })}>
-                <option value="maintenance">maintenance</option>
-                <option value="deploying">deploying</option>
-                <option value="degraded">degraded</option>
-              </select>
-            </div>
-            <div className="form-group">
-              <label>Minutes</label>
-              <input
-                type="number"
-                value={windowForm.minutes}
-                onChange={e => setWindowForm({ ...windowForm, minutes: parseInt(e.target.value, 10) || 0 })}
-              />
-            </div>
-            <div className="form-group" style={{ flex: 2 }}>
-              <label>Note</label>
-              <input
-                value={windowForm.note}
-                onChange={e => setWindowForm({ ...windowForm, note: e.target.value })}
-                placeholder="why — shown on every problem it suppresses"
-              />
-            </div>
-            <div className="form-group" style={{ alignSelf: 'flex-end' }}>
-              <button
-                className="btn btn-primary"
-                disabled={busy !== '' || !windowForm.subject.trim()}
-                onClick={() => act(async () => {
-                  await api.setServiceState({
-                    subject: windowForm.subject.trim(),
-                    subject_kind: windowForm.subject.trim() === '*' ? '*' : 'service',
-                    state: windowForm.state,
-                    minutes: windowForm.minutes,
-                    note: windowForm.note,
-                  });
-                  setWindowForm({ ...windowForm, subject: '', note: '' });
-                }, 'window')}
-              >
-                Open window
-              </button>
-            </div>
-          </div>
-        </div>
-      </div>
-
       <div className="filter-bar">
         <select value={status} onChange={e => setStatus(e.target.value)}>
           <option value="">Every status</option>
@@ -463,7 +191,6 @@ export default function Problems() {
                   ? `every ${p.class} on a ${p.subject_kind || 'subject'}`
                   : `${p.subject || '—'} (${p.subject_kind || '—'}) · class ${p.class}`} ·{' '}
                 seen {p.occurrences}× · last {ago(p.last_seen_at)}
-                {p.muted_until && new Date(p.muted_until) > new Date() ? ` · muted until ${ts(p.muted_until)}` : ''}
                 {' · '}<TaskState p={p} />
               </div>
             </div>
@@ -476,14 +203,6 @@ export default function Problems() {
               {detail && detail.problem && detail.problem.id === p.id && (
                 <>
                   <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 6 }}>
-                    <button
-                      className="btn btn-sm"
-                      disabled={busy !== ''}
-                      title="Stop raising this for 24 hours. Occurrences are still recorded and still counted; nothing is investigated and nothing is commented until it lapses."
-                      onClick={() => act(() => api.muteProblem(p.id, 24), 'mute')}
-                    >
-                      Mute 24h
-                    </button>
                     <button
                       className="btn btn-sm"
                       disabled={busy !== '' || p.status === 'resolved'}
@@ -527,13 +246,6 @@ export default function Problems() {
                   <p className="meta">
                     <code>{p.id}</code> · first seen {ts(p.first_seen_at)} · key <code>{p.correlation_key || '(uncorrelated)'}</code>
                   </p>
-
-                  {detail.window && (
-                    <p className="meta">
-                      Suppressed by <strong>{detail.window.state}</strong> on <code>{detail.window.subject}</code>,
-                      {detail.window.until_at ? ` until ${ts(detail.window.until_at)}` : ' until cleared'} (set by {detail.window.set_by}).
-                    </p>
-                  )}
 
                   {detail.links.length > 0 && (
                     <p className="meta">

@@ -722,8 +722,8 @@ async def test_on_status_renders_failures_and_pending_first():
         "llm_calls": 42,
         "llm_tokens": 12345,
         "pending_interactions": 3,
+        # An older core still sends the heartbeat's list; comms ignores it now.
         "infra_stuck": ["homelab-gitops"],
-        "infra_confirmed": [],
     }
 
     summary = await inbound.on_status()
@@ -735,7 +735,7 @@ async def test_on_status_renders_failures_and_pending_first():
     assert "RssIngestFlow" in summary
     assert "timeout" in summary
     assert "Pending on you:* 3" in summary
-    assert "homelab-gitops" in summary
+    assert "homelab-gitops" not in summary and "Infra stuck" not in summary
     assert "42" in summary
     assert "12,345" in summary
     # Failures + pending must appear before the raw run/token counts.
@@ -752,8 +752,6 @@ async def test_on_status_no_failures_or_pending():
         "llm_calls": 5,
         "llm_tokens": 100,
         "pending_interactions": 0,
-        "infra_stuck": [],
-        "infra_confirmed": [],
     }
 
     summary = await inbound.on_status()

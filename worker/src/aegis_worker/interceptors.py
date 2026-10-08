@@ -122,7 +122,7 @@ def _extract_todoist_task_ref(args: tuple[Any, ...]) -> str | None:
     """Pull todoist_task_id off the first argument when present.
 
     Supported shapes:
-      - dict input (e.g. AlertInvestigationFlow's `alert` dict).
+      - dict input carrying a `todoist_task_id` key.
       - dataclass input with a `todoist_task_id` attribute.
 
     None when the workflow has no task anchor — the column on

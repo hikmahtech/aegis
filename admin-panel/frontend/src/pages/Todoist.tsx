@@ -97,7 +97,7 @@ const _PROJECT_KEYS = ['inbox'] as const;
 // Label grouping for the read-only Labels panel — matches the GTD label scheme
 // documented in CLAUDE.md (personalities, GTD state, contexts, everything else).
 const _LABEL_GROUPS: { title: string; names: string[] }[] = [
-  { title: 'Personalities / assignees', names: ['@me', '@sebas', '@raphael', '@maou', '@pandora'] },
+  { title: 'Personalities / assignees', names: ['@me', '@sebas', '@raphael', '@maou'] },
   { title: 'GTD state', names: ['@next', '@someday', '@waiting', '@reference'] },
   { title: 'Contexts', names: ['@5min', '@deep', '@code', '@email', '@phone', '@errand', '@reading', '@home', '@office'] },
 ];
@@ -141,7 +141,7 @@ export default function Todoist() {
   const [gtd, setGtd] = useState<any>(null);
   const [savingGtd, setSavingGtd] = useState(false);
 
-  // Content routes (regex/prefix/contains on task title → assignee/labels/gate)
+  // Content routes (regex/prefix/contains on task title → assignee/labels)
   const [routes, setRoutes] = useState<any[]>([]);
   const [matchModes, setMatchModes] = useState<string[]>(['prefix', 'contains', 'regex']);
   const [savingRoutes, setSavingRoutes] = useState(false);
@@ -252,8 +252,8 @@ export default function Todoist() {
   }
   function addRoute() {
     setRoutes(rs => [...rs, {
-      key: '', match: 'prefix', value: '', assignee: '@pandora', contexts: [],
-      area_label: null, gate: true, service: null, resource_tags: [],
+      key: '', match: 'prefix', value: '', assignee: '', contexts: [],
+      area_label: null,
     }]);
   }
   function removeRoute(i: number) {
@@ -297,8 +297,8 @@ export default function Todoist() {
         // Never auto-applied — add a new editable row pre-filled with the draft
         // (regex mode). The user edits + previews before Save.
         setRoutes(rs => [...rs, {
-          key: '', match: 'regex', value: s.pattern, assignee: '@pandora', contexts: [],
-          area_label: null, gate: true, service: null, resource_tags: [],
+          key: '', match: 'regex', value: s.pattern, assignee: '', contexts: [],
+          area_label: null,
         }]);
         toast.ok(s.all_examples_match
           ? '✨ Added a suggested pattern matching all examples — review + preview before saving.'
@@ -452,7 +452,7 @@ export default function Todoist() {
           <h3>GTD clarify rules</h3>
           <p className="page-subtitle">
             How captured items are auto-labelled by source tag — assignee, context labels, and
-            skip-inbox routing. (The @sebas/@raphael/@maou/@pandora agent routing stays in code.)
+            skip-inbox routing. (The @sebas/@raphael/@maou agent routing stays in code.)
           </p>
           <div className="table-scroll">
           <table style={{ width: '100%', fontSize: 13 }}>
@@ -486,9 +486,8 @@ export default function Todoist() {
         <h3>Content routes</h3>
         <p className="page-subtitle">
           Route Inbox tasks by their <em>title</em> (complements GTD rules, which route by source
-          tag). Ordered — first match wins. <strong>gate</strong> on → asks via a Slack card
-          ("investigate / I've got it") before an agent runs; <strong>gate</strong> off → applies
-          the assignee + contexts directly. Ships empty; add your own rows.
+          tag). Ordered — first match wins. A route applies its assignee, contexts and area label to
+          a matching Inbox task; a blank assignee means <code>@me</code>. Ships empty; add your own rows.
         </p>
 
         <div style={{ display: 'flex', gap: 8, alignItems: 'flex-start', marginBottom: 12, flexWrap: 'wrap' }}>
@@ -508,7 +507,7 @@ export default function Todoist() {
           <thead><tr>
             <th style={{ textAlign: 'left' }}>Order</th>
             <th>Key</th><th>Match</th><th>Value</th><th>Assignee</th>
-            <th>Contexts</th><th>Gate</th><th>Area</th><th>Service</th><th>Res. tags</th><th></th>
+            <th>Contexts</th><th>Area</th><th></th>
           </tr></thead>
           <tbody>
             {routes.map((r: any, i: number) => (
@@ -528,23 +527,17 @@ export default function Todoist() {
                       onChange={e => updateRoute(i, { value: e.target.value })} />
                     <button className="btn btn-sm" style={{ marginLeft: 4 }} onClick={() => previewRoute(i)}>Preview</button>
                   </td>
-                  <td><input style={{ width: 80 }} value={r.assignee || ''}
+                  <td><input style={{ width: 80 }} placeholder="@me" value={r.assignee || ''}
                     onChange={e => updateRoute(i, { assignee: e.target.value })} /></td>
                   <td><input style={{ width: 110 }} value={(r.contexts || []).join(', ')}
                     onChange={e => updateRoute(i, { contexts: e.target.value.split(',').map((s: string) => s.trim()).filter(Boolean) })} /></td>
-                  <td style={{ textAlign: 'center' }}><input type="checkbox" checked={!!r.gate}
-                    onChange={e => updateRoute(i, { gate: e.target.checked })} /></td>
                   <td><input style={{ width: 90 }} placeholder="(none)" value={r.area_label || ''}
                     onChange={e => updateRoute(i, { area_label: e.target.value })} /></td>
-                  <td><input style={{ width: 70 }} placeholder="(none)" value={r.service || ''}
-                    onChange={e => updateRoute(i, { service: e.target.value })} /></td>
-                  <td><input style={{ width: 90 }} value={(r.resource_tags || []).join(', ')}
-                    onChange={e => updateRoute(i, { resource_tags: e.target.value.split(',').map((s: string) => s.trim()).filter(Boolean) })} /></td>
                   <td><button className="btn btn-sm" onClick={() => removeRoute(i)}>✕</button></td>
                 </tr>
                 {previews[i] && (
                   <tr key={`p${i}`}>
-                    <td colSpan={11} style={{ fontSize: 12, background: 'var(--surface-2)' }}>
+                    <td colSpan={8} style={{ fontSize: 12, background: 'var(--surface-2)' }}>
                       {previews[i].error
                         ? <span className="msg-error">Preview error: {previews[i].error}</span>
                         : <span>
@@ -560,7 +553,7 @@ export default function Todoist() {
               </Fragment>
             ))}
             {routes.length === 0 && (
-              <tr><td colSpan={11} style={{ color: 'var(--text-muted)' }}>No routes — add one, or ✨ suggest from examples.</td></tr>
+              <tr><td colSpan={8} style={{ color: 'var(--text-muted)' }}>No routes — add one, or ✨ suggest from examples.</td></tr>
             )}
           </tbody>
         </table>

@@ -1,3 +1,0 @@
-# GPUThermalThrottling
-
-TODO: fill in

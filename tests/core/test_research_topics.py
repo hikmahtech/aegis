@@ -305,7 +305,7 @@ async def test_an_ordinary_problem_still_reaches_the_digest(world):
     await ingest_event(
         world,
         Event(
-            source="heartbeat",
+            source="flow_health",
             external_id=f"{subject}@1",
             kind="occurrence",
             title=f"Service {subject} down",

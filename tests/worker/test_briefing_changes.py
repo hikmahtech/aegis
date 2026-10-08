@@ -43,15 +43,6 @@ async def _seeded(db_pool):
             "('brchg-old','wf2','RssIngestFlow','failed', now()-interval '2 days', "
             " now()-interval '2 days', 'old')"
         )
-        # an open drift after the cursor
-        await conn.execute(
-            "DELETE FROM pandoras_actor.homelab_drift WHERE service_name LIKE 'brchg-%'"
-        )
-        await conn.execute(
-            "INSERT INTO pandoras_actor.homelab_drift "
-            "(service_name, stack_name, drift_type, expected, actual, severity, alert_key, detected_at) "
-            "VALUES ('brchg-svc', 'test', 'config', '{}'::jsonb, '{}'::jsonb, 'warning', 'brchg-svc-key', now()-interval '1 hour')"
-        )
     yield db_pool
     # Teardown is load-bearing, not tidiness. `settings` is a GLOBAL key-value
     # table with no agent scoping, and `calendar_events_test` is read by any
@@ -66,9 +57,6 @@ async def _seeded(db_pool):
         await conn.execute("DELETE FROM settings WHERE key LIKE 'calendar_events_%'")
         await conn.execute("DELETE FROM settings WHERE key = 'briefing_state'")
         await conn.execute("DELETE FROM workflow_runs WHERE run_id LIKE 'brchg-%'")
-        await conn.execute(
-            "DELETE FROM pandoras_actor.homelab_drift WHERE service_name LIKE 'brchg-%'"
-        )
 
 
 def _kc(intel=None, contradictions=3):
@@ -96,7 +84,8 @@ async def test_changes_fire_on_planted(db_pool, _seeded):
     assert [i["title"] for i in out["intel"]] == ["GPT-6 ships"]  # sig>=4 only
     assert any(r["workflow_type"] == "RaindropIngestFlow" for r in out["broke"]["failed_runs"])
     assert not any(r["workflow_type"] == "RssIngestFlow" for r in out["broke"]["failed_runs"])
-    assert any(d["service"] == "brchg-svc" for d in out["broke"]["new_drift"])
+    # Service drift left with the infra lane (a2-devops): only failed runs here.
+    assert set(out["broke"]) == {"failed_runs"}
     assert "evt-new" in out["calendar"]["new_ids"]
     assert "i1" in out["_new_state"]["seen_intel_ids"]
 

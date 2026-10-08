@@ -1,3 +1,0 @@
-# MySQLSlowQueries
-
-TODO: fill in

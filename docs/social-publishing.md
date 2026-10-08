@@ -130,8 +130,8 @@ them on the row:
   instance showing "0 pollers" needs
   `docker service update --force <stack>_postiz`). Deduped by the problem hub: one
   `stuck_post` problem per Postiz post id, a `[SOCIAL OK]` recovery notice when it
-  finally publishes, and a repeat alert only if it gets stuck again. Silence one by
-  muting its problem. The watchdog is best-effort — a failure returns
+  finally publishes, and a repeat alert only if it gets stuck again. Drop one by
+  closing its problem on the admin **Problems** page. The watchdog is best-effort — a failure returns
   `stuck_status: "check_failed"` rather than taking the metrics refresh down, and
   reporting is **skipped** (not called with an empty list) when detection failed, so a
   detection outage can't fire bogus recovery notices.

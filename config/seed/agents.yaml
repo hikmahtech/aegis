@@ -59,24 +59,18 @@ agents:
 
   - id: pandoras-actor
     name: Pandora's Actor
-    role: Infrastructure
-    system_prompt_path: personalities/pandoras-actor
-    # `infra` is a behavior tag (aegis.agent_tags) — routing keys on it, not on the id.
-    capabilities: [infra, homelab, k8s, argocd, certs, drift]
-    model_tier: smart
+    role: Retired (infra lane moved to the DevOps vertical)
+    system_prompt_path: ""
+    capabilities: []
+    model_tier: balanced
     interaction_timeout_default: archive
     slack_channel_id: ""
     elevenlabs_voice_id: ""
     metadata:
-      intent_description: Infrastructure — homelab, Docker swarm, Kubernetes, deployments and alerts.
-      slack_icon: ":robot_face:"
-      intent_keywords: [server, docker, swarm, k8s, kubernetes, deploy, infra, drift, backup, cert, argocd, pod, container, node, homelab, restart, logs, grafana, prometheus]
-      mention_aliases: [pandora]
-      async_dispatch: true
-      knowledge_domains: [alert, sentry, github, task_outcome]
-      tool_set: [trigger_workflow, create_schedule, search_knowledge, ask_knowledge, configure_triage, remember_this, merge_problems, list_interactions, capture_to_inbox, list_next_actions, list_projects, complete_task, defer_task, handoff_task]
-    # Retired: the infra lane left v1 (migration 054). Kept as a row because
-    # other tables point at it.
+      tool_set: []
+    # Retired: the infra lane left v1 (migration 054, then PR 3). Kept as an
+    # inactive row because other tables point at it; a later PR drops it with
+    # the `pandoras_actor` schema.
     active: false
 
   # Virtual placeholder for general-topic dispatches and system events.

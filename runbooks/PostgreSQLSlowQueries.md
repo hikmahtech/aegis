@@ -1,3 +1,0 @@
-# PostgreSQLSlowQueries
-
-TODO: fill in

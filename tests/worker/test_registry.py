@@ -41,11 +41,9 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SEED_DIR = REPO_ROOT / "config" / "seed"
 
 
-def _flags(homelab: bool = True, money: bool = True, desk: bool = True) -> SimpleNamespace:
+def _flags(money: bool = True, desk: bool = True) -> SimpleNamespace:
     """Prod's settings: every feature flag on."""
-    return SimpleNamespace(
-        homelab_enabled=homelab, money_hygiene_enabled=money, trading_desk_enabled=desk
-    )
+    return SimpleNamespace(money_hygiene_enabled=money, trading_desk_enabled=desk)
 
 
 def _activities_for(settings) -> list:
@@ -218,29 +216,29 @@ def test_books_write_flow_is_gated_on_money_hygiene():
     assert "BooksWriteFlow" not in {c.__name__ for c in workflows_for(_flags(money=False))}
 
 
-def test_delivery_watchdog_registers_with_homelab_off():
+def test_delivery_watchdog_registers_with_every_flag_off():
     """v1 removal prep: the delivery watchdog watches AEGIS's own comms, so it
-    and its activities are served whatever homelab_enabled says."""
-    off = _flags(homelab=False, money=False, desk=False)
+    and its activities are served whatever the feature flags say."""
+    off = _flags(money=False, desk=False)
     assert "DeliveryWatchdogFlow" in {c.__name__ for c in workflows_for(off)}
     assert {
         "find_undelivered_interactions",
         "notify_undelivered_interactions",
         "check_comms_inbound_health",
     } <= expected_activity_names(off)
-    assert "DeliveryWatchdogFlow" not in feature_flagged_types().get("homelab_enabled", set())
+    assert not any("DeliveryWatchdogFlow" in types for types in feature_flagged_types().values())
     check_registration(off, workflows_for(off), _activities_for(off), SEED_DIR)
 
 
 def test_trading_desk_registers_with_money_off_and_the_desk_on():
     """v1 removal prep: the desk has its own flag, so it outlives the money lane."""
-    desk_only = _flags(homelab=False, money=False, desk=True)
+    desk_only = _flags(money=False, desk=True)
     assert "TradingDeskFlow" in {c.__name__ for c in workflows_for(desk_only)}
     assert "desk_tick" in expected_activity_names(desk_only)
     assert "TradingDeskFlow" in feature_flagged_types()["trading_desk_enabled"]
     check_registration(desk_only, workflows_for(desk_only), _activities_for(desk_only), SEED_DIR)
 
-    no_desk = _flags(homelab=True, money=True, desk=False)
+    no_desk = _flags(money=True, desk=False)
     assert "TradingDeskFlow" not in {c.__name__ for c in workflows_for(no_desk)}
     assert "desk_tick" not in expected_activity_names(no_desk)
 
@@ -257,7 +255,7 @@ def test_trading_desk_flag_is_a_settings_field_on_by_default():
 
 
 @pytest.mark.parametrize(
-    ("homelab", "money", "desk", "flows", "activities"),
+    ("money", "desk", "flows", "activities"),
     [
         # prod: `worker_starting activities=171 flows=35`, +1 flow and +2
         # activities from B7's WearableIngestFlow / WearableActivities, then
@@ -515,14 +513,21 @@ def test_trading_desk_flag_is_a_settings_field_on_by_default():
         # HubActivities.follow_fix_pr; `verify_fixes` stays as a no-op for
         # replays), plus `notify_pr_event` on the homelab-flagged
         # HomelabActivities, so the homelab rows lose 8.
-        (True, True, True, 53, 259),
-        (False, False, True, 44, 228),
-        (True, False, True, 47, 242),
-        (False, False, False, 43, 227),
+        # Then the infra lane left v1 (PR 3): the homelab flag is gone with
+        # its four flows (AlertInvestigation, ServiceDrift, CertRadar,
+        # InfraHeartbeat) and the Alert, AlertGovernance, Homelab and InfraOps
+        # activity classes; HubActivities loses its alert seam and
+        # investigation steps (four sweep steps stay as no-op stubs for
+        # replays); AgentTaskActivities loses apply_restart_approval
+        # (`plan_infra_task` stays as a stub). The rows keyed on homelab
+        # collapse into the money/desk ones.
+        (True, True, 49, 215),
+        (False, True, 43, 198),
+        (False, False, 42, 197),
     ],
 )
-def test_real_registration_passes_the_boot_check(homelab, money, desk, flows, activities):
-    settings = _flags(homelab, money, desk)
+def test_real_registration_passes_the_boot_check(money, desk, flows, activities):
+    settings = _flags(money, desk)
     wfs = workflows_for(settings)
     acts = _activities_for(settings)
     assert (len(wfs), len(acts)) == (flows, activities)
@@ -594,7 +599,7 @@ def test_fails_when_an_activity_is_missing_from_the_worker_list():
 def test_fails_when_a_flag_gated_activity_is_registered_with_the_flag_off():
     """The mirror direction: money activities served while money is disabled
     (the flows that call them are not registered)."""
-    off = _flags(homelab=True, money=False)
+    off = _flags(money=False)
     _expect(
         "activities handed to Worker.*unexpected=.*store_receipt_email",
         settings=off,

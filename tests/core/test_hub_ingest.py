@@ -14,7 +14,6 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from aegis.services.hub import (
     Event,
-    event_from_alert,
     get_problem,
     ingest_event,
     list_events,
@@ -27,7 +26,7 @@ NOW = datetime(2026, 9, 7, 12, 0, tzinfo=UTC)
 
 def _occ(subject: str, n: int = 1, **kw) -> Event:
     return Event(
-        source="heartbeat",
+        source="flow_health",
         external_id=f"{subject}@{n}",
         kind="occurrence",
         title=f"DockerServiceDown: {subject}",
@@ -41,7 +40,7 @@ def _occ(subject: str, n: int = 1, **kw) -> Event:
 
 def _resolved(subject: str, n: int = 1, **kw) -> Event:
     return Event(
-        source="heartbeat",
+        source="flow_health",
         external_id=f"{subject}@{n}@resolved",
         kind="resolved",
         title=f"recovered: {subject}",
@@ -68,54 +67,6 @@ async def _holder(pool, key: str) -> str | None:
     return await pool.fetchval(
         "SELECT id::text FROM problems WHERE correlation_key = $1 AND closed_at IS NULL", key
     )
-
-
-def _route_alert(task_id: str, title: str) -> dict:
-    """Clarify's synthetic alert for a task matching the prod `infra-incident`
-    route: class NodeDown from the route's overrides, no service."""
-    return {
-        "title": title,
-        "source": "todoist-infra",
-        "severity": "normal",
-        "fingerprint": f"route-{task_id}",
-        "labels": {"alertname": "NodeDown"},
-        "todoist_task_id": task_id,
-    }
-
-
-async def test_two_tasks_about_different_incidents_get_two_problems(db_pool):
-    """#472 in prod: two content-route investigations with no subject were both
-    keyed `nodedown::`, so the second (the `wow` node) attached to the first
-    (aegis_core), answered `investigate=False`, and nobody saw it."""
-    core, wow = f"6hA{uuid.uuid4().hex[:12]}", f"6hB{uuid.uuid4().hex[:12]}"
-    first = await ingest_event(
-        db_pool,
-        event_from_alert(_route_alert(core, "Service aegis_core down"), occurred_at=NOW),
-        now=NOW,
-    )
-    later = NOW + timedelta(days=2)
-    second = await ingest_event(
-        db_pool,
-        event_from_alert(
-            _route_alert(wow, "Swarm node wow down"), occurred_at=later, occurrence_key="w1"
-        ),
-        now=later,
-    )
-    assert (first.action, second.action) == ("created", "created")
-    assert first.problem_id != second.problem_id
-    assert second.investigate is True
-    p = await get_problem(db_pool, second.problem_id)
-    assert (p["subject"], p["subject_kind"]) == (wow.lower(), "task")
-
-    # The same task raised again is the same problem, not a third one.
-    again = await ingest_event(
-        db_pool,
-        event_from_alert(
-            _route_alert(wow, "Swarm node wow down"), occurred_at=later, occurrence_key="w2"
-        ),
-        now=later,
-    )
-    assert (again.problem_id, again.action) == (second.problem_id, "attached")
 
 
 async def test_first_occurrence_creates_an_open_problem(db_pool):
@@ -180,7 +131,7 @@ async def test_resolved_with_no_problem_is_ignored_and_stores_nothing(db_pool):
     assert r == r.__class__(None, "ignored", f"dockerservicedown:service:{s}")
     assert await _holder(db_pool, r.key) is None
     assert await db_pool.fetchval(
-        "SELECT count(*) FROM problem_events WHERE source='heartbeat' AND external_id=$1",
+        "SELECT count(*) FROM problem_events WHERE source='flow_health' AND external_id=$1",
         f"{s}@1@resolved",
     ) == 0
 
@@ -221,7 +172,7 @@ async def test_note_kinds_attach_to_a_named_problem_and_never_create(db_pool):
     s = _subject()
     r = await ingest_event(db_pool, _occ(s), now=NOW)
     note = Event(
-        source="investigation",
+        source="session",
         external_id=f"inv-{s}",
         kind="investigation",
         title="Investigation complete",

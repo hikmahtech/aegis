@@ -70,7 +70,7 @@ SOURCE_TYPES: dict[str, SourceTypeInfo] = {
         "Google Drive folder sync (services/drive.py, DriveSyncFlow, schedule_sync default)"
     ),
     "research": SourceTypeInfo("Synthesized answers from the research chat tool (chat.py)"),
-    "runbook": SourceTypeInfo("Alert-runbook text captured via the runbook chat tool (chat.py)"),
+    "runbook": SourceTypeInfo("Alert-runbook text (retired update_runbook chat tool; history)"),
     "reference": SourceTypeInfo(
         "GTD @reference captures routed to the knowledge store by ClarifyFlow"
     ),
@@ -94,9 +94,9 @@ SOURCE_TYPES: dict[str, SourceTypeInfo] = {
         "Auto-ingested intel-scan findings (worker activities/briefing.py, intelligence.py)"
     ),
     "briefing": SourceTypeInfo("Daily briefing text (worker activities/briefing.py)"),
-    "alert": SourceTypeInfo("Alert investigation summary (worker activities/alerts.py)"),
+    "alert": SourceTypeInfo("Alert investigation summary (retired infra lane; history)"),
     "alert_investigation": SourceTypeInfo(
-        "Full alert investigation transcript (worker activities/alerts.py)"
+        "Full alert investigation transcript (retired infra lane; history)"
     ),
     "document": SourceTypeInfo(
         "Slack-forwarded document, ingested via comms' SlackCoreClient.knowledge_ingest "

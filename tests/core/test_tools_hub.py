@@ -18,68 +18,25 @@ from aegis.services.hub import (
     get_problem,
     ingest_event,
     list_events,
-    list_service_states,
 )
 from aegis.services.hub_project import link_task
 from aegis.services.tools.base import ToolContext
 from aegis.services.tools.hub import (
     _exec_merge_problems,
     _exec_report_progress,
-    _exec_set_service_state,
     _exec_task_context,
 )
 
 pytestmark = pytest.mark.asyncio
 
-CTX = ToolContext(agent_id="pandoras-actor")
+CTX = ToolContext(agent_id="sebas")
 NOW = datetime(2026, 9, 7, 12, 0, tzinfo=UTC)
 
 
-async def _call(pool, **args) -> str:
-    return await _exec_set_service_state(pool, args, CTX)
-
-
-async def test_tool_is_registered_and_dispatches_to_the_same_function():
-    assert TOOL_EXECUTORS["set_service_state"] is _exec_set_service_state
-
-
-async def test_sets_a_window_and_lists_what_is_in_force(db_pool):
-    s = f"svc_{uuid.uuid4().hex[:8]}"
-    out = await _call(db_pool, subject=s, state="deploying", minutes=20, note="rolling core")
-    assert out.startswith(f"{s}: deploying until ")
-    assert "set by chat:pandoras-actor" in out
-    assert f"- {s} (service): deploying until" in out
-    rows = [r for r in await list_service_states(db_pool) if r["subject"] == s]
-    assert rows and rows[0]["note"] == "rolling core"
-
-
-async def test_ok_clears_and_says_so(db_pool):
-    s = f"svc_{uuid.uuid4().hex[:8]}"
-    await _call(db_pool, subject=s, state="maintenance", minutes=5)
-    out = await _call(db_pool, subject=s, state="ok")
-    assert out.startswith(f"{s}: window cleared.")
-    out = await _call(db_pool, subject=s, state="ok")
-    assert out.startswith(f"{s}: no window was set.")
-
-
-async def test_star_is_a_global_window(db_pool):
-    try:
-        out = await _call(db_pool, subject="*", state="maintenance", minutes=1, note="power cut")
-        assert "- * (*): maintenance until" in out
-    finally:
-        await _call(db_pool, subject="*", state="ok")
-
-
-async def test_empty_subject_is_refused(db_pool):
-    out = await _call(db_pool, subject="  ", state="deploying")
-    assert out.startswith("Refused: subject is required")
-
-
-async def test_unknown_args_are_dropped_not_fatal(db_pool):
-    s = f"svc_{uuid.uuid4().hex[:8]}"
-    out = await _call(db_pool, subject=s, state="degraded", bogus=1)
-    assert out.startswith(f"{s}: degraded until ")
-    await _call(db_pool, subject=s, state="ok")
+async def test_the_window_tool_left_with_the_infra_lane():
+    """`set_service_state` (deploy/maintenance windows) moved to the DevOps
+    vertical with the rest of the infra lane."""
+    assert "set_service_state" not in TOOL_EXECUTORS
 
 
 # --- task_context / report_progress / merge_problems ---------------------------
@@ -87,7 +44,7 @@ async def test_unknown_args_are_dropped_not_fatal(db_pool):
 
 def _occ(subject: str, n: int = 1) -> Event:
     return Event(
-        source="heartbeat",
+        source="flow_health",
         external_id=f"{subject}@{n}",
         kind="occurrence",
         title=f"Service {subject} down",
@@ -101,7 +58,7 @@ def _occ(subject: str, n: int = 1) -> Event:
 async def _task(pool, task_id: str, content: str = "Fix the retry policy") -> None:
     await pool.execute(
         "INSERT INTO todoist_tasks (id, content, labels, is_completed, updated_at) "
-        "VALUES ($1, $2, ARRAY['@pandora','@code'], false, now()) ON CONFLICT (id) DO NOTHING",
+        "VALUES ($1, $2, ARRAY['@sebas','@code'], false, now()) ON CONFLICT (id) DO NOTHING",
         task_id,
         content,
     )
@@ -131,7 +88,7 @@ async def test_task_context_needs_an_id():
 async def test_task_context_reads_a_plain_code_task(db_pool):
     task = f"zzc-{uuid.uuid4().hex[:6]}"
     await _task(db_pool, task)
-    await work_sessions.create_session(db_pool, task_id=task, agent_id="pandoras-actor")
+    await work_sessions.create_session(db_pool, task_id=task, agent_id="sebas")
     await work_sessions.set_repo(
         db_pool, task, repo="hikmah/aegis", github_repo="hikmahtech/aegis",
         worktree_path="/w/hikmah/aegis-aegis-wt/task-1", branch="aegis-task/1", host="meem",
@@ -139,7 +96,7 @@ async def test_task_context_reads_a_plain_code_task(db_pool):
     await work_sessions.set_last_run(db_pool, task, output_file="/tmp/x", host="meem", account="work")
     await work_sessions.set_state(db_pool, task, status="parked", summary="waiting on you: plan")
     out = await _exec_task_context(db_pool, {"task_id": task}, CTX)
-    assert out.startswith(f"Task {task}: Fix the retry policy [@pandora @code]")
+    assert out.startswith(f"Task {task}: Fix the retry policy [@sebas @code]")
     assert "No problem on the hub for this task" in out
     assert "- aegis parked (work)" in out and "waiting on you: plan" in out
     sid = (await work_sessions.get_session(db_pool, task))["session_id"]
@@ -164,7 +121,7 @@ async def test_task_context_reads_a_problem_with_events_links_and_sessions(db_po
         assert "- operator active (personal)" in out and "on it" in out
         # The occurrence and the hub's own `create` state change.
         assert "Recent events (newest first, 2):" in out
-        assert "occurrence/heartbeat" in out and "state_change/hub: create" in out
+        assert "occurrence/flow_health" in out and "state_change/hub: create" in out
     out = await _exec_task_context(db_pool, {"problem_id": "not-a-uuid"}, CTX)
     assert out.startswith("Refused")
 
@@ -176,7 +133,7 @@ async def test_report_progress_registers_the_session_and_notes_the_problem(db_po
     await _task(db_pool, task)
     r = await ingest_event(db_pool, _occ(s), now=NOW)
     await link_task(db_pool, r.problem_id, task)
-    await work_sessions.create_session(db_pool, task_id=task, agent_id="pandoras-actor")
+    await work_sessions.create_session(db_pool, task_id=task, agent_id="sebas")
 
     out = await _exec_report_progress(
         db_pool,

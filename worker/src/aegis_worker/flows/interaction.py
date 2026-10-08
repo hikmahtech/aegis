@@ -47,8 +47,8 @@ class InteractionFlowInput:
     # resolve_interaction succeeds (signal or auto-policy), call this
     # activity with args=[interaction_id, response, metadata]. Lets
     # ClarifyFlow spawn this workflow ABANDONED + still dispatch a
-    # follow-up action when the user picks an option. AlertInvestigation
-    # and other parent-await callers leave these as None.
+    # follow-up action when the user picks an option. Parent-await callers
+    # leave these as None.
     metadata: dict[str, Any] | None = None
     post_resolve_activity: str | None = None
     # How long that hook gets. The default suits the Todoist label writes

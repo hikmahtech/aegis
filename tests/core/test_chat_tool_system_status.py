@@ -41,8 +41,6 @@ async def test_system_status_executor_returns_digest_shape(db_pool):
         "llm_calls",
         "llm_tokens",
         "pending_interactions",
-        "infra_stuck",
-        "infra_confirmed",
     ):
         assert key in result
 

@@ -6,7 +6,7 @@ run can read it, and a run reads untrusted content by design and (ungated) has a
 full shell. Two consequences the issue documents:
 
 * a run could swap the ``{agent_id}`` path segment and drive ANOTHER agent's tool
-  surface — a sebas run reaching pandora's ``restart_service``;
+  surface — a sebas run reaching another agent's ``restart_service``;
 * a run could print the key into its transcript, which ``AgentRunFlow`` then
   delivers to a chat channel, leaking a credential that never expires.
 

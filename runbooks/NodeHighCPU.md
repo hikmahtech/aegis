@@ -1,3 +1,0 @@
-# NodeHighCPU
-
-TODO: fill in

@@ -7,7 +7,7 @@ from aegis_worker.activities.clarify import _RULES
 
 def test_default_assignee_by_source_tag() -> None:
     assert _RULES.default_assignee("#email") == "@sebas"
-    assert _RULES.default_assignee("#alert") == "@pandora"
+    assert _RULES.default_assignee("#alert") == "@me"
     assert _RULES.default_assignee("#receipt") == "@maou"
     assert _RULES.default_assignee("#research") == "@raphael"
     assert _RULES.default_assignee("#calendar") == "@sebas"
@@ -20,7 +20,7 @@ def test_default_assignee_by_source_tag() -> None:
 
 def test_default_contexts_by_source_tag() -> None:
     assert _RULES.default_contexts("#email") == ["@email", "@5min"]
-    assert _RULES.default_contexts("#alert") == ["@code", "@deep"]
+    assert _RULES.default_contexts("#alert") == ["@deep"]
     assert _RULES.default_contexts("#research") == ["@reading"]
     assert _RULES.default_contexts("#unknown") == ["@deep"]
     assert _RULES.default_contexts(None) == ["@deep"]

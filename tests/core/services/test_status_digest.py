@@ -18,7 +18,6 @@ async def _cleanup(pool) -> None:
     await pool.execute("DELETE FROM workflow_runs")
     await pool.execute("DELETE FROM llm_calls")
     await pool.execute("DELETE FROM interactions")
-    await pool.execute("DELETE FROM settings WHERE key = 'infra_heartbeat_state'")
 
 
 async def test_runs_by_type_status_counts(db_pool):
@@ -106,7 +105,7 @@ async def test_completed_but_failed_detection(db_pool):
         await _cleanup(db_pool)
 
 
-async def test_token_usage_pending_interactions_and_infra_stuck(db_pool):
+async def test_token_usage_and_pending_interactions(db_pool):
     try:
         await _cleanup(db_pool)
         await db_pool.execute(
@@ -119,19 +118,14 @@ async def test_token_usage_pending_interactions_and_infra_stuck(db_pool):
             "('sd-f1', 'sebas', 'approval', 'test', 'approve?', 'pending'), "
             "('sd-f2', 'sebas', 'approval', 'test', 'done already', 'resolved')"
         )
-        await db_pool.execute(
-            "INSERT INTO settings (key, value) VALUES ('infra_heartbeat_state', "
-            "'{\"nodes\": {}, \"stuck\": [\"homelab-gitops\"], \"confirmed\": [\"noon\"], "
-            "\"fail_count\": 1}'::jsonb)"
-        )
 
         digest = await get_status_digest(db_pool, hours=24)
 
         assert digest["llm_calls"] == 2
         assert digest["llm_tokens"] == 450
         assert digest["pending_interactions"] == 1
-        assert digest["infra_stuck"] == ["homelab-gitops"]
-        assert digest["infra_confirmed"] == ["noon"]
+        # The heartbeat's stuck/confirmed lists left with the infra lane.
+        assert "infra_stuck" not in digest and "infra_confirmed" not in digest
     finally:
         await _cleanup(db_pool)
 
@@ -155,14 +149,12 @@ async def test_window_hours_excludes_old_rows(db_pool):
         await _cleanup(db_pool)
 
 
-async def test_missing_infra_heartbeat_state_defaults_empty(db_pool):
+async def test_an_empty_database_digests_to_zeros(db_pool):
     try:
         await _cleanup(db_pool)
 
         digest = await get_status_digest(db_pool, hours=24)
 
-        assert digest["infra_stuck"] == []
-        assert digest["infra_confirmed"] == []
         assert digest["pending_interactions"] == 0
         assert digest["llm_calls"] == 0
         assert digest["llm_tokens"] == 0

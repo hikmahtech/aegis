@@ -1,3 +1,0 @@
-# NodeDiskSpaceLow
-
-TODO: fill in

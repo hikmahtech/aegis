@@ -30,7 +30,7 @@ def _subject() -> str:
 
 def _occ(subject: str, n: int = 1) -> Event:
     return Event(
-        source="heartbeat",
+        source="flow_health",
         external_id=f"{subject}@{n}",
         kind="occurrence",
         title=f"Service {subject} down",

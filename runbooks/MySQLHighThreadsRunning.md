@@ -1,3 +1,0 @@
-# MySQLHighThreadsRunning
-
-TODO: fill in

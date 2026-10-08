@@ -1,13 +1,12 @@
 """FlowHealthWatchdogFlow — the watchdog over AEGIS's own scheduled flows.
 
-Issue #226. AEGIS alerts richly on *infrastructure* (ServiceDrift, CertRadar,
-InfraHeartbeat, SentryPoll, DeliveryWatchdog) but had nothing watching its own
-flows, so `TodoistSyncFlow` could fail six times in a row (2026-08-02) in total
+Issue #226. AEGIS had watchdogs (DeliveryWatchdog and, then, the infra lane's)
+but nothing watching its own flows, so `TodoistSyncFlow` could fail six times in a row (2026-08-02) in total
 silence. Shaped after `DeliveryWatchdogFlow`: cheap detect activity, cheap
 notify activity; the problem hub dedupes, so a sustained fault is one alert.
 
 Watches every `workflow_type` in `workflow_runs`, not only scheduled ones —
-a child flow (AlertInvestigation, AgentTask) failing every attempt is the same
+a child flow (AgentTask, AgentChatReply) failing every attempt is the same
 class of silent breakage and costs nothing extra to catch.
 
 It also watches `llm_calls` per purpose (#321). A flow whose LLM step returns
@@ -24,8 +23,9 @@ rather than solved, deliberately (a second watchdog just moves the problem):
 * its own failures are recorded in `workflow_runs` like everyone else's, and
   the daily briefing's failed-run block plus `/status` already surface those to
   the operator;
-* total worker death (the case where no flow runs at all) is covered by the
-  existing healthchecks.io dead-man ping in `InfraHeartbeatFlow`;
+* total worker death (the case where no flow runs at all) is for the
+  monitoring outside AEGIS to see: the healthchecks.io dead-man ping left with
+  `InfraHeartbeatFlow` when the infra lane moved to the DevOps vertical;
 * it does not exclude itself from detection: after a self-failure the next
   successful run reports its own predecessor like any other flow.
 """
@@ -43,7 +43,7 @@ with workflow.unsafe.imports_passed_through():
 
 @dataclass
 class FlowHealthConfig:
-    agent_id: str = "pandoras-actor"
+    agent_id: str = ""
     # N consecutive failed runs of one workflow_type => alert. 2, not 3: a
     # workflow_runs row is only written once the run's own Temporal retry
     # budget is spent, so the first failure is already a post-retry failure and

@@ -1,3 +1,0 @@
-# RabbitMQNoConsumers
-
-TODO: fill in

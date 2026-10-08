@@ -50,12 +50,7 @@ class CaptureActivities:
     ) -> str | None:
         """The capture body shared by every public entry point.
 
-        `labels`: extra labels beyond the source tag. AlertInvestigationFlow
-        passes ["@pandora"] so the task is born already-clarified —
-        ClarifyFlow's find_unclassified_items skips it (last_clarified_at is
-        bumped after the item_add) and even if the row predates that bump, the
-        explicit @pandora ownership marker tells the clarify short-circuit to
-        leave it alone.
+        `labels`: extra labels beyond the source tag.
 
         `project_id`: None means the managed Inbox; an explicit id (a books
         entity project, spec §7.1) skips the Inbox lookup entirely, so a

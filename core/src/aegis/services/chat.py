@@ -26,18 +26,10 @@ from aegis.services.library import LIBRARY_READ_TIMEOUT_S
 from aegis.services.research import FETCH_TOOL_TIMEOUT_S, RESEARCH_TOOL_TIMEOUT_S
 from aegis.services.source_types import DEFAULT_DECAY_DAYS
 from aegis.services.tools.agents import (  # noqa: F401 — re-export: imported from here by tests
-    _AEGIS_SELF_DIAGNOSE_FETCH_TIMEOUT,
-    _AEGIS_SELF_DIAGNOSE_MAX_WAIT,
-    _AEGIS_SELF_DIAGNOSE_OUTPUT_CAP,
-    _AEGIS_SELF_DIAGNOSE_POLL,
-    _build_aegis_self_diagnose_prompt,
-    _exec_aegis_self_diagnose,
     _exec_dispatch_agent_run,
-    _exec_investigate_resource,
     _exec_list_coding_sessions,
     _exec_stop_agent_run,
     _run_timeout_minutes,
-    _slugify_issue,
 )
 from aegis.services.tools.base import (
     _MAX_LISTED_DROPPED_KEYS,  # noqa: F401 — re-export: kept importable from here
@@ -80,7 +72,6 @@ from aegis.services.tools.gtd import (
 from aegis.services.tools.hub import (
     _exec_merge_problems,
     _exec_report_progress,
-    _exec_set_service_state,
     _exec_task_context,
 )
 from aegis.services.tools.infra import (
@@ -158,16 +149,8 @@ from aegis.services.tools.system import (  # noqa: F401 — re-export: imported 
     _exec_query_activities,
     _exec_system_status,
     _exec_trigger_workflow,
-    _exec_update_runbook,
 )
 from aegis.services.tools.topics import _exec_track_topic, _exec_untrack_topic
-from aegis.services.tools.vercel import (
-    _exec_vercel_get_build_logs,
-    _exec_vercel_get_deployment,
-    _exec_vercel_get_project,
-    _exec_vercel_list_deployments,
-    _normalize_vercel_project,  # noqa: F401 — re-export: imported from here by tests
-)
 
 logger = structlog.get_logger()
 
@@ -418,7 +401,6 @@ CHAT_TOOLS = [
     _registry_schema("note_write"),
     _registry_schema("note_link"),
     _registry_schema("configure_triage"),
-    _registry_schema("update_runbook"),
     _registry_schema("list_nodes"),
     _registry_schema("list_services"),
     _registry_schema("inspect_service"),
@@ -433,13 +415,10 @@ CHAT_TOOLS = [
     _registry_schema("list_cloud_accounts"),
     _registry_schema("cloud_identity"),
     _registry_schema("run_infra_script"),
-    # Problem hub — deploy / maintenance windows, the session registry and
-    # merges; `services/tools/hub.py`.
-    _registry_schema("set_service_state"),
+    # Problem hub — the session registry and merges; `services/tools/hub.py`.
     _registry_schema("task_context"),
     _registry_schema("report_progress"),
     _registry_schema("merge_problems"),
-    _registry_schema("aegis_self_diagnose"),
     _registry_schema("list_interactions"),
     # GTD / Todoist — schemas generated from the typed `@aegis_tool` executors
     # in `services/tools/gtd.py`; the order here is still the order the LLM sees.
@@ -463,15 +442,6 @@ CHAT_TOOLS = [
     _registry_schema("desk_status"),
     _registry_schema("last_contact_with_person"),
     _registry_schema("query_observations"),
-    # --- Vercel read-only (Pandora) ---
-    # Project arg accepts either the bare Vercel project name (e.g. "example-site")
-    # or the resources-table slug ("vercel-example-site"); the executor strips the
-    # slug prefix before calling the connector.
-    _registry_schema("vercel_get_project"),
-    _registry_schema("vercel_list_deployments"),
-    _registry_schema("vercel_get_deployment"),
-    _registry_schema("vercel_get_build_logs"),
-    _registry_schema("investigate_resource"),
     _registry_schema("dispatch_agent_run"),
     _registry_schema("stop_agent_run"),
     _registry_schema("youtube_transcript"),
@@ -487,9 +457,7 @@ CHAT_TOOLS = [
 
 # Per-tool executor-timeout overrides (seconds). The default chat tool timeout
 # (settings.tool_timeout_seconds, 30s) guillotines legitimately long-running
-# tools: aegis_self_diagnose waits on a remote coding-CLI run for up to
-# _AEGIS_SELF_DIAGNOSE_MAX_WAIT, so it could NEVER finish inside 30s — and each
-# LLM retry then orphaned another kimi run on the coding host.
+# tools.
 #
 # The three ledger writers no longer do the write on this budget at all: they
 # hand it to `BooksWriteFlow` and wait `LEDGER_WRITE_WAIT_S` (issue #388). Their
@@ -497,7 +465,6 @@ CHAT_TOOLS = [
 # `tool_timeout_seconds` cannot cut it short and turn a normal write into a
 # reported timeout.
 _TOOL_TIMEOUT_OVERRIDES: dict[str, int] = {
-    "aegis_self_diagnose": _AEGIS_SELF_DIAGNOSE_MAX_WAIT + 60,
     "ledger_post": LEDGER_TOOL_TIMEOUT_S,
     "ledger_reclassify": LEDGER_TOOL_TIMEOUT_S,
     "ledger_add_rule": LEDGER_TOOL_TIMEOUT_S,
@@ -693,7 +660,6 @@ TOOL_EXECUTORS: dict[str, Any] = {
     "note_write": _exec_note_write,
     "note_link": _exec_note_link,
     "configure_triage": _exec_configure_triage,
-    "update_runbook": _exec_update_runbook,
     "list_nodes": _exec_list_nodes,
     "list_services": _exec_list_services,
     "inspect_service": _exec_inspect_service,
@@ -708,12 +674,9 @@ TOOL_EXECUTORS: dict[str, Any] = {
     "list_cloud_accounts": _exec_list_cloud_accounts,
     "cloud_identity": _exec_cloud_identity,
     "run_infra_script": _exec_run_infra_script,
-    "set_service_state": _exec_set_service_state,
     "task_context": _exec_task_context,
     "report_progress": _exec_report_progress,
     "merge_problems": _exec_merge_problems,
-    "aegis_self_diagnose": _exec_aegis_self_diagnose,
-    "investigate_resource": _exec_investigate_resource,
     "list_interactions": _exec_list_interactions,
     "capture_to_inbox": _exec_capture_to_inbox,
     "list_next_actions": _exec_list_next_actions,
@@ -732,11 +695,6 @@ TOOL_EXECUTORS: dict[str, Any] = {
     "desk_status": _exec_desk_status,
     "last_contact_with_person": _exec_last_contact_with_person,
     "query_observations": _exec_query_observations,
-    # Vercel read-only (Pandora) — see PR for design notes.
-    "vercel_get_project": _exec_vercel_get_project,
-    "vercel_list_deployments": _exec_vercel_list_deployments,
-    "vercel_get_deployment": _exec_vercel_get_deployment,
-    "vercel_get_build_logs": _exec_vercel_get_build_logs,
     "youtube_transcript": _exec_youtube_transcript,
     "pdf_to_text": _exec_pdf_to_text,
     "list_coding_sessions": _exec_list_coding_sessions,
@@ -746,7 +704,7 @@ TOOL_EXECUTORS: dict[str, Any] = {
 }
 
 # --- The example agents' tool sets ---
-# The four example agents' tool sets as code. Nothing reads it at runtime
+# The three example agents' tool sets as code. Nothing reads it at runtime
 # (#579): an agent's tools are its `metadata.tool_set`, and an agent without
 # one gets `_FALLBACK_TOOL_SET` whatever its id. It is not what a fresh install
 # gets either — config/seed/agents.yaml seeds `metadata.tool_set` — and it has
@@ -838,66 +796,6 @@ AGENT_TOOL_SETS: dict[str, set[str]] = {
         # Document-attachment tools
         "youtube_transcript",
         "pdf_to_text",
-    },
-    "pandoras-actor": {
-        "trigger_workflow",
-        # Problem hub: declare a deploy/maintenance window so the hub
-        # records what it sees there without raising it.
-        "set_service_state",
-        # Heavy lane, repo-agnostic: investigate/analyse anything in a headless
-        # CLI run. investigate_resource stays the code-fix-with-Gate-2 path.
-        "dispatch_agent_run",
-        "create_schedule",
-        "search_knowledge",
-        "update_runbook",
-        "configure_triage",
-        "remember_this",
-        # Problem hub, the session registry: read a task's context, register
-        # a session on it, fold a duplicate problem away.
-        "task_context",
-        "report_progress",
-        "merge_problems",
-        "list_interactions",
-        # Infrastructure tools — full surface across swarm swarm + acme k8s/argocd:
-        "list_nodes",
-        "list_services",
-        "inspect_service",
-        "get_service_logs",
-        "restart_service",
-        "list_pods",
-        "list_deployments",
-        "get_pod_logs",
-        "restart_deployment",
-        "list_argocd_apps",
-        "sync_argocd_app",
-        # Cloud accounts (read-only): registry listing + live sts/ADC identity
-        # check for kind=cloud entries. Gated on CLI availability in the image.
-        "list_cloud_accounts",
-        "cloud_identity",
-        "run_infra_script",
-        # AEGIS self-healing — drives kimi over SSH against the AEGIS source
-        # clone on node-a. Used when the user asks pandora about AEGIS's own
-        # behavior / bugs / improvements (via DM @pandora or Todoist comment).
-        "aegis_self_diagnose",
-        # Agent-initiated investigation of any registered repo the task concerns:
-        # spawns AlertInvestigationFlow (fix-capable kimi + Gate-2), posts back to
-        # the current task. Comment-channel only.
-        "investigate_resource",
-        # Vercel read-only — project metadata, deployments (filter by time/state),
-        # single deployment incl error fields, build logs (filter to stderr).
-        "vercel_get_project",
-        "vercel_list_deployments",
-        "vercel_get_deployment",
-        "vercel_get_build_logs",
-        # Phase 3 GTD tools (no mark_waiting / find_reference — ops doesn't
-        # use the waiting-for list and has its own runbook lookup)
-        "capture_to_inbox",
-        "list_next_actions",
-        "list_projects",
-        "complete_task",
-        "defer_task",
-        "handoff_task",
-        "comment_on_task",
     },
     "maou": {
         "get_quote",
@@ -1439,7 +1337,6 @@ async def send_message(
     finance_connector: Any = None,
     search_connector: Any = None,
     remote_script_connector: Any = None,
-    vercel_connector: Any = None,
     background_tasks: set[asyncio.Task] | None = None,
     user_metadata: dict | None = None,
     tier_override: str | None = None,
@@ -1660,7 +1557,6 @@ async def send_message(
         search_connector=search_connector,
         llm_client=llm_client,
         remote_script_connector=remote_script_connector,
-        vercel_connector=vercel_connector,
         model_light=tier_to_model_or("fast", getattr(settings, "model_fast", "gemma4:e2b")),
     )
 
@@ -1961,7 +1857,6 @@ async def synthesize_agent_reply(
     finance_connector: Any = None,
     search_connector: Any = None,
     remote_script_connector: Any = None,
-    vercel_connector: Any = None,
 ) -> dict:
     """Chat entry point for two surfaces:
 
@@ -2002,9 +1897,8 @@ async def synthesize_agent_reply(
     # promises this surface behaves identically to a web chat, and for months it
     # did not: `settings` and four connectors were dropped here, so a Slack or
     # Todoist-comment ask got a half-populated ToolContext. The tools degraded
-    # silently and differently from the admin UI — `aegis_self_diagnose`
-    # returned "settings not threaded into ToolContext", and the knowledge,
-    # money, search and vercel tools ran without their connectors.
+    # silently and differently from the admin UI: the knowledge, money and
+    # search tools ran without their connectors.
     # `test_agent_reply_forwards_every_dependency` pins the two signatures
     # together so a newly added dependency cannot be dropped here again.
     resp = await send_message(
@@ -2020,7 +1914,6 @@ async def synthesize_agent_reply(
         finance_connector=finance_connector,
         search_connector=search_connector,
         remote_script_connector=remote_script_connector,
-        vercel_connector=vercel_connector,
     )
 
     if resp.get("error"):

@@ -1,3 +1,0 @@
-# OtelCollectorExportQueueFilling
-
-TODO: fill in

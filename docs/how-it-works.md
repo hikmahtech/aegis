@@ -15,7 +15,7 @@ Sections:
 4. [The GTD / Todoist model](#4-the-gtd--todoist-model)
 5. [The agent task executor](#5-the-agent-task-executor)
 6. [Human-in-the-loop: interactions](#6-human-in-the-loop-interactions)
-7. [The alert pipeline](#7-the-alert-pipeline)
+7. [The problem hub](#7-the-problem-hub)
 8. [Operating it](#8-operating-it)
 9. [Extending it](#9-extending-it)
 10. [Failure modes worth recognising](#10-failure-modes-worth-recognising)
@@ -24,7 +24,7 @@ Sections:
 
 AEGIS is a small fleet of named agents running scheduled and event-driven
 [Temporal](https://temporal.io) workflows over your own data — tasks, email,
-money, knowledge, infrastructure — and asking you for a decision only when one
+money, knowledge — and asking you for a decision only when one
 is actually needed. Three long-running services:
 
 | Service | Package | What it does |
@@ -39,8 +39,8 @@ Behind them: **Postgres 16 + pgvector** (the only durable store), **Temporal**
 the admin **Models & Providers** page).
 
 **Why Temporal instead of cron.** Most of what AEGIS does is not
-fire-and-forget. A flow that finds an unhealthy service posts a card asking
-"restart it?" and then *waits* — possibly for days — before acting on your
+fire-and-forget. A flow that finds a charge it cannot place posts a card
+asking what it is and then *waits* — possibly for days — before acting on your
 answer. A cron job that asks a question and exits loses the question. A
 Temporal workflow is durable state: it survives worker restarts and redeploys,
 resumes exactly where it paused, retries individual activities with
@@ -68,15 +68,15 @@ point of the project is that you replace it with your own:
 | **Sebas** | Executive assistant — GTD, email, calendar, reviews | `gtd` |
 | **Raphael** | Research and knowledge — briefings, ingest, scans | `research` |
 | **Maou** | Finance — money mail into the hledger books, the weekly brief and the monthly close, market data | `finance` |
-| **Pandora's Actor** | Infrastructure — alerts, swarm/k8s, coding runs | `infra` |
 
 (There is also an inactive virtual `system` agent that only exists to satisfy a
 foreign key for system-level dispatch logging — never delete it, never chat
-with it.)
+with it. The old infra agent, `pandoras-actor`, is inactive too: the infra lane
+moved to the DevOps vertical, and its row stays only for foreign keys.)
 
 **Nothing branches on an agent's id.** Behavior is keyed on
 `agents.capabilities` — a JSONB list of tags from the closed vocabulary in
-`core/src/aegis/agent_tags.py`: `gtd`, `finance`, `research`, `infra`. Code
+`core/src/aegis/agent_tags.py`: `gtd`, `finance`, `research`. Code
 that needs "the finance agent" calls `services/agents.py::resolve_tag`
 (core) or the `AgentRegistryActivities.resolve_agents` activity (worker —
 workflows can't touch the DB). If no active agent holds a tag, the feature
@@ -97,7 +97,7 @@ Per-agent routing knobs live in `agents.metadata`:
 **To add or re-point an agent:** create it on the admin **Agents** page (or
 `POST /api/agents`), write its persona, then on the **Behavior** tab tick the
 capability tags and pick the tool set. No code changes — every tag-driven
-feature (reviews, briefings, money processing, alert investigation, Slack
+feature (reviews, briefings, money processing, Slack
 @-addressing) follows the tags automatically.
 
 Two ownership rules that bite people:
@@ -128,24 +128,22 @@ The shipped schedule set (`config/seed/activities.yaml` — all crons UTC):
 
 | Slug | Cron | Flow | Agent | What it does |
 |---|---|---|---|---|
-| `infra-heartbeat-2m` | `*/2 * * * *` | `InfraHeartbeatFlow` | Pandora's Actor | Polls swarm nodes + services; spawns an investigation on **state transitions only**, so steady state costs nothing |
 | `todoist-sync-5min` | `*/5 * * * *` | `TodoistSyncFlow` | Sebas | Incremental Todoist Sync API pull + drains the `todoist_outbox` write queue |
-| `hub-sweep-5m` | `3-58/5 * * * *` | `HubSweepFlow` | Pandora's Actor | The problem hub's housekeeping: opens a `suppressed` problem once its deploy or maintenance window passes, resolves a problem whose task you completed, brings every task up to date with its problem, and folds three or more problems of one class into a group when a model call agrees they are one condition |
+| `hub-sweep-5m` | `3-58/5 * * * *` | `HubSweepFlow` | Sebas | The problem hub's housekeeping: resolves a problem whose task you completed, brings every task up to date with its problem, and folds three or more problems of one class into a group when a model call agrees they are one condition |
 | `social-publish-5min` | `*/5 * * * *` | `SocialPublishFlow` | Sebas | `@publish`-labelled tasks due now → approval card → post. Ships **inert**: `social_publishing_enabled` defaults to false |
 | `gtd-clarify-15min` | `*/15 * * * *` | `ClarifyFlow` | Sebas | Classifies unprocessed Inbox tasks (≤ 20 per tick) |
-| `llm-spend-guard-15min` | `*/15 * * * *` | `LLMSpendGuardFlow` | Pandora's Actor | Rolling-24h token **or dollar** budget → flips the LLM kill switch. **Inert** until one is set (both default to 0) |
-| `agent-task-15min` | `*/15 * * * *` | `AgentTaskSweepFlow` | Pandora's Actor | Executes agent-assigned Todoist tasks — see [§5](#5-the-agent-task-executor) |
+| `llm-spend-guard-15min` | `*/15 * * * *` | `LLMSpendGuardFlow` | Sebas | Rolling-24h token **or dollar** budget → flips the LLM kill switch. **Inert** until one is set (both default to 0) |
+| `agent-task-15min` | `*/15 * * * *` | `AgentTaskSweepFlow` | Sebas | Executes agent-assigned Todoist tasks — see [§5](#5-the-agent-task-executor) |
 
 **Hourly / few-hourly**
 
 | Slug | Cron | Flow | Agent | What it does |
 |---|---|---|---|---|
 | `gmail-ingest-hourly` | `0 * * * *` | `GmailIngestFlow` | Sebas | Fetch + classify new mail (window `is:unread newer_than:7d` plus a forward-only cursor). Only `important_action` interrupts you — a Todoist Inbox task, and the mail kept unread; it is guarded twice, by a notification-subject cap and by a live re-read of unread state, so mail you already read never produces a task. `important_read` is labelled IMPORTANT and **marked read**; everything else is marked read with IMPORTANT stripped. Tune it on the admin **Email triage** page. Tag fan-out spawns `MoneyProcessFlow` for `financial`/`payments` mail, which parses it into a money event and posts it to Maou's hledger books. With Integrations → Features → **Passive people enrichment** on, each sender is also folded into `life.people`: it learns their address as an alias and moves `last_contact` forward, but it **never creates a person** — an inbox is unbounded and mostly transactional |
-| `delivery-watchdog-hourly` | `0 * * * *` | `DeliveryWatchdogFlow` | Pandora's Actor | Finds interaction cards that were never delivered; checks comms liveness |
-| `flow-health-watchdog-30m` | `7,37 * * * *` | `FlowHealthWatchdogFlow` | Pandora's Actor | Watches AEGIS's own flows: 2 consecutive failed runs of one `workflow_type` (recency-ordered, so a later success clears it), or an active schedule with no *successful* run in 3x its own cadence. One deduped card per fault, a `[FLOW OK]` card on recovery. Dedupe, recovery and mutes are the problem hub's: one `flow_failing` / `flow_stale` / `llm_dead` problem per subject; mute one by muting its problem. |
+| `delivery-watchdog-hourly` | `0 * * * *` | `DeliveryWatchdogFlow` | Sebas | Finds interaction cards that were never delivered; checks comms liveness |
+| `flow-health-watchdog-30m` | `7,37 * * * *` | `FlowHealthWatchdogFlow` | Sebas | Watches AEGIS's own flows: 2 consecutive failed runs of one `workflow_type` (recency-ordered, so a later success clears it), or an active schedule with no *successful* run in 3x its own cadence. One deduped card per fault, a `[FLOW OK]` card on recovery. Dedupe and recovery are the problem hub's: one `flow_failing` / `flow_stale` / `llm_dead` problem per subject; close its problem on the admin **Problems** page to drop one. |
 | `rss-ingest-hourly` | `30 * * * *` | `RssIngestFlow` | Raphael | RSS feeds → knowledge store |
 | `raindrop-ingest-2h` | `0 */2 * * *` | `RaindropIngestFlow` | Raphael | Raindrop bookmarks → knowledge store |
-| `service-drift-4h` | `0 */4 * * *` | `ServiceDriftFlow` | Pandora's Actor | Secondary swarm drift check (alertmanager is the primary path); one `replicas` / `oom_exit` problem per service on the hub, carded once |
 | `drive-sync-raphael` | `15 */4 * * *` | `DriveSyncFlow` | Raphael | Watched Google Drive folder → knowledge. **No-ops until `folder_id` is set** in its config |
 | `notes-sync-hourly` | `19 * * * *` | `NotesSyncFlow` | Raphael | Pulls the user's Obsidian vault — Raphael's record (#514) — and indexes what changed as `source_type='note'`, encrypted blocks stripped, at most `max_files` (300) a run. Leaves out `raphael/questions/`, whose answers are already in the store. Reports `not_configured` until the vault is |
 | `wearable-ingest-6h` | `50 */6 * * *` | `WearableIngestFlow` | Sebas | Wearable vendor API (Oura today) → `life.observations` (`sleep_score`, `readiness_score`, `activity_score`, `steps`). Needs **both** an `oura_api_token` under Integrations and an active `wearable` row under Channels — until then the run reports `token_missing` / `no_channel` rather than failing. Re-polls an overlapping window on purpose; rows dedup on `(source, metric, external_id)` in the database |
@@ -155,13 +153,11 @@ The shipped schedule set (`config/seed/activities.yaml` — all crons UTC):
 | Slug | Cron (UTC) | Flow | Agent | What it does |
 |---|---|---|---|---|
 | `gtd-daily-review` | `30 2 * * *` | `DailyReviewFlow` | Sebas | Daily GTD digest + acknowledgement card |
-| `memory-reflection-nightly` (+ `-maou`, `-raphael`, `-pandoras-actor`) | `0 3 * * *` (others at 03:11, 03:17, 03:29) | `MemoryReflectionFlow` | each agent, one row each | Caps the agent's `agent_memory` at `keep` rows (default 50). With `consolidate: true` it first *proposes* a merge/retire plan and logs every op to `agent_memory_ops_log`. Applying it needs **two independent keys**: `dry_run: false` on this row *and* `AEGIS_MEMORY_CONSOLIDATION_APPLY_ENABLED=true` in the worker environment. Both default to off, so it ships inert. Armed, a DELETE is a **soft retire** (recoverable; `retire_grace_days: 0` = never hard-deleted), and a plan whose destructive ops exceed `max_ops_pct` of the agent's live rows is refused wholesale |
-| `social-metrics-daily` | `30 3 * * *` | `SocialMetricsFlow` | Sebas | Pulls post analytics into `social_outbox.metrics`, then runs the stuck-post watchdog: a Postiz-routed post more than `stuck_after_hours` (6) past its schedule with no PUBLISHED confirmation raises one deduped `[SOCIAL]` card (a `[SOCIAL OK]` on recovery). Dedupe, recovery and mutes are the problem hub's: one `stuck_post` problem per post, folded into one group when several are stuck in the same queue; mute one by muting its problem |
-| `cleanup-daily` | `0 4 * * *` | `CleanupFlow` | Pandora's Actor | Retention prune for unbounded ops tables |
+| `memory-reflection-nightly` (+ `-maou`, `-raphael`) | `0 3 * * *` (others at 03:11, 03:17) | `MemoryReflectionFlow` | each agent, one row each | Caps the agent's `agent_memory` at `keep` rows (default 50). With `consolidate: true` it first *proposes* a merge/retire plan and logs every op to `agent_memory_ops_log`. Applying it needs **two independent keys**: `dry_run: false` on this row *and* `AEGIS_MEMORY_CONSOLIDATION_APPLY_ENABLED=true` in the worker environment. Both default to off, so it ships inert. Armed, a DELETE is a **soft retire** (recoverable; `retire_grace_days: 0` = never hard-deleted), and a plan whose destructive ops exceed `max_ops_pct` of the agent's live rows is refused wholesale |
+| `social-metrics-daily` | `30 3 * * *` | `SocialMetricsFlow` | Sebas | Pulls post analytics into `social_outbox.metrics`, then runs the stuck-post watchdog: a Postiz-routed post more than `stuck_after_hours` (6) past its schedule with no PUBLISHED confirmation raises one deduped `[SOCIAL]` card (a `[SOCIAL OK]` on recovery). Dedupe and recovery are the problem hub's: one `stuck_post` problem per post, folded into one group when several are stuck in the same queue; close its problem on the admin **Problems** page to drop one |
+| `cleanup-daily` | `0 4 * * *` | `CleanupFlow` | Sebas | Retention prune for unbounded ops tables |
 | `daily-briefing-raphael` | `30 4 * * *` | `DailyBriefingFlow` | Raphael | The daily brief: interactions, activity, knowledge, market summary → your channel |
-| `workspace-repo-sync-daily` | `0 5 * * *` | `WorkspaceRepoSyncFlow` | Pandora's Actor | Mirrors the coding host's workspace checkouts into `resources`; reports tracked repos whose AEGIS webhook newly went missing (the change, not the standing set — #142) |
 | `calendar-ingest-daily` | `0 6 * * *` | `CalendarIngestFlow` | Sebas | Calendar events, 30-day horizon. With **Passive people enrichment** on, attendees of small meetings (≤ 8 invitees) are auto-added to `life.people` — the only lane that creates a person. It **refuses entirely until Integrations → Owner (`owner_emails`) is filled in**, because Google lists you among your own events' attendees. It never sets `last_contact`: the horizon is forward-looking, and a meeting you have not had yet is not contact |
-| `cert-radar-daily` | `0 7 * * *` | `CertRadarFlow` | Pandora's Actor | TLS expiry checks for the domains in its config — **replace the seed list with your own**; one `cert_expiring` problem per domain on the hub, resolved when renewed |
 | `expiry-radar-daily` | `25 7 * * *` | `ExpiryRadarFlow` | Sebas | Warns on anything in `life.expiring_items` (passport, visa, licence, insurance, warranty, medication, domain) crossing one of its `lead_days` thresholds. One Acknowledge card per threshold per expiry cycle — renewing an item (moving `expires_on`) re-arms them all. Add rows on the admin **Expiring Items** page; empty registry = silent. The admin **Assets** page feeds it too: an asset with both a service interval and a last-serviced date mirrors itself in as an `asset_service` item |
 | `intel-scan-hn` / `-news` / `-finance` | `0 7` / `30 7` / `0 8 * * *` | `IntelligenceScanFlow` | Raphael | Scores sources against your topics; ingests items ≥ `significance_threshold` |
 | `curiosity-daily` | `30 9 * * *` | `CuriosityCardFlow` | Sebas | At most one `input` card per day asking about a gap in what AEGIS knows (an unexplained recurring charge, a busy project, a recurring meeting face); the answer is banked as durable `agent_memory`. Gates itself on the notification budget, so a quiet day is the normal outcome. **The calendar-attendee lane stays off until you fill in Integrations → Owner (`owner_emails`)** — Google lists you among your own events' attendees, so without it the card could ask you who *you* are |
@@ -172,7 +168,7 @@ The shipped schedule set (`config/seed/activities.yaml` — all crons UTC):
 
 | Slug | Cron (UTC) | Flow | Agent | What it does |
 |---|---|---|---|---|
-| `profile-reflection-weekly` (+ `-maou`, `-raphael`, `-pandoras-actor`) | `23 2 * * 0` (others 02:31 Tue, Thu, Sat) | `ProfileReflectionFlow` | each agent, one row each | Proposes one revision of the agent's own **user-context persona doc** from the week's evidence (chat, memories, resolved-interaction corrections, finance, calendar) and sends it as a `draft_review` card. **Nothing is written until you press Approve** — the admin panel shows the proposed document, lets you edit it, and Approve applies exactly what is in the editor; Reject writes nothing and banks your reason as a lesson. Every applied patch lands an `agent_profile_revisions` row (`source='profile_reflection'`) and is revertible. Quiet week, LLM failure, or an unchanged proposal ⇒ no card. Both learning flows are per-agent: a new agent needs its own two rows in `config/seed/activities.yaml`, because the seed deletes any activities row the yaml does not name, so one added on /admin/flows is gone after the next core restart. Until 2026-09 only Sebas had them, so his was the only persona that changed |
+| `profile-reflection-weekly` (+ `-maou`, `-raphael`) | `23 2 * * 0` (others 02:31 Tue, Thu) | `ProfileReflectionFlow` | each agent, one row each | Proposes one revision of the agent's own **user-context persona doc** from the week's evidence (chat, memories, resolved-interaction corrections, finance, calendar) and sends it as a `draft_review` card. **Nothing is written until you press Approve** — the admin panel shows the proposed document, lets you edit it, and Approve applies exactly what is in the editor; Reject writes nothing and banks your reason as a lesson. Every applied patch lands an `agent_profile_revisions` row (`source='profile_reflection'`) and is revertible. Quiet week, LLM failure, or an unchanged proposal ⇒ no card. Both learning flows are per-agent: a new agent needs its own two rows in `config/seed/activities.yaml`, because the seed deletes any activities row the yaml does not name, so one added on /admin/flows is gone after the next core restart. Until 2026-09 only Sebas had them, so his was the only persona that changed |
 | `money-brief-weekly` | `0 3 * * 0` | `MoneyBriefFlow` | Maou | The week's money, read off the hledger books: what moved, what is owed, and what the journal never got. Refreshes the FX price file first (a dead quote provider only costs you stale rates, never the brief), sends the message and files a Markdown copy in the books repo. Gated on **Money Hygiene** |
 | `gtd-weekly-review` | `30 3 * * 0` | `WeeklyReviewFlow` | Sebas | Weekly review digest (Sunday) |
 | `money-close-monthly` | `0 4 1 * *` | `MonthCloseFlow` | Maou | The previous calendar month's close — income statement, balance sheet and index counts — sent and filed under `reports/monthly/`. The flow picks the month, so a manual re-run on any day closes the same one. Gated on **Money Hygiene** |
@@ -183,13 +179,14 @@ The shipped schedule set (`config/seed/activities.yaml` — all crons UTC):
 
 Not in this table because they're **event-driven, not scheduled**:
 `InteractionFlow` (spawned by any flow needing a decision),
-`AlertInvestigationFlow` (webhooks + pollers, [§7](#7-the-alert-pipeline)),
 `MoneyProcessFlow` (per-email child: one money email into the books),
 `AgentChatReplyFlow` (Todoist comment replies), `AgentTaskFlow` (per-task child
 of the sweep), `ResearchFlow` (one research question, from `research_topic` or
 a `#research` task), `NotesWriteFlow` (one vault write from `note_write` /
 `note_link`). (`SentryPollFlow`, `JiraSyncFlow` and `GitHubAlertFlow` are gone:
-the Sentry, Jira and GitHub intakes moved to the v2 Development vertical.)
+the Sentry, Jira and GitHub intakes moved to the v2 Development vertical.
+`AlertInvestigationFlow`, `InfraHeartbeatFlow`, `ServiceDriftFlow` and
+`CertRadarFlow` are gone too: the infra lane moved to the v2 DevOps vertical.)
 
 Note the **ship-active-but-inert** pattern: `social-publish-5min`,
 `llm-spend-guard-15min`, `drive-sync-raphael`, `wearable-ingest-6h`,
@@ -217,7 +214,7 @@ The structure AEGIS manages is deliberately minimal:
   `@someday` (not yet), `@waiting` (blocked / parked), `@reference`
   (information, ingested into the knowledge store).
 - **Delegation is an assignee label**: `@me` or an agent alias
-  (`@sebas`, `@raphael`, `@maou`, `@pandora` in the shipped set — derived from
+  (`@sebas`, `@raphael`, `@maou` in the shipped set — derived from
   each agent's `mention_aliases`, not hardcoded). Commenting on an
   agent-labelled task gets you a personality-voiced reply on the task and in
   the agent's channel (`AgentChatReplyFlow`).
@@ -280,13 +277,12 @@ user-authored:
 
 | Selector | Verb | What happens |
 |---|---|---|
-| `source_tag = '#alert'` | infra | Read the problem behind the task, then act by its kind (below). A service the swarm runs: check its health *now* → healthy: comment + complete; unhealthy: logs + a "restart?" card |
 | `source_tag = '#receipt'` | finance | Legacy: `#receipt` tasks are no longer created by `MoneyProcessFlow` (since 2026-09-05); an existing one still gets the merchant-history decision card |
 | `source_tag = '#email'` | email triage | Notification → archive + complete; genuinely needs a reply → comment + `@waiting` (the Gmail scope is `gmail.modify` — AEGIS cannot send mail) |
 | `#research` | research | Run `ResearchFlow` on the task's title (its description is context, its links are read first): the knowledge store, a web search, papers when the question is academic, then one cited answer. The answer is posted on the task with its numbered sources, saved to the knowledge store, and the task goes to `@waiting`. Before #509 this tag went to `ask`, and the agent could only chat about the task |
 | `#chat`, `#calendar`, `#manual`, or no tag and no `@code` | ask | Hand the task to the agent it is assigned to, through that agent's own chat path (`AgentChatReplyFlow`, the one clarify uses when you comment on an agent's task) → `@waiting`. The first turn is read-only; your reply on the task is what lets the agent change anything |
 | `source_tag IS NULL` + `@code` | coding | Task session: one persistent Claude Code session per task, one turn per comment → plan → implement on a branch when asked → draft PR when asked → `@waiting` |
-| a tag the table maps to `None`, or one no one has decided about | — | Park once, with a comment saying the task is yours and how to route tags like it. Never guessed at. (`#money` maps to `None`, but the sweep never picks those tasks up: `EXCLUDED_LABELS`) |
+| `#alert` (a hub problem's task), a tag the table maps to `None`, or one no one has decided about | — | Park once, with a comment saying the task is yours and how to route tags like it. Never guessed at. (`#money` maps to `None`, but the sweep never picks those tasks up: `EXCLUDED_LABELS`) |
 
 **The verb table is a setting.** `DEFAULT_VERBS` in
 `core/src/aegis/services/agent_task_verbs.py` holds the generic defaults,
@@ -305,22 +301,9 @@ The agent is found through the agent registry — each agent's
 comment channel makes. A label no active agent answers to parks the task
 with a comment saying so.
 
-**The infra verb acts by the kind of problem** (`plan_infra_task`). It reads
-the problem from the hub (`find_problem_for_task`), never the title, unless
-the hub has none. Every branch below is read-only:
-
-| The problem is | What happens |
-|---|---|
-| a service the swarm runs | the health check and restart card above |
-| any other `service` subject (e.g. a pipeline tool's alerts, a scrape target) | no `docker service ps` and no restart card; quote the investigation's finding and park |
-| a node | the heartbeat's last sample of it, from its own settings row, and the alert's runbook. No Docker or SSH command against the node |
-| an alert whose `instance` label is a URL | one GET against it, and what it answered |
-| a group (subject `*`) | the members, from the hub's `grouped` events and absorbed occurrences |
-| a flow, the comms probe, a post, or another kind | the finding and where a person looks next |
-| a money problem | unchanged: Maou owns these |
-
-The investigation is never re-run here: the hub started it when the problem
-appeared. Each report ends with "What to do" and parks the task once.
+`#alert` maps to `None` since the infra lane moved to the DevOps vertical:
+a hub problem's task is yours. The old `infra` verb, with its health checks
+and restart cards, is gone.
 
 ```mermaid
 flowchart TD
@@ -328,26 +311,21 @@ flowchart TD
     E --> P["pick 3, oldest first<br/>(max 1 coding)"]
     P --> C["spawn AgentTaskFlow children<br/>ParentClosePolicy.ABANDON"]
     C --> V{"verb from source_tag<br/>(agent_task_verbs; @code only when NULL)"}
-    V -- "#alert" --> PL{"plan_infra_task:<br/>what is the problem?"}
-    PL -- "a swarm service" --> IN{"service healthy now?"}
-    IN -- yes --> D1["comment + complete"]
-    IN -- no --> R1["logs + card: restart?"] --> W1["@waiting"]
-    PL -- "node / URL / group / other" --> RP["read-only report<br/>+ what to do"] --> W6["@waiting"]
     V -- "#email" --> EM{"notification?"}
     EM -- yes --> D2["archive + complete"]
     EM -- no --> W2["comment + @waiting"]
     V -- "#receipt" --> F1["merchant history<br/>+ decision card"] --> W3["@waiting"]
     V -- "ask" --> A1["assigned agent's chat path<br/>(AgentChatReplyFlow)"] --> W7["@waiting"]
     V -- "@code" --> K1["task session: turn per comment<br/>→ plan → implement when asked<br/>→ draft PR when asked"] --> W4["@waiting"]
-    V -- "none / unknown" --> W5["comment: yours, and how to route it<br/>+ @waiting"]
+    V -- "#alert / none / unknown" --> W5["comment: yours, and how to route it<br/>+ @waiting"]
 ```
 
 **The safety model:** investigation is free; every write is gated by an
-`InteractionFlow` card. Reading service logs, repo code, charge history, email
-metadata, and commenting findings on the task — no gate. Restarting a service,
-implementing code, opening a PR, applying a finance decision — card first.
-Restart/finance cards use the fire-and-forget `post_resolve_activity` hook
-(`apply_restart_approval` / `apply_finance_decision`), so the child can park
+`InteractionFlow` card. Reading repo code, charge history, email
+metadata, and commenting findings on the task — no gate. Implementing code,
+opening a PR, applying a finance decision — card first.
+Finance cards use the fire-and-forget `post_resolve_activity` hook
+(`apply_finance_decision`), so the child can park
 the task and exit while the card is still open. The coding verb has no cards
 at all: the task's comment thread is its approval channel (see below). The
 `ask` verb works the same way: its first turn is told to stay read-only, and a
@@ -407,8 +385,8 @@ without you thinking about it; the script is in
 [`infrastructure.md`](infrastructure.md), because it lives in your dotfiles.
 
 **Every path ends completed or parked.** A task is auto-completed only when
-the work is genuinely done (service healthy, notification archived);
-everything a human still has to finish — an open PR, a declined restart, a
+the work is genuinely done (a notification archived);
+everything a human still has to finish — an open PR, a
 reply-needed email — ends at `@waiting` with an explanatory comment. Even a
 crashed child best-effort parks the task before re-raising. That invariant is
 what keeps the 6h cooldown from becoming an infinite slow loop over the same
@@ -450,198 +428,37 @@ use `archive` and treat `archived` as a rejection in the parent.
 **`post_resolve_activity`** is the fire-and-forget hook: the card's spawner
 can exit immediately (abandoned child) and still have an action run when you
 eventually answer — the named activity is invoked with
-`[interaction_id, response, metadata]`. This is how a restart approval
-executes hours after the flow that asked went away.
+`[interaction_id, response, metadata]`. This is how a finance decision
+is applied hours after the flow that asked went away.
 
 Two extras worth knowing: cards can carry an **escalation** config in
 `metadata` (`{"escalation": {"interval_minutes": N, "mention_id": "…",
-"max_repeats": N}}`) that re-pings with an @-mention until answered — used for
-critical infra cards; and approval/choice/ack cards include an optional
+"max_repeats": N}}`) that re-pings with an @-mention until answered; and approval/choice/ack cards include an optional
 free-text **note** field — a note typed alongside your tap is recorded as a
 durable `agent_memory` lesson surfaced in that agent's future prompts (the
 learning loop).
 
-## 7. The alert pipeline
+## 7. The problem hub
 
-Every alert source converges on one flow — `AlertInvestigationFlow` — so
-dedup, muting, approval gates, and the audit trail behave identically
-regardless of where the alert came from. The Alertmanager/Grafana webhook
-(`/api/webhooks/alert`), the Sentry intake and the GitHub PR webhook left v1:
-alert intake moved to the v2 DevOps vertical, Sentry and GitHub to the v2
-Development vertical. What is left:
+The infra lane left v1 on 2026-10-08 for the DevOps vertical (a2-devops).
+Homelab alerts, alert investigation, the swarm heartbeat, service drift, the
+certificate radar, automatic restarts, runbooks, and deploy or maintenance
+windows all live there now. Alertmanager, Grafana and the deploy role post to
+DevOps, not to v1.
 
-- `infra-heartbeat-2m` — AEGIS's own 2-minute swarm poll; investigates on
-  node/service **state transitions** only, and catches outages that also take
-  your alerting stack down. It also carries the **ingress canary**: set
-  `ingress_url` on its `activities.config` row and every tick GETs AEGIS's own
-  public URL from inside the worker, raising `IngressUnreachable` when the way
-  in stops answering. Core's healthcheck runs inside core's container, so it
-  stays green while the proxy in front of it drops every webhook — that is how
-  a 3.5-hour outage went unnoticed on 2026-09-11 (#492), and no outside
-  monitor could have told AEGIS, because being told is what was broken.
+What v1 keeps is the problem hub (`services/hub.py`) for its own findings: the
+flow-health and delivery watchdogs, expiry, social, the LLM spend guard,
+connectors, money, feeds, research, chat, sessions and manual reports. Each
+producer builds an `Event` and calls `hub.ingest_event`; the hub decides
+whether it is a new problem or another occurrence of a live one. Watchdogs
+resolve what they stop finding (`hub_watch.reconcile_findings`).
 
-  What counts as reachable is any answer under 500 **from the host you asked**.
-  A redirect that lands somewhere else fails: an identity proxy would otherwise
-  send the probe to its own login page, which answers 200 forever whether or
-  not the origin is alive. So aim it at a path that proxy will not challenge —
-  `/api/webhooks/ping` is the one to use: it answers **204**, which no proxy
-  invents on its own, so `ingress_expect_status: 204` catches a proxy serving
-  its own 404 for a route it has lost. (A plain webhook path answers 404 to a
-  bare GET, because the admin SPA's catch-all claims every unmatched `/api/`
-  GET before Starlette can say 405 — and 404 is exactly what a routeless proxy
-  says too, so it asserts less.) It takes `ingress_fail_threshold` failures in a row
-  (default 2, so a 4-minute fuse) because one dropped request is what a rolling
-  update of core looks like and this alert escalates. Empty `ingress_url`
-  disables the whole thing.
-- Hand-captured Todoist tasks routed via a content route with
-  `alert_overrides` (e.g. "X is down" → a synthetic `NodeDown`)
-
-```mermaid
-flowchart TD
-    HB["infra-heartbeat-2m<br/>(state transitions)"] --> HUB
-    TT["Todoist task<br/>(content route)"] --> HUB
-    HUB["problem hub: ingest_event<br/>key = class:subject_kind:subject"] --> DEC{"new or returning?"}
-    DEC -- "no: same open problem" --> X2["occurrence counted,<br/>task commented, no flow"]
-    DEC -- "suppressed by a<br/>deploy window" --> X3["stored, not raised"]
-    DEC -- "muted" --> X4["stored, not raised"]
-    DEC -- yes --> AI["AlertInvestigationFlow(problem_id)"]
-    AI --> VD["verification wait (per class)<br/>then ask the hub: resolved yet?"]
-    VD -- resolved --> X5["exit; the hub closed the task"]
-    VD -- "still wrong" --> RS{"service below replicas?"}
-    RS -- "no" --> RR["resolve the owning repo<br/>(resources table)"]
-    RS -- "yes, first time<br/>this hour" --> FR["one automatic<br/>force-restart"]
-    FR -- recovered --> X6["exit; the problem resolves"]
-    FR -- "did not recover" --> RR
-    RS -- "back within the hour<br/>of a restart" --> RR
-    RR --> KC["runbook + past verdicts<br/>(a taken fix first, discarded ones left out)"]
-    KC --> IV["investigate: coding CLI on the repo,<br/>LLM-only fallback"]
-    IV --> VE{"anything to decide?"}
-    VE -- "no" --> NO["record_investigation:<br/>event on the problem, task comment,<br/>chat ping"]
-    VE -- "fix branch / actionable<br/>with commands / escalating /<br/>restart did not stick" --> G2["Gate 2 card: Open PR / Run fix /<br/>Mute 24h / Acknowledge / Discard"]
-    G2 --> NO
-    NO --> KG["verdict stored with the outcome<br/>(opened_pr, run_fix, discarded, no_card …)"]
-    G2 -- "Open PR" --> PR["draft PR, linked to the problem;<br/>problem: fixing"]
-    PR -- "you complete the task" --> OK["resolved"]
-```
-
-The flow no longer decides whether an alert is new — the hub does, before the
-flow starts. Dedupe, muting and suppression all happen at `ingest_event`, and
-the flow is handed a `problem_id` it records against.
-
-The steps that make it trustworthy:
-
-- **The problem hub decides what is new.** Every alert — firing or resolved,
-  from the heartbeat or a hand-captured task — is
-  recorded on a `problems` row (`services/hub.py`, spec
-  `docs/superpowers/specs/2026-09-07-problem-hub-design.md`), keyed by one
-  correlation function, never by a task. A repeat of an open problem is
-  counted and commented; only a new or returning problem starts an
-  investigation. A deploy or maintenance window (`service_state`) suppresses;
-  "Mute 24h" on a card mutes the *problem*. A `resolved` event resolves it and
-  the projector closes the task, so nothing outlives its incident (#279, #341).
-  It works the other way too: completing the task resolves the problem, and a
-  mute silences occurrences but never a recovery — a muted problem that
-  resolves still closes its task (#473).
-- **The same failure on many things becomes one problem.** Six posts wedged in
-  one Postiz queue arrived as six problems and six tasks. They are one
-  condition with one fix, so the five-minute `HubSweepFlow` notices three or
-  more live problems sharing a class and a kind of subject, asks the model
-  whether they are one condition, and — only on a yes — folds them into a
-  single **group** problem. The survivor is renamed for what it now covers,
-  the others are merged in and their tasks closed with a note pointing at it,
-  and a card in Slack says what happened and why. From then on the next stuck
-  post joins the group rather than opening another task, and the group
-  recovers when the watchdog stops finding any member.
-
-  What it will not do: group across classes, group hand-written `@code` tasks
-  (their problems are `manual`, and each is its own piece of work), or group on
-  the count alone — a "no" from the judge stands until the cluster grows. To
-  unpick one, open the group on the admin **Problems** page: every member it
-  swallowed is linked from its timeline.
-- **Verification delay.** A per-class sleep, then the hub is asked whether the
-  problem already resolved, before spending any investigation effort —
-  self-healing blips cost nothing.
-- **A blip earns no Todoist task.** The same per-class window decides when a
-  problem is worth a chore: an alert younger than it stays in the hub, the
-  digest and Slack, and one that recovers inside it never gets a task at all
-  (#537). A quarter of the hub's first month of tasks were for problems that
-  were already over — created, clarified and auto-completed with nobody acting
-  on them. Only the task waits: the investigation still starts on the first
-  occurrence, so the diagnosis and the card are as quick as ever. Findings that
-  nothing will ever resolve on your behalf — a money reconciliation, a stale
-  feed, an agent's question — are projected on sight. Defaults are 180s, 300s
-  for `NodeDown` / `DockerServiceDown`, and 0 for disk, memory and OOM classes,
-  which are real the moment they fire:
-
-  Edit them on the admin **Problems** page, under *Hub configuration* — one row
-  per class, with the built-in defaults shown beside them so a blank field reads
-  as what it means. A bad value is refused with a reason rather than saved and
-  quietly ignored. The equivalent by hand, if you prefer:
-
-  ```sql
-  -- give a flappy service ten minutes to settle; never wait on a dead node
-  INSERT INTO settings (key, value) VALUES
-    ('hub_settle_seconds', '{"servicecrashlooping": 600, "nodedown": 0}')
-  ON CONFLICT (key) DO UPDATE SET value = excluded.value;
-  ```
-
-  **The row is one number with two jobs.** It is the same window the
-  verification delay above uses, on purpose — "long enough to believe this is
-  real" is one question — so shortening it also shortens the wait before AEGIS
-  spends an investigation and takes its one automatic restart. `{"*": 0}` does
-  not restore the pre-#537 behaviour: it gives back the immediate task AND
-  removes every verification delay, so a blip that would have self-healed
-  during the wait now costs a billed investigation and a force-restart. If
-  what you want is only the old task timing, that is not available through
-  this row; say so on #537 and it can have a knob of its own.
-- **One automatic restart per problem per hour.** A swarm service below its
-  replicas gets one `docker service update --force` first; that fixes most
-  flaps. If the same problem is back within the hour, it is not restarted
-  again: the task gets the first restart's evidence (what `docker service ps`
-  said) and what changed, the investigation is told the restart already
-  failed, and one card goes out (#501). The window is the
-  `alert_remediation` settings row; see
-  [`infrastructure.md`](infrastructure.md#when-pandora-asks-you-and-the-automatic-restart).
-- **Repo resolution.** Deterministic service-name matching, then an LLM pick,
-  against the `resources` table — which `workspace-repo-sync-daily` keeps
-  mirroring your coding host's actual checkouts. No JIT cloning: a repo AEGIS
-  doesn't have checked out falls back to LLM-only investigation.
-- **Context.** The alert's runbook, from the `runbooks` table if you wrote
-  one (admin **Runbooks** page), else `runbooks/<AlertName>.md` baked into
-  the worker image (`TODO: fill in` stubs are treated as absent), plus up to
-  three past verdicts on similar alerts from the knowledge store, each with
-  what you did about it: a fix you took comes first, and a fix you discarded
-  never comes back (#502).
-- **Investigation** runs your coding CLI (Claude Code / Kimi) over SSH on the
-  registered coding host against the resolved repo, LLM-only as fallback, and
-  ends in a structured verdict: `resolved` / `not_actionable` / `actionable` /
-  `inconclusive`.
-- **Gate 2** puts every consequential outcome behind a card: open the
-  proposed PR(s), **Run fix** (execute the investigation's fix commands on
-  the host — refused when the infra registry entry is `read_only`; a typed
-  note overrides the command list), **Run checks** (its read-only commands;
-  code decides which commands are read-only, #641), mute, acknowledge, or
-  discard. A card goes out only when there is such a decision, or the alert
-  escalates, or a restart did not stick (#500). Fix commands count only on an
-  `actionable` verdict (#518), and checks alone never earn a card; otherwise
-  they go on the task comment, not run. A verdict with nothing to decide is told, not asked: a comment on the
-  task, an event on the timeline and a chat ping. Mute such a problem from the
-  admin **Problems** page.
-- **After the decision.** The verdict goes to the knowledge store only once
-  you have answered, tagged with the answer (or `no_card`), so the next
-  investigation learns from what you did rather than from what was proposed.
-  An opened PR leaves the problem `fixing` until you complete its task; v1 no
-  longer follows the merge (the GitHub intake moved to the v2 Development
-  vertical).
-
-Everything lands on the problem's timeline (`problem_events`) and, projected
-from it, as a comment trail on a `@pandora`-labelled Todoist task — so the
-incident history lives where you already look, and the next session reads one
-record.
-Escalation @-mentions and a dead-man ping URL for the heartbeat are configured
-on the admin **Integrations** page. See
-[`production.md`](production.md#alert-routing-inbound-webhooks) for webhook
-setup and the heartbeat/dedup invariants.
+`hub-sweep-5m` (`HubSweepFlow`) does the rest: it resolves a problem whose task
+you completed, brings every task up to date with its problem, and folds three
+or more problems of one class into a group when a model call agrees they are
+one condition. The task is a projection of the problem, never its identity.
+Read [`architecture/problem-hub.md`](architecture/problem-hub.md) before
+touching it.
 
 ## 8. Operating it
 

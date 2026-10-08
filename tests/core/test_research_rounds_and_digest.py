@@ -1,6 +1,6 @@
 """Raphael's problems on the hub, from the audit of #511/#513:
 
-* a feed that broke is Raphael's `#feeds` task, so the infra digest leaves it
+* a feed that broke is Raphael's `#feeds` task, so the hub digest leaves it
   out — by the source that raised it, as it leaves out topics and questions;
 * a round resolved by hand (the Problems page) is over, so the next article
   opens a fresh round instead of reopening it;
@@ -51,7 +51,7 @@ async def _closes(pool, problem_id: str) -> list[str]:
     ]
 
 
-async def test_a_feed_finding_stays_out_of_the_infra_digest(world):
+async def test_a_feed_finding_stays_out_of_the_hub_digest(world):
     feed = f"https://feeds.example/{uuid.uuid4().hex[:8]}"
     svc = f"svc_{uuid.uuid4().hex[:8]}"
     await reconcile_findings(
@@ -73,7 +73,7 @@ async def test_a_feed_finding_stays_out_of_the_infra_digest(world):
     await ingest_event(
         world,
         Event(
-            source="heartbeat",
+            source="flow_health",
             external_id=f"{svc}@1",
             kind="occurrence",
             title=f"Service {svc} down",
@@ -127,7 +127,7 @@ async def test_the_problems_page_close_is_still_by_hand(world):
     res = await ingest_event(
         world,
         Event(
-            source="heartbeat",
+            source="flow_health",
             external_id=f"{svc}@1",
             kind="occurrence",
             title=f"Service {svc} down",

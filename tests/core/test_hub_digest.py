@@ -14,7 +14,6 @@ from aegis.services.hub import (
     get_problem,
     ingest_event,
     list_events,
-    set_service_state,
     set_status,
 )
 
@@ -29,7 +28,7 @@ def _subject() -> str:
 
 def _occ(subject: str, n: int = 1, **kw) -> Event:
     return Event(
-        source="heartbeat",
+        source="flow_health",
         external_id=f"{subject}@{n}",
         kind="occurrence",
         title=f"Service {subject} down",
@@ -76,11 +75,9 @@ async def test_the_digest_counts_what_the_window_saw(db_pool):
     assert ids[0] == b.problem_id or out["problems"][0]["last_seen_at"] >= out["problems"][-1]["last_seen_at"]
 
 
-async def test_the_digest_separates_what_was_not_raised(db_pool):
+async def test_the_digest_counts_what_a_mute_held_back(db_pool):
     await _quiet_everything_else(db_pool)
-    suppressed, muted = _subject(), _subject()
-    await set_service_state(db_pool, suppressed, "deploying", minutes=30, set_by="ansible", now=NOW)
-    s = await ingest_event(db_pool, _occ(suppressed), now=NOW)
+    muted = _subject()
     m = await ingest_event(db_pool, _occ(muted), now=NOW)
     await db_pool.execute(
         "UPDATE problems SET muted_until = $2 WHERE id = $1::uuid",
@@ -89,10 +86,9 @@ async def test_the_digest_separates_what_was_not_raised(db_pool):
     )
 
     counts = (await digest(db_pool, hours=24, now=NOW))["counts"]
-    assert counts["suppressed"] == 1 and counts["muted"] == 1
-    assert counts["open"] == 1, "the suppressed one is not counted open"
-    assert s.problem_id and m.problem_id
-    await set_service_state(db_pool, suppressed, "ok", set_by="ansible", now=NOW)
+    assert counts["muted"] == 1
+    # The deploy/outage windows left with the infra lane: nothing is suppressed.
+    assert "suppressed" not in counts
 
 
 async def test_an_investigation_in_the_window_is_counted(db_pool):
@@ -102,7 +98,7 @@ async def test_an_investigation_in_the_window_is_counted(db_pool):
     await ingest_event(
         db_pool,
         Event(
-            source="investigation",
+            source="session",
             external_id=f"inv-{uuid.uuid4().hex[:8]}",
             kind="investigation",
             title="looked at it",

@@ -95,33 +95,20 @@ def test_hub_sweep_mapper_reads_the_grouping_thresholds():
     assert not hasattr(cfg, "fix_grace_hours")
 
 
-def test_hub_sweep_mapper_reads_the_alertmanager_url():
-    """The reconciliation is off until the row names an alertmanager (#551), so
-    this wiring IS the feature — and nothing else pins it.
-
-    Falsifiable: rename either key in the builder and it stops arriving.
-    """
+def test_hub_sweep_mapper_ignores_the_retired_alertmanager_keys():
+    """The alertmanager reconcile left with the infra lane (a2-devops). A row
+    that still names an alertmanager (migration 056 strips the keys) must not
+    turn anything back on: the mapper leaves the config's defaults alone."""
     mapper = _ACTIVITY_TYPE_MAP["HubSweepFlow"]
     _, cfg = mapper(
         _act(
             "hub-sweep-5m",
             "HubSweepFlow",
-            {
-                "alertmanager_url": "  http://alertmanager:9093  ",
-                "alertmanager_min_uptime_seconds": 1200,
-            },
+            {"alertmanager_url": "http://alertmanager:9093", "alertmanager_min_uptime_seconds": 1},
         )
     )
-    assert cfg.alertmanager_url == "http://alertmanager:9093"
-    assert cfg.alertmanager_min_uptime_seconds == 1200
-
-
-def test_hub_sweep_mapper_ships_the_alertmanager_reconcile_off():
-    """A fork ships nobody's monitoring host: unset means the step does nothing,
-    rather than probing a guessed address."""
-    mapper = _ACTIVITY_TYPE_MAP["HubSweepFlow"]
-    _, cfg = mapper(_act("hub-sweep-5m", "HubSweepFlow", {}))
     assert cfg.alertmanager_url == ""
+    assert cfg.alertmanager_min_uptime_seconds == 900
     assert cfg.alertmanager_min_uptime_seconds == 900
 
 

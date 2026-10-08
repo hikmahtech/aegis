@@ -93,8 +93,7 @@ class AgentChatReplyFlow:
         )
         is_taskless = inp.task_id is None
 
-        # Step 1 — synthesize the reply. Smart-tier agents (pandoras-actor on
-        # claude-sonnet) routinely take 3-6 min when invoking heavy tools
+        # Step 1 — synthesize the reply. Smart-tier agents routinely take 3-6 min when invoking heavy tools
         # (remote_script kimi SSH, deep KS search). Use TIMEOUT_CHAT_REPLY
         # (600s) to match the chat path (PR #248). NO_RETRY, not RETRY_ONCE:
         # this activity is an HTTP wrapper around core's entire chat tool

@@ -1,3 +1,0 @@
-# BlackboxExporterDown
-
-TODO: fill in

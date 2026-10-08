@@ -4,26 +4,21 @@ Thin by design: the logic lives in core's `services/hub.py` and
 `services/hub_project.py`, which both packages import, so a workflow reaches
 the hub through these and never carries SQL of its own.
 
-`ingest_alert` is the seam every alert producer crosses (heartbeat and
-clarify's content routes). It records the event, links a caller-supplied Todoist
-task, projects, and reports whether the hub wants an investigation — the
-*producer* then starts `AlertInvestigationFlow`, because only a workflow can
-start a child workflow.
+The alert seam (`ingest_alert`) and the investigation's activities left with
+the infra lane, which moved to the DevOps vertical (a2-devops). Four sweep
+activities stay one release as no-ops so a sweep recorded before that change
+replays (`hub_sweep.PATCH_DROP_INFRA_STEPS`).
 """
 
 from __future__ import annotations
 
-import json
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any
 
 import asyncpg
-import httpx
 from aegis.errors import error_text, logged_failure
-from aegis.services import hub, hub_cards, hub_group, hub_project, hub_watch
+from aegis.services import hub, hub_group, hub_project, hub_watch
 from temporalio import activity
-from temporalio.client import WorkflowExecutionStatus
-from temporalio.service import RPCError, RPCStatusCode
 
 from aegis_worker.activities.delivery import safe_send_message
 
@@ -32,34 +27,6 @@ _DIGEST_LIST_CAP = 12
 # How many members a grouping judge is shown. Enough to see a pattern; a
 # hundred stuck posts do not read differently from twelve.
 _GROUP_PROMPT_CAP = 12
-# Two small reads of alertmanager, on the LAN. Short: the sweep runs every five
-# minutes and a monitoring stack that cannot answer in this long is one the
-# reconciliation must decline to act on anyway.
-_ALERTMANAGER_TIMEOUT_S = 8.0
-# The producers that start an investigation for a problem they raise, so a
-# problem of theirs a window held back gets one when the window ends (#630).
-_INVESTIGATED_ON_PROMOTE = frozenset({"alertmanager", "heartbeat"})
-
-
-def _uptime_since(raw: str, now: datetime) -> timedelta | None:
-    """How long alertmanager has been up, from its `/api/v2/status` `uptime`.
-
-    That field is a START TIMESTAMP in RFC 3339 (`2026-09-12T21:04:27.879Z`),
-    not a duration — measured against the live instance, not assumed. `None`
-    when it cannot be read, which the caller treats as "do not reconcile":
-    without a trustworthy uptime there is no way to tell a healthy empty alert
-    set from one a restart has just emptied.
-    """
-    text = (raw or "").strip()
-    if not text:
-        return None
-    try:
-        started = datetime.fromisoformat(text.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if started.tzinfo is None:
-        started = started.replace(tzinfo=UTC)
-    return now - started
 
 
 class HubActivities:
@@ -78,90 +45,24 @@ class HubActivities:
         self.llm_client = llm_client
         self.model = model
         self.delivery = delivery
-        # `retire_cards` signals a retired card's waiting `InteractionFlow`,
-        # which may belong to any run; without a client the card is still
-        # retired and edited, and its run waits out its own timeout.
-        # `claim_investigation` asks whether the run holding a problem is still
-        # going; without a client it assumes not, and investigates (#639).
+        # Unused since the infra lane left; kept so the worker's constructor
+        # call is unchanged. Remove with the legacy sweep stubs.
         self.temporal_client = temporal_client
 
-    async def _infra_agent(self) -> str:
-        """The `infra` holder, who judges and announces a group — never an
-        example id (#579). "" when nobody holds the tag or there is no pool."""
+    async def _owner_agent(self) -> str:
+        """The generalist (`gtd` holder), who judges and announces a group —
+        never an example id (#579). "" when nobody holds the tag or there is
+        no pool."""
         if self.db_pool is None:
             return ""
+        from aegis.agent_tags import GENERALIST_TAG
         from aegis.services.agents import resolve_tag
 
         try:
-            return await resolve_tag(self.db_pool, "infra") or ""
+            return await resolve_tag(self.db_pool, GENERALIST_TAG) or ""
         except Exception as exc:  # noqa: BLE001 — an owner lookup never breaks the sweep
-            activity.logger.warning("hub_infra_agent_lookup_failed error=%s", error_text(exc))
+            activity.logger.warning("hub_owner_agent_lookup_failed error=%s", error_text(exc))
             return ""
-
-    @activity.defn
-    async def ingest_alert(self, alert: dict, resolved: bool = False) -> dict:
-        """Record an alert dict (the shape every producer builds) as a problem
-        event. Returns the ingest result plus `problem_id`, `todoist_task_id`
-        and `investigate`. A caller-supplied `alert["todoist_task_id"]` (the
-        clarify and chat paths) becomes the problem's task when it has none.
-
-        Without a pool (tests without a DB) it reports a fresh, investigable
-        problem with no id, so a flow still runs end to end."""
-        if self.db_pool is None:
-            return {
-                "problem_id": None,
-                "action": "created",
-                "investigate": not resolved,
-                "todoist_task_id": alert.get("todoist_task_id"),
-                "suppressed": False,
-                "muted": False,
-            }
-        now = datetime.now(UTC)
-        # An occurrence id that survives a retry of THIS activity task. Temporal
-        # keeps the activity id across attempts, so the second attempt of an
-        # ingest that already committed comes back `duplicate` instead of
-        # minting a second occurrence and answering `investigate=False`.
-        occurrence_key = ""
-        if activity.in_activity():
-            info = activity.info()
-            occurrence_key = f"{info.workflow_id}:{info.activity_id}"
-        event = hub.event_from_alert(
-            alert, occurred_at=now, resolved=resolved, occurrence_key=occurrence_key
-        )
-        result = await hub.ingest_event(self.db_pool, event, now=now)
-        task_id = str(alert.get("todoist_task_id") or "") or None
-        if result.problem_id and task_id:
-            await hub_project.link_task(self.db_pool, result.problem_id, task_id)
-        projected: dict = {}
-        if result.problem_id:
-            try:
-                projected = await hub_project.project(self.db_pool, result.problem_id, now=now)
-            except Exception as exc:  # noqa: BLE001 — the sweep retries projection
-                activity.logger.warning(
-                    "ingest_alert_project_failed problem=%s err=%s",
-                    result.problem_id,
-                    error_text(exc),
-                )
-        return {
-            **result.to_dict(),
-            "todoist_task_id": task_id or projected.get("task_id"),
-        }
-
-    @activity.defn
-    async def verification_delay(self, alert: dict) -> dict:
-        """Seconds an investigation waits before spending effort, by the
-        alert's class (`hub.verify_seconds`, with the operator's
-        `hub_settle_seconds` overrides). An activity rather than a pure call in
-        the flow so a test can shorten it, and so the override is read live.
-
-        It is the same number the projector waits out before a problem earns a
-        Todoist task (#537) — "long enough to believe this is real" is one
-        question, so it has one answer."""
-        labels = alert.get("labels") if isinstance(alert.get("labels"), dict) else {}
-        alertname = str(labels.get("alertname") or "")
-        if self.db_pool is None:
-            return {"delay_seconds": hub.verify_seconds(alertname)}
-        return {"delay_seconds": await hub.verify_seconds_for(self.db_pool, alertname)}
 
     @activity.defn
     async def ingest_finding(self, inp: dict) -> dict:
@@ -214,7 +115,6 @@ class HubActivities:
                 "fresh": [{**f, "problem_id": None} for f in findings],
                 "attached": 0,
                 "muted": 0,
-                "suppressed": 0,
                 "resolved": [],
             }
         return await hub_watch.reconcile_findings(
@@ -225,140 +125,29 @@ class HubActivities:
             findings=findings,
         )
 
-    @activity.defn
-    async def problem_status(self, problem_id: str) -> dict:
-        """What the hub currently knows about a problem — the investigation
-        flow's replacement for polling `audit_log` for a resolved row."""
-        p = await hub.get_problem(self.db_pool, problem_id) if self.db_pool and problem_id else None
-        if p is None:
-            return {"found": False, "status": "", "resolved": False, "todoist_task_id": None}
-        return {
-            "found": True,
-            "status": p["status"],
-            "resolved": p["status"] in {"resolved", "closed"},
-            "occurrences": p["occurrences"],
-            "todoist_task_id": p["todoist_task_id"],
-            "muted": p["muted_until"] is not None and p["muted_until"] > datetime.now(UTC),
-        }
+    # --- legacy sweep stubs (one release; see the module docstring) ---------
 
     @activity.defn
-    async def claim_investigation(self, inp: dict) -> dict:
-        """Make the calling run the one investigation of its problem (#639).
-        `{"claimed": False, "holder": <id>}` means another run is still going
-        and the caller must stand down.
-
-        Keys: `problem_id`, `run_id` (the caller's workflow id).
-
-        Fails open: no pool, no Temporal client, or a describe that errors
-        for any reason but "no such workflow" all count as "the holder is not
-        provably running", and the caller investigates. A second run is the
-        old behaviour; a lost investigation is worse."""
-        problem_id = str(inp.get("problem_id") or "")
-        run_id = str(inp.get("run_id") or "")
-        if self.db_pool is None or not problem_id or not run_id:
-            return {"claimed": True, "holder": run_id}
-
-        async def is_running(holder: str) -> bool:
-            if self.temporal_client is None:
-                return False
-            try:
-                desc = await self.temporal_client.get_workflow_handle(holder).describe()
-            except RPCError as exc:
-                if exc.status != RPCStatusCode.NOT_FOUND:
-                    activity.logger.warning(
-                        "hub_claim_describe_failed holder=%s err=%s", holder, error_text(exc)
-                    )
-                return False
-            except Exception as exc:  # noqa: BLE001 — see the docstring: fail open
-                activity.logger.warning(
-                    "hub_claim_describe_failed holder=%s err=%s", holder, error_text(exc)
-                )
-                return False
-            return desc.status == WorkflowExecutionStatus.RUNNING
-
-        return await hub.claim_investigation(
-            self.db_pool, problem_id, run_id, is_running=is_running
-        )
+    async def promote_expired_suppressions(self) -> dict:
+        """Retired with the deploy/outage windows. No-op stub for a sweep
+        recorded before `PATCH_DROP_INFRA_STEPS`."""
+        return {"promoted": 0, "problem_ids": []}
 
     @activity.defn
-    async def project_problem(self, problem_id: str) -> dict:
-        """Bring the problem's task up to date and report the task's id.
-
-        How the investigation flow learns a task the settle window deferred
-        (#537): it asks for this once its verification delay is over, which is
-        the same window, so the projection mints the task and hands back the id
-        the flow needs for every comment it is about to post. Idempotent — the
-        projector is re-runnable by design — and quiet about a problem that has
-        nothing to project.
-        """
-        if self.db_pool is None or not problem_id:
-            return {"task_id": "", "skipped": "no_pool"}
-        projected = await hub_project.project(
-            self.db_pool, problem_id, now=datetime.now(UTC)
-        )
-        return {
-            "task_id": str(projected.get("task_id") or ""),
-            "skipped": str(projected.get("skipped") or ""),
-        }
+    async def promoted_investigations(self, problem_ids: list[str]) -> list[dict]:
+        """Retired with the investigations. No-op stub, as above."""
+        return []
 
     @activity.defn
-    async def record_investigation(self, inp: dict) -> dict:
-        """Write an `investigation` event (and move the problem to
-        `inp["status"]` when given), then project. One dict argument because
-        Temporal activities take positional args only.
+    async def reconcile_alertmanager(self, url: str, min_uptime_seconds: int = 900) -> dict:
+        """Retired with the alertmanager intake. No-op stub, as above."""
+        return {"resolved": 0, "checked": 0, "skipped": "retired"}
 
-        A problem the alert already resolved stays resolved: the event is
-        still written, and `status_changed` comes back False (`hub.set_status`,
-        #484).
-
-        Keys: `problem_id`, `status`, `text`, `external_id` (idempotency),
-        `posted` (True = the flow already put this text on the task, so the
-        projector must not repeat it), `payload` (extra, kept on the event)."""
-        problem_id = str(inp.get("problem_id") or "")
-        if self.db_pool is None or not problem_id:
-            return {"recorded": False}
-        status = str(inp.get("status") or "")
-        text = str(inp.get("text") or "")
-        payload = dict(inp.get("payload") or {})
-        now = datetime.now(UTC)
-        await hub.ingest_event(
-            self.db_pool,
-            hub.Event(
-                source="investigation",
-                external_id=str(inp.get("external_id") or f"{problem_id}:{now.isoformat()}"),
-                kind="investigation",
-                title=text[:200] or status or "investigation",
-                payload={
-                    **payload,
-                    "text": text[:4000],
-                    "status": status,
-                    "posted": bool(inp.get("posted", True)),
-                },
-                occurred_at=now,
-                problem_id=problem_id,
-            ),
-            now=now,
-        )
-        moved = False
-        if status:
-            moved = await hub.set_status(
-                self.db_pool, problem_id, status, reason=text[:300], now=now
-            )
-        task_id = ""
-        try:
-            projected = await hub_project.project(self.db_pool, problem_id, now=now)
-            task_id = str(projected.get("task_id") or "")
-        except Exception as exc:  # noqa: BLE001
-            activity.logger.warning(
-                "record_investigation_project_failed problem=%s err=%s", problem_id, error_text(exc)
-            )
-        # `task_id` is reported because THIS projection is what mints the task
-        # when a settle window held it back (#537): the status this call just
-        # moved is what stops the projector deferring. Without it the flow goes
-        # on holding the None it was handed at step 0, and every comment it
-        # posts afterwards — the start note, the restart evidence, the verdict,
-        # the transcript — lands on an empty id and is silently dropped.
-        return {"recorded": True, "status_changed": moved, "task_id": task_id}
+    @activity.defn
+    async def retire_cards(self, inp: dict) -> dict:
+        """Retired with the investigations' decision cards. No-op stub, as
+        above."""
+        return {"retired": 0, "finished": 0}
 
     @activity.defn
     async def verify_fixes(self, window_hours: float = 0.0, grace_hours: float = 0.0) -> dict:
@@ -442,11 +231,8 @@ class HubActivities:
             f"{counts['investigated']} investigated. "
             f"{counts['occurrences']} occurrences in total."
         )
-        if counts["suppressed"] or counts["muted"]:
-            head += (
-                f" Not raised: {counts['suppressed']} suppressed by a window, "
-                f"{counts['muted']} muted."
-            )
+        if counts["muted"]:
+            head += f" Not raised: {counts['muted']} muted."
         lines = []
         for p in out["problems"][:_DIGEST_LIST_CAP]:
             mark = "🆕" if p["is_new"] else "•"
@@ -470,187 +256,6 @@ class HubActivities:
             return {"closed": 0, "problem_ids": []}
         ids = await hub.close_resolved(self.db_pool, days=days)
         return {"closed": len(ids), "problem_ids": ids}
-
-    @activity.defn
-    async def mute_problem(self, problem_id: str, hours: float, by: str = "gate2") -> dict:
-        if self.db_pool is None or not problem_id:
-            return {"muted_until": None}
-        until = await hub.mute_problem(self.db_pool, problem_id, hours=hours, by=by)
-        return {"muted_until": until.isoformat() if until else None}
-
-    @activity.defn
-    async def stale_stuck_problems(
-        self, subjects: list[str], hours: float, classes: list[str] | None = None
-    ) -> list[dict]:
-        """Among `subjects` (services the heartbeat sees stuck right now), the
-        ones whose open problem is older than `hours` and has had no
-        investigation event in that long — due for a re-investigation.
-
-        `classes` is what keeps the answer to the question the caller asked:
-        the heartbeat means "this service is still down", not "anything ever
-        recorded about this service"."""
-        if self.db_pool is None or not subjects:
-            return []
-        rows = await hub.stale_open_problems(
-            self.db_pool,
-            [hub.slug(x) for x in subjects],
-            hours=hours,
-            classes=list(classes) if classes else None,
-        )
-        return rows
-
-    @activity.defn
-    async def promote_expired_suppressions(self) -> dict:
-        """Open every `suppressed` problem whose deploy/maintenance window has
-        passed without a resolution. Run by `HubSweepFlow`."""
-        if self.db_pool is None:
-            return {"promoted": 0, "problem_ids": []}
-        ids = await hub.promote_expired_suppressions(self.db_pool)
-        return {"promoted": len(ids), "problem_ids": ids}
-
-    @activity.defn
-    async def promoted_investigations(self, problem_ids: list[str]) -> list[dict]:
-        """The alert to investigate each just-promoted problem with (#630).
-
-        A window held these problems back, so they got no investigation when
-        they appeared, and nothing else will start one: alertmanager re-sends
-        a firing alert under the same occurrence id, and the heartbeat emits
-        only on a change. Only the producers that start an investigation for a
-        new problem qualify (alertmanager and the heartbeat), and only a
-        problem still `open` — one that resolved during the window needs
-        nothing. The alert is rebuilt from the problem and its last
-        occurrence, and carries `problem_id`, so the flow skips ingest."""
-        if self.db_pool is None or not problem_ids:
-            return []
-        rows = await self.db_pool.fetch(
-            "SELECT p.id::text AS id, p.title, p.severity, p.subject, p.subject_kind, "
-            "       p.status, p.todoist_task_id, "
-            "  (SELECT e.source FROM problem_events e WHERE e.problem_id = p.id "
-            "     AND e.kind = 'occurrence' ORDER BY e.id LIMIT 1) AS source, "
-            "  (SELECT e.payload FROM problem_events e WHERE e.problem_id = p.id "
-            "     AND e.kind = 'occurrence' ORDER BY e.id DESC LIMIT 1) AS payload "
-            "FROM problems p WHERE p.id = ANY($1::uuid[]) ORDER BY p.first_seen_at",
-            list(problem_ids),
-        )
-        out: list[dict] = []
-        for r in rows:
-            if r["status"] != "open" or r["source"] not in _INVESTIGATED_ON_PROMOTE:
-                continue
-            payload = r["payload"] if isinstance(r["payload"], dict) else {}
-            labels = payload.get("labels") if isinstance(payload.get("labels"), dict) else {}
-            service = r["subject"] if r["subject_kind"] == "service" else ""
-            out.append(
-                {
-                    "title": r["title"],
-                    "fingerprint": str(payload.get("fingerprint") or ""),
-                    "severity": r["severity"],
-                    # The spelling the producers use; `hub.event_from_alert`
-                    # maps it back to `heartbeat`.
-                    "source": "aegis-heartbeat" if r["source"] == "heartbeat" else r["source"],
-                    "service": service,
-                    "description": str(payload.get("description") or ""),
-                    "labels": labels,
-                    "escalate": False,
-                    "problem_id": r["id"],
-                    "todoist_task_id": r["todoist_task_id"],
-                }
-            )
-        return out
-
-    @activity.defn
-    async def retire_cards(self, inp: dict) -> dict:
-        """Retire stale decision cards and finish the ones already retired
-        (#629, `aegis.services.hub_cards`).
-
-        `inp` may name a `problem_id` and a `reason`: the investigation flow
-        passes `superseded` for the problem it is about to post a newer card
-        for, with `exclude_run` set to its own run. Every card retired so far
-        — here, or by a resolve inside the hub — is then finished: its Slack
-        message edited to say why, and its waiting `InteractionFlow` signalled
-        so the old run ends now. The sweep calls it with no problem, which
-        finishes every retired card still waiting.
-
-        Safe to retry: retiring only moves `pending` rows, and a finished card
-        is not touched again."""
-        if self.db_pool is None:
-            return {"retired": 0, "finished": 0, "waiting": 0}
-        problem_id = str(inp.get("problem_id") or "")
-        reason = str(inp.get("reason") or "")
-        retired: list[dict] = []
-        if problem_id and reason:
-            retired = await hub_cards.retire(
-                self.db_pool,
-                problem_id,
-                reason=reason,
-                exclude_run=str(inp.get("exclude_run") or ""),
-            )
-        rows = await hub_cards.unfinished(self.db_pool, problem_id=problem_id)
-        finished = 0
-        for row in rows:
-            why = row["reason"] if row["reason"] in hub_cards.REASONS else hub_cards.SUPERSEDED
-            edited = await self._edit_retired_card(row, why)
-            signalled = await self._end_card_flow(row, why)
-            if await hub_cards.finish(self.db_pool, row["id"], edited=edited, signalled=signalled):
-                finished += 1
-        if retired or rows:
-            activity.logger.info(
-                "hub_cards_retire problem=%s retired=%d finished=%d",
-                problem_id or "*",
-                len(retired),
-                finished,
-            )
-        return {"retired": len(retired), "finished": finished, "waiting": len(rows) - finished}
-
-    async def _edit_retired_card(self, row: dict, reason: str) -> bool:
-        ref = row.get("delivery_ref")
-        if isinstance(ref, str):
-            try:
-                ref = json.loads(ref)
-            except ValueError:
-                ref = None
-        if self.delivery is None:
-            return not (isinstance(ref, dict) and ref.get("adapter") == "slack")
-        try:
-            result = await self.delivery.edit_card(
-                ref if isinstance(ref, dict) else None,
-                hub_cards.edit_text(reason, str(row.get("prompt") or "")),
-            )
-        except Exception as exc:  # noqa: BLE001 — the next sweep tries again
-            activity.logger.warning("hub_card_edit_failed id=%s err=%s", row["id"], error_text(exc))
-            return False
-        ok = isinstance(result, dict) and bool(result.get("ok"))
-        if not ok:
-            activity.logger.warning(
-                "hub_card_edit_failed id=%s err=%s", row["id"], str((result or {}).get("error"))[:200]
-            )
-        return ok
-
-    async def _end_card_flow(self, row: dict, reason: str) -> bool:
-        """Signal the card's `InteractionFlow` with the answer that ends its
-        run. A problem retired as resolved that has come back since is told
-        `superseded` instead: `self_resolved` would make the old run record
-        the problem resolved again while it is live."""
-        if self.temporal_client is None:
-            return False
-        if reason == hub_cards.RESOLVED and row.get("problem_id"):
-            try:
-                p = await hub.get_problem(self.db_pool, row["problem_id"])
-            except Exception:  # noqa: BLE001 — unknown reads as "still resolved"
-                p = None
-            if p is not None and p["status"] not in {"resolved", "closed"}:
-                reason = hub_cards.SUPERSEDED
-        try:
-            handle = self.temporal_client.get_workflow_handle(row["flow_run_id"])
-            await handle.signal("submit_response", hub_cards.answer(reason))
-        except RPCError as exc:
-            if exc.status == RPCStatusCode.NOT_FOUND:
-                return True  # its run is already over: nothing waits on the card
-            activity.logger.warning("hub_card_signal_failed id=%s err=%s", row["id"], error_text(exc))
-            return False
-        except Exception as exc:  # noqa: BLE001 — the next sweep tries again
-            activity.logger.warning("hub_card_signal_failed id=%s err=%s", row["id"], error_text(exc))
-            return False
-        return True
 
     @activity.defn
     async def reconcile_completed_tasks(self) -> dict:
@@ -681,15 +286,6 @@ class HubActivities:
             "created": sum(1 for r in results if r.get("created")),
             "errors": sum(1 for r in results if "error" in r),
         }
-
-    @activity.defn
-    async def clear_converged_deploys(self, stuck_services: list[str]) -> dict:
-        """End `deploying` windows for services the heartbeat sees converged.
-        `stuck_services` is the heartbeat's current below-desired list."""
-        if self.db_pool is None:
-            return {"cleared": []}
-        cleared = await hub.clear_converged_deploys(self.db_pool, list(stuck_services or []))
-        return {"cleared": cleared}
 
     # --- grouping: the same failure on many entities -------------------------
 
@@ -789,7 +385,7 @@ class HubActivities:
                 ),
                 db_pool=self.db_pool,
                 purpose="hub_group_judge",
-                agent_id=await self._infra_agent() or None,
+                agent_id=await self._owner_agent() or None,
             )
         except Exception as exc:  # noqa: BLE001 — a judge that will not answer says no
             activity.logger.warning("hub_group_judge_failed error=%s", error_text(exc))
@@ -880,7 +476,7 @@ class HubActivities:
         )
         await safe_send_message(
             self.delivery,
-            agent_id=await self._infra_agent(),
+            agent_id=await self._owner_agent(),
             message=f"[PROBLEM GROUPED] {title}\n\n{body}",
             log_event="hub_group_notify_failed",
         )
@@ -891,83 +487,4 @@ class HubActivities:
             "title": title,
             "folded": len(result["merged"]),
             "tasks_retired": retired,
-        }
-
-    @activity.defn
-    async def reconcile_alertmanager(self, url: str, min_uptime_seconds: int = 900) -> dict:
-        """Resolve live alertmanager problems whose alerts it no longer lists.
-
-        The alertmanager lane was the only producer on the hub with no
-        reconciliation: it resolves a problem solely on the `resolved` webhook,
-        and alertmanager keeps its alerts in memory, so a restart means that
-        webhook is never sent and the problem plus its Todoist task are stranded
-        for good (#551). Every other lane already recovers — the heartbeat
-        re-checks, the watchdogs run `reconcile_findings`.
-
-        **Everything here fails closed**, because the failure mode of getting
-        this wrong is mass-resolving a live estate:
-
-        * no URL configured → do nothing (a fork ships nobody's monitoring host);
-        * the status or alerts read fails, times out, or answers non-200 → do
-          nothing, because an unreachable monitoring stack must never read as
-          "everything recovered";
-        * **alertmanager itself started less than `min_uptime_seconds` ago → do
-          nothing.** This is the guard the bug taught: a freshly restarted
-          alertmanager holds an empty set until Prometheus re-sends, and
-          reconciling against that would resolve every open problem at once.
-          Prometheus re-sends on the order of a minute, so the default leaves a
-          wide margin.
-
-        A `suppressed` alert (silenced or inhibited) counts as ACTIVE: it is
-        still firing, someone has merely asked not to be told.
-        """
-        target = (url or "").strip().rstrip("/")
-        if not target:
-            return {"skipped": "not_configured", "resolved": 0, "checked": 0}
-        if self.db_pool is None:
-            return {"skipped": "no_pool", "resolved": 0, "checked": 0}
-        try:
-            async with httpx.AsyncClient(timeout=_ALERTMANAGER_TIMEOUT_S) as client:
-                status = await client.get(f"{target}/api/v2/status")
-                status.raise_for_status()
-                uptime_raw = str((status.json() or {}).get("uptime") or "")
-                alerts = await client.get(f"{target}/api/v2/alerts")
-                alerts.raise_for_status()
-                payload = alerts.json()
-        except Exception as exc:  # noqa: BLE001 — fail closed, never resolve on doubt
-            activity.logger.warning(
-                "hub_alertmanager_read_failed url=%s err=%s", target, error_text(exc)
-            )
-            return {"skipped": "unreachable", "resolved": 0, "checked": 0}
-
-        now = datetime.now(UTC)
-        uptime = _uptime_since(uptime_raw, now)
-        if uptime is None:
-            return {"skipped": "uptime_unreadable", "resolved": 0, "checked": 0}
-        if uptime < timedelta(seconds=max(0, min_uptime_seconds)):
-            # It has forgotten what it was holding and has not been told again.
-            return {
-                "skipped": "alertmanager_just_started",
-                "uptime_seconds": int(uptime.total_seconds()),
-                "resolved": 0,
-                "checked": 0,
-            }
-
-        if not isinstance(payload, list):
-            return {"skipped": "unexpected_payload", "resolved": 0, "checked": 0}
-        active = {
-            str(a.get("fingerprint") or "")
-            for a in payload
-            if isinstance(a, dict) and str((a.get("status") or {}).get("state") or "") != "unprocessed"
-        }
-        active.discard("")
-
-        out = await hub_watch.reconcile_alertmanager(
-            self.db_pool, active_fingerprints=active, now=now
-        )
-        return {
-            "checked": out["checked"],
-            "resolved": len(out["resolved"]),
-            "problems": [r["problem_id"] for r in out["resolved"]],
-            "active_alerts": len(active),
         }

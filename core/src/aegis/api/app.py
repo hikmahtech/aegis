@@ -132,17 +132,6 @@ async def lifespan(app: FastAPI):
     search_connector = SearchConnector(base_url=settings.searxng_url)
     app.state.search_connector = search_connector
 
-    # Vercel connector — read-only project/deployment/build-log queries for
-    # Pandora's chat tools. Short-circuits to no-op when token is empty.
-    from aegis.connectors.vercel import VercelConnector
-
-    vercel_connector = VercelConnector(
-        token=settings.vercel_token,
-        team_id=settings.vercel_team_id,
-        db_pool=pool,
-    )
-    app.state.vercel_connector = vercel_connector
-
     # Remote script connector (SSH to the coding host — used by infra chat
     # tools and coding-agent runs). Config is DB-first: an infra registry row
     # with coding.enabled overrides the env settings at call time, so the
@@ -162,7 +151,6 @@ async def lifespan(app: FastAPI):
         claude_binary=getattr(settings, "claude_cli_binary_path", ""),
         kimi_binary=getattr(settings, "kimi_cli_binary_path", ""),
         self_repo_path=getattr(settings, "aegis_self_repo_path", ""),
-        runbooks_dir=getattr(settings, "runbooks_dir", ""),
         mcp_server_url=getattr(settings, "mcp_server_external_url", ""),
         api_key=getattr(settings, "api_key", ""),
         db_pool=pool,
@@ -209,7 +197,6 @@ async def lifespan(app: FastAPI):
                     task.cancel()
 
     await knowledge_connector.close()
-    await vercel_connector.close()
     await finance_connector.close()
     sc = getattr(app.state, "search_connector", None)
     if sc:
@@ -263,8 +250,6 @@ def create_app(run_lifespan: bool = True, settings: Settings | None = None) -> F
         expiring_items_admin,
         gmail_reauth,
         health,
-        homelab,
-        hub,
         infra,
         infra_admin,
         integrations,
@@ -283,7 +268,6 @@ def create_app(run_lifespan: bool = True, settings: Settings | None = None) -> F
         references,
         research_admin,
         resources,
-        runbooks_admin,
         settings,
         slack,
         social_auth,
@@ -362,8 +346,6 @@ def create_app(run_lifespan: bool = True, settings: Settings | None = None) -> F
     app.include_router(mcp_server.router)
     app.include_router(market.router)
     app.include_router(overview.router)
-    app.include_router(homelab.router)
-    app.include_router(hub.router)
     app.include_router(problems_admin.router)
     app.include_router(money.router)
     # The trading desk: same /api/admin/money prefix, its own module.
@@ -375,7 +357,6 @@ def create_app(run_lifespan: bool = True, settings: Settings | None = None) -> F
     app.include_router(people_admin.router)
     app.include_router(expiring_items_admin.router)
     app.include_router(assets_admin.router)
-    app.include_router(runbooks_admin.router)
     app.include_router(todoist.router)
     app.include_router(task_sessions.router)
     app.include_router(notes_admin.router)

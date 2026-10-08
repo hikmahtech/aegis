@@ -60,7 +60,6 @@ COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
 COPY migrations/ migrations/
-COPY runbooks/ runbooks/
 
 RUN useradd --create-home --shell /bin/bash aegis \
     && chown -R aegis:aegis /app

@@ -90,7 +90,7 @@ async def test_find_unclassified_excludes_agent_reply_prefix(db_pool, _inbox_see
 @pytest.mark.asyncio
 async def test_find_unclassified_does_not_loop_on_agent_reply_note(db_pool, _inbox_seeded):
     """Regression for the loop bug caught in prod 2026-05-27 — three
-    @pandora tasks were re-classified on every 15-min tick because
+    agent-addressed tasks were re-classified on every 15-min tick because
     AgentChatReplyFlow's own success/error reply notes bumped
     last_note_at past last_clarified_at, satisfying the raw
     `last_note_at > last_clarified_at` eligibility filter even though
@@ -113,7 +113,7 @@ async def test_find_unclassified_does_not_loop_on_agent_reply_note(db_pool, _inb
             "Investigate something",
             "PROJ-INBOX",
             "#manual",
-            ["@pandora"],
+            ["@maou"],
             # last_note_at = agent reply timestamp (the loop driver)
             dt.datetime(2026, 5, 27, 18, 30, tzinfo=dt.UTC),
             # last_clarified_at is AFTER the original user comment
@@ -124,7 +124,7 @@ async def test_find_unclassified_does_not_loop_on_agent_reply_note(db_pool, _inb
             "INSERT INTO todoist_notes (id, item_id, content, posted_at) VALUES ($1, $2, $3, $4)",
             "note-loop-user",
             "task-loop",
-            "Look into this @pandora",
+            "Look into this @maou",
             dt.datetime(2026, 5, 27, 9, 40, tzinfo=dt.UTC),
         )
         # Agent reply posted AFTER the last clarify — bumps last_note_at
@@ -133,7 +133,7 @@ async def test_find_unclassified_does_not_loop_on_agent_reply_note(db_pool, _inb
             "INSERT INTO todoist_notes (id, item_id, content, posted_at) VALUES ($1, $2, $3, $4)",
             "note-loop-agent",
             "task-loop",
-            f"{AGENT_REPLY_PREFIX}18:30 UTC agent=pandoras-actor]\nMy reply.",
+            f"{AGENT_REPLY_PREFIX}18:30 UTC agent=maou]\nMy reply.",
             dt.datetime(2026, 5, 27, 18, 30, tzinfo=dt.UTC),
         )
 
@@ -170,7 +170,7 @@ async def test_find_unclassified_picks_up_genuine_new_user_comment(db_pool, _inb
             "Some task",
             "PROJ-INBOX",
             "#manual",
-            ["@pandora"],
+            ["@maou"],
             dt.datetime(2026, 5, 27, 18, 30, tzinfo=dt.UTC),
             dt.datetime(2026, 5, 27, 18, 15, tzinfo=dt.UTC),
         )
@@ -179,7 +179,7 @@ async def test_find_unclassified_picks_up_genuine_new_user_comment(db_pool, _inb
             "INSERT INTO todoist_notes (id, item_id, content, posted_at) VALUES ($1, $2, $3, $4)",
             "note-newcom-agent",
             "task-newcom",
-            f"{AGENT_REPLY_PREFIX}18:00 UTC agent=pandoras-actor]\nOld reply.",
+            f"{AGENT_REPLY_PREFIX}18:00 UTC agent=maou]\nOld reply.",
             dt.datetime(2026, 5, 27, 18, 0, tzinfo=dt.UTC),
         )
         # NEW user comment AFTER last_clarified_at — task MUST re-eligible
@@ -244,7 +244,7 @@ async def test_classify_one_short_circuits_on_addressable_agent_with_fresh_comme
 @pytest.mark.asyncio
 async def test_classify_one_no_short_circuit_when_user_note_empty(db_pool):
     """@sebas alone (no fresh comment) must NOT short-circuit — that lets
-    classify_one fall through to the LLM (or pandora_owned later).
+    classify_one fall through to the LLM.
     """
     from unittest.mock import AsyncMock
 
@@ -274,119 +274,6 @@ async def test_classify_one_no_short_circuit_when_user_note_empty(db_pool):
 
 
 @pytest.mark.asyncio
-async def test_classify_one_pandora_wins_co_occurrence(db_pool):
-    """When @sebas AND @pandora both present, pandora branch wins (the
-    per-agent block guards on '@pandora not in labels').
-
-    Post-2026-05-27: non-APP @pandora + a fresh comment routes to the
-    new pandora_chat_followup (not pandora_owned) — the Branch 2
-    fall-through that used to silently drop the comment is gone.
-    """
-    from unittest.mock import AsyncMock
-
-    llm = AsyncMock()
-    acts = ClarifyActivities(db_pool=db_pool, llm_client=llm)
-    task = {
-        "id": "task-x",
-        "content": "Maintenance window prep",  # not APP-<n>: → pandora_chat_followup
-        "description": "",
-        "labels": ["@sebas", "@pandora"],
-        "source_tag": "#manual",
-        "latest_user_note": "What's happening?",
-    }
-
-    decision = await acts.classify_one(task)
-
-    # @pandora wins the sebas/pandora co-occurrence (sebas's per-agent
-    # short-circuit is gated on '@pandora not in labels'). Inside the
-    # @pandora block, no APP-<n>: prefix + a fresh comment routes to
-    # pandora_chat_followup, which spawns AgentChatReplyFlow downstream.
-    assert decision["classification"] == "pandora_chat_followup"
-    assert decision["assignee"] == "@pandora"
-    assert decision["llm_model"] == "rules"
-    llm.think.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_classify_one_pandora_chat_followup_when_no_app_prefix(db_pool):
-    """Bare @pandora label + fresh user comment + no APP-<n>: prefix:
-    the new comment-channel branch routes to pandora_chat_followup so
-    the user's comment reaches pandoras-actor instead of dead-ending in
-    pandora_owned (the pre-2026-05-27 behaviour).
-    """
-    from unittest.mock import AsyncMock
-
-    llm = AsyncMock()
-    acts = ClarifyActivities(db_pool=db_pool, llm_client=llm)
-    task = {
-        "id": "task-x",
-        "content": "Do investigation about the religion of indo europeans",
-        "description": "",
-        "labels": ["@pandora"],
-        "source_tag": "#manual",
-        "latest_user_note": "Anything from the recent reading?",
-    }
-
-    decision = await acts.classify_one(task)
-
-    assert decision["classification"] == "pandora_chat_followup"
-    assert decision["assignee"] == "@pandora"
-    assert decision["llm_model"] == "rules"
-    llm.think.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_classify_one_pandora_owned_when_no_user_comment_non_app(db_pool):
-    """@pandora label, no APP- prefix, no fresh user note → still
-    pandora_owned (regression for the new pandora_chat_followup
-    branch — it must NOT swallow @pandora-only no-op cases).
-    """
-    from unittest.mock import AsyncMock
-
-    llm = AsyncMock()
-    acts = ClarifyActivities(db_pool=db_pool, llm_client=llm)
-    task = {
-        "id": "task-x",
-        "content": "Already-owned task",
-        "description": "",
-        "labels": ["@pandora"],
-        "source_tag": "#manual",
-        "latest_user_note": None,
-    }
-
-    decision = await acts.classify_one(task)
-
-    assert decision["classification"] == "pandora_owned"
-    llm.think.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_classify_one_pandora_followup_still_wins_when_app_prefix(db_pool):
-    """APP-<n>: @pandora + fresh user comment must still route to
-    pandora_followup (Jira investigation re-run), NOT the new
-    pandora_chat_followup. Pins the branch order inside the @pandora
-    block — Jira routing is sacred.
-    """
-    from unittest.mock import AsyncMock
-
-    llm = AsyncMock()
-    acts = ClarifyActivities(db_pool=db_pool, llm_client=llm)
-    task = {
-        "id": "task-x",
-        "content": "APP-1234: something broke",
-        "description": "",
-        "labels": ["@pandora"],
-        "source_tag": None,
-        "latest_user_note": "Look at this again",
-    }
-
-    decision = await acts.classify_one(task)
-
-    assert decision["classification"] == "pandora_followup"
-    llm.think.assert_not_called()
-
-
-@pytest.mark.asyncio
 async def test_classify_one_first_match_wins_sebas_then_raphael(db_pool):
     """Documented iteration order: @sebas → @raphael → @maou. If both
     @sebas and @raphael are present, sebas wins.
@@ -406,33 +293,6 @@ async def test_classify_one_first_match_wins_sebas_then_raphael(db_pool):
     decision = await acts.classify_one(task)
 
     assert decision["classification"] == "sebas_followup"
-
-
-@pytest.mark.asyncio
-async def test_classify_one_raphael_on_app_jira_title_yields_pandora_gate(db_pool):
-    """When the title is APP-<n>: AND @raphael is present, the Jira route
-    still wins over the per-agent reply branch — but as the pandora_gate
-    choice card (no @pandora yet), not a silent investigation. (inbox gate.)
-    """
-    from unittest.mock import AsyncMock
-
-    acts = ClarifyActivities(db_pool=db_pool, llm_client=AsyncMock())
-    task = {
-        "id": "task-x",
-        "content": "APP-1234: foo broke yesterday",
-        "description": "",
-        "labels": ["@raphael"],
-        "source_tag": None,
-        "latest_user_note": "Tell me about this",
-    }
-
-    decision = await acts.classify_one(task)
-
-    # @raphael is present but @pandora is NOT in labels. The per-agent block is
-    # skipped because content matches a content route (the third guard). Then
-    # the content-route branch fires → pandora_gate. Tightened to == so a
-    # misfire to a different branch would be caught.
-    assert decision["classification"] == "pandora_gate"
 
 
 @pytest.mark.asyncio
@@ -591,7 +451,7 @@ async def test_post_agent_reply_comment_includes_message_id_anchor(db_pool):
 
 
 @pytest.mark.asyncio
-async def test_clear_clarify_watermark_sets_null(db_pool):
+async def test_clear_clarify_watermark_sets_null(db_pool, _inbox_seeded):
     """Compensating action when AgentChatReplyFlow spawn fails — clear
     last_clarified_at so the task re-emerges on the next tick.
     """

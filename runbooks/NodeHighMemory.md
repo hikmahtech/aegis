@@ -1,3 +1,0 @@
-# NodeHighMemory
-
-TODO: fill in
