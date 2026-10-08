@@ -823,8 +823,8 @@ async def test_a_finding_without_its_row_ids_is_never_taken_as_acknowledged(db_p
 async def test_the_lane_projects_through_the_hub_projector(db_pool, monkeypatch):
     """§15.8: the money lane posts no comments of its own. Everything it puts
     in front of a human goes through `hub_project.project`, whose comments
-    carry the `Workflow run: problem-hub` footer that clarify's loop guard and
-    `work_sessions.is_user_note` exclude."""
+    carry the `Workflow run: problem-hub` footer that clarify's loop guard
+    excludes."""
     seen: list[str] = []
 
     async def fake_project(pool, problem_id, **kw):

@@ -43,7 +43,6 @@ import structlog
 from temporalio import activity, workflow
 
 from aegis_worker.flows.agent_chat_reply import AgentChatReplyFlow
-from aegis_worker.flows.agent_run import AgentRunFlow
 from aegis_worker.flows.agent_task import (
     AgentTaskFlow,
     AgentTaskSweepConfig,
@@ -100,7 +99,6 @@ from aegis_worker.flows.tender_watch import TenderWatchConfig, TenderWatchFlow
 from aegis_worker.flows.todoist_sync import TodoistSyncConfig, TodoistSyncFlow
 from aegis_worker.flows.trading_desk import TradingDeskConfig, TradingDeskFlow
 from aegis_worker.flows.wearable_ingest import WearableIngestFlow, WearableIngestInput
-from aegis_worker.flows.workspace_repo_sync import WorkspaceRepoSyncFlow
 from aegis_worker.flows.world_watch import WorldWatchConfig, WorldWatchFlow
 
 logger = structlog.get_logger()
@@ -197,17 +195,12 @@ def _enabled(spec: FlowSpec, settings: object | None) -> bool:
 
 FLOWS: tuple[FlowSpec, ...] = (
     FlowSpec(AgentChatReplyFlow),
-    # Event-driven: dispatched by the `dispatch_agent_run` chat tool, never on
-    # a schedule — so no schedule_config and no activities.yaml seed row.
-    FlowSpec(AgentRunFlow),
     FlowSpec(
         AgentTaskSweepFlow,
         lambda act: AgentTaskSweepConfig(
             agent_id=act["agent_id"],
             max_tasks=_int(act["config"], "max_tasks", 3),
             cooldown_hours=_int(act["config"], "cooldown_hours", 6),
-            max_coding=_int(act["config"], "max_coding", 3),
-            turn_timeout_minutes=_int(act["config"], "turn_timeout_minutes", 60),
         ),
     ),
     FlowSpec(AgentTaskFlow),
@@ -257,7 +250,6 @@ FLOWS: tuple[FlowSpec, ...] = (
             retentions=act["config"].get("retentions") or {},
             interaction_orphan_days=_int(act["config"], "interaction_orphan_days", 7),
             dispatch_days=_int(act["config"], "dispatch_days", 30),
-            task_session_days=_int(act["config"], "task_session_days", 7),
             problem_close_days=_float(act["config"], "problem_close_days", 7.0),
         ),
     ),
@@ -429,8 +421,6 @@ FLOWS: tuple[FlowSpec, ...] = (
             agent_id=act["agent_id"],
         ),
     ),
-    # Unscheduled since the v1 removal prep (see the money block below).
-    FlowSpec(WorkspaceRepoSyncFlow),
     FlowSpec(
         SocialPublishFlow,
         lambda act: SocialPublishConfig(

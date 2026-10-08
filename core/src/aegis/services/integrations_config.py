@@ -111,7 +111,6 @@ CONFIG_REGISTRY: list[ConfigKey] = [
     ConfigKey("searxng_url", "Base URL", "Search (SearXNG)", False),
     ConfigKey("finance_provider", "Provider (yahoo | stooq)", "Finance", False),
     ConfigKey("finance_indices", "Overview indices (comma-sep symbols)", "Finance", False),
-    ConfigKey("aegis_stack_name", "Swarm stack name (blank = show all services)", "System Monitoring", False),
     ConfigKey(
         "slack_owner_member_id", "Your Slack member id",
         "Slack self-capture", False,

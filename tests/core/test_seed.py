@@ -71,12 +71,11 @@ async def test_load_seeds_populates_resources_and_activities(db_pool):
 @pytest.mark.asyncio
 async def test_load_seeds_preserves_sync_managed_resource_kinds(db_pool):
     """Regression: the orphan-delete in _load_resources must NOT touch rows of
-    kinds the YAML doesn't own. `repository` (via WorkspaceRepoSyncFlow + the
-    resolve_alert_resource auto-register path) is the real example;
-    `test_other_kind` stands in for "any kind outside yaml_managed_kinds" to
-    prove this is an allow-list, not a block-list. Only kinds the YAML
-    actually owns (connector/runbook/endpoint/mcp_server) are eligible for
-    orphan-delete.
+    kinds the YAML doesn't own. `repository` was the real example until the
+    repo registry left v1 (057); two made-up kinds stand in for "any kind
+    outside yaml_managed_kinds" to prove this is an allow-list, not a
+    block-list. Only kinds the YAML actually owns
+    (connector/runbook/endpoint/mcp_server) are eligible for orphan-delete.
     """
     await run_migrations(db_pool)
     await load_seeds(db_pool, SEED_DIR)
@@ -84,7 +83,7 @@ async def test_load_seeds_preserves_sync_managed_resource_kinds(db_pool):
         # Insert sync-managed rows (slugs that don't appear in resources.yaml)
         await conn.execute(
             "INSERT INTO resources (kind, slug, title) VALUES "
-            "('repository','test-sync-managed-repo','test sync repo'),"
+            "('operator_kind','test-sync-managed-repo','test sync repo'),"
             "('test_other_kind','test-sync-managed-other','test sync other')"
         )
         # Re-run the loader; the new rows must survive.
@@ -521,11 +520,12 @@ def test_the_seed_no_longer_carries_the_removed_schedules():
     )
 
 
-def test_the_shared_schedules_belong_to_sebas_and_no_coding_runs():
+def test_the_shared_schedules_belong_to_sebas_and_carry_no_coding_knobs():
     rows = {r["slug"]: r for r in _seed_rows("activities.yaml", "activities")}
     for slug in _REASSIGNED_SLUGS:
         assert rows[slug]["agent_id"] == "sebas", slug
-    assert rows["agent-task-15min"]["config"]["max_coding"] == 0
+    # The coding lane left v1 (057), and with it the sweep's turn budget.
+    assert "max_coding" not in (rows["agent-task-15min"].get("config") or {})
 
 
 def test_the_infra_agent_ships_inactive():
@@ -638,3 +638,60 @@ async def test_migration_056_clears_the_infra_lane_rows_and_is_idempotent(db_poo
     assert [r["key"] for r in routes] == ["bug"]
     assert verbs == {"#calendar": None, "#chat": "research"}
     assert sweep == {"group_min_members": 4}
+
+
+@pytest.mark.asyncio
+async def test_migration_057_clears_the_coding_lane_rows_and_is_idempotent(db_pool):
+    """057 deletes the repo registry (`repository` resources, `project_repo_map`),
+    strips the coding and registry tools from every tool_set and the coding
+    knobs from the sweep's and cleanup's config. Everything else stays."""
+    sql = (REPO_ROOT / "migrations" / "057_v1_removal_coding.sql").read_text()
+    await run_migrations(db_pool)
+    await load_seeds(db_pool, SEED_DIR)
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO resources (kind, slug, title, metadata) VALUES "
+            "('repository', 'zz-057-repo', 'repo', '{\"github_repo\": \"o/r\"}'::jsonb), "
+            "('endpoint', 'zz-057-endpoint', 'endpoint', '{}'::jsonb) "
+            "ON CONFLICT (slug) DO NOTHING"
+        )
+        await conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('project_repo_map', $1) "
+            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            {"AEGIS": "o/aegis"},
+        )
+        await conn.execute(
+            "INSERT INTO agents (id, name, role, system_prompt_path, metadata) "
+            "VALUES ('zz-057', 'zz', 'test', 'personalities/zz', $1) "
+            "ON CONFLICT (id) DO UPDATE SET metadata = EXCLUDED.metadata",
+            {"tool_set": ["search_knowledge", "comment_on_task", "capture_to_inbox",
+                          "report_progress", "run_infra_script", "merge_problems"]},
+        )
+        await conn.execute(
+            "UPDATE activities SET config = $1 WHERE slug = 'agent-task-15min'",
+            {"max_tasks": 2, "max_coding": 0, "turn_timeout_minutes": 60},
+        )
+        await conn.execute(
+            "UPDATE activities SET config = $1 WHERE slug = 'cleanup-daily'",
+            {"dispatch_days": 30, "task_session_days": 7},
+        )
+        await conn.execute(sql)
+        await conn.execute(sql)  # a re-run is a no-op
+        kinds = {
+            r["slug"]: r["kind"]
+            for r in await conn.fetch("SELECT slug, kind FROM resources WHERE slug LIKE 'zz-057-%'")
+        }
+        repo_map = await conn.fetchval("SELECT 1 FROM settings WHERE key = 'project_repo_map'")
+        tools = await conn.fetchval("SELECT metadata->'tool_set' FROM agents WHERE id = 'zz-057'")
+        sweep = await conn.fetchval("SELECT config FROM activities WHERE slug = 'agent-task-15min'")
+        cleanup = await conn.fetchval("SELECT config FROM activities WHERE slug = 'cleanup-daily'")
+        await conn.execute("DELETE FROM resources WHERE slug LIKE 'zz-057-%'")
+        await conn.execute("DELETE FROM agents WHERE id = 'zz-057'")
+        await conn.execute(
+            "UPDATE activities SET config = '{}'::jsonb WHERE slug IN ('agent-task-15min', 'cleanup-daily')"
+        )
+    assert kinds == {"zz-057-endpoint": "endpoint"}
+    assert repo_map is None
+    assert tools == ["search_knowledge", "capture_to_inbox", "merge_problems"]
+    assert sweep == {"max_tasks": 2}
+    assert cleanup == {"dispatch_days": 30}

@@ -20,7 +20,7 @@ from aegis.api.sql_filters import build_where
 from aegis.config import Settings
 from aegis.errors import error_text
 from aegis.observability import log_audit
-from aegis.services import agent_task_verbs, content_routes, gtd_rules, project_repo_map
+from aegis.services import agent_task_verbs, content_routes, gtd_rules
 from aegis.services.settings_store import get_setting
 
 router = APIRouter(
@@ -81,27 +81,6 @@ settings_row_routes(
         "Content-routing rules: regex/prefix/contains on the task title → assignee / contexts "
         "/ area label. Complements gtd-rules, which routes by source_tag. The PUT replaces the "
         "ordered list; 400 on a malformed rule or regex."
-    ),
-)
-
-settings_row_routes(
-    router,
-    "/project-repo-map",
-    get=project_repo_map.get_project_repo_map,
-    save=project_repo_map.save_project_repo_map,
-    body=lambda body: body.get("project_repo_map") or {},
-    view=lambda _pool, mapping: {"project_repo_map": mapping},
-    audit=lambda request, mapping: log_audit(
-        request.app.state.db_pool,
-        actor="admin",
-        action="project_repo_map_saved",
-        target_type="settings",
-        target_id="project_repo_map",
-        details={"project_repo_map": mapping},
-    ),
-    doc=(
-        "Todoist project name → GitHub repo, the coding lane's tier-1 resolver. Ships empty; "
-        "each deployment maps its own projects (issue #345). 400 on a bad project name or repo."
     ),
 )
 

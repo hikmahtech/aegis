@@ -86,10 +86,10 @@ async def test_boolean_flag_get_state(clean_int):
 
 async def test_a_db_value_overrides_the_env(clean_int):
     """A registry key's DB value overrides the env default."""
-    s = _settings(aegis_stack_name="env-stack")
-    await save_integration(clean_int, s, "aegis_stack_name", "db-stack")
+    s = _settings(finance_indices="^GSPC")
+    await save_integration(clean_int, s, "finance_indices", "^NSEI")
     await apply_config_overrides(s, clean_int)
-    assert s.aegis_stack_name == "db-stack"
+    assert s.finance_indices == "^NSEI"
 
 
 async def test_owner_emails_overlay_from_db(clean_int):
@@ -102,10 +102,10 @@ async def test_owner_emails_overlay_from_db(clean_int):
 
 
 async def test_an_empty_db_value_keeps_the_env(clean_int):
-    s = _settings(aegis_stack_name="env-stack")
-    await save_integration(clean_int, s, "aegis_stack_name", "")
+    s = _settings(finance_indices="^GSPC")
+    await save_integration(clean_int, s, "finance_indices", "")
     await apply_config_overrides(s, clean_int)
-    assert s.aegis_stack_name == "env-stack"
+    assert s.finance_indices == "^GSPC"
 
 
 def test_the_infra_lane_keys_left_the_registry():
@@ -117,6 +117,26 @@ def test_the_infra_lane_keys_left_the_registry():
         "vercel_token", "vercel_team_id",
     ):
         assert gone not in keys
+
+
+def test_the_coding_and_registry_keys_left_settings_and_the_registry():
+    """The coding lane and the infra registry moved out of v1 (the Development
+    vertical, a2-development); their Settings fields and the registry's
+    running-services key went with them."""
+    from aegis.config import Settings
+
+    keys = {c.key for c in CONFIG_REGISTRY}
+    for gone in (
+        "remote_script_host", "remote_script_user", "remote_script_key_file",
+        "remote_script_known_hosts", "remote_script_repo_base", "remote_script_kimi_host",
+        "remote_script_tmux_session", "remote_script_tmux_window_cap",
+        "remote_script_claude_orgs", "kimi_cli_binary_path", "claude_cli_binary_path",
+        "claude_personal_config_dir", "aegis_self_repo_path", "mcp_server_enabled",
+        "mcp_server_allow_unauthenticated", "mcp_server_external_url",
+        "mcp_gate_wait_seconds", "aegis_stack_name",
+    ):
+        assert gone not in Settings.model_fields, gone
+        assert gone not in keys, gone
 
 
 def test_every_config_key_is_a_settings_field():

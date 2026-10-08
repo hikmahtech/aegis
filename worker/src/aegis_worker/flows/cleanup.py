@@ -14,6 +14,13 @@ with workflow.unsafe.imports_passed_through():
     from aegis_worker.shared.retry import NO_RETRY, TIMEOUT_LONG
 
 
+# The coding lane moved to the Development vertical (a2-development), and with
+# it the nightly release of finished coding sessions' worktrees. A run recorded
+# before this change scheduled `cleanup_work_sessions`; it replays through the
+# legacy branch, where the activity is now a no-op stub. Retire the branch and
+# the stub the #614 way.
+PATCH_DROP_WORK_SESSIONS = "cleanup-drop-work-sessions"
+
 _DEFAULT_RETENTIONS: dict[str, int] = {
     "audit_log": 90,
     "llm_calls": 90,
@@ -77,10 +84,6 @@ class CleanupConfig:
     # telegram_message_id) get channel-deleted via the comms adapter before the
     # DB row is dropped. Set to 0 to skip channel cleanup (DB prune still runs).
     dispatch_days: int = 30
-    # Release the git worktree of a coding session whose task is completed or
-    # gone and which has been idle this many days. The branch stays — it may
-    # back an open PR. Set to 0 to disable.
-    task_session_days: int = 7
     # Close problems resolved longer ago than this. Closing frees the
     # correlation key, so the same service breaking next month is a new
     # problem rather than a reopened old one. Set to 0 to disable.
@@ -156,24 +159,19 @@ class CleanupFlow:
                 )
                 result["interactions_archived"] = -1
 
-        # Janitor: release the git worktrees of coding sessions whose task is
-        # finished. Nothing else on the coding host ever removes them, so
-        # skipping this leaves one checkout per @code task there forever.
-        # Independent of the sweeps above for the same reason they are of each
-        # other — a failure earlier must not silently stop disk being freed.
-        if config.task_session_days > 0:
+        if not workflow.patched(PATCH_DROP_WORK_SESSIONS):
+            # Legacy replay only. Every deployment ran this step (the config
+            # default was 7 days and prod never set it), so the replay
+            # schedules it unconditionally; the arguments are not replayed.
             try:
-                session_result = await workflow.execute_activity_method(
+                result["work_sessions"] = await workflow.execute_activity_method(
                     CleanupActivities.cleanup_work_sessions,
-                    args=[config.task_session_days],
+                    args=[7],
                     start_to_close_timeout=TIMEOUT_LONG,
                     retry_policy=NO_RETRY,
                 )
-                result["work_sessions"] = session_result
             except Exception as exc:
-                workflow.logger.error(
-                    "task_session_sweep_failed error=%s", error_text(exc)
-                )
+                workflow.logger.error("task_session_sweep_failed error=%s", error_text(exc))
                 result["work_sessions"] = {"status": "failed"}
 
         # The problem hub's close sweep. Last, and independent of everything

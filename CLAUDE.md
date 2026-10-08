@@ -60,8 +60,8 @@ The full stack is `docker compose up -d`. Add `--profile slack` for comms and
   `-n`, deadlocks. Always use `-n auto --dist loadfile`.
 - Tests need a real Postgres (`docker compose up -d postgres`). No DB mocks. Each xdist worker
   gets its own database, so two runs on one host do not collide.
-- Never `ruff format` `core/src/aegis/services/chat.py` or `core/src/aegis/services/tools/infra.py`.
-  Local ruff rewrites their hand-laid tables. Run `ruff check` only, and keep diffs minimal.
+- Never `ruff format` `core/src/aegis/services/chat.py`.
+  Local ruff rewrites its hand-laid tables. Run `ruff check` only, and keep diffs minimal.
 - CI test workflows are `paths:`-filtered. When tests start reading a new path, add it to the
   filter, or the job silently stops guarding it. `ci-grep-guard.yml` fails the build if n8n-era
   files come back.
@@ -113,7 +113,9 @@ The full stack is `docker compose up -d`. Add `--profile slack` for comms and
 - The problem hub owns problem identity. A new producer builds an `Event`, calls
   `hub.ingest_event`, and adds its source to `SOURCES`. The infra lane (alerts,
   investigations, the swarm heartbeat, runbooks, deploy windows) moved to the
-  DevOps vertical (a2-devops) on 2026-10-08; do not add it back here. A Todoist task is a projection of a
+  DevOps vertical (a2-devops) on 2026-10-08, and the development lane (coding
+  runs, task sessions, the MCP server, the repo and infra registries) to the
+  Development vertical (a2-development); do not add either back here. A Todoist task is a projection of a
   problem, never its identity.
 - The hledger journal is the money record; Postgres is only its index. Writes go through
   `services/books.py` and `services/ledger_write.py`. Keep `run_hledger`'s exact-match allowlist.
@@ -148,8 +150,8 @@ add a build or deploy job; a fork wires up its own. Fork-facing notes: `docs/pro
 - `docs/architecture/research-lane.md`: read before touching research, feeds, Calibre, topics,
   areas, or the world, GitHub and tender watches.
 - `docs/architecture/vault.md`: read before touching `notes.py`, the journal or `vault_layout`.
-- `docs/infrastructure.md`: the infra registry, the coding host, and setup guides per lane
-  (the registry and coding lane stay until a later removal PR).
+- `docs/infrastructure.md`: setup and operations per lane (hub, books, research, feeds,
+  Calibre, vault), and what moved out of v1.
 - `docs/superpowers/specs/`: design specs.
 
 ## Issue tracking

@@ -689,7 +689,5 @@ activities:
     workflow_type: AgentTaskSweepFlow
     agent_id: sebas
     schedule_cron: "*/15 * * * *"
+    config: {}
     active: true
-    # max_coding: 0 — no coding runs from v1; the development lane moved out.
-    config:
-      max_coding: 0

@@ -106,30 +106,6 @@ class Settings(BaseSettings):
     gmail_accounts: str = ""  # "name1:email1,name2:email2"
     gmail_credentials_file: str = "config/google_credentials.json"
     gmail_token_dir: str = "config/"
-    # Remote script / coding agents — ENV FALLBACK ONLY. The preferred way to
-    # configure the coding host is the admin Infra page: an infra registry row
-    # with a `coding` block (enabled=true) supplies the SSH identity (host,
-    # user, port, encrypted key — materialized to a temp file per call, no key
-    # file on any volume) plus repo_base/engines/routing/tmux/kimi-host. These
-    # env settings apply only while no such row exists. See docs/infrastructure.md.
-    remote_script_host: str = ""
-    remote_script_user: str = "deploy"
-    remote_script_key_file: str = "~/.ssh/id_ed25519"
-    remote_script_known_hosts: str | None = None  # if set, passed to ssh via UserKnownHostsFile
-    remote_script_repo_base: str = ""
-    # Preferred host for the kimi lifecycle (e.g. "buildhost"). Empty ⇒ kimi runs on
-    # remote_script_host with today's detached nohup. When set AND reachable,
-    # runs are wrapped in a tmux session for live attach; unreachable ⇒ falls
-    # back to remote_script_host. Hostname comes from env only (no committed default).
-    remote_script_kimi_host: str = ""
-    remote_script_tmux_session: str = "remote"
-    remote_script_tmux_window_cap: int = 10
-    # Comma-separated GitHub orgs whose repos must be worked on with the claude
-    # CLI on remote_script_host (the base host), NOT kimi — that host's claude
-    # login belongs to the org, so org-repo work runs under the org's account.
-    # Matched case-insensitively against the org part of a resource's
-    # metadata.github_repo. Empty (default) ⇒ everything uses kimi.
-    remote_script_claude_orgs: str = ""
     # Todoist (GTD task management)
     todoist_api_key: str = ""
     todoist_webhook_secret: str = ""
@@ -147,19 +123,6 @@ class Settings(BaseSettings):
     # Browser-facing Postiz URL for admin-UI links — distinct from postiz_url,
     # which may be an internal-only address the browser can't reach.
     postiz_public_url: str = ""
-    # Kimi CLI — the remote coding-CLI the coding lane runs on the coding host.
-    kimi_cli_binary_path: str = "/usr/local/bin/kimi"
-    # Claude CLI on remote_script_host — used instead of kimi for repos whose
-    # GitHub org is listed in remote_script_claude_orgs.
-    claude_cli_binary_path: str = "/usr/local/bin/claude"
-    # CLAUDE_CONFIG_DIR for the claude CLI when it runs as the kimi fallback on a
-    # NON-org repo. The default ~/.claude login belongs to an org (acme);
-    # the fallback runs under the personal account instead. Empty ⇒ default config.
-    claude_personal_config_dir: str = ""
-    # Workspace-relative path (under `remote_script_repo_base`) of AEGIS's own
-    # checkout on the coding host. The coding lane seeds a claude run's
-    # skills from its `config/skills` (`RemoteScriptConnector._skills_source_dir`).
-    aegis_self_repo_path: str = "aegis"
     slack_owner_member_id: str = ""  # the owner's Slack member id ("" = unset)
     # Curated self-signal ingest (comms reads these over /api/internal/slack-config).
     # Reaction names (no colons, comma-separated) that file YOUR OWN message as a
@@ -188,11 +151,6 @@ class Settings(BaseSettings):
     # stray env can grant write access on its own. Turning this back off kills
     # writes fleet-wide on the next worker restart, no DB edit needed.
     memory_consolidation_apply_enabled: bool = False
-    # Swarm stack name AEGIS itself is deployed as. The System Monitoring page
-    # filters `docker service ls` to this stack (com.docker.stack.namespace
-    # label) so it shows AEGIS's own services, not every stack on the swarm.
-    # Blank = no filter (show all services). Editable from the admin UI.
-    aegis_stack_name: str = "aegis"
     # Knowledge subsystem (native pgvector — no external service).
     # embedding_model must be served by litellm_url's /embeddings; its vector dim
     # must match the knowledge_chunks.embedding column (768 for nomic-embed-text).
@@ -238,33 +196,6 @@ class Settings(BaseSettings):
     # an unset secret as "skip verification": this door writes into the
     # owner's personal data store.
     life_webhook_secret: str = ""  # X-Aegis-Signature + X-Aegis-Timestamp
-
-    # MCP — SERVER side (api/routes/mcp_server.py): serve AEGIS's own chat tools
-    # to external MCP clients (claude/kimi CLI, Claude Desktop) at
-    # POST /api/mcp-server/{agent_id}. Off by default, default-deny posture —
-    # this door lets an outside harness run AEGIS tools.
-    mcp_server_enabled: bool = False
-    # Escape hatch for `mcp_server_enabled` + `auth_disabled` together. That
-    # pair serves every agent's tools with NO credential: auth_disabled makes
-    # verify_auth a no-op (correct only behind an authenticating proxy), while
-    # this endpoint is mounted at a LAN/overlay URL that deliberately bypasses
-    # that proxy so a headless CLI can reach it. The endpoint 403s on the
-    # combination unless this is explicitly true.
-    mcp_server_allow_unauthenticated: bool = False
-    # Core's base URL **as reachable from the coding host** (e.g.
-    # http://10.0.0.5:8080) — NOT the browser-facing one, which is typically
-    # behind an authenticating proxy the CLI can't traverse. Used only to mount
-    # AEGIS's tools into a claude-engine agent run (`RemoteScriptConnector`);
-    # empty ⇒ runs launch with no AEGIS tools. An infra `coding.mcp_server_url`
-    # overrides it. The run authenticates with `api_key`, so both must be set.
-    mcp_server_external_url: str = ""
-    # How long the GATED endpoint (`/api/mcp-server/{agent_id}/gated`) holds a
-    # mutating tool call open waiting for the operator before telling the model
-    # to retry. Deliberately well under the ~60s hard cap the claude CLI was
-    # measured to impose on an MCP tool call (2.1.231 — MCP_TOOL_TIMEOUT does
-    # not lift it), because the gate's contract is "retry and it executes",
-    # which only works if OUR answer comes back before the CLI gives up.
-    mcp_gate_wait_seconds: int = 40
 
     # Worker -> Core API
     core_api_url: str = "http://localhost:8080"

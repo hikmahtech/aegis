@@ -48,7 +48,6 @@ export const NAV: NavSection[] = [
   {
     section: 'System',
     items: [
-      { path: '/infra', label: 'Infrastructure', icon: 'infra' },
       { path: '/system', label: 'System monitoring', icon: 'monitoring' },
       { path: '/admin/todoist', label: 'Todoist', icon: 'todoist' },
       { path: '/admin/email-triage', label: 'Email triage', icon: 'email' },

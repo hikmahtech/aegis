@@ -133,7 +133,6 @@ async def chat(request: Request, body: dict[str, Any]) -> dict[str, Any]:
         temporal_client=getattr(request.app.state, "temporal_client", None),
         finance_connector=getattr(request.app.state, "finance_connector", None),
         search_connector=getattr(request.app.state, "search_connector", None),
-        remote_script_connector=getattr(request.app.state, "remote_script_connector", None),
         background_tasks=getattr(request.app.state, "background_tasks", None),
         user_metadata=user_metadata,
         tier_override=(body.get("tier") or None),
@@ -282,9 +281,6 @@ async def post_agent_reply(
             knowledge_connector=getattr(request.app.state, "knowledge_connector", None),
             finance_connector=getattr(request.app.state, "finance_connector", None),
             search_connector=getattr(request.app.state, "search_connector", None),
-            remote_script_connector=getattr(
-                request.app.state, "remote_script_connector", None
-            ),
         )
     except (httpx.HTTPStatusError, httpx.ConnectError, httpx.TimeoutException) as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc

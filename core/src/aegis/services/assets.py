@@ -1,9 +1,9 @@
 """Household/asset registry service — CRUD over `life.assets` (migration 019).
 
 Cars, appliances, home systems: the physical things that get bought,
-warrantied and serviced. Generalises the `services/infra.py` shape (slug +
-name + open `kind` + metadata) without any of infra's credentials/SSH/
-provisioning machinery — this is data, not an actuation target.
+warrantied and serviced. Slug + name + open `kind` + metadata, the shape the
+old infra registry had, without its credentials/SSH/provisioning machinery —
+this is data, not an actuation target.
 
 Shaped after `services/expiring_items.py` and `services/people.py`: plain
 dicts in and out over an asyncpg pool, no ORM, so admin routes, worker

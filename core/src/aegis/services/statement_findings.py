@@ -37,7 +37,7 @@ keeps this source out of the sweep's clustering.
 
 Nothing here writes a Todoist comment. Projection goes through
 `hub_project.project`, whose comments carry the `Workflow run: problem-hub`
-footer that clarify's loop guard and `work_sessions.is_user_note` exclude. A
+footer that clarify's loop guard excludes. A
 projector without one re-reads its own comments as human signal — the
 self-grading loop that made 39 of 39 "user corrections" fake.
 """

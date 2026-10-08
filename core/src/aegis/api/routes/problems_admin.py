@@ -1,7 +1,7 @@
 """Admin reads and mutations over the problem hub (`services/hub.py`).
 
 The Problems page is the operator's view of what AEGIS currently thinks is
-wrong: one row per problem, its timeline and the sessions on it.
+wrong: one row per problem and its timeline.
 
 Two rules hold this module together. Every mutation calls the SAME function the
 chat tool and the worker call — resolving, closing and merging live in `hub.py`,
@@ -93,7 +93,7 @@ async def get_digest(request: Request, hours: float = 24.0) -> dict[str, Any]:
 
 @router.get("/problems/{problem_id}")
 async def get_problem_detail(request: Request, problem_id: str, events: int = 50) -> dict[str, Any]:
-    """One problem with its timeline, links and sessions."""
+    """One problem with its timeline and links."""
     detail = await problem_detail(get_pool(request), problem_id, events=events)
     if detail is None:
         raise HTTPException(status_code=404, detail="problem_not_found")

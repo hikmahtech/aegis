@@ -130,21 +130,3 @@ def test_post_chat_agent_reply_route_threads_llm_to_send_message(_client):
     # Verify send_message was called with llm_client present (TypeError would
     # otherwise propagate as 500).
     assert "llm_client" in send_mock.call_args.kwargs
-
-
-def test_post_chat_agent_reply_threads_remote_script_connector(_client):
-    """The comment/DM path must forward app.state.remote_script_connector to
-    send_message, or pandora's infra chat tools (list_services / inspect_service /
-    aegis_self_diagnose) get a None connector and return "Remote script connector
-    not available". Regression guard for that silent gap.
-    """
-    sentinel = object()
-    _client.app.state.remote_script_connector = sentinel
-    send_mock = AsyncMock(return_value={"response": "OK", "model": "m", "tool_calls": []})
-    with patch("aegis.services.chat.send_message", new=send_mock):
-        resp = _client.post(
-            "/api/chat/agent-reply",
-            json={"agent_id": "pandoras-actor", "message": "x", "thread_id": "t", "task_id": "abc"},
-        )
-    assert resp.status_code == 200
-    assert send_mock.call_args.kwargs.get("remote_script_connector") is sentinel

@@ -4,7 +4,7 @@
 the other names/emails they go by, the relationship, key dates (birthday,
 anniversary), free-form notes, and when they were last in contact.
 
-Shaped after `services/infra.py`: plain dicts in and out over an asyncpg
+Plain dicts in and out over an asyncpg
 pool, no ORM, so the admin CRUD routes and (later) worker activities and
 chat tools can all call the same functions.
 

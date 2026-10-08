@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import pytest
 from aegis.services.assets import slugify as asset_slug
-from aegis.services.infra import _slugify as infra_slug
 from aegis.services.social_channels import slugify_label
 from aegis.slugs import slugify, unique_slug
 
@@ -22,7 +21,6 @@ def test_the_shared_rule():
 
 def test_each_caller_keeps_its_own_fallback():
     assert asset_slug("!!!") == "asset"
-    assert infra_slug("!!!") == "infra"
     # A Postiz label has no fallback: an unnamed channel falls back to its id.
     assert slugify_label("!!!") == ""
 

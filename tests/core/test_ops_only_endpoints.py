@@ -245,3 +245,26 @@ async def test_the_infra_lane_routes_are_gone(client, method, path):
     not come back: a POST or a GET is answered by nothing in v1."""
     resp = await getattr(client, method)(path, headers=AUTH_HEADERS)
     assert resp.status_code in (404, 405), f"{path} is back"
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("get", "/api/admin/infra"),
+        ("post", "/api/admin/infra"),
+        ("post", "/api/admin/infra/00000000-0000-0000-0000-000000000000/provision"),
+        ("get", "/api/infra/services"),
+        ("post", "/api/infra/argocd/apps/x/sync"),
+        ("post", "/api/mcp-server/sebas"),
+        ("post", "/api/mcp-server/sebas/operator"),
+        ("get", "/api/admin/task-sessions/by-thread?channel=C1&ts=1.0"),
+        ("post", "/api/admin/tasks/T1/comment"),
+        ("get", "/api/admin/todoist/project-repo-map"),
+        ("put", "/api/admin/todoist/project-repo-map"),
+    ],
+)
+async def test_the_coding_lane_and_registry_routes_are_gone(client, method, path):
+    """The coding lane, the repo registry and the infra registry moved to the
+    Development vertical (a2-development). Their routes must not come back."""
+    resp = await getattr(client, method)(path, headers=AUTH_HEADERS)
+    assert resp.status_code in (404, 405), f"{path} is back"

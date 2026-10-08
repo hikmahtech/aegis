@@ -22,13 +22,8 @@ def _seeded_tools(agent_id: str) -> set[str]:
     return set((agent.get("metadata") or {}).get("tool_set") or agent.get("tool_set") or [])
 
 
-# Trimmed from every seeded tool_set by the v1 removal prep (migration 054);
-# `AGENT_TOOL_SETS` keeps them until the removal PRs delete the tools.
-_REMOVED_BY_054 = {"task_context", "report_progress"}
-
-
 def test_raphaels_code_default_is_his_seed_tool_set():
-    assert AGENT_TOOL_SETS["raphael"] - _REMOVED_BY_054 == _seeded_tools("raphael")
+    assert AGENT_TOOL_SETS["raphael"] == _seeded_tools("raphael")
 
 
 def test_raphael_has_the_vault_tools():

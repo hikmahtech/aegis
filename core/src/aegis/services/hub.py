@@ -678,9 +678,7 @@ async def merge_problems(
 ) -> dict[str, Any]:
     """Fold ``merge_id`` into ``keep_id``: its events and links move, its
     occurrences count on the kept problem, and it closes with a `problem` link
-    back so the history reads both ways. Its `work_sessions` rows are
-    re-pointed too, but nothing reads `work_sessions.problem_id` — sessions are
-    listed by task, so they stay on the merged problem's task.
+    back so the history reads both ways.
 
     A wrong merge hides an outage, so every caller is a deliberate decision:
     a person on the admin Problems page; a person or agent through the
@@ -752,11 +750,6 @@ async def merge_problems(
                 a,
                 b,
             )
-        await conn.execute(
-            "UPDATE work_sessions SET problem_id = $1::uuid WHERE problem_id = $2::uuid",
-            keep_id,
-            merge_id,
-        )
         await conn.execute(
             "UPDATE problems SET occurrences = occurrences + $2, "
             "first_seen_at = LEAST(first_seen_at, $3), last_seen_at = GREATEST(last_seen_at, $4) "
@@ -986,10 +979,7 @@ async def list_problems(
 async def problem_detail(
     pool: asyncpg.Pool, problem_id: str, *, events: int = 50
 ) -> dict[str, Any] | None:
-    """One problem with everything hanging off it: its events, its links, its
-    sessions."""
-    from aegis.services import work_sessions
-
+    """One problem with everything hanging off it: its events and its links."""
     problem = await get_problem(pool, problem_id)
     if problem is None:
         return None
@@ -1001,14 +991,8 @@ async def problem_detail(
             problem_id,
         )
     ]
-    sessions = (
-        await work_sessions.list_for_task(pool, problem["todoist_task_id"])
-        if problem["todoist_task_id"]
-        else []
-    )
     return {
         "problem": problem,
         "events": await list_events(pool, problem_id, limit=events),
         "links": links,
-        "sessions": sessions,
     }

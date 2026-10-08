@@ -25,52 +25,15 @@ RUN pip install --no-deps --force-reinstall ./core
 # Runtime
 FROM python:3.12-slim
 
-# curl: healthcheck. openssh-client: RemoteScriptConnector SSHes to node-a
-# for infrastructure chat tools and the claude_code task handler.
+# curl: healthcheck. git + openssh-client: the books and notes checkouts
+# (`services/git_checkout.py`) clone and push over SSH with a deploy key.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl openssh-client git && rm -rf /var/lib/apt/lists/*
-
-# kubectl: infra registry k8s ops (services/infra.py runs it against the
-# per-entry kubeconfig stored encrypted in the DB).
-ARG TARGETARCH=amd64
-ARG KUBECTL_VERSION=v1.31.4
-RUN curl -fsSL -o /usr/local/bin/kubectl \
-    "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${TARGETARCH}/kubectl" \
-    && chmod +x /usr/local/bin/kubectl
 
 # hledger — the books. Core and the worker share ONE books checkout, so the
 # version and its checksum live once, in the script both images run.
 COPY docker/install-hledger.sh /tmp/install-hledger.sh
 RUN /tmp/install-hledger.sh && rm -f /tmp/install-hledger.sh
-
-# Optional cloud CLIs — needed only when a registered kubeconfig authenticates
-# via an exec plugin (EKS: `aws eks get-token`, GKE: gke-gcloud-auth-plugin).
-# Space-separated list; supported: "aws gcloud". Default empty keeps the image slim.
-#   docker build --build-arg EXTRA_CLOUD_CLIS="aws gcloud" ...
-# See docs/infrastructure.md ("Cloud CLIs for exec-plugin kubeconfigs").
-ARG EXTRA_CLOUD_CLIS=""
-RUN set -e; for cli in ${EXTRA_CLOUD_CLIS}; do \
-      case "$cli" in \
-        aws) \
-          apt-get update && apt-get install -y --no-install-recommends unzip \
-          && curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o /tmp/awscli.zip \
-          && unzip -q /tmp/awscli.zip -d /tmp \
-          && /tmp/aws/install \
-          && rm -rf /tmp/aws /tmp/awscli.zip /var/lib/apt/lists/* \
-          && aws --version ;; \
-        gcloud) \
-          apt-get update && apt-get install -y --no-install-recommends gnupg \
-          && curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
-             | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg \
-          && echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" \
-             > /etc/apt/sources.list.d/google-cloud-sdk.list \
-          && apt-get update && apt-get install -y --no-install-recommends \
-             google-cloud-cli google-cloud-cli-gke-gcloud-auth-plugin \
-          && rm -rf /var/lib/apt/lists/* \
-          && gcloud --version && gke-gcloud-auth-plugin --version ;; \
-        *) echo "Unsupported EXTRA_CLOUD_CLIS entry: $cli (supported: aws gcloud)"; exit 1 ;; \
-      esac; \
-    done
 
 WORKDIR /app
 COPY --from=builder /opt/venv /opt/venv

@@ -2,6 +2,7 @@
 
 **Date:** 2026-09-07
 **Status:** approved; every PR shipped (1, 2, 3a, 3b, 4a, 4b, 5a, 5b, 6a, 6c, 7, 8). 6b was dropped and 6c (the admin page) rides the operator's UI pass — see §12. §12a records what the spec described and the code deliberately does not do.
+**Since v1 removal PR 4:** the session registry (`work_sessions`, `task_context`, `report_progress`) left with the coding lane for the Development vertical (a2-development); the infra sources left in PR 3.
 
 ## Problem
 

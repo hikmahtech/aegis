@@ -79,7 +79,7 @@ async def research_task(db_pool):
 
 async def _run(db_pool, task_id: str, activities: list) -> dict:
     act = AgentTaskActivities(db_pool=db_pool)
-    task = dict(await act.load_task(task_id))
+    task = dict(await act._load_task(task_id))
     task.pop("notes", None)
     async with await WorkflowEnvironment.start_time_skipping() as env:
         queue = f"tq-{uuid.uuid4()}"

@@ -1,27 +1,10 @@
 import { useEffect, useState } from 'react';
-import { Link } from 'react-router-dom';
 import { api } from '../api/client';
 import ErrorBanner from '../components/ErrorBanner';
-import DataTable from '../components/DataTable';
 
 interface DbStatus {
   status?: string;
   latency_ms?: number;
-  error?: string;
-}
-
-interface ServiceRow {
-  name: string;
-  stack?: string;
-  replicas?: string;
-  image?: string;
-}
-
-interface ServicesStatus {
-  status?: 'ok' | 'error' | 'unconfigured';
-  services?: ServiceRow[];
-  infra_slug?: string;
-  note?: string;
   error?: string;
 }
 
@@ -35,7 +18,6 @@ interface SystemStatus {
   status?: 'ok' | 'degraded';
   auth_mode?: 'disabled' | 'basic' | 'api_key' | 'basic+api_key' | 'none';
   db?: DbStatus;
-  services?: ServicesStatus;
   temporal?: TemporalStatus;
 }
 
@@ -49,16 +31,6 @@ function probeBadgeClass(status?: string) {
   if (status === 'ok') return 'badge badge-success';
   if (status === 'error') return 'badge badge-error';
   if (status === 'unconfigured' || status === 'unknown') return 'badge badge-neutral';
-  return 'badge badge-neutral';
-}
-
-function replicaBadgeClass(replicas?: string) {
-  if (!replicas) return 'badge badge-neutral';
-  const match = replicas.match(/^(\d+)\/(\d+)$/);
-  if (match) {
-    const [, running, desired] = match;
-    return running === desired ? 'badge badge-success' : 'badge badge-error';
-  }
   return 'badge badge-neutral';
 }
 
@@ -91,9 +63,7 @@ export default function SystemMonitoring() {
         <div>
           <h1 className="page-title">System monitoring</h1>
           <p className="page-subtitle">
-            Live health of AEGIS's own running services — database, container services, and Temporal.
-            Requires an infrastructure entry flagged &ldquo;hosts AEGIS&rdquo; on the{' '}
-            <Link to="/infra">Infrastructure</Link> page to detect where AEGIS itself runs.
+            Live health of AEGIS's own backing services: the database and Temporal.
           </p>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
@@ -157,50 +127,6 @@ export default function SystemMonitoring() {
             <p className="meta">{data.temporal.note}</p>
           ) : (
             <p className="meta">Workflow engine reachable.</p>
-          )}
-        </div>
-
-        {/* Services (spans full width since it can hold a table) */}
-        <div className="card" style={{ gridColumn: '1 / -1' }}>
-          <div className="section-header-row" style={{ marginBottom: '0.6rem' }}>
-            <h3 style={{ margin: 0 }}>Services</h3>
-            <span className={probeBadgeClass(data?.services?.status)}>{data?.services?.status || 'unknown'}</span>
-          </div>
-
-          {data?.services?.status === 'unconfigured' ? (
-            <p className="meta">
-              {data.services.note || 'No infrastructure entry is flagged as hosting AEGIS yet.'}{' '}
-              Go to <Link to="/infra">Infrastructure</Link> and mark the host running AEGIS with &ldquo;This host runs AEGIS itself&rdquo;, then provision it.
-            </p>
-          ) : data?.services?.status === 'error' ? (
-            <p className="msg-error">{data.services.error || 'Failed to query services.'}</p>
-          ) : data?.services?.services && data.services.services.length > 0 ? (
-            <>
-              {data.services.infra_slug && (
-                <p className="meta" style={{ marginBottom: '0.5rem' }}>Source: <span className="mono">{data.services.infra_slug}</span></p>
-              )}
-              <div className="table-scroll">
-                <DataTable
-                  rows={data.services.services}
-                  rowKey={(s, i) => `${s.name}-${i}`}
-                  columns={[
-                    { header: 'Name', cell: s => <strong>{s.name}</strong> },
-                    { header: 'Stack', cell: s => s.stack || '—' },
-                    {
-                      header: 'Replicas',
-                      cell: s => <span className={replicaBadgeClass(s.replicas)}>{s.replicas || '—'}</span>,
-                    },
-                    {
-                      header: 'Image',
-                      td: { className: 'mono', style: { fontSize: 12, color: 'var(--text-muted)' } },
-                      cell: s => s.image || '—',
-                    },
-                  ]}
-                />
-              </div>
-            </>
-          ) : (
-            <div className="empty">No services reported.</div>
           )}
         </div>
       </div>

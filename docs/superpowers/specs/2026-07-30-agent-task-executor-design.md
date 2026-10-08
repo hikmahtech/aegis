@@ -4,6 +4,7 @@
 registration notes below (`worker/__main__.py`'s "two separate lists",
 `_ACTIVITY_TYPE_MAP`) were superseded by the `registry.py` `FlowSpec` table in
 PR #204; see [`development.md`](../../development.md#adding-a-new-flow).
+**Removed (v1 removal PR 4):** the coding verb left v1 for the Development vertical (a2-development); an untagged `@code` task now parks once with a note. The ask, research, email and finance verbs stay.
 **Issue:** [#151](https://github.com/hikmahtech/aegis/issues/151)
 **Date:** 2026-07-30
 

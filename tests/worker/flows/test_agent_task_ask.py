@@ -78,7 +78,7 @@ async def test_a_chat_task_is_asked_of_its_agent_and_parked(db_pool, chat_task):
     `@waiting`, and nobody ever answered it."""
     act = AgentTaskActivities(db_pool=db_pool)
     calls: list = []
-    task = dict(await act.load_task(chat_task))
+    task = dict(await act._load_task(chat_task))
     task.pop("notes", None)
 
     async with await WorkflowEnvironment.start_time_skipping() as env:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
+from datetime import timedelta
 
 import pytest
 from aegis_worker.flows.agent_task import (
@@ -14,16 +15,18 @@ from aegis_worker.flows.agent_task import (
 )
 from temporalio import activity, workflow
 from temporalio.client import WorkflowFailureError
+from temporalio.common import RetryPolicy
 from temporalio.testing import WorkflowEnvironment
-from temporalio.worker import Worker
+from temporalio.worker import Replayer, Worker
 
 # Module is `interaction` (singular) — imported inside imports_passed_through
-# per repo convention (mirror tests/worker/flows/test_agent_task_coding.py:15).
+# per repo convention.
 # This module defines workflows of its own, so the sandbox re-imports it: the
 # activities module (asyncpg underneath) must pass through too.
 with workflow.unsafe.imports_passed_through():
     from aegis_worker.activities.agent_task import resolve_verb
     from aegis_worker.flows.agent_chat_reply import AgentChatReplyInput
+    from aegis_worker.flows.agent_task import CODING_MOVED_COMMENT
     from aegis_worker.flows.interaction import InteractionFlowInput, InteractionResult
 
 _TASK = {
@@ -125,33 +128,114 @@ async def test_activity_failure_still_parks_the_task_before_the_flow_fails():
     )
 
 
-async def test_sweep_spawns_one_child_per_task_and_does_not_await_them():
-    @activity.defn(name="find_actionable_tasks")
-    async def find_actionable_tasks(
-        max_tasks: int = 3, cooldown_hours: int = 6, max_coding: int = 1
-    ) -> list[dict]:
-        return [dict(_TASK, id=f"tf-{n}") for n in range(1, 4)]
+_SHORT = timedelta(seconds=30)
+_SWEEP_CALLS: list[str] = []
 
-    @activity.defn(name="find_task_turns_due")
-    async def find_task_turns_due(limit: int = 20) -> list[dict]:
-        return []
 
+@activity.defn(name="find_actionable_tasks")
+async def _find_three(max_tasks: int = 3, cooldown_hours: int = 6, max_coding: int = 0) -> list[dict]:
+    _SWEEP_CALLS.append("find_actionable_tasks")
+    return [dict(_TASK, id=f"tf-{n}") for n in range(1, 4)]
+
+
+@activity.defn(name="find_task_turns_due")
+async def _no_turns_due(limit: int = 20) -> list[dict]:
+    _SWEEP_CALLS.append("find_task_turns_due")
+    return []
+
+
+@activity.defn(name="reconcile_work_sessions")
+async def _reconcile_sessions() -> dict:
+    _SWEEP_CALLS.append("reconcile_work_sessions")
+    return {"refreshed": 0, "parked": 0, "inventory": "ok"}
+
+
+async def _run_sweep(flow=AgentTaskSweepFlow, config: AgentTaskSweepConfig | None = None):
+    """One sweep; returns `(result, history)`. The children it spawns are
+    abandoned and never run here (no AgentTaskFlow on the worker)."""
+    _SWEEP_CALLS.clear()
     async with await WorkflowEnvironment.start_time_skipping() as env:
         queue = f"tq-{uuid.uuid4()}"
         async with Worker(
             env.client,
             task_queue=queue,
-            workflows=[AgentTaskSweepFlow, AgentTaskFlow],
-            activities=[find_actionable_tasks, find_task_turns_due],
+            workflows=[flow],
+            activities=[_find_three, _no_turns_due, _reconcile_sessions],
         ):
-            result = await env.client.execute_workflow(
-                AgentTaskSweepFlow.run,
-                AgentTaskSweepConfig(agent_id="maou"),
+            handle = await env.client.start_workflow(
+                flow.run,
+                config or AgentTaskSweepConfig(agent_id="maou"),
                 id=f"sweep-{uuid.uuid4()}",
                 task_queue=queue,
             )
+            result = await handle.result()
+            return result, await handle.fetch_history()
 
+
+async def test_sweep_spawns_one_child_per_task_and_does_not_await_them():
+    result, _ = await _run_sweep()
     assert result == {"found": 3, "spawned": 3, "resumed": 0}
+    # The coding lane left v1: a new tick neither dispatches turns nor
+    # reconciles sessions.
+    assert _SWEEP_CALLS == ["find_actionable_tasks"]
+
+
+@workflow.defn(name="AgentTaskSweepFlow")
+class _SweepBeforeTheCodingLaneWent:
+    """The sweep as the worker before `PATCH_DROP_CODING_SWEEP` ran it: the
+    spawn loop, the fallback turn dispatcher (only with a turn budget; prod's
+    was 0) and the session reconcile. Every tick in flight at the PR 4 deploy
+    has this history."""
+
+    @workflow.run
+    async def run(self, config: AgentTaskSweepConfig) -> dict:
+        tasks = await workflow.execute_activity(
+            "find_actionable_tasks",
+            args=[config.max_tasks, config.cooldown_hours, config.max_coding],
+            start_to_close_timeout=_SHORT,
+        )
+        for task in tasks:
+            await workflow.start_child_workflow(
+                "AgentTaskFlow",
+                AgentTaskFlowInput(agent_id=config.agent_id, todoist_task_id=str(task["id"]), task=task),
+                id=f"agent-task-{task['id']}",
+                parent_close_policy=workflow.ParentClosePolicy.ABANDON,
+            )
+        if config.max_coding:
+            await workflow.execute_activity(
+                "find_task_turns_due", args=[config.max_coding], start_to_close_timeout=_SHORT
+            )
+        await workflow.execute_activity(
+            "reconcile_work_sessions",
+            start_to_close_timeout=_SHORT,
+            retry_policy=RetryPolicy(maximum_attempts=1),
+        )
+        return {"found": len(tasks), "spawned": len(tasks), "resumed": 0}
+
+
+@pytest.mark.parametrize("max_coding", [0, 2])
+async def test_a_sweep_that_ran_the_coding_steps_replays_after_they_went(max_coding):
+    """Falsifiable: delete the `if not workflow.patched(PATCH_DROP_CODING_SWEEP)`
+    branch from `agent_task.py` and this fails with a nondeterminism error (the
+    history schedules `reconcile_work_sessions`, the new shape never does).
+    `max_coding=0` is prod's recorded config (054); 2 is a deployment that
+    still had a turn budget."""
+    config = AgentTaskSweepConfig(agent_id="maou", max_coding=max_coding)
+    _, history = await _run_sweep(flow=_SweepBeforeTheCodingLaneWent, config=config)
+    assert "reconcile_work_sessions" in _SWEEP_CALLS  # the premise
+    assert ("find_task_turns_due" in _SWEEP_CALLS) is bool(max_coding)
+    await Replayer(workflows=[AgentTaskSweepFlow]).replay_workflow(history)
+
+
+async def test_a_new_sweep_records_the_coding_drop_marker_and_replays():
+    _, history = await _run_sweep()
+    markers = [
+        e.marker_recorded_event_attributes.marker_name
+        for e in history.events
+        if e.HasField("marker_recorded_event_attributes")
+    ]
+    assert markers, "a new tick records PATCH_DROP_CODING_SWEEP"
+    await Replayer(workflows=[AgentTaskSweepFlow]).replay_workflow(history)
 
 
 # --- Issue #154: parametrised proof over every AgentTaskFlow.run exit path ---
@@ -159,43 +243,25 @@ async def test_sweep_spawns_one_child_per_task_and_does_not_await_them():
 # `find_actionable_tasks` excludes @waiting, so every exit MUST complete or
 # park the task — otherwise the 6h cooldown re-picks (and re-fails) it
 # forever. This is the single mechanical proof of that invariant: one case
-# per terminal return/raise statement a run can reach today (15 total — 3 in
-# run(), 2 in _run_ask, 2 in _run_email, 2 in _run_finance, 6 in _run_coding;
-# see issue #154 for the original enumeration. The infra verb's three exits
-# left with the infra lane (a2-devops); a `#alert` task now parks as decided
-# — nothing in AEGIS works it — and `test_agent_task_infra.py` pins the
-# legacy branch's replay. PR 5 of the
-# problem hub deleted the "handed to operator" exit: an operator who wants
-# AEGIS out of a task says so with `report_progress`, which is what the
-# `you_are_in_it` exit below reads. #344 added the two `ask` exits and
-# replaced the infra verb's two "nothing to check" parks with the plan's one
-# report).
+# per terminal return/raise statement a run can reach today (10 total — 3 in
+# run(), 2 in _run_ask, 2 in _run_email, 2 in _run_finance, 1 in
+# _park_coding). The infra verb's exits left with the infra lane (a2-devops),
+# and the coding loop's six with the development lane (a2-development): an
+# untagged `@code` task now parks once with a note.
 #
-# THREE exits deliberately do not park, and each carries its own terminal proof
-# instead (`case.expect_terminal`):
-#   * `unknown_task` — the task was deleted before we loaded it. There is
-#     nothing to park and nothing to comment on.
-#   * `you_are_in_it` — the operator's own session is registered active on
-#     the task, so the comment is already in front of them. Parking would
-#     stamp @waiting on a task somebody is actively working; what stops the
-#     fallback sweep re-dispatching the same comment is the `record_task_turn`
-#     watermark, so THAT is what the case asserts.
-#   * `turn_still_running` — an orphan turn of our own. The
-#     comment has been read by nobody, so this exit deliberately leaves the
-#     task IN the pool: the fallback sweep must re-dispatch it once the run
-#     ends. "No park and no watermark" is the correct terminal state here, and
-#     `test_agent_task_coding.py` pins the missing watermark specifically.
+# ONE exit deliberately does not park, and carries its own terminal proof
+# (`case.expect_terminal`): `no_task` — only the retired coding lane started
+# this flow without the task, so there is nothing to park.
 #
-# Each case asserts the ACTUAL park/complete/record activity call fired, not
-# just the returned status string — the literal `return {...}` dict on every
-# exit is unchanged by deleting the park_task call above it, so asserting on
-# the return value alone would not be falsifiable.
+# Each case asserts the ACTUAL park/complete activity call fired, not just
+# the returned status string — the literal `return {...}` dict on every exit
+# is unchanged by deleting the park_task call above it, so asserting on the
+# return value alone would not be falsifiable.
 
 # Module-level stub — Temporal does not allow @workflow.defn on local classes
 # (see tests/worker/test_clarify_flow_agent_spawn.py:14). One shape covers
 # every remaining card: only the finance verb raises one, and it parks
-# immediately afterwards whatever the answer is. The coding verb no
-# longer cards anything — it comments and waits for the user's reply instead.
+# immediately afterwards whatever the answer is.
 @workflow.defn(name="InteractionFlow")
 class _StubInteractionApprove:
     @workflow.run
@@ -221,21 +287,6 @@ _CHAT_TASK = dict(_TASK, source_tag="#chat", content="Why is the cache slow?")
 _ASK = {"agent_id": "agent-x", "message": "m", "thread_id": "todoist-task-x", "comment": "",
         "reason": ""}
 
-_SESSION = {
-    "task_id": "x", "agent_id": "maou", "session_id": "sess-1",
-    "repo": "repo", "github_repo": "org/repo", "branch": "aegis-task/x",
-    "worktree_path": "/srv/repo-aegis-wt/task-x", "host": "h",
-    "slack_ref": "", "turns": 0, "last_turn_at": "", "created_at": "",
-}
-_ENSURE_READY = {"status": "ready", "session": _SESSION, "candidates": [], "error": ""}
-_PROCEED = {"verdict": "proceed", "session": None, "reason": ""}
-_LAUNCH_OK = {
-    "status": "running", "run_id": "r1", "output_file": "turn.jsonl", "host": "h",
-    "engine": "claude", "tmux_window": "w", "worktree_path": _SESSION["worktree_path"],
-    "error": "",
-}
-
-
 @dataclass
 class _ExitCase:
     id: str
@@ -246,12 +297,11 @@ class _ExitCase:
     expect_raises: bool = False
     expect_status: str | None = None
     # Which activity call proves this exit reached a terminal state. "park" and
-    # "complete" are the two label writes; "record" is the session watermark
-    # (the you_are_in_it exit, which must NOT park); "none" is a task that no
-    # longer exists to write anything to.
+    # "complete" are the two label writes; "none" is a run with no task to
+    # write anything to.
     expect_terminal: str = "park"
-    # Start the flow with an EMPTY task dict — the webhook/sweep-fallback shape,
-    # which makes run() load the task through the `load_task` activity.
+    # Start the flow with an EMPTY task dict — the shape only the retired
+    # coding lane (webhook, fallback dispatcher) ever started it with.
     load_from_id: bool = False
 
 
@@ -286,62 +336,14 @@ _CASES = [
         {"merchant_history": {"merchant": "Acme", "charges": [], "summary": "..."}},
         expect_status="carded",
     ),
-    _ExitCase(
-        "coding_repo_ambiguous", _CODE_TASK,
-        {
-            "ensure_task_session": {
-                "status": "candidates", "session": _SESSION, "error": "",
-                "candidates": [{"github_repo": "org/one"}, {"github_repo": "org/two"}],
-            },
-        },
-        expect_status="repo_ambiguous",
-    ),
-    _ExitCase(
-        "coding_repo_unresolved", _CODE_TASK,
-        {
-            "ensure_task_session": {
-                "status": "unresolved", "session": None, "candidates": [], "error": "no repo",
-            },
-        },
-        expect_status="parked",
-    ),
-    _ExitCase(
-        "coding_you_are_in_it", _CODE_TASK,
-        {
-            "check_task_collision": {
-                "verdict": "you_are_in_it",
-                "session": {"name": "repo fix", "owner": "operator", "account": "personal"},
-                "reason": "operator session (personal) active on the task",
-            },
-        },
-        expect_status="operator_in_session",
-        expect_terminal="record",
-    ),
-    _ExitCase(
-        "coding_orphan_aegis_turn", _CODE_TASK,
-        {
-            "check_task_collision": {
-                "verdict": "turn_still_running",
-                "session": {"name": "task x", "owner": "aegis"},
-                "reason": "the last turn is still writing /tmp/x.jsonl",
-            },
-        },
-        expect_status="turn_still_running",
-        expect_terminal="none",
-    ),
-    _ExitCase(
-        "coding_launch_failed", _CODE_TASK,
-        {"launch_task_turn": {**_LAUNCH_OK, "status": "failed", "error": "no route to host"}},
-        expect_status="launch_failed",
-    ),
-    _ExitCase("coding_turn_ran", _CODE_TASK, expect_status="parked"),
-    _ExitCase("run_unknown_task", _CODE_TASK, {"load_task": {}},
-              expect_status="unknown_task", expect_terminal="none", load_from_id=True),
+    _ExitCase("coding_moved", _CODE_TASK, expect_status="parked"),
+    _ExitCase("run_no_task", _CODE_TASK, expect_status="no_task", expect_terminal="none",
+              load_from_id=True),
 ]
 
-# 15 exits, plus `alert_left_to_the_user`: the `none` decision reaching
+# 10 exits, plus `alert_left_to_the_user`: the `none` decision reaching
 # run()'s unrouted park, which `run_unknown_verb` reaches as `unknown`.
-assert len(_CASES) == 16, "one case per AgentTaskFlow exit — see issue #154"
+assert len(_CASES) == 11, "one case per AgentTaskFlow exit — see issue #154"
 
 
 def _exit_case_activities(events: list, case: _ExitCase):
@@ -383,62 +385,9 @@ def _exit_case_activities(events: list, case: _ExitCase):
     async def merchant_history(title: str, limit: int = 6) -> dict:
         return r["merchant_history"]
 
-    @activity.defn(name="load_task")
-    async def load_task(task_id: str) -> dict:
-        return r.get("load_task", dict(case.task, id=task_id))
-
-    @activity.defn(name="ensure_task_session")
-    async def ensure_task_session(
-        task_id: str, agent_id: str, task: dict, comment: str
-    ) -> dict:
-        return r.get("ensure_task_session", _ENSURE_READY)
-
-    @activity.defn(name="check_task_collision")
-    async def check_task_collision(task_id: str, override: bool = False) -> dict:
-        return r.get("check_task_collision", _PROCEED)
-
-    @activity.defn(name="record_task_turn")
-    async def record_task_turn(task_id: str, launched: bool) -> dict:
-        events.append(("record", str(launched)))
-        return {"recorded": True}
-
-    @activity.defn(name="launch_task_turn")
-    async def launch_task_turn(
-        session: dict, prompt: str, agent_id: str, resume: bool,
-        name: str, turn_timeout_minutes: int,
-    ) -> dict:
-        return r.get("launch_task_turn", _LAUNCH_OK)
-
-    @activity.defn(name="check_agent_run")
-    async def check_agent_run(output_file: str, host: str = "", probe_alive: bool = True) -> dict:
-        return {"status": "finished", "output": "done", "reason": "", "final": "STATUS: plan"}
-
-    @activity.defn(name="kill_task_turn")
-    async def kill_task_turn(output_file: str, host: str) -> dict:
-        return {"killed": True}
-
-    @activity.defn(name="send_message")
-    async def send_message(
-        agent_id: str,
-        message: str,
-        chat_id: int = 0,
-        thread_ref: dict | None = None,
-        thread_overflow: bool = False,
-    ) -> dict:
-        events.append(("slack", message))
-        return {"ok": True}
-
-    @activity.defn(name="set_task_slack_ref")
-    async def set_task_slack_ref(task_id: str, ref: dict) -> dict:
-        events.append(("slack_ref", ref))
-        return {"stored": True}
-
     return [
-        load_task, load_task_context, comment, park_task, complete_task,
+        load_task_context, comment, park_task, complete_task,
         prepare_agent_ask, triage_email, merchant_history,
-        ensure_task_session, check_task_collision, record_task_turn,
-        launch_task_turn, check_agent_run, kill_task_turn, send_message,
-        set_task_slack_ref,
     ]
 
 
@@ -497,9 +446,7 @@ async def test_every_exit_path_ends_completed_or_parked(case: _ExitCase):
     assert any(kind == terminal for kind, _ in events), (
         f"{case.id}: expected a {terminal} activity call, got {events}"
     )
-    if terminal == "record":
-        assert not any(kind == "park" for kind, _ in events), (
-            f"{case.id}: this exit must NOT stamp @waiting, got {events}"
-        )
+    if case.id == "coding_moved":
+        assert [body for kind, body in events if kind == "comment"] == [CODING_MOVED_COMMENT]
 
 

@@ -32,7 +32,7 @@ class _UnavailableConnector:
     moment anyone actually reaches for it.
 
     Deliberately **truthy**, which is the whole behaviour change. Activities
-    guard with ``if not self.remote_script: return``, meaning a falsy stand-in
+    guard with ``if not self.connector: return``, meaning a falsy stand-in
     would restore exactly the silent no-op this exists to remove.
     """
 
@@ -206,39 +206,6 @@ async def bootstrap(settings: Settings | None = None) -> WorkerDeps:
             "search",
             lambda: SearchConnector(base_url=searxng_url),
         )
-
-    # RemoteScript — always constructed: config resolves DB-first from the
-    # infra registry (coding.enabled entry), with the env settings as fallback,
-    # so the coding host can be configured entirely from the admin UI.
-    def _remote_script() -> Any:
-        # Imported inside the factory so an ImportError (a missing optional
-        # dependency) degrades exactly like a constructor failure instead of
-        # taking the whole worker down.
-        from aegis.connectors.remote_script import RemoteScriptConnector
-
-        return RemoteScriptConnector(
-            host=getattr(settings, "remote_script_host", ""),
-            user=getattr(settings, "remote_script_user", "deploy"),
-            key_file=getattr(settings, "remote_script_key_file", "~/.ssh/id_ed25519"),
-            repo_base=getattr(settings, "remote_script_repo_base", ""),
-            known_hosts=getattr(settings, "remote_script_known_hosts", None),
-            kimi_host=getattr(settings, "remote_script_kimi_host", ""),
-            tmux_session=getattr(settings, "remote_script_tmux_session", "remote"),
-            tmux_window_cap=getattr(settings, "remote_script_tmux_window_cap", 10),
-            claude_orgs=getattr(settings, "remote_script_claude_orgs", ""),
-            claude_binary=getattr(settings, "claude_cli_binary_path", ""),
-            kimi_binary=getattr(settings, "kimi_cli_binary_path", ""),
-            self_repo_path=getattr(settings, "aegis_self_repo_path", ""),
-            # The worker owns AgentRunFlow, so this is the connector that
-            # actually mounts AEGIS's tools into a run — core's copy matters
-            # only for the chat-tool lane.
-            mcp_server_url=getattr(settings, "mcp_server_external_url", ""),
-            api_key=getattr(settings, "api_key", ""),
-            db_pool=pool,
-            secret_key=getattr(settings, "secret_key", ""),
-        )
-
-    _register_connector(connectors, connector_errors, "remote_script", _remote_script)
 
     # Knowledge subsystem — native pgvector over our own pool. The ONE fatal
     # connector: it is not an optional external integration but a thin wrapper

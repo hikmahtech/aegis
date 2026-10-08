@@ -79,9 +79,6 @@ class CleanupActivities:
     db_pool: Any = None
     comms_url: str = ""
     api_key: str = ""
-    # RemoteScriptConnector — needed only by `cleanup_work_sessions`, which is
-    # why it is optional: every other activity here is pure SQL.
-    remote_script: Any = None
 
     @activity.defn
     async def archive_orphan_interactions(self, threshold_days: int = 7) -> dict:
@@ -138,101 +135,11 @@ class CleanupActivities:
 
     @activity.defn
     async def cleanup_work_sessions(self, days: int = 7) -> dict:
-        """Release the git worktrees of coding sessions whose task is finished.
-
-        Each `@code` Todoist task holds one persistent Claude Code session in
-        its own worktree on the coding host (`work_sessions`, migrations 025 and 034).
-        Nothing else ever removes those directories, so without this sweep the
-        host accumulates one checkout per task, forever.
-
-        Eligible: the task is completed, **or** gone from `todoist_tasks`
-        altogether (a deleted task never comes back as `is_completed`), and the
-        session has been idle — `last_turn_at`, or `created_at` for a session
-        that never ran a turn — for longer than `days`. Completion alone is not
-        enough: a PR raised from that worktree may still be in review.
-
-        The branch is deliberately left in place; it may back an open PR.
-
-        A worktree that could not be removed leaves its row behind, so the next
-        run retries. Deleting the row anyway would strand the directory forever
-        — the row is the only record of where it is.
-
-        Returns ``{removed: int, skipped: int}``.
-        """
-        if not self.db_pool:
-            logger.warning("cleanup_work_sessions_no_db_pool")
-            return {"removed": 0, "skipped": 0}
-        try:
-            days_int = int(days)
-        except (TypeError, ValueError):
-            days_int = 7
-        if days_int <= 0:
-            # 0 is the operator's off switch; a negative window would reach
-            # into the future and sweep live sessions.
-            logger.warning("cleanup_work_sessions_disabled", days=days)
-            return {"removed": 0, "skipped": 0}
-
-        rows = await self.db_pool.fetch(
-            """
-            SELECT ts.task_id, ts.worktree_path, ts.host
-            FROM work_sessions ts
-            LEFT JOIN todoist_tasks t ON t.id = ts.task_id
-            WHERE (t.id IS NULL OR t.is_completed)
-              AND COALESCE(ts.last_turn_at, ts.created_at)
-                  < now() - make_interval(days => $1)
-            """,
-            days_int,
-        )
-
-        removed = 0
-        skipped = 0
-        for index, row in enumerate(rows, start=1):
-            # Top of the loop, so a run that skips every row still heartbeats.
-            # A worktree removal is an SSH round trip, and a long tail of them
-            # all failing is exactly the run that would otherwise time out
-            # without ever having reported progress.
-            if activity.in_activity():
-                activity.heartbeat(f"work_sessions:{index}/{len(rows)}")
-            task_id = row["task_id"]
-            worktree_path = row["worktree_path"] or ""
-            host = row["host"] or ""
-            if worktree_path:
-                if self.remote_script is None:
-                    logger.warning(
-                        "cleanup_task_session_no_connector",
-                        task_id=task_id,
-                        worktree_path=worktree_path,
-                    )
-                    skipped += 1
-                    continue
-                try:
-                    # Documented as never raising — the try is for the case
-                    # where the connector itself is broken (config unreadable,
-                    # SSH key missing), not for a failed `git worktree remove`.
-                    await self.remote_script.remove_worktree(worktree_path, host=host)
-                except Exception as exc:
-                    logger.warning(
-                        "cleanup_task_session_worktree_failed",
-                        task_id=task_id,
-                        worktree_path=worktree_path,
-                        host=host,
-                        error=error_text(exc),
-                    )
-                    skipped += 1
-                    continue
-            await self.db_pool.execute(
-                "DELETE FROM work_sessions WHERE task_id = $1", task_id
-            )
-            removed += 1
-
-        if removed or skipped:
-            logger.info(
-                "cleanup_work_sessions_done",
-                removed=removed,
-                skipped=skipped,
-                idle_days=days_int,
-            )
-        return {"removed": removed, "skipped": skipped}
+        """Stub for one release: the coding lane moved to the Development
+        vertical (a2-development), and nothing here reaches the coding host
+        any more. Only a `CleanupFlow` recorded before the change schedules
+        this (`cleanup.PATCH_DROP_WORK_SESSIONS`). Remove it with that branch."""
+        return {"removed": 0, "skipped": 0}
 
     @activity.defn
     async def cleanup_old_dispatches(self, days: int = 30) -> dict:

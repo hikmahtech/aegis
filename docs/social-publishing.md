@@ -182,8 +182,8 @@ them on the row:
 
 Out of scope (deliberately): Reddit/HN (karma is anti-automation by design — stay
 manual), personal LinkedIn/Facebook profiles (no API; browser automation risks the
-account), Medium (no API since ~2023; a later Playwright script via
-`RemoteScriptConnector` if ever), media generation.
+account), Medium (no API since ~2023; a later Playwright script if ever),
+media generation.
 
 ## Platform reality — the part that gates everything
 
@@ -410,7 +410,7 @@ label. No new tables, flows, or routes.
   Platform media upload (chunked for X, resumable for YouTube) lands per-platform
   when needed.
 - **Threads/multi-post:** one task = one post. A thread is N tasks.
-- **Medium/browser platforms:** a Playwright script run via `RemoteScriptConnector`
+- **Medium/browser platforms:** a Playwright script
   writing back into `social_outbox` — only if republishing there ever matters enough.
 - **Cross-posting articles from the websites:** later, a small `POST /api/social/queue`
   route can insert `social_outbox` rows directly, bypassing Todoist — the outbox is

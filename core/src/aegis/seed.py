@@ -173,10 +173,9 @@ async def _load_resources(pool: asyncpg.Pool, path: Path) -> None:
                 r.get("tags", []),
                 r.get("metadata", {}),
             )
-        # Delete orphans only among kinds the YAML actually owns. The
-        # WorkspaceRepoSyncFlow sync flow adds rows of kind `repository` that
-        # intentionally aren't tracked in the YAML — without this scope, every
-        # Core restart wiped 248 GitHub repos.
+        # Delete orphans only among kinds the YAML actually owns: a row an
+        # operator added from the admin Resources page under another kind is
+        # not the seed's to prune.
         yaml_slugs = [r["slug"] for r in rows]
         yaml_managed_kinds = ("connector", "runbook", "endpoint", "mcp_server")
         status = await conn.execute(

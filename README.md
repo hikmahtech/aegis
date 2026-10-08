@@ -46,21 +46,14 @@ before you trust *any* LLM workflow in production, run the free
 - **Your knowledge, local.** A native Postgres + pgvector RAG store. Seed it
   from URLs, uploads, server folders, or a watched Drive folder. Embeddings run
   on a free local model — no per-token cost.
-- **Your infrastructure, registered.** An infrastructure registry holds SSH
-  hosts, your Docker Swarm, Kubernetes clusters, cloud accounts (AWS / GCP),
-  and the coding-agent host — credentials pasted in the admin UI, encrypted in
-  the DB, with per-entry read-only gating for the ops the agents may run. A
-  **System monitoring** page shows the health of AEGIS's own services (scoped
-  to its own stack, so a shared swarm stays legible).
-- **Agents that write code.** Register your repos and a coding host in the UI —
-  SSH identity plus **Claude Code / Kimi** engines, named Claude accounts, and
-  per-GitHub-org routing. An agent SSHes in and runs the CLI on the right
-  repo, on the right account, to work a coding task and open a draft PR.
+- **System monitoring.** A page shows the health of AEGIS's own database and
+  Temporal. (The infrastructure registry and the coding lane left this repo:
+  they live in separate services now.)
 - **Market data without a vendor contract.** A provider-agnostic finance
   connector (keyless Yahoo / Stooq) backs the money agent's quotes, market
   overview, and finance news.
 - **Configured in the UI, not in YAML.** Agents, personalities, channels,
-  schedules, integration secrets, the LLM backend, and infrastructure are all
+  schedules, integration secrets and the LLM backend are all
   DB-owned and edited in the admin panel; seed files and env vars are
   first-boot bootstrap only. Slack (Socket Mode) is the optional chat channel —
   the web Interactions inbox always works.

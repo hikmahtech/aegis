@@ -323,46 +323,6 @@ export const api = {
   // Market
   marketSummary: () => apiFetch<any>('/api/market/summary'),
 
-  // Infrastructure
-  infraListServices: (context = 'swarm') =>
-    apiFetch<any>(`/api/infra/services?context=${context}`),
-  infraInspectService: (name: string, context = 'swarm') =>
-    apiFetch<any>(`/api/infra/services/${name}?context=${context}`),
-  infraServiceLogs: (name: string, tail = 200, context = 'swarm') =>
-    apiFetch<any>(`/api/infra/services/${name}/logs?context=${context}&tail=${tail}`),
-  infraRestartService: (name: string, context = 'swarm') =>
-    apiFetch<any>(`/api/infra/services/${name}/restart?context=${context}`, { method: 'POST' }),
-  infraListPods: (context = '', namespace = 'default') =>
-    apiFetch<any>(`/api/infra/pods?context=${context}&namespace=${namespace}`),
-  infraPodLogs: (ns: string, name: string, tail = 200, context = '') =>
-    apiFetch<any>(`/api/infra/pods/${ns}/${name}/logs?context=${context}&tail=${tail}`),
-  infraListDeployments: (context = '', namespace = 'default') =>
-    apiFetch<any>(`/api/infra/deployments?context=${context}&namespace=${namespace}`),
-  infraListArgocd: (context = '') =>
-    apiFetch<any>(`/api/infra/argocd/apps?context=${context}`),
-  infraSyncArgocd: (name: string, context = '') =>
-    apiFetch<any>(`/api/infra/argocd/apps/${name}/sync?context=${context}`, { method: 'POST' }),
-
-  // Infrastructure registry (dynamic hosts + provisioning)
-  listInfra: () => apiFetch<any[]>('/api/admin/infra'),
-  getInfra: (id: string) => apiFetch<any>(`/api/admin/infra/${id}`),
-  createInfra: (data: any) =>
-    apiFetch<any>('/api/admin/infra', { method: 'POST', body: JSON.stringify(data) }),
-  updateInfra: (id: string, data: any) =>
-    apiFetch<any>(`/api/admin/infra/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
-  deleteInfra: (id: string) =>
-    apiFetch<any>(`/api/admin/infra/${id}`, { method: 'DELETE' }),
-  provisionInfra: (id: string) =>
-    apiFetch<any>(`/api/admin/infra/${id}/provision`, { method: 'POST' }),
-  infraK8sPods: (id: string, namespace = 'default') =>
-    apiFetch<any>(`/api/admin/infra/${id}/k8s/pods?namespace=${namespace}`),
-  infraK8sDeployments: (id: string, namespace = 'default') =>
-    apiFetch<any>(`/api/admin/infra/${id}/k8s/deployments?namespace=${namespace}`),
-  infraK8sPodLogs: (id: string, namespace: string, pod: string, tail = 200) =>
-    apiFetch<any>(`/api/admin/infra/${id}/k8s/pods/${namespace}/${pod}/logs?tail=${tail}`),
-  infraK8sRestartDeployment: (id: string, namespace: string, name: string) =>
-    apiFetch<any>(`/api/admin/infra/${id}/k8s/deployments/${namespace}/${name}/restart`, { method: 'POST' }),
-
   // System monitoring (AEGIS's own stack status)
   systemStatus: () => apiFetch<any>('/api/admin/system/status'),
 
@@ -481,14 +441,7 @@ export const api = {
     apiFetch<any>('/api/admin/todoist/content-routes/preview', { method: 'POST', body: JSON.stringify(body) }),
   suggestContentRoute: (body: { examples: string[] }) =>
     apiFetch<any>('/api/admin/todoist/content-routes/suggest', { method: 'POST', body: JSON.stringify(body) }),
-  // Todoist project → repo (the coding lane's first guess) and source tag →
-  // agent-task verb. Both were settings rows with no field anywhere (#558).
-  getProjectRepoMap: () =>
-    apiFetch<{ project_repo_map: Record<string, string> }>('/api/admin/todoist/project-repo-map'),
-  saveProjectRepoMap: (project_repo_map: Record<string, string>) =>
-    apiFetch<{ project_repo_map: Record<string, string> }>('/api/admin/todoist/project-repo-map', {
-      method: 'PUT', body: JSON.stringify({ project_repo_map }),
-    }),
+  // Source tag → agent-task verb: a settings row with no field anywhere until #558.
   getAgentTaskVerbs: () =>
     apiFetch<{
       overrides: Record<string, string | null>;

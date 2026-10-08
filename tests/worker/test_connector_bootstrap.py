@@ -19,18 +19,14 @@ from typing import Any
 import pytest
 from aegis.config import Settings
 from aegis_worker import bootstrap as bootstrap_mod
-from aegis_worker.activities.inventory import InventoryActivities
 from aegis_worker.bootstrap import (
     ConnectorUnavailableError,
     _UnavailableConnector,
     bootstrap,
 )
 from structlog.testing import capture_logs
-from temporalio.testing import ActivityEnvironment
 
-PREFIX = "zzsf2-"
-
-_BOOM = "ssh key file /nope/id_ed25519 is not readable"
+_BOOM = "postiz base url is not a url"
 
 
 @pytest.fixture
@@ -43,20 +39,6 @@ def worker_settings(test_settings, test_db_url) -> Settings:
     if test_db_url is None:
         pytest.skip("no Postgres reachable for the test database")
     return test_settings.model_copy(update={"database_url": test_db_url})
-
-
-async def _seed_repo_resource(pool) -> None:
-    await pool.execute(
-        "INSERT INTO resources (kind, slug, title, metadata) VALUES ('repository', $1, $2, $3)",
-        f"{PREFIX}repo",
-        f"{PREFIX}Repo",
-        # The pool codec json.dumps() this — a pre-dumped string is rejected.
-        {"github_repo": f"acme/{PREFIX}repo"},
-    )
-
-
-async def _wipe(pool) -> None:
-    await pool.execute("DELETE FROM resources WHERE slug LIKE $1", f"{PREFIX}%")
 
 
 # ---------------------------------------------------------------------------
@@ -73,30 +55,30 @@ async def test_a_broken_connector_is_reported_and_the_worker_still_boots(
         raise OSError(_BOOM)
 
     monkeypatch.setattr(
-        "aegis.connectors.remote_script.RemoteScriptConnector.__init__", explode
+        "aegis.connectors.social.SocialConnector.__init__", explode
     )
 
     with capture_logs() as logs:
         deps = await bootstrap(worker_settings)
     try:
         # 1. Recorded, with the underlying reason — not merely absent.
-        assert "remote_script" in deps.connector_errors
-        assert _BOOM in deps.connector_errors["remote_script"]
+        assert "social" in deps.connector_errors
+        assert _BOOM in deps.connector_errors["social"]
 
         # 2. Logged at ERROR naming the connector. structlog bypasses stdlib
         #    logging, so caplog would see nothing here.
         failed = [e for e in logs if e["event"] == "connector_init_failed"]
-        assert [e["connector"] for e in failed] == ["remote_script"]
+        assert [e["connector"] for e in failed] == ["social"]
         assert failed[0]["log_level"] == "error"
         assert failed[0]["fatal"] is False
         degraded = [e for e in logs if e["event"] == "worker_bootstrap_degraded"]
-        assert degraded and degraded[0]["unavailable"] == ["remote_script"]
+        assert degraded and degraded[0]["unavailable"] == ["social"]
         assert degraded[0]["log_level"] == "error"
 
         # 3. The worker booted anyway, and the connectors that build fine are
         #    real objects — the failure did not take the healthy ones with it.
         assert deps.pool is not None
-        assert isinstance(deps.connectors["remote_script"], _UnavailableConnector)
+        assert isinstance(deps.connectors["social"], _UnavailableConnector)
         assert not isinstance(deps.connectors["knowledge"], _UnavailableConnector)
         assert "knowledge" not in deps.connector_errors
     finally:
@@ -179,49 +161,15 @@ def test_the_money_activities_are_handed_the_finance_connector():
 # ---------------------------------------------------------------------------
 
 
-async def test_dependent_activity_fails_with_the_reason_instead_of_a_clean_lie(
-    db_pool,
-):
-    """The activity must stop, not return a reassuring empty result.
-
-    `check_github_webhooks` is the sharp end of #205: handed `None` it answers
-    "0 missing webhooks", which reads as a clean bill of health while nothing
-    was actually checked.
-    """
-    await _wipe(db_pool)
-    await _seed_repo_resource(db_pool)
-    env = ActivityEnvironment()
-    try:
-        # Status quo for a connector that was never configured — still an
-        # empty result, shown here so the contrast is not taken on trust. It
-        # now at least labels itself `webhook_check_status='skipped'` (#142)
-        # rather than being indistinguishable from a clean bill of health.
-        silent = InventoryActivities(db_pool=db_pool, remote_script=None)
-        assert await env.run(silent.check_github_webhooks) == {
-            "missing_webhooks": [],
-            "missing_webhooks_count": 0,
-            "webhooks_newly_missing": [],
-            "webhooks_recovered": [],
-            "webhooks_inconclusive": [],
-            "checked": 0,
-            "skipped": 0,
-            "webhook_check_status": "skipped",
-        }
-
-        # A connector that was configured and failed to build: same call, and
-        # now it raises with the boot error attached rather than an
-        # `AttributeError: 'NoneType' object has no attribute 'ensure_config'`
-        # or a fabricated all-clear.
-        broken = InventoryActivities(
-            db_pool=db_pool,
-            remote_script=_UnavailableConnector("remote_script", f"OSError: {_BOOM}"),
-        )
-        with pytest.raises(ConnectorUnavailableError) as excinfo:
-            await env.run(broken.check_github_webhooks)
-        assert "remote_script" in str(excinfo.value)
-        assert _BOOM in str(excinfo.value)
-    finally:
-        await _wipe(db_pool)
+async def test_a_dependent_call_fails_with_the_reason_instead_of_a_clean_lie():
+    """A connector that was configured and failed to build raises at first
+    use, with the boot error attached, rather than an `AttributeError:
+    'NoneType' object has no attribute ...` or a fabricated all-clear."""
+    broken = _UnavailableConnector("social", f"ValueError: {_BOOM}")
+    with pytest.raises(ConnectorUnavailableError) as excinfo:
+        await broken.list_channels()
+    assert "social" in str(excinfo.value)
+    assert _BOOM in str(excinfo.value)
 
 
 async def test_the_stand_in_is_truthy_so_none_guards_do_not_swallow_it():

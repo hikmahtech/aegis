@@ -74,7 +74,7 @@ LEDGER_WRITE_WAIT_S = 20
 LEDGER_TOOL_TIMEOUT_S = LEDGER_WRITE_WAIT_S + 10
 
 # Core never imports worker code, so the flow is started by NAME with a plain
-# dict on the queue the worker serves — the same seam as `dispatch_agent_run`.
+# dict on the queue the worker serves.
 _BOOKS_WRITE_FLOW = "BooksWriteFlow"
 _TASK_QUEUE = "aegis-main"
 

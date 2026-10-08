@@ -20,7 +20,6 @@ from temporalio.contrib.opentelemetry import TracingInterceptor
 from temporalio.worker import Worker
 
 from aegis_worker.activities.agent_registry import AgentRegistryActivities
-from aegis_worker.activities.agent_run import AgentRunActivities
 from aegis_worker.activities.agent_task import AgentTaskActivities
 from aegis_worker.activities.briefing import BriefingActivities
 from aegis_worker.activities.calendar import CalendarActivities
@@ -44,7 +43,6 @@ from aegis_worker.activities.hub import HubActivities
 from aegis_worker.activities.intel_scan import IntelScanActivities
 from aegis_worker.activities.intelligence import IntelligenceActivities
 from aegis_worker.activities.interactions import InteractionActivities
-from aegis_worker.activities.inventory import InventoryActivities
 from aegis_worker.activities.llm_governor import LLMGovernorActivities
 from aegis_worker.activities.meeting import MeetingActivities
 from aegis_worker.activities.memory import MemoryActivities
@@ -244,10 +242,6 @@ async def main():
         db_pool=deps.pool,
         comms_url=settings.comms_url,
         api_key=settings.api_key,
-        # `cleanup_work_sessions` removes the finished sessions' worktrees on
-        # the coding host; without the connector it only prunes rows that have
-        # no worktree, and leaves the rest for the next run.
-        remote_script=connectors.get("remote_script"),
     )
     interaction_act = InteractionActivities(db_pool=deps.pool)
     run_recorder_act = RunRecorderActivities(db_pool=deps.pool)
@@ -454,10 +448,6 @@ async def main():
         db_pool=deps.pool,
     )
     intel_scan_act = IntelScanActivities(searxng_url=getattr(settings, "searxng_url", ""))
-    inventory_act = InventoryActivities(
-        db_pool=deps.pool,
-        remote_script=connectors.get("remote_script"),
-    )
     from aegis.connectors.todoist import TodoistConnector
 
     # Settings-row invariant check: the GTD pipeline (capture → clarify) reads
@@ -523,16 +513,9 @@ async def main():
         # the flow-health watchdog.
         delivery=delivery_act,
     )
-    # General agent-run lane (AgentRunFlow) — same coding host + connector as
-    # the coding lane below, no Todoist coupling.
-    agent_run_act = AgentRunActivities(remote_script=connectors.get("remote_script"))
     agent_task_act = AgentTaskActivities(
         db_pool=deps.pool,
         todoist_connector=todoist_connector,
-        remote_script=connectors.get("remote_script"),
-        # resolve_task_repo's tier 2 asks the balanced tier to pick a repo.
-        llm_client=deps.llm,
-        model=model_balanced,
     )
     expiring_items_act = ExpiringItemsActivities(db_pool=deps.pool)
     flow_health_act = FlowHealthActivities(db_pool=deps.pool, delivery=delivery_act)
@@ -575,8 +558,7 @@ async def main():
             base_url=getattr(settings, "core_api_url", "http://localhost:8080"),
             api_key=getattr(settings, "api_key", ""),
             # ChatActivities.synthesize_reply covers smart-tier agents with
-            # heavy tool calls —
-            # remote_script kimi SSH, deep KS search — that legitimately
+            # heavy tool calls (deep KS search, research) that legitimately
             # take 3-6 min wall time. Aligns below the activity-level
             # TIMEOUT_CHAT_REPLY (600s) with headroom; the chat-reply
             # path uses the same 600s ceiling.
@@ -629,8 +611,6 @@ async def main():
         clarify_act,
         chat_act,
         review_act,
-        inventory_act,
-        agent_run_act,
         agent_task_act,
         expiring_items_act,
         flow_health_act,

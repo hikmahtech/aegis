@@ -20,16 +20,6 @@ docker build -f worker/Dockerfile -t <registry>/aegis-worker:latest .
 docker build -f comms/Dockerfile  -t <registry>/aegis-comms:latest .
 ```
 
-**Cloud CLIs** (`kind=k8s` exec-plugin kubeconfigs and `kind=cloud` accounts in the
-infrastructure registry need them):
-
-```bash
-docker build --build-arg EXTRA_CLOUD_CLIS="aws gcloud" -f core/Dockerfile .
-```
-
-The default is empty (slim image). Supported values: `aws`, `gcloud` — see
-[`infrastructure.md`](infrastructure.md) for when you need which.
-
 ## Running
 
 Any orchestrator works — the maintainer runs Docker Swarm (`docker stack deploy`,
@@ -61,9 +51,7 @@ its namespace), and your LLM gateway settings if not configured from the UI.
 
 **Admin UI / DB (everything else):** integration secrets (Slack, Todoist, GitHub,
 Postiz, finance), generated API keys, the LLM backend (Models & Providers page),
-agents + personalities, channels, flow schedules, and the infrastructure registry
-(SSH hosts / swarm / k8s clusters / cloud accounts / the coding host) with per-entry
-encrypted credentials. Secrets are entered once in the UI and stored encrypted with
+agents + personalities, channels and flow schedules. Secrets are entered once in the UI and stored encrypted with
 `AEGIS_SECRET_KEY` — they are **not** baked into images or committed to config.
 
 **Seed data is first-boot-only.** `config/seed/*.yaml` and

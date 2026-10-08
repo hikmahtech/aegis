@@ -4,8 +4,8 @@ Mirrors expiring_items_admin.py / people_admin.py: thin handlers over
 services/assets.py, audit-logged mutations, auth on the whole router.
 Consumed by the admin panel's Assets page.
 
-No provisioning/status endpoints — unlike infra_admin.py, which this
-generalises, an asset is data, not something we can SSH into.
+No provisioning/status endpoints: an asset is data, not something we can
+SSH into.
 """
 
 from __future__ import annotations

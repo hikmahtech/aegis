@@ -1,19 +1,23 @@
 """CleanupFlow — the step wiring, with every activity stubbed.
 
 The activities have their own tests against real Postgres; what is under test
-here is that the flow actually calls the task-session sweep, passes it the
-configured window, reports it under its own key, and neither suppresses nor is
-suppressed by the steps around it.
+here is that each sweep runs with its configured window, reports under its own
+key, and neither suppresses nor is suppressed by the steps around it.
+
+The coding sessions' worktree sweep left with the coding lane (the Development
+vertical). A run recorded before that still replays, through the legacy
+branch behind `PATCH_DROP_WORK_SESSIONS`.
 """
 
 from __future__ import annotations
 
+from datetime import timedelta
 from uuid import uuid4
 
 import pytest
 from temporalio import activity, workflow
 from temporalio.testing import WorkflowEnvironment
-from temporalio.worker import Worker
+from temporalio.worker import Replayer, Worker
 
 with workflow.unsafe.imports_passed_through():
     from aegis_worker.flows.cleanup import CleanupConfig, CleanupFlow
@@ -67,13 +71,7 @@ async def _stub_prune_boom(config: dict) -> dict:
     raise RuntimeError("relation does not exist")
 
 
-@activity.defn(name="cleanup_work_sessions")
-async def _stub_sessions_boom(days: int) -> dict:
-    _record("sessions", days)
-    raise RuntimeError("ssh: no route to host")
-
-
-async def _run(config: CleanupConfig, *activities) -> dict:
+async def _run_with_history(config: CleanupConfig, *activities, flow=CleanupFlow):
     _calls.clear()
     acts = list(activities) or [
         _stub_dispatches,
@@ -85,75 +83,104 @@ async def _run(config: CleanupConfig, *activities) -> dict:
     tq = f"tq-{uuid4().hex[:8]}"
     async with (
         await WorkflowEnvironment.start_time_skipping() as env,
-        Worker(env.client, task_queue=tq, workflows=[CleanupFlow], activities=acts),
+        Worker(env.client, task_queue=tq, workflows=[flow], activities=acts),
     ):
-        return await env.client.execute_workflow(
-            CleanupFlow.run,
+        handle = await env.client.start_workflow(
+            flow.run,
             config,
             id=f"cleanup-{uuid4().hex[:8]}",
             task_queue=tq,
         )
+        result = await handle.result()
+        return result, await handle.fetch_history()
+
+
+async def _run(config: CleanupConfig, *activities) -> dict:
+    result, _ = await _run_with_history(config, *activities)
+    return result
+
+
+_SHORT = timedelta(seconds=30)
+
+
+@workflow.defn(name="CleanupFlow")
+class _CleanupBeforeTheSessionSweepWent:
+    """CleanupFlow as the worker before the coding lane left ran it: the
+    dispatch prune, the retention prune, the orphan sweep, the coding
+    sessions' worktree sweep, then the problem close sweep. Every run in
+    flight at the deploy has this history."""
+
+    @workflow.run
+    async def run(self, config: CleanupConfig) -> dict:
+        await workflow.execute_activity(
+            "cleanup_old_dispatches", args=[30], start_to_close_timeout=_SHORT
+        )
+        await workflow.execute_activity(
+            "prune_old_records", args=[{"retentions": {"audit_log": 90}}], start_to_close_timeout=_SHORT
+        )
+        await workflow.execute_activity(
+            "archive_orphan_interactions", args=[7], start_to_close_timeout=_SHORT
+        )
+        await workflow.execute_activity(
+            "cleanup_work_sessions", args=[7], start_to_close_timeout=_SHORT
+        )
+        await workflow.execute_activity(
+            "close_resolved_problems", args=[7.0], start_to_close_timeout=_SHORT
+        )
+        return {}
 
 
 @pytest.mark.asyncio
-async def test_task_session_sweep_runs_and_lands_under_its_own_key():
-    result = await _run(CleanupConfig(retentions={"audit_log": 90}, task_session_days=14))
-
-    assert _calls["sessions"] == [14]
-    assert result["work_sessions"] == {"removed": 2, "skipped": 1}
-    # The neighbouring steps still reported their own results.
-    assert result["audit_log"] == 3
-    assert result["interactions_archived"] == 1
-
-
-@pytest.mark.asyncio
-async def test_default_window_is_seven_days():
-    result = await _run(CleanupConfig(retentions={"audit_log": 90}))
-
-    assert _calls["sessions"] == [7]
-    assert result["work_sessions"] == {"removed": 2, "skipped": 1}
-
-
-@pytest.mark.asyncio
-async def test_zero_days_skips_the_sweep_entirely():
-    """0 is the operator's off switch — the activity must not run at all, and
-    no key is reported, so a disabled sweep is not read as a sweep of nothing."""
-    result = await _run(CleanupConfig(retentions={"audit_log": 90}, task_session_days=0))
+async def test_a_new_run_no_longer_sweeps_coding_sessions():
+    result, history = await _run_with_history(CleanupConfig(retentions={"audit_log": 90}))
 
     assert "sessions" not in _calls
     assert "work_sessions" not in result
+    # The neighbouring steps still reported their own results.
+    assert result["audit_log"] == 3
+    assert result["interactions_archived"] == 1
+    markers = [
+        e.marker_recorded_event_attributes.marker_name
+        for e in history.events
+        if e.HasField("marker_recorded_event_attributes")
+    ]
+    assert markers, "a new run records the PATCH_DROP_WORK_SESSIONS marker"
+    await Replayer(workflows=[CleanupFlow]).replay_workflow(history)
 
 
 @pytest.mark.asyncio
-async def test_sweep_failure_is_marked_not_fatal():
-    result = await _run(
+async def test_a_run_that_swept_sessions_replays_after_the_step_went():
+    """Falsifiable: delete the `if not workflow.patched(PATCH_DROP_WORK_SESSIONS)`
+    branch from `cleanup.py` and this fails with a nondeterminism error (the
+    history schedules `cleanup_work_sessions`, the new shape never does)."""
+    _, history = await _run_with_history(
         CleanupConfig(retentions={"audit_log": 90}),
         _stub_dispatches,
         _stub_prune,
         _stub_orphans,
-        _stub_sessions_boom,
+        _stub_sessions,
+        _stub_close_problems,
+        flow=_CleanupBeforeTheSessionSweepWent,
     )
-
-    assert result["work_sessions"] == {"status": "failed"}
-    # The steps before it still reported — one broken sweep is not a broken run.
-    assert result["audit_log"] == 3
-    assert result["interactions_archived"] == 1
+    assert _calls["sessions"] == [7]  # the premise: the old shape really ran it
+    await Replayer(workflows=[CleanupFlow]).replay_workflow(history)
 
 
 @pytest.mark.asyncio
-async def test_prune_failure_does_not_suppress_the_sweep():
+async def test_prune_failure_does_not_suppress_the_later_sweeps():
     """Each step is independent: a prune blowing up must not silently stop the
-    worktrees being released."""
+    sweeps after it."""
     result = await _run(
         CleanupConfig(retentions={"audit_log": 90}),
         _stub_dispatches,
         _stub_prune_boom,
         _stub_orphans,
-        _stub_sessions,
+        _stub_close_problems,
     )
 
     assert result["prune_status"] == "failed"
-    assert result["work_sessions"] == {"removed": 2, "skipped": 1}
+    assert result["interactions_archived"] == 1
+    assert result["problems_closed"] == {"closed": 3, "problem_ids": ["a", "b", "c"]}
 
 
 async def test_the_problem_close_sweep_runs_last_and_lands_under_its_own_key():
@@ -188,14 +215,15 @@ def test_every_window_is_read_from_activities_config():
         {
             "dispatch_days": 14,
             "interaction_orphan_days": 3,
+            # A stored key of the retired session sweep is ignored (057 strips it).
             "task_session_days": 5,
             "problem_close_days": 2.5,
         }
     )
     assert cfg.dispatch_days == 14
     assert cfg.interaction_orphan_days == 3
-    assert cfg.task_session_days == 5
     assert cfg.problem_close_days == 2.5
+    assert not hasattr(cfg, "task_session_days")
 
 
 def test_an_empty_or_blank_config_keeps_the_flows_own_defaults():
@@ -206,7 +234,6 @@ def test_an_empty_or_blank_config_keeps_the_flows_own_defaults():
         cfg = _schedule_config(config)
         assert cfg.dispatch_days == default.dispatch_days
         assert cfg.interaction_orphan_days == default.interaction_orphan_days
-        assert cfg.task_session_days == default.task_session_days
         assert cfg.problem_close_days == default.problem_close_days
 
 
@@ -216,8 +243,7 @@ async def test_a_failing_close_sweep_is_reported_not_fatal():
         _stub_dispatches,
         _stub_prune,
         _stub_orphans,
-        _stub_sessions,
         _stub_close_problems_boom,
     )
     assert result["problems_closed"] == {"status": "failed"}
-    assert result["work_sessions"] == {"removed": 2, "skipped": 1}, "the earlier sweeps still ran"
+    assert result["interactions_archived"] == 1, "the earlier sweeps still ran"

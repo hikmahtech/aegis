@@ -7,7 +7,6 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from aegis.services import work_sessions
 from aegis.services.hub import (
     Event,
     add_link,
@@ -81,7 +80,7 @@ async def test_add_link_is_idempotent_and_refuses_blank(db_pool):
     assert [(x["link_kind"], x["ref"]) for x in refs] == [("github_pr", "https://github.com/o/r/pull/5")]
 
 
-async def test_merge_moves_events_links_sessions_and_closes_the_duplicate(db_pool):
+async def test_merge_moves_events_and_links_and_closes_the_duplicate(db_pool):
     keep_task, dup_task = f"zzk-{uuid.uuid4().hex[:6]}", f"zzd-{uuid.uuid4().hex[:6]}"
     await _task(db_pool, keep_task)
     await _task(db_pool, dup_task)
@@ -92,7 +91,6 @@ async def test_merge_moves_events_links_sessions_and_closes_the_duplicate(db_poo
     await link_task(db_pool, keep.problem_id, keep_task)
     await link_task(db_pool, dup.problem_id, dup_task)
     await add_link(db_pool, dup.problem_id, "github_pr", "o/r#9")
-    await work_sessions.create_session(db_pool, task_id=dup_task, agent_id="pandoras-actor")
 
     out = await merge_problems(db_pool, keep.problem_id, dup.problem_id, by="chat:x", now=NOW)
     # Two occurrences and the duplicate's own `create` state change.
@@ -128,8 +126,6 @@ async def test_merge_moves_events_links_sessions_and_closes_the_duplicate(db_poo
         dup.problem_id,
     )
     assert back == keep.problem_id
-    sess = await work_sessions.get_session(db_pool, dup_task)
-    assert sess["problem_id"] == keep.problem_id
 
 
 async def test_merge_refuses_self_missing_and_closed_targets(db_pool):

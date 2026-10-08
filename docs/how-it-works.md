@@ -52,7 +52,7 @@ scheduled tick.
 **Where configuration lives.** The DB, edited through the admin UI. The YAML
 under `config/seed/` and the markdown under `personalities/` are first-boot
 seeds only — after that, agents, personalities, channels, schedules,
-integration secrets, and the infrastructure registry are all DB-owned, and
+integration secrets and the LLM backend are all DB-owned, and
 editing the files on a live install has no effect. The one env-side exception
 is bootstrap: `AEGIS_DATABASE_URL`, admin credentials, `AEGIS_SECRET_KEY`
 (encrypts every DB-stored secret — set it in production), and the Temporal/
@@ -186,7 +186,9 @@ a `#research` task), `NotesWriteFlow` (one vault write from `note_write` /
 `note_link`). (`SentryPollFlow`, `JiraSyncFlow` and `GitHubAlertFlow` are gone:
 the Sentry, Jira and GitHub intakes moved to the v2 Development vertical.
 `AlertInvestigationFlow`, `InfraHeartbeatFlow`, `ServiceDriftFlow` and
-`CertRadarFlow` are gone too: the infra lane moved to the v2 DevOps vertical.)
+`CertRadarFlow` are gone too: the infra lane moved to the v2 DevOps vertical.
+`AgentRunFlow` and `WorkspaceRepoSyncFlow` are gone: the development lane and
+the repo registry moved to the v2 Development vertical.)
 
 Note the **ship-active-but-inert** pattern: `social-publish-5min`,
 `llm-spend-guard-15min`, `drive-sync-raphael`, `wearable-ingest-6h`,
@@ -267,9 +269,8 @@ per-item child:
 `@waiting`, completed. **The brake:** 3 tasks per tick, oldest first; a 6-hour
 per-task cooldown (keyed on `workflow_runs.todoist_task_ref`, which the run
 recorder populates automatically from the flow input's `todoist_task_id`
-field); at most 1 coding task per tick. A large backlog drains over days
-rather than stampeding. All four knobs are `activities.config` keys
-(`max_tasks`, `cooldown_hours`, `max_coding`) — editable live.
+field). A large backlog drains over days rather than stampeding. Both knobs
+are `activities.config` keys (`max_tasks`, `cooldown_hours`) — editable live.
 
 **Verb resolution** comes from the task's `source_tag` (who captured it);
 `@code` is consulted only when `source_tag` is NULL, i.e. the task is
@@ -281,7 +282,7 @@ user-authored:
 | `source_tag = '#email'` | email triage | Notification → archive + complete; genuinely needs a reply → comment + `@waiting` (the Gmail scope is `gmail.modify` — AEGIS cannot send mail) |
 | `#research` | research | Run `ResearchFlow` on the task's title (its description is context, its links are read first): the knowledge store, a web search, papers when the question is academic, then one cited answer. The answer is posted on the task with its numbered sources, saved to the knowledge store, and the task goes to `@waiting`. Before #509 this tag went to `ask`, and the agent could only chat about the task |
 | `#chat`, `#calendar`, `#manual`, or no tag and no `@code` | ask | Hand the task to the agent it is assigned to, through that agent's own chat path (`AgentChatReplyFlow`, the one clarify uses when you comment on an agent's task) → `@waiting`. The first turn is read-only; your reply on the task is what lets the agent change anything |
-| `source_tag IS NULL` + `@code` | coding | Task session: one persistent Claude Code session per task, one turn per comment → plan → implement on a branch when asked → draft PR when asked → `@waiting` |
+| `source_tag IS NULL` + `@code` | coding | Park once, with a comment that the coding lane moved to the Development vertical (a2-development) → `@waiting` |
 | `#alert` (a hub problem's task), a tag the table maps to `None`, or one no one has decided about | — | Park once, with a comment saying the task is yours and how to route tags like it. Never guessed at. (`#money` maps to `None`, but the sweep never picks those tasks up: `EXCLUDED_LABELS`) |
 
 **The verb table is a setting.** `DEFAULT_VERBS` in
@@ -308,7 +309,7 @@ and restart cards, is gone.
 ```mermaid
 flowchart TD
     S["agent-task-15min<br/>AgentTaskSweepFlow"] --> E["eligible: open, assignee label,<br/>not @someday / @waiting,<br/>no run in the last 6h"]
-    E --> P["pick 3, oldest first<br/>(max 1 coding)"]
+    E --> P["pick 3, oldest first"]
     P --> C["spawn AgentTaskFlow children<br/>ParentClosePolicy.ABANDON"]
     C --> V{"verb from source_tag<br/>(agent_task_verbs; @code only when NULL)"}
     V -- "#email" --> EM{"notification?"}
@@ -316,78 +317,31 @@ flowchart TD
     EM -- no --> W2["comment + @waiting"]
     V -- "#receipt" --> F1["merchant history<br/>+ decision card"] --> W3["@waiting"]
     V -- "ask" --> A1["assigned agent's chat path<br/>(AgentChatReplyFlow)"] --> W7["@waiting"]
-    V -- "@code" --> K1["task session: turn per comment<br/>→ plan → implement when asked<br/>→ draft PR when asked"] --> W4["@waiting"]
+    V -- "@code" --> K1["comment: coding moved out"] --> W4["@waiting"]
     V -- "#alert / none / unknown" --> W5["comment: yours, and how to route it<br/>+ @waiting"]
 ```
 
 **The safety model:** investigation is free; every write is gated by an
-`InteractionFlow` card. Reading repo code, charge history, email
-metadata, and commenting findings on the task — no gate. Implementing code,
-opening a PR, applying a finance decision — card first.
+`InteractionFlow` card. Reading charge history and email metadata, and
+commenting findings on the task — no gate. Applying a finance decision — card
+first.
 Finance cards use the fire-and-forget `post_resolve_activity` hook
 (`apply_finance_decision`), so the child can park
-the task and exit while the card is still open. The coding verb has no cards
-at all: the task's comment thread is its approval channel (see below). The
+the task and exit while the card is still open. The
 `ask` verb works the same way: its first turn is told to stay read-only, and a
 change waits for your go-ahead — a reply on the task, which clarify's comment
 channel carries to the same agent while the task is in the Inbox, or a message
 to the agent in its channel.
 
-**Task sessions (the coding verb).** A `@code` task gets one persistent Claude
-Code session, recorded in `work_sessions` (session uuid, per-task worktree
-`<repo>-aegis-wt/task-<id>`, branch `aegis-task/<id>`, and the
-`CLAUDE_CONFIG_DIR` account the turn ran under, so a later `--resume` uses the
-same login). The first turn
-investigates read-only and posts a plan as a comment; every later user comment
-is the next turn of the same session (`claude -p --resume`), so "go",
-"also fix the tests" and "open a PR" all work. Comments reach the flow within a
-second through the Todoist webhook (`dispatch_task_turn`: start the workflow
-`agent-task-<id>`, or signal `comment` into a running one) and within 15
-minutes through the sweep's `find_task_turns_due` fallback, keyed on
-`work_sessions.last_turn_at`. Before each turn a collision check reads the
-registry: if AEGIS's own last turn is still writing its output file the comment
-is left due for the next sweep, and if one of your sessions has reported itself
-active on the task (`report_progress`, within 30 minutes) AEGIS stays out and
-tells you in Slack. `take over` in a comment overrides your own row. A
-15-minute sweep cross-checks the registry against `claude agents --json` and
-parks a session the host no longer lists. Take a task over with
-`cd <worktree> && claude --resume <session_id>` (both are in every comment's
-footer); hand it back by commenting. `ClarifyFlow` ignores tasks that have a
-session row, so a comment never gets both a chat reply and a turn. Every
-message the lane posts is mirrored into one Slack thread per task in the
-owning agent's channel (`work_sessions.slack_ref` holds the root), and a reply
-typed in that thread is posted to the task as a comment, so Slack and Todoist
-are the same conversation. From your own Claude Code session or a chat agent,
-`comment_on_task` posts in your voice (verbatim, no footer) — it is withheld
-from a run's own MCP mount so a session cannot trigger its own next turn, and
-it refuses a task that has no coding session, where a footer-less note would
-start nothing and simply read back as your own words.
-`CleanupFlow` removes the worktree and the row `task_session_days` (default 7)
-after the task is completed.
-
-**Plans become checklists.** A turn that writes its plan under a `PLAN:` line
-(one numbered step per line) has those steps opened as Todoist subtasks under
-the task, and the status block counts them (`Steps: 1/3 done`). Tick one off
-with `report_progress(step_done=2)` from whichever session did the work. The
-list is created once: a later plan comments but never reopens a checklist
-somebody is part-way through.
-
-**From your own session.** Three tools put a session on the record: `task_context`
-reads the problem behind a task, its recent events, every session on it and the
-command that takes AEGIS's over; `report_progress` registers your session with a
-one-line summary, which becomes a comment on the task and a line in its status
-block (and gives a plain `@code` task a problem if it has none); `merge_problems`
-folds a duplicate problem into the one to keep. All three are withheld from a
-coding run's own mount — a run that could report progress could mark its own task
-done. Two hooks in your own `~/.claude/settings.json` call `report_progress` at
-the start and end of a session in a task worktree, so the registry stays right
-without you thinking about it; the script is in
-[`infrastructure.md`](infrastructure.md), because it lives in your dotfiles.
+**The coding lane moved out.** Task sessions, coding runs on a coding host,
+the session registry tools (`task_context`, `report_progress`) and
+`comment_on_task` left v1 for the Development vertical (a2-development). The
+hub still turns a `plan` event with steps into subtasks, but nothing in v1
+produces one now.
 
 **Every path ends completed or parked.** A task is auto-completed only when
 the work is genuinely done (a notification archived);
-everything a human still has to finish — an open PR, a
-reply-needed email — ends at `@waiting` with an explanatory comment. Even a
+everything a human still has to finish — a reply-needed email, a decision — ends at `@waiting` with an explanatory comment. Even a
 crashed child best-effort parks the task before re-raising. That invariant is
 what keeps the 6h cooldown from becoming an infinite slow loop over the same
 tasks. Related invariant: every agent-authored task comment carries a
@@ -440,7 +394,8 @@ learning loop).
 
 ## 7. The problem hub
 
-The infra lane left v1 on 2026-10-08 for the DevOps vertical (a2-devops).
+The infra lane left v1 on 2026-10-08 for the DevOps vertical (a2-devops), and
+the development lane left for the Development vertical (a2-development).
 Homelab alerts, alert investigation, the swarm heartbeat, service drift, the
 certificate radar, automatic restarts, runbooks, and deploy or maintenance
 windows all live there now. Alertmanager, Grafana and the deploy role post to
@@ -448,7 +403,7 @@ DevOps, not to v1.
 
 What v1 keeps is the problem hub (`services/hub.py`) for its own findings: the
 flow-health and delivery watchdogs, expiry, social, the LLM spend guard,
-connectors, money, feeds, research, chat, sessions and manual reports. Each
+connectors, money, feeds, research, chat and manual reports. Each
 producer builds an `Event` and calls `hub.ingest_event`; the hub decides
 whether it is a new problem or another occurrence of a live one. Watchdogs
 resolve what they stop finding (`hub_watch.reconcile_findings`).

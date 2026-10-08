@@ -14,8 +14,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from aegis.errors import error_text, logged_failure
-from aegis.services import work_sessions
+from aegis.errors import error_text
 from aegis.services.agent_task_verbs import (
     DEFAULT_VERBS,
     UNTAGGED,
@@ -23,11 +22,8 @@ from aegis.services.agent_task_verbs import (
 )
 from aegis.services.agent_task_verbs import SETTINGS_KEY as VERBS_SETTING
 from aegis.services.agent_task_verbs import merge as merge_verbs
-from aegis.services.project_repo_map import get_project_repo_map, lookup
 from aegis.services.settings_store import get_setting
 from temporalio import activity
-
-from aegis_worker.activities.repo_resolve import resolve_repo_by_text
 
 # Assignee labels this flow will act on. @me is deliberately absent: a task the
 # user has claimed is theirs to handle.
@@ -42,19 +38,8 @@ PARK_LABEL = "@waiting"
 # one would research the feed's URL.
 EXCLUDED_LABELS = ["@someday", PARK_LABEL, "#money", "#feeds"]
 
-# Upper bound on the eligible pool we consider per tick. Production's whole
-# agent-assigned backlog is ~80 rows, so this is the pool, not a sample.
-# ponytail: fixed bound; move both caps into SQL if the pool ever nears it.
-_ELIGIBLE_SCAN_LIMIT = 200
-
-# The comment thread is a coding session's memory, and the whole tail is re-read
-# on every turn. 30 notes is a long day of back-and-forth; the flow, not this
-# activity, caps the RENDERED thread at 12,000 characters (newest kept).
+# How much of a task's comment thread `_load_task` reads (oldest first).
 _TASK_NOTE_LIMIT = 30
-
-# A turn's MCP mount token outlives its deadline by an hour, so a run that is
-# being killed or inspected past the deadline still has its tools.
-_TURN_TOKEN_GRACE_SECONDS = 3600
 
 # comment() retries in-activity rather than via a Temporal retry_policy, so the
 # command uuid stays stable and the Sync API dedups. A parked task's comment is
@@ -67,8 +52,9 @@ _COMMENT_RETRY_SECONDS = 2
 
 # source_tag → verb. source_tag is PRIMARY; @code is consulted only when
 # source_tag IS NULL (i.e. the task is user-authored). Clarify put a stray
-# @code label on a real #email task in prod, and treating that as "run a
-# coding agent on this email" would be nonsense.
+# @code label on a real #email task in prod, and treating that as a coding
+# task would be nonsense. The coding verb itself only parks now: the
+# development lane moved to the Development vertical (a2-development).
 #
 # The table itself — every tag AEGIS captures under, with a verb or an explicit
 # None — is `DEFAULT_VERBS` in `aegis.services.agent_task_verbs`, with the
@@ -91,7 +77,8 @@ async def load_verbs(pool: Any) -> dict[str, str | None]:
 
 
 def resolve_verb(task: dict, verbs: dict[str, str | None] | None = None) -> str:
-    """Verb for a task: its source tag's, or `coding` for an untagged `@code` task.
+    """Verb for a task: its source tag's, or `coding` for an untagged `@code` task
+    (which the flow parks with a note: the coding lane left v1).
 
     `verbs` is the effective table (`load_verbs`); None is the shipped one. A
     tag the table maps to None resolves to `none` (decided: nothing works it)
@@ -143,45 +130,6 @@ def extract_merchant(title: str) -> str:
     return ""
 
 
-# Todoist project name → GitHub repo now lives in the `project_repo_map`
-# settings row (`core/src/aegis/services/project_repo_map.py`), edited at
-# GET/PUT /api/admin/todoist/project-repo-map. It used to be a constant here,
-# which shipped one operator's Todoist layout in a public repo and could not be
-# changed without editing code (issue #345). Ships EMPTY: a deployment with no
-# mapping simply falls through to the resolver's later tiers.
-
-# Tier 2 (title/description match via `repo_resolve.resolve_repo_by_text`)
-# auto-accepts only at or above this bar. The resolver's OWN "llm" vs
-# "llm_unconfirmed" split sits at 0.5. resolve_task_repo has no further check
-# downstream — the flow proceeds straight to a real kimi run — so a
-# bare 0.5 here would let a coin-flip LLM guess kick one off unsupervised,
-# which is the one thing this resolver must never do (issue #158). 0.8 still
-# passes genuinely confident picks (free-text token overlap is always 1.0;
-# a clear LLM match commonly scores >= 0.85) while anything softer is
-# surfaced as `candidates` for the flow's tier 3 Gate-0 confirm card instead
-# of guessed.
-_TIER2_CONFIDENCE_THRESHOLD = 0.8
-
-
-def match_repo_candidate(candidates: list[dict], comment: str) -> dict | None:
-    """The candidate the operator named in a comment, or None.
-
-    An EXACT (case-insensitive) match on one of the three names a candidate is
-    known by. Deliberately not a substring or fuzzy match: this is the answer to
-    "which repo?", and the cost of a wrong pick is an unattended coding session
-    in someone else's checkout. Anything unrecognised repeats the question.
-    """
-    text = (comment or "").strip().lower()
-    if not text:
-        return None
-    for candidate in candidates:
-        for key in ("github_repo", "resource_title", "resource_path"):
-            value = str(candidate.get(key) or "").strip().lower()
-            if value and value == text:
-                return candidate
-    return None
-
-
 # --- the `ask` verb (#344) --------------------------------------------------
 
 # How much of a thread or a description a message quotes. Per field, so one pasted stack trace cannot crowd out the rest.
@@ -198,7 +146,7 @@ def _cut(text: str, cap: int) -> str:
 def _ask_message(task: dict) -> str:
     """The turn the sweep sends an agent when it hands over a task.
 
-    Read-only is a product rule, the same one the coding lane's turn 1 keeps:
+    Read-only is a product rule:
     nobody is in this conversation when the sweep asks, so the turn may look
     and answer but not change anything. A change waits for the user's
     go-ahead — a reply on the task, which clarify's comment channel carries to
@@ -229,31 +177,20 @@ def _ask_message(task: dict) -> str:
 class AgentTaskActivities:
     db_pool: Any = None
     todoist_connector: Any = None
-    remote_script: Any = None
     gmail_accounts: list[str] = field(default_factory=list)
     # GmailActivities instance (for triage_email's apply_label calls). A plain
     # field, late-wired in __main__.py after GmailActivities is constructed.
     gmail_activities: Any = None
-    # resolve_task_repo's tier 2 (`repo_resolve.resolve_repo_by_text`) asks the
-    # model. None ⇒ tier 2 runs its deterministic match only.
-    llm_client: Any = None
-    model: str = ""
 
     @activity.defn
     async def find_actionable_tasks(
-        self, max_tasks: int = 3, cooldown_hours: int = 6, max_coding: int = 1
+        self, max_tasks: int = 3, cooldown_hours: int = 6, max_coding: int = 0
     ) -> list[dict]:
         """Eligible agent-assigned tasks, oldest first, cooldown-filtered.
 
-        `max_coding` caps coding tasks (source_tag IS NULL + @code) within the
-        batch — a kimi run takes minutes and the coding host's tmux window cap
-        is 10, so an uncapped fan-out would wedge it.
-
-        A task that already has a `work_sessions` row is excluded outright: the
-        sweep only ever starts TURN ONE. Later turns come from
-        `find_task_turns_due`, keyed on the session's own `last_turn_at`
-        watermark, so without this exclusion every tick would start a second
-        first turn on a conversation that is already going.
+        `max_coding` is ignored. It was the coding lane's cap; a sweep recorded
+        before the lane left v1 still passes it, so the parameter stays one
+        release (`PATCH_DROP_CODING_SWEEP`).
         """
         if self.db_pool is None:
             return []
@@ -271,31 +208,19 @@ class AgentTaskActivities:
                     AND wr.todoist_task_ref = t.id
                     AND wr.started_at > now() - make_interval(hours => $3)
               )
-              AND NOT EXISTS (
-                  SELECT 1 FROM work_sessions ts WHERE ts.task_id = t.id AND ts.owner = 'aegis'
-              )
             ORDER BY t.updated_at ASC
             LIMIT $4
             """,
             ADDRESSABLE_ASSIGNEES,
             EXCLUDED_LABELS,
             cooldown_hours,
-            _ELIGIBLE_SCAN_LIMIT,
+            max_tasks,
         )
-
         out: list[dict] = []
-        coding_seen = 0
         for row in rows:
             task = dict(row)
             task["labels"] = list(task["labels"] or [])
-            is_coding = task["source_tag"] is None and "@code" in task["labels"]
-            if is_coding:
-                if coding_seen >= max_coding:
-                    continue
-                coding_seen += 1
             out.append(task)
-            if len(out) >= max_tasks:
-                break
         return out
 
     @activity.defn
@@ -405,15 +330,6 @@ class AgentTaskActivities:
         )
         if labels is None:
             return {"parked": False}
-        # The registry says why the task is parked, not only the worker log:
-        # a session opened on the task later reads it from `task_context`.
-        # No-op for a task with no coding session.
-        try:
-            await work_sessions.set_state(self.db_pool, task_id, status="parked", summary=reason)
-        except Exception as exc:  # noqa: BLE001 — the park itself must still land
-            activity.logger.warning(
-                "task_park_state_not_recorded task_id=%s err=%s", task_id, error_text(exc)
-            )
         if PARK_LABEL in labels:
             return {"parked": True}
         new_labels = [*labels, PARK_LABEL]
@@ -649,7 +565,7 @@ class AgentTaskActivities:
         from aegis_worker.activities.clarify import get_agent_registry
 
         nobody = {"agent_id": "", "message": "", "thread_id": "", "comment": "", "reason": ""}
-        task = await self.load_task(task_id)
+        task = await self._load_task(task_id)
         if not task:
             return {**nobody, "reason": "the task is not in the Todoist mirror"}
         label = str(task.get("assignee_label") or "")
@@ -696,109 +612,10 @@ class AgentTaskActivities:
             "reason": "infra lane moved to DevOps",
         }
 
-    @activity.defn
-    async def resolve_task_repo(self, task: dict) -> dict:
-        """Resolve a coding task to a repo. Never guesses.
-
-        Tier 1: Todoist project name -> the `project_repo_map` setting — the strongest
-        signal, since a project already mirrors a repo.
-
-        Tier 2 (only when tier 1 misses): `repo_resolve.resolve_repo_by_text`,
-        a deterministic token match on the title and description, then the
-        model. A confident pick (>= _TIER2_CONFIDENCE_THRESHOLD) resolves
-        exactly like tier 1.
-
-        Tier 3: anything less confident is surfaced as `candidates` (never
-        auto-applied) for the flow's Gate-0 confirm card — running a coding
-        agent against the wrong checkout is worse than not running it.
-        """
-        empty = {"github_repo": "", "repo_path": "", "source": "none", "candidates": []}
-        project_id = task.get("project_id")
-        name = None
-        if self.db_pool is not None and project_id:
-            name = await self.db_pool.fetchval(
-                "SELECT name FROM todoist_projects WHERE id = $1", project_id
-            )
-        mapping = await get_project_repo_map(self.db_pool) if self.db_pool is not None else {}
-        github_repo = lookup(name, mapping)
-        if github_repo:
-            # repo_path is the workspace-relative checkout path start_kimi_run needs.
-            # The JSONB key is `path`, NOT `resource_path`. `resource_path` is only an
-            # application-level rename applied AFTER reading;
-            # inventory.py:386-397 writes {"path", "github_repo", "origin_url"}.
-            # Querying 'resource_path' always yields NULL, silently flattening a
-            # nested checkout (stockopedia/bcp -> bcp) so start_kimi_run then hard-
-            # fails with a false "Repo checkout missing".
-            row = await self.db_pool.fetchrow(
-                "SELECT metadata->>'path' AS rpath FROM resources "
-                "WHERE kind = 'repository' AND metadata->>'github_repo' = $1 LIMIT 1",
-                github_repo,
-            )
-            return {
-                "github_repo": github_repo,
-                "repo_path": (row["rpath"] if row and row["rpath"] else github_repo.split("/")[-1]),
-                "source": "project_map",
-                "candidates": [],
-            }
-        if name:
-            activity.logger.info("agent_task_repo_unmapped project=%s", name)
-
-        synthetic_alert = {
-            "title": str(task.get("content") or ""),
-            "description": str(task.get("description") or ""),
-            "fingerprint": f"task:{task.get('id') or ''}",
-            "service": "",
-        }
-        try:
-            resolved = await resolve_repo_by_text(
-                self.db_pool, self.llm_client, self.model, synthetic_alert
-            )
-        except Exception as exc:  # noqa: BLE001 — tier 2 is best-effort; never guess on error
-            activity.logger.warning("agent_task_repo_tier2_failed err=%s", error_text(exc))
-            return empty
-
-        # Candidate shape matches what _build_repo_confirm_prompt expects
-        # (resource_title/github_repo/resource_path/score) so the flow's Gate-0
-        # card can consume it unchanged. Drop any candidate with no github_repo —
-        # nothing to check out, so it isn't a pickable option.
-        candidates = [
-            {
-                "resource_title": r.get("resource_title") or "",
-                "github_repo": r.get("github_repo") or "",
-                "resource_path": r.get("resource_path") or "",
-                "score": float(r.get("confidence") or 0.0),
-            }
-            for r in (resolved.get("resources") or [])
-            if r.get("github_repo")
-        ]
-        tier2_repo = resolved.get("github_repo") or ""
-        tier2_confidence = float(resolved.get("confidence") or 0.0)
-        if tier2_repo and tier2_confidence >= _TIER2_CONFIDENCE_THRESHOLD:
-            repo_path = resolved.get("resource_path") or tier2_repo.split("/")[-1]
-            return {
-                "github_repo": tier2_repo,
-                "repo_path": repo_path,
-                "source": "title_match",
-                "candidates": [],
-            }
-        return {**empty, "candidates": candidates}
-
-    # --- task sessions: one persistent coding session per @code task ---------
-
-    @activity.defn
-    async def load_task(self, task_id: str) -> dict:
-        """The task plus the tail of its comment thread.
-
-        The webhook path carries a task id and nothing else, so the flow loads
-        the task here rather than trusting whatever a payload claimed. The
-        thread rides along because it IS the session's context: notes come back
-        oldest-first, the order a person reads them in and the order the turn
-        prompt renders them.
-
-        An unknown task is `{}`, not an error — it may have been deleted between
-        the comment that woke us and this activity, and that reads as "nothing
-        to do".
-        """
+    async def _load_task(self, task_id: str) -> dict:
+        """The task plus the tail of its comment thread, oldest first — the
+        order a person reads them in and the order `_ask_message` renders them.
+        An unknown task is `{}`."""
         if self.db_pool is None or not task_id:
             return {}
         row = await self.db_pool.fetchrow(
@@ -809,8 +626,7 @@ class AgentTaskActivities:
         if row is None:
             return {}
         # `id` breaks the tie on `posted_at`: Todoist stamps a burst of notes
-        # with the same second, and an unstable sort would reorder the
-        # conversation between turns.
+        # with the same second, and an unstable sort would reorder the thread.
         notes = await self.db_pool.fetch(
             "SELECT content, posted_at FROM ("
             "  SELECT id, content, posted_at FROM todoist_notes WHERE item_id = $1"
@@ -824,400 +640,24 @@ class AgentTaskActivities:
         task["notes"] = [
             {
                 "content": note["content"] or "",
-                # ISO strings rather than datetimes: the thread is rendered
-                # straight into a prompt and echoed in the flow's result
-                # summary, and both want one stable textual shape.
                 "posted_at": note["posted_at"].isoformat() if note["posted_at"] else "",
             }
             for note in notes
         ]
         return task
 
-    @activity.defn
-    async def ensure_task_session(
-        self, task_id: str, agent_id: str, task: dict, comment: str
-    ) -> dict:
-        """The task's session row, with a repo and a live worktree when known.
-
-        Called before every turn. A row that already carries a repo skips the
-        RESOLVER — re-resolving each turn would let a later LLM guess move a
-        task to a different checkout mid-conversation — but still verifies its
-        worktree, which is one idempotent SSH round trip. Without that check a
-        tree removed out of band (a manual `git worktree remove`, a disk clean)
-        would leave the row `ready` for ever while every turn launched into a
-        directory that is not there.
-
-        An unresolved task still gets its row. That row is what makes the NEXT
-        comment reach the flow at all (the webhook keys on its existence), and
-        it is how the operator answers: they name one of the returned
-        `candidates` in a comment and the following turn matches it. There is
-        no card and no guess — running an unattended coding session in the
-        wrong checkout is worse than not running one.
-
-        `set_repo` is deliberately the LAST step, after the worktree exists. A
-        row carrying a repo short-circuits to `ready` for ever, so recording one
-        whose worktree failed to build would wedge the task on a directory that
-        is not there; leaving it empty makes the next turn retry.
-        """
-        empty: dict = {"status": "unresolved", "session": None, "candidates": [], "error": ""}
-        if self.db_pool is None or not task_id:
-            return {**empty, "error": "no database pool"}
-        session = await work_sessions.create_session(
-            self.db_pool, task_id=task_id, agent_id=agent_id
-        )
-        if self.remote_script is None:
-            return {
-                **empty,
-                "session": session,
-                "error": "remote_script connector is not configured",
-            }
-        if session.get("repo"):
-            error = await self._build_task_worktree(
-                repo=str(session["repo"]),
-                worktree_path=str(session.get("worktree_path") or ""),
-                branch=str(session.get("branch") or ""),
-                host=str(session.get("host") or ""),
-            )
-            if error:
-                return {**empty, "session": session, "error": error}
-            return {"status": "ready", "session": session, "candidates": [], "error": ""}
-
-        resolved = await self.resolve_task_repo(task or {})
-        github_repo = str(resolved.get("github_repo") or "")
-        repo_path = str(resolved.get("repo_path") or "")
-        candidates = list(resolved.get("candidates") or [])
-        if not repo_path:
-            picked = match_repo_candidate(candidates, comment)
-            if picked is None:
-                return {
-                    "status": "candidates" if candidates else "unresolved",
-                    "session": session,
-                    "candidates": candidates,
-                    "error": "",
-                }
-            github_repo = str(picked.get("github_repo") or "")
-            repo_path = str(picked.get("resource_path") or "") or github_repo.split("/")[-1]
-
-        settings = await self.remote_script.coding_settings()
-        host = str(settings.get("host") or "")
-        # Sibling of the shared checkout, like the per-run worktrees, but keyed
-        # on the TASK: turn 2 has to find turn 1's uncommitted work.
-        worktree_path = (
-            f"{str(settings.get('repo_base') or '').rstrip('/')}/{repo_path}"
-            f"-aegis-wt/task-{task_id}"
-        )
-        branch = f"aegis-task/{task_id}"
-        error = await self._build_task_worktree(
-            repo=repo_path, worktree_path=worktree_path, branch=branch, host=host
-        )
-        if error:
-            return {
-                **empty,
-                "session": session,
-                "candidates": candidates,
-                "error": error,
-            }
-        await work_sessions.set_repo(
-            self.db_pool,
-            task_id,
-            repo=repo_path,
-            github_repo=github_repo,
-            worktree_path=worktree_path,
-            branch=branch,
-            host=host,
-        )
-        fresh = await work_sessions.get_session(self.db_pool, task_id)
-        return {"status": "ready", "session": fresh or session, "candidates": [], "error": ""}
-
-    async def _build_task_worktree(
-        self, *, repo: str, worktree_path: str, branch: str, host: str
-    ) -> str:
-        """Create-or-verify the task's worktree. `""` on success, else the error.
-
-        Idempotent by design on the connector side, so calling it before every
-        turn costs one cheap SSH round trip and buys the self-heal: a worktree
-        that disappeared is rebuilt on the same branch, with the task's
-        committed work still on it.
-        """
-        built = await self.remote_script.ensure_task_worktree(
-            repo=repo, worktree_path=worktree_path, branch=branch, host=host
-        )
-        if built.get("status") == "ready":
-            return ""
-        return str(built.get("error") or "the task worktree could not be created")
-
-    @activity.defn
-    async def check_task_collision(self, task_id: str, override: bool = False) -> dict:
-        """Who is on this task right now: `proceed`, `you_are_in_it` or
-        `turn_still_running`. A registry lookup, not an investigation.
-
-        1. `turn_still_running` — the last turn AEGIS launched is still holding
-           its output file open: an orphan the deadline kill did not reach.
-           Launching `--resume` beside it would have two runs writing one
-           session, so the comment waits for the sweep to re-dispatch it.
-        2. `you_are_in_it` — an operator session reported itself `active` on
-           the task inside the last `OPERATOR_LIVE_WINDOW` (via
-           `report_progress`). The comment is already in front of them.
-        3. `proceed` — everything else.
-
-        `override` (the operator's `take over`) skips step 2 only: a person
-        who is in the task and says "go" means it, but a comment cannot
-        authorise driving over a turn of ours that is still running.
-
-        EVERY failure path returns `proceed`. An unreadable registry or an
-        unreachable host must not become an outage of the coding lane; the
-        launch that follows fails on its own terms if the host is down.
-        """
-        proceed: dict = {"verdict": "proceed", "session": None, "reason": ""}
-        if self.db_pool is None or not task_id:
-            return {**proceed, "reason": "no database pool"}
-        try:
-            row = await work_sessions.get_session(self.db_pool, task_id) or {}
-            output_file = str(row.get("last_output_file") or "")
-            if output_file and self.remote_script is not None:
-                try:
-                    alive = await self.remote_script.kimi_run_alive(
-                        output_file, host=str(row.get("last_host") or "")
-                    )
-                except Exception as exc:  # noqa: BLE001 — unknown is "not running"
-                    activity.logger.warning(
-                        "task_turn_probe_failed task_id=%s err=%s", task_id, error_text(exc)
-                    )
-                    alive = False
-                if alive:
-                    return {
-                        "verdict": "turn_still_running",
-                        "session": {
-                            "owner": "aegis",
-                            "session_id": str(row.get("session_id") or ""),
-                            "name": f"task {task_id}",
-                            "output_file": output_file,
-                        },
-                        "reason": f"the last turn is still writing {output_file}",
-                    }
-            if override:
-                return {**proceed, "reason": "override"}
-            live = await work_sessions.live_operator_sessions(self.db_pool, task_id)
-            if live:
-                sess = live[0]
-                account = str(sess.get("account") or "operator")
-                return {
-                    "verdict": "you_are_in_it",
-                    "session": {
-                        "owner": "operator",
-                        "session_id": str(sess.get("session_id") or ""),
-                        "account": account,
-                        "name": str(sess.get("summary") or "")[:80] or f"{account} session",
-                        "summary": str(sess.get("summary") or ""),
-                    },
-                    "reason": f"operator session ({account}) active on the task",
-                }
-            return proceed
-        except Exception as exc:  # noqa: BLE001 — see the docstring: fails open
-            activity.logger.warning(
-                "task_collision_check_failed task_id=%s err=%s", task_id, error_text(exc)
-            )
-            return {**proceed, "reason": f"check failed: {error_text(exc)}"}
+    # --- the retired coding lane -----------------------------------------------
 
     @activity.defn
     async def reconcile_work_sessions(self) -> dict:
-        """The registry's liveness cross-check, run by the sweep.
-
-        `report_progress` says a session is active; `claude agents --json` says
-        whether it still exists. An active operator row whose session the
-        host lists is touched, and one the host does not list that has gone
-        quiet past `OPERATOR_LIVE_WINDOW` is parked, so the collision check
-        and `task_context` stop reporting a session that ended without a
-        final report. Fails open: with no inventory nothing is parked, and the
-        window in `live_operator_sessions` still bounds the collision check.
-        """
-        if self.db_pool is None:
-            return {"refreshed": 0, "parked": 0, "inventory": "no database pool"}
-        live: list[str] = []
-        status = "unavailable"
-        if self.remote_script is not None:
-            with logged_failure("work_sessions_inventory_failed", logger=activity.logger):
-                inventory = await self.remote_script.list_coding_sessions() or {}
-                status = str(inventory.get("status") or "unavailable")
-                if status == "ok":
-                    live = [
-                        str(s.get("session_id") or "")
-                        for s in (inventory.get("sessions") or [])
-                        if s.get("session_id")
-                    ]
-        if status != "ok":
-            return {"refreshed": 0, "parked": 0, "inventory": status}
-        result = await work_sessions.reconcile_operator_sessions(self.db_pool, live)
-        return {**result, "inventory": status}
-
-    @activity.defn
-    async def launch_task_turn(
-        self,
-        session: dict,
-        prompt: str,
-        agent_id: str,
-        resume: bool,
-        name: str,
-        turn_timeout_minutes: int,
-    ) -> dict:
-        """Start one turn of the task's session. NOT idempotent — a retry is a
-        second billed CLI session, so the flow launches this exactly once.
-
-        Three arguments are what make this a TURN rather than a fresh run:
-        `session_id` (the same conversation), `resume` (continue it instead of
-        creating it) and `worktree_path` (the task's own tree, which the
-        connector then neither creates nor removes). Drop any one and the result
-        is a healthy-looking run with no memory of the last turn.
-
-        The engine is forced to claude for every repo: only claude resumes a
-        session, mounts the agent's AEGIS tools and can be taken over
-        interactively with `claude --resume`.
-        """
-        failed: dict = {
-            "status": "failed",
-            "run_id": "",
-            "output_file": "",
-            "host": "",
-            "engine": "",
-            "tmux_window": "",
-            "worktree_path": "",
-            "error": "",
-        }
-        if self.remote_script is None:
-            return {**failed, "error": "remote_script connector is not configured"}
-        repo = str(session.get("repo") or "")
-        if not repo:
-            return {**failed, "error": "the task session has no repo yet"}
-
-        settings = await self.remote_script.coding_settings()
-        started = await self.remote_script.start_kimi_run(
-            repo=repo,
-            prompt=prompt,
-            kimi_binary=settings.get("kimi_binary", ""),
-            github_repo=str(session.get("github_repo") or ""),
-            engine_override="claude",
-            # The account the session was created under, once known. A resume
-            # on another profile is a fresh, amnesiac session (the spec's
-            # "silent wrong-profile resume"); an empty label lets the
-            # connector resolve it from routing, and the answer is recorded.
-            claude_account=str(session.get("account") or ""),
-            agent_id=agent_id,
-            session_id=str(session.get("session_id") or ""),
-            resume=bool(resume),
-            name=name,
-            worktree_path=str(session.get("worktree_path") or ""),
-            token_ttl_seconds=int(turn_timeout_minutes) * 60 + _TURN_TOKEN_GRACE_SECONDS,
-        )
-        if started.get("status") != "running":
-            return {
-                **failed,
-                "run_id": started.get("run_id", ""),
-                "engine": started.get("engine", ""),
-                "error": str(started.get("error") or "")[:500],
-            }
-
-        from aegis_worker.activities.agent_run import _tmux_window_name
-
-        engine = started.get("engine", "")
-        run_id = started.get("run_id", "")
-        # Remember WHERE this turn is writing and under WHICH account.
-        # `check_task_collision` probes the file to tell an orphan of ours from
-        # a finished turn; the next turn's `--resume` runs under the account,
-        # and a resume on another profile is a fresh, amnesiac session.
-        # Best-effort: the session is already running and this activity is
-        # NO_RETRY, so raising here would strand a live turn nobody polls.
-        task_id = str(session.get("task_id") or "")
-        if self.db_pool is not None and task_id:
-            try:
-                await work_sessions.set_last_run(
-                    self.db_pool,
-                    task_id,
-                    output_file=str(started.get("output_file") or ""),
-                    host=str(started.get("host") or ""),
-                    account=str(started.get("claude_account") or ""),
-                    engine=str(engine or ""),
-                )
-            except Exception as exc:  # noqa: BLE001
-                activity.logger.warning(
-                    "task_last_run_not_recorded task_id=%s err=%s", task_id, error_text(exc)
-                )
-        return {
-            "status": "running",
-            "run_id": run_id,
-            "output_file": started.get("output_file", ""),
-            "host": started.get("host", ""),
-            "engine": engine,
-            # Same composition the connector's tmux launch uses, so the name we
-            # hand the operator is the name they can attach to.
-            "tmux_window": (
-                _tmux_window_name(engine, repo, run_id) if started.get("in_tmux") else ""
-            ),
-            "worktree_path": started.get("worktree_path", ""),
-            "error": "",
-        }
-
-    @activity.defn
-    async def kill_task_turn(self, output_file: str, host: str) -> dict:
-        """Kill whatever process still holds this turn's output file open.
-
-        `killed: True` means the SSH round trip RAN — not that a process died.
-        The remote `fuser` may be absent, or may have found nothing to kill
-        because the turn had already exited. Treat it as "the kill was
-        attempted" and keep polling for the exit; never as proof the run is
-        gone.
-
-        The tmux window is deliberately left for inspection. An orphan run still
-        writing the same session while the next turn starts is worse than a lost
-        turn, which is why this exists at all.
-        """
-        if self.remote_script is None or not output_file:
-            return {"killed": False}
-        return {"killed": bool(await self.remote_script.kill_run(output_file, host=host))}
-
-    @activity.defn
-    async def record_task_turn(self, task_id: str, launched: bool) -> dict:
-        """Move the session's watermark past the comment this turn consumed.
-
-        EVERY verdict bumps it, including the two that hand the task back to the
-        operator: the comment has been dealt with, and the 15-minute fallback
-        sweep would otherwise re-dispatch it for ever. Only a turn that actually
-        launched a session counts towards `turns`.
-
-        `recorded: False` means no session row matched — it was cleaned up (or
-        never created) while the turn ran, so the watermark this claims to have
-        moved does not exist.
-        """
-        if self.db_pool is None or not task_id:
-            return {"recorded": False}
-        moved = await work_sessions.record_turn(self.db_pool, task_id, launched=bool(launched))
-        if not moved:
-            activity.logger.warning("task_turn_not_recorded task_id=%s", task_id)
-        return {"recorded": bool(moved)}
-
-    @activity.defn
-    async def set_task_slack_ref(self, task_id: str, ref: dict) -> dict:
-        """Remember the root of the task's Slack thread.
-
-        Written once, by the first task message that lands — every later
-        message threads under it, and inbound replies are routed back to the
-        task by matching on it. An empty ref is refused rather than stored: it
-        would overwrite a working root with one that matches no thread, which
-        is worse than having none.
-        """
-        if self.db_pool is None or not task_id or not ref:
-            return {"stored": False}
-        await work_sessions.set_slack_ref(self.db_pool, task_id, dict(ref))
-        return {"stored": True}
+        """Stub for one release: the coding lane moved to the Development
+        vertical (a2-development). Only an `AgentTaskSweepFlow` recorded before
+        the change schedules this (`PATCH_DROP_CODING_SWEEP`). Remove it with
+        that branch."""
+        return {"refreshed": 0, "parked": 0, "inventory": "retired"}
 
     @activity.defn
     async def find_task_turns_due(self, limit: int = 20) -> list[dict]:
-        """Sessions whose newest USER comment is newer than their last turn.
-
-        The Todoist webhook is the fast path; this is the sweep's fallback for a
-        missed one, so it keys on the session's own `last_turn_at` watermark and
-        NOT on the flow cooldown — a comment must not wait six hours because the
-        task ran recently.
-        """
-        if self.db_pool is None:
-            return []
-        return await work_sessions.find_turns_due(self.db_pool, limit)
+        """Stub for one release (`PATCH_DROP_CODING_SWEEP`): no turn is ever
+        due now. Remove it with that branch."""
+        return []

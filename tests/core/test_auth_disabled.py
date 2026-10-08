@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 import os
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 from aegis.api.app import create_app
@@ -41,19 +41,15 @@ def _make_app(settings: Settings):
 def test_protected_route_401s_without_creds_normally():
     settings = Settings(**_BASE, admin_username="admin", admin_password="admin")
     client = TestClient(_make_app(settings))
-    assert client.get("/api/infra/services").status_code == 401
+    assert client.get("/api/admin/system/status").status_code == 401
 
 
 def test_protected_route_passes_without_creds_when_auth_disabled():
     settings = Settings(**_BASE, auth_disabled=True)
     client = TestClient(_make_app(settings))
-    with patch(
-        "aegis.services.chat._exec_list_services",
-        new=AsyncMock(return_value=json.dumps([{"name": "aegis_core"}])),
-    ):
-        resp = client.get("/api/infra/services")
+    resp = client.get("/api/admin/system/status")
     assert resp.status_code == 200
-    assert resp.json() == [{"name": "aegis_core"}]
+    assert resp.json()["auth_mode"] == "disabled"
 
 
 def test_webhook_hmac_still_enforced_when_auth_disabled():

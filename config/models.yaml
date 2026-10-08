@@ -36,7 +36,6 @@ routes:
     intent_route: classify                                  # which agent answers a chat message — a verdict, not a fast-tier reply
     money_event_extraction: extract
     memory_consolidation: extract
-    alert_resource_resolution: extract                      # the coding lane's repo pick (repo_resolve.py)
     content_route_suggest: extract
     persona_draft: extract                                  # parses {soul, operating_notes, user_context}
     review_frame: extract                                   # parses {narrative, order}

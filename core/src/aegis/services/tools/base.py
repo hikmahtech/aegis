@@ -6,8 +6,7 @@ modules back (that would be a cycle). `chat.py` re-exports it, so
 `from aegis.services.chat import ToolContext` is unchanged.
 
 The truncation helpers (`_truncate_result` and friends) also live here: domain
-executors (social, mcp), the chat loop, and `routes/mcp_server.py` all need
-them, and this module is the lowest rung of the dependency ladder. `chat.py`
+executors (social) and the chat loop all need them, and this module is the lowest rung of the dependency ladder. `chat.py`
 re-exports them under their original names for backwards compatibility.
 """
 
@@ -34,7 +33,6 @@ class ToolContext:
     temporal_client: Any = None
     search_connector: Any | None = None
     llm_client: Any | None = None
-    remote_script_connector: Any | None = None
     model_light: str = "gemma4:e2b"
 
 

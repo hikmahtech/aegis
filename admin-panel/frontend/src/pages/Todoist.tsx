@@ -2,7 +2,6 @@ import { Fragment, useEffect, useState } from 'react';
 import { api } from '../api/client';
 import AgentTaskVerbsPanel from '../components/AgentTaskVerbsPanel';
 import ErrorBanner from '../components/ErrorBanner';
-import ProjectRepoMapPanel from '../components/ProjectRepoMapPanel';
 import { toast } from '../components/Toast';
 import DataTable from '../components/DataTable';
 
@@ -564,7 +563,6 @@ export default function Todoist() {
         </button>
       </div>
 
-      <ProjectRepoMapPanel projectNames={allProjects.map(p => p.name)} />
       <AgentTaskVerbsPanel />
 
       {/* Tasks workbench */}

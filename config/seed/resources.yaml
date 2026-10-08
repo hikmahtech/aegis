@@ -12,8 +12,5 @@ resources:
     metadata:
       env_keys: [AEGIS_FINANCE_PROVIDER, AEGIS_FINANCE_API_KEY, AEGIS_FINANCE_INDICES]
 
-  # Code repositories (kind: repository) are NOT seeded here — they are owned
-  # end-to-end by WorkspaceRepoSyncFlow, which scans the canonical workspace
-  # host's ~/Workspace hierarchy daily: a repo is a resource iff it is checked
-  # out there, with metadata.path carrying the workspace-relative path (e.g.
-  # "acme/bcp").
+  # Code repositories (kind: repository) are gone: the repo registry left v1
+  # with the development lane (the Development vertical, a2-development).

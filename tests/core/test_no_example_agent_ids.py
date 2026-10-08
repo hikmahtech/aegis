@@ -16,7 +16,7 @@ from aegis.api.app import create_app
 from aegis.api.deps import get_settings
 from aegis.api.routes._flow_trigger import start_named_workflow
 from aegis.config import Settings
-from aegis.services.chat import ToolContext, _exec_create_schedule, _exec_dispatch_agent_run
+from aegis.services.chat import ToolContext, _exec_create_schedule
 from aegis.services.workflows import trigger_workflow, with_owner, workflow_owner
 from fastapi.testclient import TestClient
 
@@ -95,22 +95,6 @@ def _pool(*fetch_results) -> AsyncMock:
     pool = AsyncMock()
     pool.fetch = AsyncMock(side_effect=list(fetch_results))
     return pool
-
-
-async def test_dispatch_with_no_calling_agent_runs_as_the_gtd_holder():
-    temporal = AsyncMock()
-    ctx = ToolContext(agent_id=None, temporal_client=temporal)
-    out = await _exec_dispatch_agent_run(_pool([{"id": "jeeves"}]), {"prompt": "look"}, ctx)
-    assert "Dispatched" in out
-    assert temporal.start_workflow.await_args.args[1]["agent_id"] == "jeeves"
-
-
-async def test_dispatch_with_nobody_holding_gtd_refuses_rather_than_guessing():
-    temporal = AsyncMock()
-    ctx = ToolContext(agent_id=None, temporal_client=temporal)
-    out = await _exec_dispatch_agent_run(_pool([]), {"prompt": "look"}, ctx)
-    assert "gtd" in out
-    temporal.start_workflow.assert_not_awaited()
 
 
 async def test_a_schedule_with_no_calling_agent_is_owned_by_the_gtd_holder():

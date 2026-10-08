@@ -159,7 +159,9 @@ def test_agent_task_sweep_flow_in_schedule_map():
     assert config.agent_id == "pandoras-actor"
     assert config.max_tasks == 5
     assert config.cooldown_hours == 3
-    assert config.max_coding == 2
+    # The coding lane left v1: a stored `max_coding` is no longer read. The
+    # field stays one release for the legacy replay branch only.
+    assert config.max_coding == 0
 
     # The seed row ships `config: {}`, so in a real deployment the DEFAULTS are
     # what run — a builder that forgot a key would silently take the dataclass
@@ -168,8 +170,6 @@ def test_agent_task_sweep_flow_in_schedule_map():
         {"agent_id": "pandoras-actor", "config": {}}
     )
     assert (config.max_tasks, config.cooldown_hours) == (3, 6)
-    assert config.max_coding == 3
-    assert config.turn_timeout_minutes == 60
 
 
 def test_agent_task_registrations_reach_the_worker():
@@ -182,14 +182,14 @@ def test_agent_task_registrations_reach_the_worker():
     tests/worker/test_registry.py).
 
     What remains worth pinning here: these names — the agent_task
-    registrations for the email and finance verbs, the coding lane and the
-    `plan_infra_task` stub kept one release for replays — are the activity
-    names the worker serves. A rename or a dropped
-    @activity.defn still breaks the flows that call them by name.
+    registrations for the email and finance verbs, and the stubs kept one
+    release for replays (`plan_infra_task`, `find_task_turns_due`,
+    `reconcile_work_sessions`) — are the activity names the worker serves. A
+    rename or a dropped @activity.defn still breaks the flows that call them
+    by name.
 
-    The one-shot coding verb (`run_task_investigation` / `collect_coding_run` /
-    `run_task_implementation`) is gone: the coding lane is now one persistent
-    session per task, driven by the seven task-session activities below.
+    The coding lane is gone (it moved to the Development vertical): its
+    task-session activities are not served any more.
     """
     served = expected_activity_names(_PROD)
     registered_flows = {c.__name__ for c in workflows_for(_PROD)}
@@ -205,6 +205,13 @@ def test_agent_task_registrations_reach_the_worker():
         "triage_email",
         "merchant_history",
         "apply_finance_decision",
+        "find_task_turns_due",
+        "reconcile_work_sessions",
+        "prepare_agent_ask",
+        "plan_infra_task",
+    ):
+        assert expected in served, f"{expected} is not an activity the worker serves"
+    for gone in (
         "resolve_task_repo",
         "load_task",
         "ensure_task_session",
@@ -212,10 +219,10 @@ def test_agent_task_registrations_reach_the_worker():
         "launch_task_turn",
         "kill_task_turn",
         "record_task_turn",
-        "find_task_turns_due",
-        "reconcile_work_sessions",
+        "set_task_slack_ref",
         "record_plan",
-        "prepare_agent_ask",
-        "plan_infra_task",
+        "launch_agent_run",
     ):
-        assert expected in served, f"{expected} is not an activity the worker serves"
+        assert gone not in served, f"{gone} left with the coding lane"
+    assert "AgentRunFlow" not in registered_flows
+    assert "WorkspaceRepoSyncFlow" not in registered_flows

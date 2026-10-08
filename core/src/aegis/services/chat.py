@@ -25,12 +25,6 @@ from aegis.services.knowledge_ranking import score as score_knowledge
 from aegis.services.library import LIBRARY_READ_TIMEOUT_S
 from aegis.services.research import FETCH_TOOL_TIMEOUT_S, RESEARCH_TOOL_TIMEOUT_S
 from aegis.services.source_types import DEFAULT_DECAY_DAYS
-from aegis.services.tools.agents import (  # noqa: F401 — re-export: imported from here by tests
-    _exec_dispatch_agent_run,
-    _exec_list_coding_sessions,
-    _exec_stop_agent_run,
-    _run_timeout_minutes,
-)
 from aegis.services.tools.base import (
     _MAX_LISTED_DROPPED_KEYS,  # noqa: F401 — re-export: kept importable from here
     _SHRINK_PASSES,  # noqa: F401 — re-export: imported from here by tests
@@ -41,7 +35,7 @@ from aegis.services.tools.base import (
     _shrink_strings,  # noqa: F401 — re-export: kept importable from here
     _smart_subset,  # noqa: F401 — re-export: imported from here by tests
     _truncate_result,
-    _truncate_text,  # noqa: F401 — re-export: routes/mcp_server.py imports it here
+    _truncate_text,  # noqa: F401 — re-export: kept importable from here
     recorded_result,
 )
 from aegis.services.tools.content import (  # noqa: F401 — re-export: imported from here by tests
@@ -59,7 +53,6 @@ from aegis.services.tools.gtd import (
     _assignee_labels,  # noqa: F401 — re-export: imported from here by tests
     _capture_to_inbox_impl,  # noqa: F401 — re-export: routes/chat.py + routes/capture.py
     _exec_capture_to_inbox,
-    _exec_comment_on_task,
     _exec_complete_task,
     _exec_defer_task,
     _exec_find_reference,
@@ -69,28 +62,7 @@ from aegis.services.tools.gtd import (
     _exec_mark_waiting,
     _exec_whats_next,
 )
-from aegis.services.tools.hub import (
-    _exec_merge_problems,
-    _exec_report_progress,
-    _exec_task_context,
-)
-from aegis.services.tools.infra import (
-    _INFRA_CONTEXTS_K8S,  # noqa: F401 — re-export: tests mutate this set in place
-    _exec_cloud_identity,
-    _exec_get_pod_logs,
-    _exec_get_service_logs,
-    _exec_inspect_service,
-    _exec_list_argocd_apps,
-    _exec_list_cloud_accounts,
-    _exec_list_deployments,
-    _exec_list_nodes,
-    _exec_list_pods,
-    _exec_list_services,
-    _exec_restart_deployment,
-    _exec_restart_service,
-    _exec_run_infra_script,
-    _exec_sync_argocd_app,
-)
+from aegis.services.tools.hub import _exec_merge_problems
 from aegis.services.tools.knowledge import (
     _exec_ask_knowledge,
     _exec_remember_this,
@@ -401,23 +373,7 @@ CHAT_TOOLS = [
     _registry_schema("note_write"),
     _registry_schema("note_link"),
     _registry_schema("configure_triage"),
-    _registry_schema("list_nodes"),
-    _registry_schema("list_services"),
-    _registry_schema("inspect_service"),
-    _registry_schema("get_service_logs"),
-    _registry_schema("restart_service"),
-    _registry_schema("list_pods"),
-    _registry_schema("list_deployments"),
-    _registry_schema("get_pod_logs"),
-    _registry_schema("restart_deployment"),
-    _registry_schema("list_argocd_apps"),
-    _registry_schema("sync_argocd_app"),
-    _registry_schema("list_cloud_accounts"),
-    _registry_schema("cloud_identity"),
-    _registry_schema("run_infra_script"),
-    # Problem hub — the session registry and merges; `services/tools/hub.py`.
-    _registry_schema("task_context"),
-    _registry_schema("report_progress"),
+    # Problem hub — merges; `services/tools/hub.py`.
     _registry_schema("merge_problems"),
     _registry_schema("list_interactions"),
     # GTD / Todoist — schemas generated from the typed `@aegis_tool` executors
@@ -430,7 +386,6 @@ CHAT_TOOLS = [
     _registry_schema("defer_task"),
     _registry_schema("mark_waiting"),
     _registry_schema("handoff_task"),
-    _registry_schema("comment_on_task"),
     _registry_schema("find_reference"),
     # The books (Maou) — every write goes through `books.py`'s locked,
     # `check --strict`-guarded writer; `services/tools/ledger.py`.
@@ -442,11 +397,8 @@ CHAT_TOOLS = [
     _registry_schema("desk_status"),
     _registry_schema("last_contact_with_person"),
     _registry_schema("query_observations"),
-    _registry_schema("dispatch_agent_run"),
-    _registry_schema("stop_agent_run"),
     _registry_schema("youtube_transcript"),
     _registry_schema("pdf_to_text"),
-    _registry_schema("list_coding_sessions"),
     _registry_schema("system_status"),
     _registry_schema("social_timeline"),
     _registry_schema("list_social_channels"),
@@ -634,8 +586,6 @@ TOOL_EXECUTORS: dict[str, Any] = {
     "remember_this": _exec_remember_this,
     "query_activities": _exec_query_activities,
     "trigger_workflow": _exec_trigger_workflow,
-    "dispatch_agent_run": _exec_dispatch_agent_run,
-    "stop_agent_run": _exec_stop_agent_run,
     "create_schedule": _exec_create_schedule,
     "get_quote": _exec_get_quote,
     "get_market_overview": _exec_get_market_overview,
@@ -660,22 +610,6 @@ TOOL_EXECUTORS: dict[str, Any] = {
     "note_write": _exec_note_write,
     "note_link": _exec_note_link,
     "configure_triage": _exec_configure_triage,
-    "list_nodes": _exec_list_nodes,
-    "list_services": _exec_list_services,
-    "inspect_service": _exec_inspect_service,
-    "get_service_logs": _exec_get_service_logs,
-    "restart_service": _exec_restart_service,
-    "list_pods": _exec_list_pods,
-    "list_deployments": _exec_list_deployments,
-    "get_pod_logs": _exec_get_pod_logs,
-    "restart_deployment": _exec_restart_deployment,
-    "list_argocd_apps": _exec_list_argocd_apps,
-    "sync_argocd_app": _exec_sync_argocd_app,
-    "list_cloud_accounts": _exec_list_cloud_accounts,
-    "cloud_identity": _exec_cloud_identity,
-    "run_infra_script": _exec_run_infra_script,
-    "task_context": _exec_task_context,
-    "report_progress": _exec_report_progress,
     "merge_problems": _exec_merge_problems,
     "list_interactions": _exec_list_interactions,
     "capture_to_inbox": _exec_capture_to_inbox,
@@ -686,7 +620,6 @@ TOOL_EXECUTORS: dict[str, Any] = {
     "defer_task": _exec_defer_task,
     "mark_waiting": _exec_mark_waiting,
     "handoff_task": _exec_handoff_task,
-    "comment_on_task": _exec_comment_on_task,
     "find_reference": _exec_find_reference,
     "ledger_query": _exec_ledger_query,
     "ledger_post": _exec_ledger_post,
@@ -697,7 +630,6 @@ TOOL_EXECUTORS: dict[str, Any] = {
     "query_observations": _exec_query_observations,
     "youtube_transcript": _exec_youtube_transcript,
     "pdf_to_text": _exec_pdf_to_text,
-    "list_coding_sessions": _exec_list_coding_sessions,
     "system_status": _exec_system_status,
     "social_timeline": _exec_social_timeline,
     "list_social_channels": _exec_list_social_channels,
@@ -716,16 +648,10 @@ AGENT_TOOL_SETS: dict[str, set[str]] = {
     "sebas": {
         "query_activities",
         "trigger_workflow",
-        # Heavy lane: hand multi-step work to a headless CLI run (AgentRunFlow),
-        # result delivered to the channel later.
-        "dispatch_agent_run",
         "search_knowledge",
         "configure_triage",
         "remember_this",
-        # Problem hub, the session registry: read a task's context, register
-        # a session on it, fold a duplicate problem away.
-        "task_context",
-        "report_progress",
+        # Problem hub: fold a duplicate problem away.
         "merge_problems",
         "list_interactions",  # NEW (Phase 5 PR 1)
         # Phase 3 GTD tools
@@ -737,7 +663,6 @@ AGENT_TOOL_SETS: dict[str, set[str]] = {
         "defer_task",
         "mark_waiting",
         "handoff_task",
-        "comment_on_task",
         "find_reference",
         # Read-only over the books; the three write tools are Maou's alone.
         "ledger_query",
@@ -781,10 +706,7 @@ AGENT_TOOL_SETS: dict[str, set[str]] = {
         # Tracked topics' rounds in the hub (#513): stop tracking one.
         "untrack_topic",
         "remember_this",
-        # Problem hub, the session registry: read a task's context, register
-        # a session on it, fold a duplicate problem away.
-        "task_context",
-        "report_progress",
+        # Problem hub: fold a duplicate problem away.
         "merge_problems",
         # Phase 3 GTD tools (research-leaning subset)
         "capture_to_inbox",
@@ -803,10 +725,7 @@ AGENT_TOOL_SETS: dict[str, set[str]] = {
         "get_finance_news",
         "search_knowledge",
         "remember_this",
-        # Problem hub, the session registry: read a task's context, register
-        # a session on it, fold a duplicate problem away.
-        "task_context",
-        "report_progress",
+        # Problem hub: fold a duplicate problem away.
         "merge_problems",
         "list_interactions",  # NEW (Phase 5 PR 1)
         # Phase 3 GTD tools (full set minus find_reference — maou queries
@@ -1336,7 +1255,6 @@ async def send_message(
     temporal_client: Any = None,
     finance_connector: Any = None,
     search_connector: Any = None,
-    remote_script_connector: Any = None,
     background_tasks: set[asyncio.Task] | None = None,
     user_metadata: dict | None = None,
     tier_override: str | None = None,
@@ -1556,7 +1474,6 @@ async def send_message(
         temporal_client=temporal_client,
         search_connector=search_connector,
         llm_client=llm_client,
-        remote_script_connector=remote_script_connector,
         model_light=tier_to_model_or("fast", getattr(settings, "model_fast", "gemma4:e2b")),
     )
 
@@ -1721,8 +1638,8 @@ async def send_message(
                 result_dict = recorded_result(tool_result)
 
                 # An executor reports failure by RETURNING an error envelope, not
-                # by raising: `_exec_infra` turns a non-zero exit into
-                # {"error": ..., "exit_code": ...} so the MODEL can read and relay
+                # by raising (the old infra tools turned a non-zero exit into
+                # {"error": ..., "exit_code": ...}) so the MODEL can read and relay
                 # it. Only a raise reached the `except` arms above, so every such
                 # failure was stored as status='success' with the error sitting in
                 # `result` — and every "which tools are failing?" query answered
@@ -1730,7 +1647,7 @@ async def send_message(
                 # stayed invisible from 2026-07-16 to 08-28.
                 #
                 # Detection is deliberately narrow: a JSON object with a truthy
-                # `error`. A tool that returns a prose apology ("the coding host is
+                # `error`. A tool that returns a prose apology ("the service is
                 # not configured") is indistinguishable from a successful answer at
                 # this layer, and guessing from prose would be worse than the gap.
                 if (
@@ -1856,7 +1773,6 @@ async def synthesize_agent_reply(
     knowledge_connector: Any = None,
     finance_connector: Any = None,
     search_connector: Any = None,
-    remote_script_connector: Any = None,
 ) -> dict:
     """Chat entry point for two surfaces:
 
@@ -1913,7 +1829,6 @@ async def synthesize_agent_reply(
         knowledge_connector=knowledge_connector,
         finance_connector=finance_connector,
         search_connector=search_connector,
-        remote_script_connector=remote_script_connector,
     )
 
     if resp.get("error"):

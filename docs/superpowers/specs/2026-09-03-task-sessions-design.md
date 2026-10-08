@@ -1,7 +1,8 @@
 # Task sessions: comment-driven coding work
 
 **Date:** 2026-09-03
-**Status:** approved design, not yet implemented
+**Status:** approved design, not yet implemented.
+**Removed (v1 removal PR 4):** the coding lane, task sessions, the coding host, the MCP server and the repo and infra registries left v1 for the Development vertical (a2-development). This spec is a historical record.
 
 ## Problem
 

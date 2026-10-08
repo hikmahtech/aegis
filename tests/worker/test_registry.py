@@ -521,9 +521,16 @@ def test_trading_desk_flag_is_a_settings_field_on_by_default():
         # replays); AgentTaskActivities loses apply_restart_approval
         # (`plan_infra_task` stays as a stub). The rows keyed on homelab
         # collapse into the money/desk ones.
-        (True, True, 49, 215),
-        (False, True, 43, 198),
-        (False, False, 42, 197),
+        # Then the coding lane left v1 (PR 4): MINUS 2 flows (AgentRunFlow,
+        # WorkspaceRepoSyncFlow) and MINUS 16 unflagged activities (the
+        # AgentRunActivities and InventoryActivities classes, eight coding
+        # activities on AgentTaskActivities and HubActivities.record_plan;
+        # `reconcile_work_sessions`, `find_task_turns_due` and
+        # `cleanup_work_sessions` stay as no-op stubs for replays). All three
+        # rows move.
+        (True, True, 47, 199),
+        (False, True, 41, 182),
+        (False, False, 40, 181),
     ],
 )
 def test_real_registration_passes_the_boot_check(money, desk, flows, activities):

@@ -94,11 +94,11 @@ class AgentChatReplyFlow:
         is_taskless = inp.task_id is None
 
         # Step 1 — synthesize the reply. Smart-tier agents routinely take 3-6 min when invoking heavy tools
-        # (remote_script kimi SSH, deep KS search). Use TIMEOUT_CHAT_REPLY
+        # (deep KS search, research). Use TIMEOUT_CHAT_REPLY
         # (600s) to match the chat path (PR #248). NO_RETRY, not RETRY_ONCE:
         # this activity is an HTTP wrapper around core's entire chat tool
-        # loop, which can execute side-effecting tools (restart_service,
-        # complete_task, trigger_workflow, capture_to_inbox, handoff_task)
+        # loop, which can execute side-effecting tools (complete_task,
+        # trigger_workflow, capture_to_inbox, handoff_task)
         # before a timeout or late failure is raised back to us. It is NOT
         # idempotent, so at-least-once retry means duplicating real-world
         # actions, not just re-spending LLM cost. A transient failure

@@ -132,37 +132,6 @@ async def lifespan(app: FastAPI):
     search_connector = SearchConnector(base_url=settings.searxng_url)
     app.state.search_connector = search_connector
 
-    # Remote script connector (SSH to the coding host — used by infra chat
-    # tools and coding-agent runs). Config is DB-first: an infra registry row
-    # with coding.enabled overrides the env settings at call time, so the
-    # connector is always constructed (env values are the fallback).
-    from aegis.connectors.remote_script import RemoteScriptConnector
-
-    remote_script_connector = RemoteScriptConnector(
-        host=settings.remote_script_host,
-        user=settings.remote_script_user,
-        key_file=settings.remote_script_key_file,
-        repo_base=settings.remote_script_repo_base,
-        known_hosts=getattr(settings, "remote_script_known_hosts", None),
-        kimi_host=getattr(settings, "remote_script_kimi_host", ""),
-        tmux_session=getattr(settings, "remote_script_tmux_session", "remote"),
-        tmux_window_cap=getattr(settings, "remote_script_tmux_window_cap", 10),
-        claude_orgs=getattr(settings, "remote_script_claude_orgs", ""),
-        claude_binary=getattr(settings, "claude_cli_binary_path", ""),
-        kimi_binary=getattr(settings, "kimi_cli_binary_path", ""),
-        self_repo_path=getattr(settings, "aegis_self_repo_path", ""),
-        mcp_server_url=getattr(settings, "mcp_server_external_url", ""),
-        api_key=getattr(settings, "api_key", ""),
-        db_pool=pool,
-        secret_key=settings.secret_key,
-    )
-    logger.info(
-        "remote_script_connector_ready",
-        env_host=settings.remote_script_host or None,
-        db_first=True,
-    )
-    app.state.remote_script_connector = remote_script_connector
-
     app.state.settings = settings
 
     # Temporal client (best-effort — don't block startup if unreachable)
@@ -250,14 +219,11 @@ def create_app(run_lifespan: bool = True, settings: Settings | None = None) -> F
         expiring_items_admin,
         gmail_reauth,
         health,
-        infra,
-        infra_admin,
         integrations,
         interactions,
         knowledge,
         llm_backend,
         market,
-        mcp_server,
         money,
         notes_admin,
         observability,
@@ -272,7 +238,6 @@ def create_app(run_lifespan: bool = True, settings: Settings | None = None) -> F
         slack,
         social_auth,
         system_status,
-        task_sessions,
         temporal,
         todoist,
         webhooks,
@@ -343,22 +308,18 @@ def create_app(run_lifespan: bool = True, settings: Settings | None = None) -> F
     app.include_router(interactions.router)
     app.include_router(webhooks.router)
     app.include_router(capture.router)
-    app.include_router(mcp_server.router)
     app.include_router(market.router)
     app.include_router(overview.router)
     app.include_router(problems_admin.router)
     app.include_router(money.router)
     # The trading desk: same /api/admin/money prefix, its own module.
     app.include_router(desk.router)
-    app.include_router(infra.router)
-    app.include_router(infra_admin.router)
     app.include_router(system_status.router)
     app.include_router(resources.router)
     app.include_router(people_admin.router)
     app.include_router(expiring_items_admin.router)
     app.include_router(assets_admin.router)
     app.include_router(todoist.router)
-    app.include_router(task_sessions.router)
     app.include_router(notes_admin.router)
     app.include_router(preferences.router)
 

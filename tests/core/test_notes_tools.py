@@ -149,14 +149,10 @@ async def test_a_write_with_no_calling_agent_goes_to_the_research_holder(tmp_pat
     assert client.started[0]["arg"]["agent_id"] == holder
 
 
-def test_the_four_tools_are_registered_and_the_writers_are_not_read_only():
-    from aegis.api.routes import mcp_server as mcp
-
+def test_the_four_tools_are_registered():
     names = {t["function"]["name"] for t in chat.CHAT_TOOLS}
     for tool in ("note_search", "note_read", "note_write", "note_link"):
         assert tool in names and tool in chat.TOOL_EXECUTORS
-    assert {"note_search", "note_read"} <= mcp._READ_ONLY_TOOLS
-    assert not {"note_write", "note_link"} & mcp._READ_ONLY_TOOLS
 
 
 def test_notes_rank_above_raw_documents():

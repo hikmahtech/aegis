@@ -111,8 +111,3 @@ async def test_suggest_needs_a_topic_and_uses_the_index(conn, health):
     out = await _call("library_suggest", {"topic": "neural nets"}, _ctx(knowledge_connector=kc))
     assert out["via"] == "index" and out["books"][0]["id"] == 12
 
-
-def test_the_four_tools_are_read_only_on_the_mcp_surface():
-    from aegis.api.routes.mcp_server import _READ_ONLY_TOOLS
-
-    assert {"library_search", "library_book", "library_read", "library_suggest"} <= _READ_ONLY_TOOLS

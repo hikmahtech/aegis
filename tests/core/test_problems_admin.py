@@ -88,8 +88,7 @@ async def test_the_list_is_live_first_and_filters(client, db_pool):
     ] == []
 
 
-async def test_detail_carries_the_timeline_links_and_sessions(client, db_pool):
-    from aegis.services import work_sessions
+async def test_detail_carries_the_timeline_and_links(client, db_pool):
     from aegis.services.hub_project import link_task
 
     s = _subject()
@@ -101,13 +100,12 @@ async def test_detail_carries_the_timeline_links_and_sessions(client, db_pool):
         task,
     )
     await link_task(db_pool, r.problem_id, task)
-    await work_sessions.create_session(db_pool, task_id=task, agent_id="sebas")
 
     body = (await client.get(f"/api/admin/problems/{r.problem_id}")).json()
     assert body["problem"]["id"] == r.problem_id
     assert [e["kind"] for e in body["events"]].count("occurrence") == 1
     assert ("todoist_task", task) in [(x["link_kind"], x["ref"]) for x in body["links"]]
-    assert [x["owner"] for x in body["sessions"]] == ["aegis"]
+    assert "sessions" not in body  # the session registry left with the coding lane
     assert "window" not in body  # the deploy windows left with the infra lane
 
     missing = await client.get(f"/api/admin/problems/{uuid.uuid4()}")

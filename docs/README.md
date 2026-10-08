@@ -14,7 +14,7 @@
 | [Money and trading desk](architecture/money-and-trading-desk.md) | Maou's hledger books, bank parsers, dues, the chart of accounts, the paper trading desk |
 | [Research lane](architecture/research-lane.md) | Research flow, RSS feeds, Calibre, tracked topics, areas, story feedback, world/GitHub/tender watches |
 | [Obsidian vault](architecture/vault.md) | The notes writer's rules, `vault_layout`, the journal prompt, the `me/` record |
-| [Infrastructure registry](infrastructure.md) | Registering SSH hosts / the swarm / k8s clusters / cloud accounts / the coding host from the admin UI: encrypted credentials, kubeconfigs (incl. EKS/GKE exec-plugin auth + AWS profiles), read-only gating, chat contexts, `EXTRA_CLOUD_CLIS` image build arg; the note that the infra lane moved to DevOps (a2-devops) |
+| [Lanes, setup and operations](infrastructure.md) | The problem hub, the books, the research lane, feeds, Calibre, tracked topics, the vault; what moved out of v1 (the infra lane to DevOps, a2-devops; the development lane, the repo registry and the infra registry to Development, a2-development) |
 | [Social publishing](social-publishing.md) | Todoist-scheduled social posting with approval cards; native X OAuth + Postiz transport |
 | [Local development](development.md) | Docker Compose, setup, config, auth, adding flows/tools |
 | [Production](production.md) | Fork-owned image build + deploy, migrations, config plane, features that stay inert until you act, Slack scopes, inbound webhooks, the signed life-data webhook, comms/Slack debugging |

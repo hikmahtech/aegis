@@ -2,8 +2,8 @@
 
 Two sites in `services/chat.py` read the RAW `settings.model_fast` field
 instead of `tier_to_model("fast")`: the intent router, and the `model_light`
-handed to tool executors. A third, `routes/mcp_server.py::_tool_context`,
-does the same for the MCP surface.
+handed to tool executors. (A third, the MCP surface's own `ToolContext`, left
+with the coding lane.)
 
 `settings.model_fast` is the FALLBACK the tier map falls back TO — it is
 `AEGIS_MODEL_FAST` from the stack env, and `services/llm_backend.py` only
@@ -162,19 +162,3 @@ async def test_model_light_falls_back_to_settings_when_no_fast_tier_is_loaded(mo
     built = _capture_tool_context(monkeypatch)
     await send_message(_chat_pool(), _chat_llm(), "sebas", "hello", settings=_settings())
     assert built[-1].model_light == _STALE_ENV_FAST
-
-
-def test_the_mcp_tool_context_resolves_model_light_the_same_way():
-    """The third site, found by the issue's own grep. The MCP surface builds
-    its own `ToolContext` and had the identical `getattr(settings,
-    "model_fast", ...)` read, so an MCP `research_topic` synthesised on the
-    stale env model while the same tool over chat used the tier map."""
-    from aegis.api.routes.mcp_server import _tool_context
-
-    request = MagicMock()
-    request.app.state = MagicMock()
-    ctx = _tool_context(request, "sebas", _settings())
-    assert ctx.model_light == _TIER_FAST
-
-    set_model_tiers({"balanced": "kimi-k2.5"})
-    assert _tool_context(request, "sebas", _settings()).model_light == _STALE_ENV_FAST

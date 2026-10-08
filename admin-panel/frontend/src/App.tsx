@@ -10,7 +10,6 @@ import Content from './pages/Content';
 import ContentDetail from './pages/ContentDetail';
 import Flows from './pages/Flows';
 import SystemMonitoring from './pages/SystemMonitoring';
-import Infra from './pages/Infra';
 import Integrations from './pages/Integrations';
 import InteractionDetail from './pages/InteractionDetail';
 import Interactions from './pages/Interactions';
@@ -70,7 +69,6 @@ export default function App() {
           <Route path="/assets" element={<Assets />} />
           <Route path="/audit" element={<AuditLog />} />
           <Route path="/settings" element={<Settings />} />
-          <Route path="/infra" element={<Infra />} />
           <Route path="/system" element={<SystemMonitoring />} />
           <Route path="/admin/money" element={<Money />} />
           <Route path="/admin/desk" element={<TradingDesk />} />

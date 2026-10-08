@@ -34,7 +34,7 @@ What a projection does, in order:
    event carrying ``step_done`` completes that step's subtask. One step is not
    a plan, so it stays a comment.
 
-Comments carry the ``Workflow run:`` token so `is_user_note` and clarify keep
+Comments carry the ``Workflow run:`` token so clarify keeps
 excluding them, and a comment that fails to post leaves the watermark where it
 was: the next sweep retries rather than the event being lost.
 """
@@ -53,7 +53,6 @@ import structlog
 from aegis.agent_tags import GENERALIST_TAG
 from aegis.connectors.todoist import TodoistConnector
 from aegis.errors import error_text
-from aegis.services import work_sessions
 from aegis.services.agents import resolve_tag
 from aegis.services.git_checkout import parse_kv
 from aegis.services.hub import (
@@ -71,7 +70,7 @@ from aegis.services.tools.gtd import _capture_to_inbox_impl
 
 logger = structlog.get_logger()
 
-# The literal token clarify's loop guard and `work_sessions.is_user_note` key on.
+# The literal token clarify's loop guard keys on.
 FOOTER = "\n\nWorkflow run: problem-hub"
 SOURCE_TAG = "#alert"
 # The tag on a money problem's task (see `_OWNER_BY_SOURCE`). Clarify reads it
@@ -170,7 +169,6 @@ def render_block(
     problem: dict[str, Any],
     *,
     links: list[dict[str, Any]] | None = None,
-    sessions: list[dict[str, Any]] | None = None,
     steps: str = "",
 ) -> str:
     """The status block for a task description. Pure."""
@@ -198,23 +196,8 @@ def render_block(
         lines.append("Links: " + " · ".join(refs))
     if steps:
         lines.append("Steps: " + steps)
-    for sess in sessions or []:
-        lines.append("Session: " + session_line(sess))
     lines.append("<!-- /aegis:problem -->")
     return "\n".join(lines)
-
-
-def session_line(sess: dict[str, Any]) -> str:
-    """One registry row as the block and `task_context` show it:
-    `aegis active (work) · seen 2026-09-07 10:12 UTC · <summary>`."""
-    who = str(sess.get("owner") or "aegis")
-    account = str(sess.get("account") or "")
-    head = f"{who} {sess.get('status') or 'active'}" + (f" ({account})" if account else "")
-    seen = sess.get("last_seen_at") or sess.get("last_turn_at")
-    if seen:
-        head += f" · seen {_ts(seen)}"
-    summary = str(sess.get("summary") or "").strip()
-    return f"{head} · {summary[:160]}" if summary else head
 
 
 def plan_steps(payload: dict[str, Any]) -> list[str]:
@@ -327,9 +310,10 @@ async def ensure_problem_for_task(
     settings: Any = None,
 ) -> dict[str, Any] | None:
     """The problem behind a Todoist task, creating a `manual` one when the task
-    has none. This is what lets the hub carry a plain `@code` task: a session
-    registry, a timeline and a plan need a problem to hang off, and a task the
-    user wrote by hand has no alert behind it.
+    has none: a timeline needs a problem to hang off, and a task the user
+    wrote by hand has no alert behind it. The research lane is the caller
+    (`source="research"`); the `session` default was the coding lane's, which
+    moved to the Development vertical (a2-development).
 
     Returns the problem, or None when the task is unknown or the hub refused
     the event.
@@ -736,13 +720,7 @@ async def project(
             problem_id,
         )
     ]
-    sessions = await work_sessions.list_for_task(pool, task_id) if task_id else []
-    block = render_block(
-        p,
-        links=links,
-        sessions=sessions,
-        steps=await _step_progress(pool, problem_id),
-    )
+    block = render_block(p, links=links, steps=await _step_progress(pool, problem_id))
 
     if not task_id:
         if p["class"] == TOPIC_CLASS:
@@ -912,12 +890,7 @@ async def project(
     # just ticked off changes the count the block reports.
     progress = await _step_progress(pool, problem_id)
     if progress and f"Steps: {progress}" not in block:
-        block = render_block(
-            p,
-                links=links,
-            sessions=sessions,
-            steps=progress,
-        )
+        block = render_block(p, links=links, steps=progress)
     # The problem's title only changes when the hub rewrites it — today that
     # is a group upgrade, where "Post cms4k… stuck in Postiz" has to become
     # "6 posts stuck in Postiz" or the task lies about its own scope. A task

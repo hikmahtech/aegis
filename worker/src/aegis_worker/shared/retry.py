@@ -28,5 +28,5 @@ TIMEOUT_LLM = timedelta(seconds=600)
 TIMEOUT_LONG = timedelta(seconds=300)
 TIMEOUT_CHAT_REPLY = timedelta(
     seconds=600
-)  # comment-channel synthesize_reply: smart-tier LLM + heavy tools (kimi SSH, deep search)
+)  # comment-channel synthesize_reply: smart-tier LLM + heavy tools (deep search, research)
 TIMEOUT_CLAUDE = timedelta(minutes=35)

@@ -107,8 +107,8 @@ CI lints **scoped per package** (`ruff check core/src/ tests/core/ …`, see
 clean and equivalent because `docs/` sits in ruff's `extend-exclude` (#236).
 
 `ruff format` is deliberately absent from that block. Do **not** run it on
-`core/src/aegis/services/chat.py` or `core/src/aegis/services/tools/infra.py` — both carry
-hand-laid-out data tables (`CHAT_TOOLS`/`TOOL_EXECUTORS`, `_INFRA_SPECS`) that a local ruff
+`core/src/aegis/services/chat.py` — it carries
+hand-laid-out data tables (`CHAT_TOOLS`/`TOOL_EXECUTORS`) that a local ruff
 version rewrites wholesale while CI's ruff version considers them clean, burying real changes
 in whole-file churn. CI never runs `ruff format`, so it is not a gate you have to satisfy:
 write already-formatted edits, let `ruff check` be the gate, and verify a minimal diff with
@@ -126,14 +126,14 @@ cp config/.env.example config/.env
 Key settings:
 - `AEGIS_DATABASE_URL` — PostgreSQL connection
 - `AEGIS_ADMIN_USERNAME` + `AEGIS_ADMIN_PASSWORD` — admin credentials (required unless `AEGIS_AUTH_DISABLED=true`; see the auth section below)
-- `AEGIS_SECRET_KEY` — Fernet key encrypting DB-stored secrets (integration tokens, infra credentials, API keys); unset = plaintext-with-flag, fine for local dev only
+- `AEGIS_SECRET_KEY` — Fernet key encrypting DB-stored secrets (integration tokens, API keys); unset = plaintext-with-flag, fine for local dev only
 - `AEGIS_LITELLM_URL` + `AEGIS_LITELLM_API_KEY` — LLM gateway (or configure the backend from the admin **Models & Providers** page)
 - `AEGIS_COMMS_URL` — how Core reaches the comms delivery server (e.g. `http://localhost:8081`)
 - `AEGIS_SLACK_BOT_TOKEN` + `AEGIS_SLACK_APP_TOKEN` — Slack (comms); can also be set from the admin UI (stored encrypted in the DB)
 - `AEGIS_GMAIL_ACCOUNTS` — Gmail OAuth (format: `name:email,name:email`)
 
-Most integration secrets (Todoist, Slack, Postiz, finance provider keys, infra/cloud
-credentials, API keys) are entered in the admin UI and stored encrypted in the DB —
+Most integration secrets (Todoist, Slack, Postiz, finance provider keys, API
+keys) are entered in the admin UI and stored encrypted in the DB —
 env vars exist as bootstrap/fallback for local dev, not as the primary store.
 
 ### Agent personalities
@@ -153,7 +153,7 @@ install. `AEGIS_PERSONALITY_DIR` overrides where the starter files are read from
 ### Agent behavior (tags, tools, routing)
 
 Behavior is data, not code (issue #36). An agent's `capabilities` (JSONB) holds
-its behavior tags — closed vocab `gtd` / `finance` / `research` / `infra` from
+its behavior tags — closed vocab `gtd` / `finance` / `research` from
 `core/src/aegis/agent_tags.py` — and `metadata` (JSONB) holds routing knobs:
 `tool_set`, `intent_keywords`, `intent_description`, `mention_aliases`,
 `async_dispatch`, `knowledge_domains`, `voice_lines`. Flows/routes resolve *who
@@ -187,76 +187,12 @@ DB owns the channels, so UI edits, deactivations, and operator-added channels
 (e.g. a new Gmail account) survive Core restarts. Email channels additionally need
 the account authorized via the Google accounts re-auth flow (Flows page).
 
-### MCP server (serving AEGIS tools)
-
-The other direction: AEGIS can *be* an MCP server, so an external agent harness
-— `claude` / `kimi` CLI headless runs, Claude Desktop — mounts AEGIS's GTD,
-knowledge, infra and money tools natively instead of shelling back into the chat
-API. Route: `core/src/aegis/api/routes/mcp_server.py`, one streamable-HTTP
-endpoint per agent.
-
-**Off by default**: set `AEGIS_MCP_SERVER_ENABLED=true`
-(`settings.mcp_server_enabled`) and restart Core. While off, every method on the
-endpoint returns 403 with that instruction.
-
-**It also refuses to run unauthenticated.** `AEGIS_AUTH_DISABLED=true` makes
-`verify_auth` a no-op, which is the documented posture for a deployment behind
-an authenticating proxy (Cloudflare Access, an OAuth2 proxy) — but the URL an
-agent run mounts is deliberately a LAN/overlay address that *bypasses* that
-proxy, so the two together would serve every agent's tool set (`restart_service`,
-`run_infra_script`, money and GTD writes) to anything that can open a socket to
-Core. Enabled + `auth_disabled` is therefore a 403 naming both settings, unless
-the operator accepts it explicitly with
-`AEGIS_MCP_SERVER_ALLOW_UNAUTHENTICATED=true`. The fix in almost every case is
-the other direction: unset `AEGIS_AUTH_DISABLED` and give the endpoint a key.
-
-| Method | Behaviour |
-|---|---|
-| `POST /api/mcp-server/{agent_id}` | one JSON-RPC 2.0 message per request — `initialize`, `ping`, `tools/list`, `tools/call`, plus 202 for notifications |
-| `POST /api/mcp-server/{agent_id}/gated` | identical, except a tool outside `_READ_ONLY_TOOLS` needs an operator approval first — see [Gated runs](#gated-runs-human-in-the-loop) |
-| `GET /api/mcp-server/{agent_id}[/gated]` | 405 — stateless, no server-initiated SSE stream |
-| `DELETE /api/mcp-server/{agent_id}[/gated]` | 204 — session termination no-op |
-
-Three things bound what a mounted client can do:
-
-- **Auth** is the repo standard (`verify_auth`): `X-API-Key`, or Basic. No new scheme.
-- **The URL names an agent**, and the served tools are exactly that agent's
-  `metadata.tool_set` (the same `_get_agent_tools` the chat loop uses), so the
-  MCP surface can never be wider than that agent's chat surface. An agent id
-  with no row is a 404. Point a harness at a *narrow* agent.
-- **`_UNSERVED_TOOLS` is always removed** from the served list, even when the
-  agent holds those tools. `dispatch_agent_run` **starts another CLI
-  run** — which mounts this same endpoint with the same tool set, so serving
-  it is unbounded recursion with no depth counter anywhere in the loop (the
-  only brake is the coding host's tmux window cap, past which launches fall
-  through to detached `nohup` and stop being bounded at all). The exclusion is
-  applied where the served set is *derived*, so an excluded tool is neither
-  listed nor callable — `tools/call` authorizes against that same list.
-
-Responses are always `application/json`; no `Mcp-Session-Id` is issued and one
-sent by a client is ignored. A *tool* failure (bad arguments, timeout, executor
-exception) comes back as an MCP tool result with `isError: true` — argument
-errors carry the tool's schema hint so the calling model can self-correct —
-while protocol problems use JSON-RPC error envelopes (`-32700`, `-32600`,
-`-32601`, `-32602`) sent with HTTP 200, because a compliant client treats a
-non-2xx status as a transport failure and never reads the body. Results are
-truncated to 64 KB (an engine holds far more context than the small chat model,
-so the 4 KB `tool_result_max_bytes` chat cap would throw away useful output).
-Each call logs `mcp_server_tool_call` with the argument **keys** only — never
-their values.
-
-Client config for the `claude` CLI (`.mcp.json`, or Claude Desktop's config):
-
-```json
-{"mcpServers": {"aegis": {"type": "http", "url": "http://<core-host>:8080/api/mcp-server/sebas", "headers": {"X-API-Key": "<key>"}}}}
-```
-
 ### Authentication (required for non-proxied deployments)
 
 If your deployment is **NOT** behind an authenticating proxy (Cloudflare Access, an
 OAuth2 proxy, Tailscale-only access, etc.), basic auth **MUST stay on** — it is the only
-thing standing between the internet/LAN and full admin access to your data, credentials
-and infrastructure registry. Keep `AEGIS_AUTH_DISABLED` unset (or `false`) and set both:
+thing standing between the internet/LAN and full admin access to your data and
+credentials. Keep `AEGIS_AUTH_DISABLED` unset (or `false`) and set both:
 
 ```bash
 # config/.env
@@ -446,248 +382,13 @@ scopes and the reinstall they require are in
 4. Grant it to agents via their `metadata.tool_set` — set it on the admin **Behavior** tab (runtime source of truth) and/or in `config/seed/agents.yaml`. The shipped `AGENT_TOOL_SETS` dict is now only a seed-time default for the four example agents; an agent's DB `metadata.tool_set` overrides it, and an unconfigured agent falls back to a small read-only `_FALLBACK_TOOL_SET` (not Sebas's full surface). `_validate_agent_tool_sets` refuses to boot on a tool name with no executor, and Core additionally warns at startup on any DB `metadata.tool_set` entry that references a missing executor.
 5. If the tool needs new connectors on `ToolContext`, add the field and wire it in `send_message()`
 6. Write tests in `tests/core/test_{tool_name}_tool.py`
-7. If the tool can legitimately run longer than `tool_timeout_seconds` (default 30s), add an entry to `_TOOL_TIMEOUT_OVERRIDES` in `chat.py` — otherwise the executor cancels it mid-flight and the model retries, orphaning whatever the tool started (e.g. `aegis_self_diagnose` gets its full remote coding-run budget there).
+7. If the tool can legitimately run longer than `tool_timeout_seconds` (default 30s), add an entry to `_TOOL_TIMEOUT_OVERRIDES` in `chat.py` — otherwise the executor cancels it mid-flight and the model retries, orphaning whatever the tool started
 
-## Agent runs (the heavy lane)
+## Coding runs and the MCP server moved out
 
-Agent work runs in two lanes.
-
-| | Light lane | Heavy lane |
-|---|---|---|
-| What | Core's in-process chat loop (`services/chat.py`) | `AgentRunFlow` — a headless claude/kimi CLI session on the coding host |
-| Where | Core, one LLM call + a bounded tool loop | `RemoteScriptConnector.start_kimi_run`, in a per-run git worktree, tmux window when the host is reachable |
-| How long | Seconds; answers in the same turn | Minutes to tens of minutes; the result is delivered to the agent's channel when it lands |
-| Dispatch | the user talks to the agent | the `dispatch_agent_run` chat tool, or `start_workflow("AgentRunFlow", {...})` |
-| Permissions | every tool call is AEGIS's own, already scoped to the agent | full-auto by default; `gated: true` puts a human on every non-allowed action (see [Gated runs](#gated-runs-human-in-the-loop)) |
-
-An **agent run** is deliberately not "a coding task ending in a PR". It is the
-same machinery `activities/agent_task.py` uses for the coding lane with the
-Todoist coupling removed, so investigation, research and analysis are equally
-valid asks — the run gets a filesystem, a full tool budget and its own
-time, and AEGIS gets the transcript tail back in chat.
-
-Three invariants worth knowing before you touch `flows/agent_run.py`:
-
-- **The launch activity is `NO_RETRY`.** Launching is not idempotent — a retry
-  is a second CLI session on a second worktree, burning tokens and racing the
-  first one's writes. Polling (`check_agent_run`) is a `cat` plus a `fuser`,
-  so it retries freely.
-- **A timeout does not kill the run.** The process may be minutes from a good
-  answer and the operator can attach to its tmux window, so the flow reports
-  where the run is (`tmux window <name> on <host>`, plus the output file) and
-  exits with `status: "timeout"`.
-- **Every terminal path calls `cleanup_agent_run`.** Nothing else removes a
-  run's worktree, so a missing call leaks one directory and one
-  `git worktree list` registration per run, for ever (#300). The activity
-  probes liveness before removing anything and the flow passes `output_file`
-  only on the timeout path — where the process was deliberately *not* killed,
-  so a live run keeps its worktree (leaking it is better than deleting the cwd
-  it is writing to). `start_kimi_run` cleans up after its own failed launches
-  for the same reason, except a launch that TIMED OUT, which may already have
-  forked the agent.
-
-Completion is detected by **process exit**, not by a `STATUS:` footer: the
-old alert investigation's footer regex accepted a closed vocabulary of
-alert-RCA verbs a general run has no reason to emit.
-
-### What a run gets in its workspace
-
-A **claude-engine** run is not a bare CLI session — the connector mounts two
-things into it before launch. Both are best-effort: neither can fail a launch,
-and a run that gets neither is degraded, not broken.
-
-**SKILL.md runbooks.** `config/skills/*/SKILL.md` in this repo are copied into
-`<worktree>/.claude/skills` as part of the worktree-creation command. The source
-is AEGIS's own checkout on the coding host — `coding.self_repo_path` (or
-`AEGIS_SELF_REPO_PATH`), resolved against `repo_base`, which
-`WorkspaceRepoSyncFlow` keeps current, so editing a skill and merging it is
-enough to change what runs see. With `self_repo_path` unset, or the directory
-missing on the host, the copy fragment is skipped (`[ -d … ] && … || true`) and
-the launch proceeds. The copy happens only when the per-run worktree was
-actually created: the shared clone is long-lived, and seeding `.claude/skills`
-into it would leave untracked files behind forever.
-
-**AEGIS's own tools over MCP.** The run mounts `POST /api/mcp-server/{agent_id}`
-(PR #284) as an MCP server named `aegis`, so it can read the GTD projection,
-capture tasks, search knowledge and query infra with the *same* tools the
-dispatching agent has in chat — its `metadata.tool_set`, no wider. The gate is a
-chain, and every link must be open:
-
-| Link | Where | If missing |
-|---|---|---|
-| `mcp_server_enabled` | `AEGIS_MCP_SERVER_ENABLED` | endpoint 403s; the run mounts a server that refuses everything |
-| not (`auth_disabled` without `mcp_server_allow_unauthenticated`) | `AEGIS_AUTH_DISABLED` / `AEGIS_MCP_SERVER_ALLOW_UNAUTHENTICATED` | endpoint 403s (see the MCP-server section above) |
-| `mcp_server_external_url` | `AEGIS_MCP_SERVER_EXTERNAL_URL`, or infra `coding.mcp_server_url` (DB wins) | no config written, run launches toolless |
-| an API key | `AEGIS_API_KEY`, **or** the admin-generated key in `settings` (env first, DB fallback — `_resolve_mount_api_key`) | no config written + a `mcp_mount_skipped` WARNING |
-| engine == `claude` | routing / `engine_override` | kimi runs never mount (see below) |
-| `agent_id` | `AgentRunInput.agent_id`, threaded through `launch_agent_run` | no per-agent endpoint to point at |
-
-The URL must be reachable **from the coding host** — an internal address like
-`http://10.0.0.5:8080`, not the browser-facing hostname, which is typically
-behind an authenticating proxy a headless CLI cannot traverse.
-
-**Security posture.** The mounted key is full API access to AEGIS, so:
-
-- It is written by piping the config through the **SSH channel's stdin**, never
-  as a command argument. argv is world-readable via `ps` on a shared coding host
-  and lands in shell audit logs; a heredoc would be equivalent but leaves the
-  content in the command string too. The content is never logged — only
-  `mcp_config_written agent_id=… path=…`.
-- The file lives at `$HOME/.aegis/mcp-<agent_id>.json` (a gated run gets its own
-  `mcp-<agent_id>-gated.json`, pointed at the enforcing endpoint), written under
-  `umask 077` (0600, in a 0700 directory) and deliberately **outside the run's
-  worktree**, so the agent it authenticates cannot commit or push its own
-  credential.
-- The launch adds `--strict-mcp-config`, which makes that file the *only* server
-  list. Without it, a `.mcp.json` checked into the target repo could add servers
-  of its own to an unattended, full-auto run.
-- The write is `cat > <path>.$$.tmp && mv <path>.$$.tmp <path>`, not a plain
-  `cat >`: two launches for the same agent target the same path, and a
-  truncate-in-place would be read half-written by the other run's CLI.
-
-**Per-agent tool scoping is not a security boundary against a hostile run.**
-The mount key is one shared AEGIS API key, and the per-agent scoping is only
-the URL a run was *handed*. A run that goes off the rails can read the other
-agents' config files on the same coding host (or simply guess the path — it is
-`$HOME/.aegis/mcp-<agent_id>.json`) and drive `/api/mcp-server/<other-agent>`
-with the same key, which is every tool any agent holds. Per-run scoped tokens
-are issue **#288**; until then the real containment is (a) gated runs, which
-put a human on every action, and (b) the `_UNSERVED_TOOLS` exclusions above,
-which keep the recursion-capable tools off the mount entirely. Treat "agent X's
-mount" as "AEGIS's whole tool surface, addressed conveniently", not as a
-sandbox.
-
-**Kimi runs get neither (v1).** The kimi CLI has no `--mcp-config` /
-`--strict-mcp-config` pair and no skills convention, so a kimi run is a plain
-CLI session exactly as before. Force `engine: "claude"` on a dispatch that needs
-AEGIS's tools.
-
-### Gated runs (human-in-the-loop)
-
-A normal run launches with `--dangerously-skip-permissions`: nobody is sitting
-at the terminal, so nothing can prompt. A **gated** run
-(`gated: true` on `dispatch_agent_run` / `AgentRunInput`) replaces that flag with
-`--permission-prompt-tool mcp__aegis__approve_tool_use` and turns every action
-the CLI would otherwise auto-allow into a question for a human.
-
-```
-run wants to use Bash/Write/…
-  └─ CLI calls mcp__aegis__approve_tool_use {tool_name, input, tool_use_id}
-       └─ core (routes/mcp_server.py) starts an InteractionFlow
-            └─ approval card lands in the agent's channel
-                 └─ ✅ Approve → {"behavior":"allow","updatedInput":<the input, verbatim>}
-                    ⛔ Deny    → {"behavior":"deny","message":"Denied by operator: …"}
-  └─ run continues either way (a deny is a tool result, not a crash)
-```
-
-**That path covers the CLI's BUILT-IN tools only.** Live E2E on 2026-08-13
-(issue **#294**) caught claude 2.1.231 executing `mcp__aegis__capture_to_inbox`
-in a gated run with zero cards: tools that arrive through an explicitly-passed
-`--mcp-config` are trusted in `-p` mode and never reach
-`--permission-prompt-tool` (Bash *does* still reach it). So AEGIS's own tools are
-gated **server-side** instead, by the URL the gated run mounts:
-
-```
-POST /api/mcp-server/{agent_id}/gated        ← what a gated run mounts
-  read-only tool (_READ_ONLY_TOOLS)   → executes, no card
-  anything else                       → approve-then-retry:
-     1st call  → raise an InteractionFlow card, wait mcp_gate_wait_seconds (40),
-                 then answer isError "…retry this exact call in ~60 seconds…"
-     retry     → find the approval by (agent, tool, sha256(canonical args)),
-                 claim it single-use, execute, return the real result
-     denied    → permanent deny for those arguments; archived → "expired"
-```
-
-40 seconds is deliberate: the CLI was measured to abandon an MCP tool call at
-~60s regardless of `MCP_TOOL_TIMEOUT`, so the gate cannot hold a call open until
-a human answers — it has to come back in time to *instruct the retry*. An
-approval lives 15 minutes, covers exactly the arguments the operator read
-(canonical-JSON hash, so key order is not a new call) and authorises exactly one
-execution: the claim is an atomic `UPDATE … WHERE metadata->>'gate_consumed_at'
-IS NULL`, so two concurrent retries cannot both run. `_READ_ONLY_TOOLS`
-(`api/routes/mcp_server.py`) is v1 of the classification issue **#289** asks for
-— an ALLOW-list, so a tool added later is gated until someone classifies it.
-
-This is AEGIS's **Rule-of-Two** posture in one flag: a run that reads untrusted
-content *and* can mutate state should not also be unsupervised. Give up any one
-of the three and you are back in safe territory — a gated run keeps the first
-two and hands the third to a person.
-
-**The gate fails closed.** Only a human resolving the card with an approve value
-produces an `allow`. Every other outcome is a deny: no Temporal client, a
-malformed request, a workflow that will not start, an exception mid-flight, a
-timeout, an archived card, or a response value the gate does not positively
-recognise. That is deliberate and worth preserving — a permission gate that
-opens when it breaks is not a gate. The verdict always comes back as a normal
-(`isError: false`) MCP result, because an error result is a broken permission
-check rather than a decision.
-
-**Two timeouts, and their order matters.** Core holds the CLI's permission call
-open for `AGENT_RUN_APPROVAL_TIMEOUT_S` (**9 min**,
-`api/routes/mcp_server.py`) and the launch exports `MCP_TOOL_TIMEOUT=600000`
-(**10 min**, `connectors/remote_script.py`). The nine must stay under the ten: if
-the CLI gave up first, a slow operator would surface inside the run as a
-transport failure and their answer would land nowhere. Raise one and raise the
-other. The card's own `timeout_policy` is `archive`, so an unanswered card stops
-being pending instead of holding a workflow open forever.
-
-**A third clock: the flow's watch window.** `AgentRunInput.timeout_minutes`
-(default 30) is how long `AgentRunFlow` keeps polling; it never kills the run,
-it only stops watching and reports where the process is. A gated run spends most
-of that window *blocked on a human* (up to 9 min per card), so three or four
-questions exhaust 30 minutes while the CLI is still working and still raising
-cards. `dispatch_agent_run` therefore takes an optional `timeout_minutes`
-(5–240) and defaults a **gated** dispatch to **120** when the caller omits it.
-
-**Gated has two hard preconditions**, both checked at launch and both returned
-as a normal `{"status": "failed", ...}`:
-
-| Precondition | Why |
-|---|---|
-| engine is `claude` | kimi has no `--permission-prompt-tool` equivalent |
-| the MCP mount succeeded | it is both where the approval tool lives and what points the run at the enforcing `/gated` endpoint — an unmounted gated run is an ungated run |
-
-Neither degrades to an ungated run. A request for a human in the loop that
-quietly became a full-auto session is the one failure mode this feature cannot
-have, so it fails the launch instead and the flow delivers the reason.
-
-`approve_tool_use` is served by `POST /api/mcp-server/{agent_id}` to **every**
-agent regardless of `metadata.tool_set` — `--permission-prompt-tool` only
-resolves a tool the server advertises, and an agent whose gate is invisible
-could not run gated at all. It is deliberately **not** a `CHAT_TOOLS` entry: it
-is a transport-level permission gate, not something an agent may call in chat,
-and calling it grants nothing anyway.
-
-### Provisioning the aegis-scratch workspace (once)
-
-`start_kimi_run` never JIT-clones — a missing checkout is a deliberate hard
-failure. A run dispatched without a `repo` uses the fixed `aegis-scratch`
-checkout, which the operator creates once on the coding host. The name is
-AEGIS-prefixed deliberately (#292): `repo_base` is a real workspace root where a
-plain `scratch/` usually already exists as a personal, non-git folder.
-
-```bash
-mkdir -p <repo_base>/aegis-scratch && cd <repo_base>/aegis-scratch && \
-  git init && git commit --allow-empty -m init
-```
-
-The empty commit is load-bearing: the launch adds a **detached worktree**, which
-needs a `HEAD` to detach from. If it is missing, the flow delivers the failure
-with this exact command in it.
-
-### Granting the tool on an existing deployment
-
-`agents.metadata.tool_set` is **DB-owned once non-empty**, so adding
-`dispatch_agent_run` to `config/seed/agents.yaml` grants it on a *fresh* boot
-only. On a running deployment, add it on the admin **Behavior** tab or:
-
-```bash
-curl -X PATCH "$AEGIS_URL/api/agents/sebas" \
-  -H 'content-type: application/json' \
-  -d '{"metadata": {"tool_set": [<existing tools...>, "dispatch_agent_run"]}}'
-```
-
-`tool_set` is replaced wholesale, so send the full list, not just the new entry.
+Agent runs on a coding host (`AgentRunFlow`, claude/kimi), task sessions and
+the MCP server (`/api/mcp-server/*`) left v1 with the development lane. They
+live in the Development vertical (a2-development) now.
 
 ## Adding Intelligence Topics
 

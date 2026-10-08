@@ -1,6 +1,6 @@
 """Admin CRUD for the people registry (`life.people`, migration 016).
 
-Mirrors the resources.py / infra_admin.py CRUD pattern: thin handlers over
+Mirrors the resources.py CRUD pattern: thin handlers over
 services/people.py, audit-logged mutations, auth on the whole router.
 Consumed by the admin panel's People page.
 """

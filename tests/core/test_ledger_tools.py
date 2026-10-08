@@ -1609,16 +1609,13 @@ async def test_books_disabled_is_reported_not_raised(db_pool, tmp_path):
         assert out.startswith("error:"), out
 
 
-def test_tools_are_registered_and_gated():
-    from aegis.api.routes.mcp_server import _UNSERVED_TOOLS
+def test_tools_are_registered():
     from aegis.services.chat import AGENT_TOOL_SETS, CHAT_TOOLS, TOOL_EXECUTORS
 
     names = {t["function"]["name"] for t in CHAT_TOOLS}
     for n in ("ledger_query", "ledger_post", "ledger_reclassify", "ledger_add_rule"):
         assert n in names and n in TOOL_EXECUTORS and n in AGENT_TOOL_SETS["maou"]
     assert "ledger_query" in AGENT_TOOL_SETS["sebas"]
-    assert {"ledger_post", "ledger_reclassify", "ledger_add_rule"} <= _UNSERVED_TOOLS
-    assert "ledger_query" not in _UNSERVED_TOOLS
 
 
 def test_the_seed_grants_no_ledger_tool():

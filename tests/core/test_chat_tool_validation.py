@@ -97,11 +97,9 @@ async def test_retry_message_includes_schema_hint():
     """The tool message fed back on a validation failure spells out the
     expected arguments (required fields + enum values) so the model can
     self-correct — the fix for gpt-oss fumbling a required `context` enum
-    and then giving up to prose. Uses `list_nodes` (swarm-only, still has an
-    `enum` on `context`) via the real CHAT_TOOLS schema (the production path).
-    `run_infra_script`/`list_argocd_apps`/etc. dropped their `context` enum
-    (issue #51 — script-host k8s contexts are self-hoster-configurable), so
-    they no longer exercise this "one of" hint path."""
+    and then giving up to prose. Uses `configure_triage` (a required `setting`
+    with an `enum`) via the real CHAT_TOOLS schema (the production path); the
+    infra tool this used to use left with the infra registry."""
     from aegis.services.chat import _dispatch_tool_call_with_retry
 
     captured: dict[str, str] = {}
@@ -111,26 +109,26 @@ async def test_retry_message_includes_schema_hint():
 
     def _retry(err: str) -> dict:
         captured["err"] = err
-        return {"context": "swarm"}
+        return {"setting": "notification_mode", "action": "get"}
 
     messages: list[dict] = []
     result = await _dispatch_tool_call_with_retry(
         pool=None,
-        name="list_nodes",
+        name="configure_triage",
         tool_call_id="call_hint",
-        initial_args={},  # missing required `context`
+        initial_args={},  # missing required `setting` and `action`
         messages=messages,
         retry_args_provider=_retry,
         executor=_fake_executor,
         ctx=None,
     )
     assert result["ok"] is True
-    # The retry was told what `context` must be: required + its enum values.
+    # The retry was told what `setting` must be: required + its enum values.
     err = captured["err"]
-    assert "context" in err
+    assert "setting" in err
     assert "required" in err
     assert "one of" in err
-    assert "swarm" in err
+    assert "notification_mode" in err
     # The same enriched message is what the LLM sees in the transcript.
     tool_msgs = [m for m in messages if m.get("role") == "tool"]
     assert tool_msgs and "Expected arguments" in tool_msgs[0]["content"]

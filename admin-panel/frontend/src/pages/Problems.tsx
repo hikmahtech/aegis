@@ -258,22 +258,6 @@ export default function Problems() {
                     </p>
                   )}
 
-                  {detail.sessions.length > 0 && (
-                    <>
-                      <h4>Sessions</h4>
-                      {detail.sessions.map((s: any) => (
-                        <div key={s.id} className="meta">
-                          <strong>{s.owner}</strong> {s.status}
-                          {s.account ? ` (${s.account})` : ''} · seen {ago(s.last_seen_at)}
-                          {s.summary ? ` · ${s.summary}` : ''}
-                          {s.owner === 'aegis' && s.session_id ? (
-                            <div><code>cd {s.worktree_path} &amp;&amp; claude --resume {s.session_id}</code></div>
-                          ) : null}
-                        </div>
-                      ))}
-                    </>
-                  )}
-
                   <h4>Timeline</h4>
                   {detail.events.length === 0 && <p className="meta">no events</p>}
                   {detail.events.map((e: any) => (

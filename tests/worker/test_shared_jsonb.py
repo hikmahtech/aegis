@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import pytest
 from aegis_worker.activities.channels import _decode_config
-from aegis_worker.activities.repo_resolve import _decode_metadata
 from aegis_worker.activities.review import _decode_counts
 from aegis_worker.shared.jsonb import decode_jsonb
 
@@ -52,11 +51,7 @@ def test_a_channel_config_raises_and_is_a_copy():
 
 
 def test_the_degrading_callers_degrade():
-    """A digest line and an alert's routing would each rather lose one row
-    than fail the run."""
+    """A digest line would rather lose one row than fail the run."""
     assert _decode_counts("not json") == {}
     assert _decode_counts(["not", "a", "dict"]) == {}
     assert _decode_counts('{"tasks": 3}') == {"tasks": 3}
-    assert _decode_metadata({"metadata": "not json"}) == {}
-    assert _decode_metadata({"metadata": None}) == {}
-    assert _decode_metadata({"metadata": {"github_repo": "a/b"}}) == {"github_repo": "a/b"}
